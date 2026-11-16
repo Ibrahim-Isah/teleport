@@ -1,162 +1,135 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
-	"fmt"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/elasticache"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	ectypes "github.com/aws/aws-sdk-go-v2/service/elasticache/types"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/cloud"
 	"github.com/gravitational/teleport/lib/cloud/mocks"
-	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
 func TestElastiCacheFetcher(t *testing.T) {
 	t.Parallel()
 
-	elasticacheProd, elasticacheDatabaseProd, elasticacheProdTags := makeElastiCacheCluster(t, "ec1", "us-east-1", "prod")
-	elasticacheQA, elasticacheDatabaseQA, elasticacheQATags := makeElastiCacheCluster(t, "ec2", "us-east-1", "qa", withElastiCacheConfigurationEndpoint())
-	elasticacheUnavailable, _, elasticacheUnavailableTags := makeElastiCacheCluster(t, "ec4", "us-east-1", "prod", func(cluster *elasticache.ReplicationGroup) {
+	elasticacheProd, elasticacheDatabasesProd, elasticacheProdTags := makeElastiCacheCluster(t, "ec1", "us-east-1", "prod", mocks.WithElastiCacheReaderEndpoint)
+	elasticacheQA, elasticacheDatabasesQA, elasticacheQATags := makeElastiCacheCluster(t, "ec2", "us-east-1", "qa", mocks.WithElastiCacheConfigurationEndpoint, withElastiCacheEngine("valkey"))
+	elasticacheUnavailable, _, elasticacheUnavailableTags := makeElastiCacheCluster(t, "ec4", "us-east-1", "prod", func(cluster *ectypes.ReplicationGroup) {
 		cluster.Status = aws.String("deleting")
 	})
-	elasticacheUnsupported, _, elasticacheUnsupportedTags := makeElastiCacheCluster(t, "ec5", "us-east-1", "prod", func(cluster *elasticache.ReplicationGroup) {
+	elasticacheUnsupported, _, elasticacheUnsupportedTags := makeElastiCacheCluster(t, "ec5", "us-east-1", "prod", func(cluster *ectypes.ReplicationGroup) {
 		cluster.TransitEncryptionEnabled = aws.Bool(false)
 	})
-	elasticacheTagsByARN := map[string][]*elasticache.Tag{
-		aws.StringValue(elasticacheProd.ARN):        elasticacheProdTags,
-		aws.StringValue(elasticacheQA.ARN):          elasticacheQATags,
-		aws.StringValue(elasticacheUnavailable.ARN): elasticacheUnavailableTags,
-		aws.StringValue(elasticacheUnsupported.ARN): elasticacheUnsupportedTags,
+	elasticacheTagsByARN := map[string][]ectypes.Tag{
+		aws.ToString(elasticacheProd.ARN):        elasticacheProdTags,
+		aws.ToString(elasticacheQA.ARN):          elasticacheQATags,
+		aws.ToString(elasticacheUnavailable.ARN): elasticacheUnavailableTags,
+		aws.ToString(elasticacheUnsupported.ARN): elasticacheUnsupportedTags,
 	}
 
-	tests := []struct {
-		name          string
-		inputClients  cloud.AWSClients
-		inputLabels   map[string]string
-		wantDatabases types.Databases
-	}{
+	tests := []awsFetcherTest{
 		{
 			name: "fetch all",
-			inputClients: &cloud.TestCloudClients{
-				ElastiCache: &mocks.ElastiCacheMock{
-					ReplicationGroups: []*elasticache.ReplicationGroup{elasticacheProd, elasticacheQA},
-					TagsByARN:         elasticacheTagsByARN,
-				},
+			fetcherCfg: AWSFetcherFactoryConfig{
+				AWSClients: fakeAWSClients{
+					ecClient: &mocks.ElastiCacheClient{
+						ReplicationGroups: []ectypes.ReplicationGroup{*elasticacheProd, *elasticacheQA},
+						TagsByARN:         elasticacheTagsByARN,
+					}},
 			},
-			inputLabels:   wildcardLabels,
-			wantDatabases: types.Databases{elasticacheDatabaseProd, elasticacheDatabaseQA},
+			inputMatchers: makeAWSMatchersForType(types.AWSMatcherElastiCache, "us-east-1", wildcardLabels),
+			wantDatabases: append(elasticacheDatabasesProd, elasticacheDatabasesQA...),
 		},
 		{
 			name: "fetch prod",
-			inputClients: &cloud.TestCloudClients{
-				ElastiCache: &mocks.ElastiCacheMock{
-					ReplicationGroups: []*elasticache.ReplicationGroup{elasticacheProd, elasticacheQA},
-					TagsByARN:         elasticacheTagsByARN,
+			fetcherCfg: AWSFetcherFactoryConfig{
+				AWSClients: fakeAWSClients{
+					ecClient: &mocks.ElastiCacheClient{
+						ReplicationGroups: []ectypes.ReplicationGroup{*elasticacheProd, *elasticacheQA},
+						TagsByARN:         elasticacheTagsByARN,
+					},
 				},
 			},
-			inputLabels:   envProdLabels,
-			wantDatabases: types.Databases{elasticacheDatabaseProd},
+			inputMatchers: makeAWSMatchersForType(types.AWSMatcherElastiCache, "us-east-1", envProdLabels),
+			wantDatabases: elasticacheDatabasesProd,
 		},
 		{
 			name: "skip unavailable",
-			inputClients: &cloud.TestCloudClients{
-				ElastiCache: &mocks.ElastiCacheMock{
-					ReplicationGroups: []*elasticache.ReplicationGroup{elasticacheProd, elasticacheUnavailable},
-					TagsByARN:         elasticacheTagsByARN,
+			fetcherCfg: AWSFetcherFactoryConfig{
+				AWSClients: fakeAWSClients{
+					ecClient: &mocks.ElastiCacheClient{
+						ReplicationGroups: []ectypes.ReplicationGroup{*elasticacheProd, *elasticacheUnavailable},
+						TagsByARN:         elasticacheTagsByARN,
+					},
 				},
 			},
-			inputLabels:   wildcardLabels,
-			wantDatabases: types.Databases{elasticacheDatabaseProd},
+			inputMatchers: makeAWSMatchersForType(types.AWSMatcherElastiCache, "us-east-1", wildcardLabels),
+			wantDatabases: elasticacheDatabasesProd,
 		},
 		{
 			name: "skip unsupported",
-			inputClients: &cloud.TestCloudClients{
-				ElastiCache: &mocks.ElastiCacheMock{
-					ReplicationGroups: []*elasticache.ReplicationGroup{elasticacheProd, elasticacheUnsupported},
-					TagsByARN:         elasticacheTagsByARN,
+			fetcherCfg: AWSFetcherFactoryConfig{
+				AWSClients: fakeAWSClients{
+					ecClient: &mocks.ElastiCacheClient{
+						ReplicationGroups: []ectypes.ReplicationGroup{*elasticacheProd, *elasticacheUnsupported},
+						TagsByARN:         elasticacheTagsByARN,
+					},
 				},
 			},
-			inputLabels:   wildcardLabels,
-			wantDatabases: types.Databases{elasticacheDatabaseProd},
+			inputMatchers: makeAWSMatchersForType(types.AWSMatcherElastiCache, "us-east-1", wildcardLabels),
+			wantDatabases: elasticacheDatabasesProd,
 		},
 	}
-
-	for _, test := range tests {
-		test := test
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			fetchers := mustMakeAWSFetchersForMatcher(t, test.inputClients, services.AWSMatcherElastiCache, "us-east-2", toTypeLabels(test.inputLabels))
-			require.ElementsMatch(t, test.wantDatabases, mustGetDatabases(t, fetchers))
-		})
-	}
+	testAWSFetchers(t, tests...)
 }
 
-func makeElastiCacheCluster(t *testing.T, name, region, env string, opts ...func(*elasticache.ReplicationGroup)) (*elasticache.ReplicationGroup, types.Database, []*elasticache.Tag) {
-	cluster := &elasticache.ReplicationGroup{
-		ARN:                      aws.String(fmt.Sprintf("arn:aws:elasticache:%s:123456789012:replicationgroup:%s", region, name)),
-		ReplicationGroupId:       aws.String(name),
-		Status:                   aws.String("available"),
-		TransitEncryptionEnabled: aws.Bool(true),
+func makeElastiCacheCluster(t *testing.T, name, region, env string, opts ...func(*ectypes.ReplicationGroup)) (*ectypes.ReplicationGroup, types.Databases, []ectypes.Tag) {
+	cluster := mocks.ElastiCacheCluster(name, region, opts...)
 
-		// Default has one primary endpoint in the only node group.
-		NodeGroups: []*elasticache.NodeGroup{{
-			PrimaryEndpoint: &elasticache.Endpoint{
-				Address: aws.String("primary.localhost"),
-				Port:    aws.Int64(6379),
-			},
-		}},
-	}
-
-	for _, opt := range opts {
-		opt(cluster)
-	}
-
-	tags := []*elasticache.Tag{{
+	tags := []ectypes.Tag{{
 		Key:   aws.String("env"),
 		Value: aws.String(env),
 	}}
-	extraLabels := services.ExtraElastiCacheLabels(cluster, tags, nil, nil)
+	extraLabels := common.ExtraElastiCacheLabels(cluster, tags, nil, nil)
 
-	if aws.BoolValue(cluster.ClusterEnabled) {
-		database, err := services.NewDatabaseFromElastiCacheConfigurationEndpoint(cluster, extraLabels)
+	if aws.ToBool(cluster.ClusterEnabled) {
+		database, err := common.NewDatabaseFromElastiCacheConfigurationEndpoint(cluster, extraLabels)
 		require.NoError(t, err)
-		return cluster, database, tags
+		common.ApplyAWSDatabaseNameSuffix(database, types.AWSMatcherElastiCache)
+		return cluster, types.Databases{database}, tags
 	}
 
-	databases, err := services.NewDatabasesFromElastiCacheNodeGroups(cluster, extraLabels)
+	databases, err := common.NewDatabasesFromElastiCacheNodeGroups(cluster, extraLabels)
 	require.NoError(t, err)
-	require.Len(t, databases, 1)
-	return cluster, databases[0], tags
+	for _, database := range databases {
+		common.ApplyAWSDatabaseNameSuffix(database, types.AWSMatcherElastiCache)
+	}
+	return cluster, databases, tags
 }
 
-// withElastiCacheConfigurationEndpoint returns an option function for
-// makeElastiCacheCluster to set a configuration endpoint.
-func withElastiCacheConfigurationEndpoint() func(*elasticache.ReplicationGroup) {
-	return func(cluster *elasticache.ReplicationGroup) {
-		cluster.ClusterEnabled = aws.Bool(true)
-		cluster.ConfigurationEndpoint = &elasticache.Endpoint{
-			Address: aws.String("configuration.localhost"),
-			Port:    aws.Int64(6379),
-		}
+func withElastiCacheEngine(engine string) func(*ectypes.ReplicationGroup) {
+	return func(rg *ectypes.ReplicationGroup) {
+		rg.Engine = &engine
 	}
 }

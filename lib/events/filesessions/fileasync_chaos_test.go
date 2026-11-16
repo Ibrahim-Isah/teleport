@@ -1,22 +1,20 @@
-//go:build !race
-// +build !race
-
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package filesessions
 
@@ -31,31 +29,23 @@ import (
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/events/eventstest"
 	"github.com/gravitational/teleport/lib/session"
 )
 
 // TestChaosUpload introduces failures in all stages of the async
 // upload process and verifies that the system is working correctly.
-//
-// Data race detector slows down the test significantly (10x+),
-// that is why the test is skipped when tests are running with
-// `go test -race` flag or `go test -short` flag
 func TestChaosUpload(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping chaos test in short mode.")
-	}
+	ctx := t.Context()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	clock := clockwork.NewFakeClock()
 	eventsC := make(chan events.UploadEvent, 100)
-	memUploader := events.NewMemoryUploader(eventsC)
+	memUploader := eventstest.NewMemoryUploader(eventstest.MemoryUploaderConfig{
+		EventsC: eventsC,
+	})
 	streamer, err := events.NewProtoStreamer(events.ProtoStreamerConfig{
 		Uploader:       memUploader,
 		MinUploadBytes: 1024,
@@ -69,9 +59,10 @@ func TestChaosUpload(t *testing.T) {
 
 	faultyStreamer, err := events.NewCallbackStreamer(events.CallbackStreamerConfig{
 		Inner: streamer,
-		OnEmitAuditEvent: func(ctx context.Context, sid session.ID, event apievents.AuditEvent) error {
+		OnRecordEvent: func(ctx context.Context, sid session.ID, pe apievents.PreparedSessionEvent) error {
+			event := pe.GetAuditEvent()
 			if event.GetIndex() > 700 && terminateConnection.Add(1) < 5 {
-				log.Debugf("Terminating connection at event %v", event.GetIndex())
+				t.Logf("Terminating connection at event %v", event.GetIndex())
 				return trace.ConnectionProblem(nil, "connection terminated")
 			}
 			return nil
@@ -100,7 +91,7 @@ func TestChaosUpload(t *testing.T) {
 					if fi.Name() == sid.String()+checkpointExt {
 						err := os.Remove(filepath.Join(scanDir, fi.Name()))
 						require.NoError(t, err)
-						log.Debugf("Deleted checkpoint file: %v.", fi.Name())
+						t.Logf("Deleted checkpoint file: %v.", fi.Name())
 						break
 					}
 				}
@@ -110,22 +101,21 @@ func TestChaosUpload(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	scanPeriod := 10 * time.Second
 	uploader, err := NewUploader(UploaderConfig{
 		ScanDir:      scanDir,
 		CorruptedDir: corruptedDir,
-		ScanPeriod:   scanPeriod,
+		ScanPeriod:   100 * time.Millisecond,
 		Streamer:     faultyStreamer,
-		Clock:        clock,
+		Clock:        clockwork.NewRealClock(),
 	})
 	require.NoError(t, err)
-	go uploader.Serve(ctx)
-	// wait until uploader blocks on the clock
-	clock.BlockUntil(1)
 
+	go uploader.Serve(ctx)
 	defer uploader.Close()
 
-	fileStreamer, err := NewStreamer(scanDir)
+	fileStreamer, err := NewStreamer(StreamerConfig{
+		Dir: scanDir,
+	})
 	require.NoError(t, err)
 
 	parallelStreams := 20
@@ -135,9 +125,9 @@ func TestChaosUpload(t *testing.T) {
 		err    error
 	}
 	streamsCh := make(chan streamState, parallelStreams)
-	for i := 0; i < parallelStreams; i++ {
+	for range parallelStreams {
 		go func() {
-			inEvents := events.GenerateTestSession(events.SessionParams{PrintEvents: 4096})
+			inEvents := eventstest.GenerateTestSession(eventstest.SessionParams{PrintEvents: 4096})
 			sid := inEvents[0].(events.SessionMetadataGetter).GetSessionID()
 			s := streamState{
 				sid:    sid,
@@ -151,7 +141,7 @@ func TestChaosUpload(t *testing.T) {
 				return
 			}
 			for _, event := range inEvents {
-				err := stream.EmitAuditEvent(ctx, event)
+				err := stream.RecordEvent(ctx, eventstest.PrepareEvent(event))
 				if err != nil {
 					s.err = err
 					streamsCh <- s
@@ -163,18 +153,9 @@ func TestChaosUpload(t *testing.T) {
 		}()
 	}
 
-	// initiate concurrent scans
-	scansCh := make(chan error, parallelStreams)
-	for i := 0; i < parallelStreams; i++ {
-		go func() {
-			_, err := uploader.Scan(ctx)
-			scansCh <- trace.Wrap(err)
-		}()
-	}
-
 	// wait for all streams to be completed
 	streams := make(map[string]streamState)
-	for i := 0; i < parallelStreams; i++ {
+	for range parallelStreams {
 		select {
 		case status := <-streamsCh:
 			require.NoError(t, status.err)
@@ -184,32 +165,19 @@ func TestChaosUpload(t *testing.T) {
 		}
 	}
 
-	// wait for all scans to be completed
-	for i := 0; i < parallelStreams; i++ {
-		select {
-		case err := <-scansCh:
-			require.NoError(t, err, trace.DebugReport(err))
-		case <-ctx.Done():
-			t.Fatalf("Timeout waiting for parallel scan complete, try `go test -v` to get more logs for details")
-		}
-	}
+	require.Len(t, streams, parallelStreams)
 
-	for i := 0; i < parallelStreams; i++ {
-		// do scans to catch remaining uploads
-		_, err = uploader.Scan(ctx)
-		require.NoError(t, err)
-
-		// wait for the upload events
-		var event events.UploadEvent
+	for range parallelStreams {
 		select {
-		case event = <-eventsC:
+		case event := <-eventsC:
 			require.NoError(t, event.Error)
-			state, ok := streams[event.SessionID]
-			require.True(t, ok)
+			require.Contains(t, streams, event.SessionID, "missing stream for session")
+
+			state := streams[event.SessionID]
 			outEvents := readStream(ctx, t, event.UploadID, memUploader)
-			require.Equal(t, len(state.events), len(outEvents), fmt.Sprintf("event: %v", event))
+			require.Len(t, state.events, len(outEvents), fmt.Sprintf("event: %v", event))
 		case <-ctx.Done():
-			t.Fatalf("Timeout waiting for async upload, try `go test -v` to get more logs for details")
+			t.Fatal("Timeout waiting for async upload, try `go test -v` to get more logs for details")
 		}
 	}
 }

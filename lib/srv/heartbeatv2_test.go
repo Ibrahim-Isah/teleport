@@ -1,28 +1,32 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport"
@@ -30,6 +34,7 @@ import (
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/inventory"
+	"github.com/gravitational/teleport/lib/inventory/metadata"
 )
 
 type fakeHeartbeatDriver struct {
@@ -48,9 +53,11 @@ type fakeHeartbeatDriver struct {
 	pollChanged int
 	fallbackErr int
 	announceErr int
+
+	disableFallback bool
 }
 
-func (h *fakeHeartbeatDriver) Poll() (changed bool) {
+func (h *fakeHeartbeatDriver) Poll(ctx context.Context) (changed bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.pollCount++
@@ -64,12 +71,19 @@ func (h *fakeHeartbeatDriver) Poll() (changed bool) {
 func (h *fakeHeartbeatDriver) FallbackAnnounce(ctx context.Context) (ok bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if !h.SupportsFallback() {
+		panic("FallbackAnnounce called when SupportsFallback is false")
+	}
 	h.fallbackCount++
 	if h.fallbackErr > 0 {
 		h.fallbackErr--
 		return false
 	}
 	return true
+}
+
+func (h *fakeHeartbeatDriver) SupportsFallback() bool {
+	return !h.disableFallback
 }
 
 func (h *fakeHeartbeatDriver) Announce(ctx context.Context, sender inventory.DownstreamSender) (ok bool) {
@@ -103,13 +117,12 @@ func (h *fakeHeartbeatDriver) newStream(ctx context.Context, t *testing.T) clien
 		t.Fatalf("context canceled during fake stream recv")
 	}
 
-	_, ok := msg.(proto.UpstreamInventoryHello)
-	require.True(t, ok)
+	require.IsType(t, *new(*proto.UpstreamInventoryHello), msg)
 
-	err := upstream.Send(ctx, proto.DownstreamInventoryHello{
+	err := upstream.Send(ctx, proto.DownstreamInventoryHello_builder{
 		ServerID: "test-auth",
 		Version:  teleport.Version,
-	})
+	}.Build())
 	require.NoError(t, err)
 
 	return upstream
@@ -119,13 +132,13 @@ func newFakeHeartbeatDriver(t *testing.T) *fakeHeartbeatDriver {
 	// streamC is used to pass a fake control stream to the downstream handle's create func.
 	streamC := make(chan client.DownstreamInventoryControlStream)
 
-	hello := proto.UpstreamInventoryHello{
+	hello := proto.UpstreamInventoryHello_builder{
 		ServerID: "test-node",
 		Version:  teleport.Version,
-		Services: []types.SystemRole{types.RoleNode},
-	}
+		Services: types.SystemRoles{types.RoleNode}.StringSlice(),
+	}.Build()
 
-	handle := inventory.NewDownstreamHandle(func(ctx context.Context) (client.DownstreamInventoryControlStream, error) {
+	handle, err := inventory.NewDownstreamHandle(func(ctx context.Context) (client.DownstreamInventoryControlStream, error) {
 		// we're emulating an inventory.DownstreamCreateFunc here, but those are typically
 		// expected to return an error if no stream can be acquired. we're deliberately going
 		// with a blocking strategy instead here to avoid dealing w/ backoff that could make the
@@ -136,7 +149,8 @@ func newFakeHeartbeatDriver(t *testing.T) *fakeHeartbeatDriver {
 		case stream := <-streamC:
 			return stream, nil
 		}
-	}, hello)
+	}, func(ctx context.Context) (*proto.UpstreamInventoryHello, error) { return hello, nil })
+	require.NoError(t, err)
 
 	t.Cleanup(func() {
 		handle.Close()
@@ -155,8 +169,7 @@ func newFakeHeartbeatDriver(t *testing.T) *fakeHeartbeatDriver {
 func TestHeartbeatV2Basics(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	// set up fake hb driver that lets us easily inject failures for
 	// the diff steps and assists w/ faking inventory control handles.
@@ -176,8 +189,8 @@ func TestHeartbeatV2Basics(t *testing.T) {
 	// use the control-stream announce. First poll always reads
 	// as different, so expect that too.
 	awaitEvents(t, hb.testEvents,
-		expect(hbv2PollDiff, hbv2FallbackOk, hbv2Start),
-		deny(hbv2FallbackErr, hbv2FallbackBackoff, hbv2AnnounceOk, hbv2AnnounceErr),
+		expect(hbv2PollDiff, hbv2FallbackOk, hbv2Start, hbv2OnHeartbeatOk),
+		deny(hbv2FallbackErr, hbv2FallbackBackoff, hbv2AnnounceOk, hbv2AnnounceErr, hbv2OnHeartbeatErr),
 	)
 
 	// verify that we're now polling "same" and that time-based announces
@@ -196,7 +209,7 @@ func TestHeartbeatV2Basics(t *testing.T) {
 	// wait for fallback errors to happen, and confirm that we see fallback backoff
 	// come into effect. we still expect no proper announce events.
 	awaitEvents(t, hb.testEvents,
-		expect(hbv2FallbackErr, hbv2FallbackErr, hbv2FallbackBackoff, hbv2FallbackOk),
+		expect(hbv2FallbackErr, hbv2FallbackErr, hbv2FallbackBackoff, hbv2FallbackOk, hbv2OnHeartbeatErr, hbv2OnHeartbeatOk),
 		deny(hbv2AnnounceOk, hbv2AnnounceErr),
 	)
 
@@ -224,8 +237,8 @@ func TestHeartbeatV2Basics(t *testing.T) {
 	// in case we refactor anything later). Take this opportunity to re-check that our announces
 	// are internval and not poll based.
 	awaitEvents(t, hb.testEvents,
-		expect(hbv2AnnounceOk, hbv2AnnounceOk, hbv2PollSame, hbv2AnnounceInterval),
-		deny(hbv2AnnounceErr, hbv2FallbackOk, hbv2FallbackErr),
+		expect(hbv2AnnounceOk, hbv2AnnounceOk, hbv2PollSame, hbv2AnnounceInterval, hbv2OnHeartbeatOk),
+		deny(hbv2AnnounceErr, hbv2FallbackOk, hbv2FallbackErr, hbv2OnHeartbeatErr),
 	)
 
 	// set up a "changed" poll since we haven't traversed that path
@@ -276,6 +289,122 @@ func TestHeartbeatV2Basics(t *testing.T) {
 	awaitEvents(t, hb.testEvents,
 		expect(hbv2AnnounceOk),
 		deny(hbv2AnnounceErr, hbv2FallbackOk, hbv2FallbackErr),
+	)
+}
+
+func TestHeartbeatV2NoFallbackUnchecked(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	// set up fake hb driver that lets us easily inject failures for
+	// the diff steps and assists w/ faking inventory control handles.
+	driver := newFakeHeartbeatDriver(t)
+
+	driver.mu.Lock()
+	driver.disableFallback = true
+	driver.mu.Unlock()
+
+	// set up hb with very long degraded check interval to confirm expected
+	// OnHeartbeat behavior outside of periodic checks.
+	hb := newHeartbeatV2(driver.handle, driver, heartbeatV2Config{
+		announceInterval:      time.Millisecond * 200,
+		pollInterval:          time.Millisecond * 50,
+		fallbackBackoff:       time.Millisecond * 400,
+		degradedCheckInterval: time.Hour,
+		testEvents:            make(chan hbv2TestEvent, 1028),
+	})
+	go hb.Run()
+	defer hb.Close()
+
+	// verify that we tick but don't ever emit a degraded state
+	awaitEvents(t, hb.testEvents,
+		expect(hbv2NoFallback, hbv2NoFallback),
+		deny(hbv2OnHeartbeatOk, hbv2OnHeartbeatErr),
+	)
+
+	// make a stream available to the heartbeat instance
+	// (note: we don't need to pull from our half of the stream since
+	// fakeHeartbeatDriverInner doesn't actually send any messages across it).
+	stream := driver.newStream(ctx, t)
+
+	// verify heartbeats
+	awaitEvents(t, hb.testEvents,
+		expect(hbv2OnHeartbeatOk),
+		deny(hbv2OnHeartbeatErr),
+	)
+
+	// verify that while heartbeating, we don't hit the "NoFallback" case
+	awaitEvents(t, hb.testEvents,
+		expect(hbv2OnHeartbeatOk, hbv2OnHeartbeatOk),
+		deny(hbv2OnHeartbeatErr, hbv2NoFallback),
+	)
+
+	stream.Close()
+
+	awaitEvents(t, hb.testEvents,
+		expect(hbv2NoFallback),
+		deny(hbv2OnHeartbeatErr),
+	)
+}
+
+func TestHeartbeatV2NoFallbackChecked(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	// set up fake hb driver that lets us easily inject failures for
+	// the diff steps and assists w/ faking inventory control handles.
+	driver := newFakeHeartbeatDriver(t)
+
+	driver.mu.Lock()
+	driver.disableFallback = true
+	driver.mu.Unlock()
+
+	// set up hb with fast degraded check interval
+	hb := newHeartbeatV2(driver.handle, driver, heartbeatV2Config{
+		announceInterval:      time.Millisecond * 200,
+		pollInterval:          time.Millisecond * 50,
+		fallbackBackoff:       time.Millisecond * 400,
+		degradedCheckInterval: time.Millisecond * 100,
+		testEvents:            make(chan hbv2TestEvent, 1028),
+	})
+	go hb.Run()
+	defer hb.Close()
+
+	// verify that we tick and emit hb errs
+	awaitEvents(t, hb.testEvents,
+		expect(hbv2NoFallback, hbv2NoFallback, hbv2OnHeartbeatErr),
+		deny(hbv2OnHeartbeatOk),
+	)
+
+	// make a stream available to the heartbeat instance
+	// (note: we don't need to pull from our half of the stream since
+	// fakeHeartbeatDriverInner doesn't actually send any messages across it).
+	stream := driver.newStream(ctx, t)
+
+	// verify heartbeats start
+	awaitEvents(t, hb.testEvents,
+		expect(hbv2OnHeartbeatOk),
+	)
+
+	// verify that the hb errs have stopped
+	awaitEvents(t, hb.testEvents,
+		expect(hbv2OnHeartbeatOk, hbv2OnHeartbeatOk),
+		deny(hbv2OnHeartbeatErr),
+	)
+
+	stream.Close()
+
+	// verify that closure causes errors to resume
+	awaitEvents(t, hb.testEvents,
+		expect(hbv2NoFallback, hbv2OnHeartbeatErr),
+	)
+
+	// verify that closure means OK events have stopped
+	awaitEvents(t, hb.testEvents,
+		expect(hbv2NoFallback, hbv2OnHeartbeatErr),
+		deny(hbv2OnHeartbeatOk),
 	)
 }
 
@@ -331,4 +460,87 @@ func awaitEvents(t *testing.T, ch <-chan hbv2TestEvent, opts ...eventOption) {
 			require.Failf(t, "timeout waiting for events", "expect=%+v", options.expect)
 		}
 	}
+}
+
+type fakeDownstreamHandle struct {
+	inventory.DownstreamHandle
+}
+
+func (f *fakeDownstreamHandle) CloseContext() context.Context {
+	return context.Background()
+}
+
+func mockMetadataGetter() (metadataGetter, chan *metadata.Metadata) {
+	ch := make(chan *metadata.Metadata, 1)
+	return func(ctx context.Context) (*metadata.Metadata, error) {
+		select {
+		case meta := <-ch:
+			if meta == nil {
+				return nil, errors.New("error fetching metadata")
+			}
+			return meta, nil
+		default:
+		}
+
+		select {
+		case meta := <-ch:
+			if meta == nil {
+				return nil, errors.New("error fetching metadata")
+			}
+			return meta, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}, ch
+}
+
+func makeMetadata(id string) *metadata.Metadata {
+	return &metadata.Metadata{
+		CloudMetadata: &types.CloudMetadata{
+			AWS: &types.AWSInfo{
+				InstanceID: id,
+			},
+		},
+	}
+}
+
+func TestNewHeartbeatFetchMetadata(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	heartbeat, err := NewSSHServerHeartbeat(HeartbeatV2Config[*types.ServerV2]{
+		InventoryHandle: &fakeDownstreamHandle{},
+		GetResource: func(context.Context) (*types.ServerV2, error) {
+			return &types.ServerV2{
+				Spec: types.ServerSpecV2{},
+			}, nil
+		},
+	})
+	require.NoError(t, err)
+	metadataGetter, metaCh := mockMetadataGetter()
+	t.Cleanup(func() { close(metaCh) })
+	inner := heartbeat.inner.(*sshServerHeartbeatV2)
+	inner.getMetadata = metadataGetter
+
+	// Metadata won't be set before metadata getter returns.
+	server, err := inner.getServer(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, server.GetCloudMetadata(), "Metadata was set before background process returned")
+
+	// Metadata won't be set if the getter fails.
+	metaCh <- nil
+	time.Sleep(100 * time.Millisecond) // Wait for goroutines to complete
+	server, err = inner.getServer(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, server.GetCloudMetadata(), "Metadata was set despite metadata getter failing")
+
+	// getServer gets updated metadata value.
+	metaCh <- makeMetadata("foo")
+	time.Sleep(100 * time.Millisecond) // Wait for goroutines to complete
+	server, err = inner.getServer(ctx)
+	require.NoError(t, err)
+	meta := server.GetCloudMetadata()
+	assert.NotNil(t, meta, "Heartbeat never got metadata")
+	assert.Equal(t, "foo", meta.AWS.InstanceID)
 }

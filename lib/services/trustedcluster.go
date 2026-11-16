@@ -1,34 +1,40 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/set"
 )
 
 // ValidateTrustedCluster checks and sets Trusted Cluster defaults
 func ValidateTrustedCluster(tc types.TrustedCluster, allowEmptyRolesOpts ...bool) error {
-	if err := tc.CheckAndSetDefaults(); err != nil {
+	if err := CheckAndSetDefaults(tc); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -96,36 +102,41 @@ func parseRoleMap(r types.RoleMap) (map[string][]string, error) {
 	return directMatch, nil
 }
 
-// MapRoles maps local roles to remote roles
-func MapRoles(r types.RoleMap, remoteRoles []string) ([]string, error) {
-	_, err := parseRoleMap(r)
-	if err != nil {
-		return nil, trace.Wrap(err)
+func mapRoles(remoteUserRoles []string, r types.RoleMap) (map[string]set.Set[string], error) {
+	// define a mapping from local roles to the possible remote roles that may
+	// have granted them access
+	index := make(map[string]set.Set[string])
+	addToIndex := func(localRole, remoteRole string) {
+		remoteRoles, ok := index[localRole]
+		if !ok {
+			index[localRole] = set.New[string](remoteRole)
+			return
+		}
+		remoteRoles.Add(remoteRole)
 	}
-	var outRoles []string
-	// when no remote roles are specified, assume that
-	// there is a single empty remote role (that should match wildcards)
-	if len(remoteRoles) == 0 {
-		remoteRoles = []string{""}
-	}
+
+	// Run the role mapping forwards over the remote roles, collecting which
+	// localRoles are granted by which remote roles
 	for _, mapping := range r {
 		expression := mapping.Remote
-		for _, remoteRole := range remoteRoles {
+		for _, remoteRole := range remoteUserRoles {
 			// never map default implicit role, it is always
 			// added by default
 			if remoteRole == constants.DefaultImplicitRole {
 				continue
 			}
+
 			for _, replacementRole := range mapping.Local {
 				replacement, err := utils.ReplaceRegexp(expression, replacementRole, remoteRole)
 				switch {
 				case err == nil:
 					// empty replacement can occur when $2 expand refers
 					// to non-existing capture group in match expression
-					if replacement != "" {
-						outRoles = append(outRoles, replacement)
+					if replacement == "" {
+						continue
 					}
-				case trace.IsNotFound(err):
+					addToIndex(replacement, remoteRole)
+				case errors.Is(err, utils.ErrReplaceRegexNotFound):
 					continue
 				default:
 					return nil, trace.Wrap(err)
@@ -133,7 +144,50 @@ func MapRoles(r types.RoleMap, remoteRoles []string) ([]string, error) {
 			}
 		}
 	}
-	return outRoles, nil
+
+	return index, nil
+}
+
+// MapRoles maps remote roles to local roles
+func MapRoles(r types.RoleMap, remoteRoles []string) ([]string, error) {
+	_, err := parseRoleMap(r)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// when no remote roles are specified, assume that
+	// there is a single empty remote role (that should match wildcards)
+	if len(remoteRoles) == 0 {
+		remoteRoles = []string{""}
+	}
+
+	index, err := mapRoles(remoteRoles, r)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return slices.Collect(maps.Keys(index)), nil
+}
+
+// UnmapRoles attempts to deduce what remote-cluster roles a user might have,
+// given the set of local roles the user has.
+func UnmapRoles(r types.RoleMap, remoteUserRoles, localRoles []string) ([]string, error) {
+	index, err := mapRoles(remoteUserRoles, r)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// collect the remote roles of interest
+	remoteRoleSet := set.New[string]()
+	for _, localRole := range localRoles {
+		rr, ok := index[localRole]
+		if !ok {
+			return nil, trace.BadParameter("not all local roles could be mapped to remote roles")
+		}
+		remoteRoleSet.Add(rr.Elements()...)
+	}
+
+	return remoteRoleSet.Elements(), nil
 }
 
 // UnmarshalTrustedCluster unmarshals the TrustedCluster resource from JSON.
@@ -149,7 +203,7 @@ func UnmarshalTrustedCluster(bytes []byte, opts ...MarshalOption) (types.Trusted
 	}
 
 	if err := utils.FastUnmarshal(bytes, &trustedCluster); err != nil {
-		return nil, trace.BadParameter(err.Error())
+		return nil, trace.BadParameter("%s", err)
 	}
 	// DELETE IN(7.0)
 	// temporarily allow to read trusted cluster with no role map
@@ -158,8 +212,8 @@ func UnmarshalTrustedCluster(bytes []byte, opts ...MarshalOption) (types.Trusted
 	if err = ValidateTrustedCluster(&trustedCluster, allowEmptyRoleMap); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if cfg.ID != 0 {
-		trustedCluster.SetResourceID(cfg.ID)
+	if cfg.Revision != "" {
+		trustedCluster.SetRevision(cfg.Revision)
 	}
 	if !cfg.Expires.IsZero() {
 		trustedCluster.SetExpiry(cfg.Expires)
@@ -184,14 +238,7 @@ func MarshalTrustedCluster(trustedCluster types.TrustedCluster, opts ...MarshalO
 
 	switch trustedCluster := trustedCluster.(type) {
 	case *types.TrustedClusterV2:
-		if !cfg.PreserveResourceID {
-			// avoid modifying the original object
-			// to prevent unexpected data races
-			copy := *trustedCluster
-			copy.SetResourceID(0)
-			trustedCluster = &copy
-		}
-		return utils.FastMarshal(trustedCluster)
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, trustedCluster))
 	default:
 		return nil, trace.BadParameter("unrecognized trusted cluster version %T", trustedCluster)
 	}

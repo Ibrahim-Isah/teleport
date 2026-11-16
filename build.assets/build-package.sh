@@ -2,7 +2,7 @@
 set -e
 
 usage() {
-  echo "Usage: $(basename $0) [-t <oss/ent>] [-v <version>] [-p <package type>] <-a [amd64/x86_64]|[386/i386]|arm|arm64> <-r fips> <-s tarball source dir>" 1>&2
+  echo "Usage: $(basename $0) [-t <oss/ent>] [-v <version>] [-p <package type>] [-b <bundle id>] <-a [amd64/x86_64]|[386/i386]|arm|arm64> <-r fips> <-s tarball source dir>" 1>&2
   exit 1
 }
 
@@ -11,7 +11,7 @@ usage() {
 #shellcheck disable=SC1091
 . "$(dirname "$0")/build-common.sh"
 
-while getopts ":t:v:p:a:r:s:n" o; do
+while getopts ":t:v:p:a:r:s:b:n" o; do
     case "${o}" in
         t)
             t=${OPTARG}
@@ -26,7 +26,7 @@ while getopts ":t:v:p:a:r:s:n" o; do
             ;;
         a)
             a=${OPTARG}
-            if [[ ${a} != "amd64" && ${a} != "x86_64" && ${a} != "386" && ${a} != "i386" && ${a} != "arm" && ${a} != "arm64" ]]; then usage; fi
+            if [[ ${a} != "amd64" && ${a} != "x86_64" && ${a} != "386" && ${a} != "i386" && ${a} != "arm" && ${a} != "arm64" && ${a} != "universal" ]]; then usage; fi
             ;;
         r)
             r=${OPTARG}
@@ -35,6 +35,9 @@ while getopts ":t:v:p:a:r:s:n" o; do
         s)
             s=${OPTARG}
             ;;
+	b)
+	    b=${OPTARG}
+	    ;;
         n)
             # Dry-run mode.
             # Only affects parts of the script, use at your own peril!
@@ -60,16 +63,20 @@ TARBALL_DIRECTORY="$s"
 GNUPG_DIR=${GNUPG_DIR:-/tmp/gnupg}
 
 # linux package configuration
-LINUX_BINARY_DIR=/usr/local/bin
-LINUX_SYSTEMD_DIR=/lib/systemd/system
+LINUX_BINARY_DIR=/opt/teleport/system/bin
+LINUX_SYSTEMD_DIR=/opt/teleport/system/lib/systemd/system
 LINUX_CONFIG_DIR=/etc
 LINUX_DATA_DIR=/var/lib/teleport
 
+# Image containing fpm for building linux packages. Built from gravitational/docker-fpm repo.
+FPM_IMAGE_DEB="public.ecr.aws/gravitational/fpm:debian12-1.15.1-1"
+FPM_IMAGE_RPM="public.ecr.aws/gravitational/fpm:centos8-1.15.1-1"
+
 # extra package information for linux
 MAINTAINER="info@goteleport.com"
-LICENSE="Apache-2.0"
+LICENSE="Teleport Community Edition License"
 VENDOR="Gravitational"
-DESCRIPTION="Teleport is a gateway for managing access to clusters of Linux servers via SSH or the Kubernetes API"
+DESCRIPTION="Teleport provides on-demand, least-privileged access to your infrastructure, on a foundation of cryptographic identity and zero trust, with built-in identity and policy governance"
 DOCS_URL="https://goteleport.com/docs"
 
 # check that curl is installed
@@ -98,16 +105,11 @@ if [[ "${PACKAGE_TYPE}" == "pkg" ]]; then
         echo "You must be running on OS X to build .pkg files"
         exit 4
     fi
-    if [[ "${ARCH}" != "" ]]; then
-        echo "arch parameter is ignored when building for OS X"
-        unset ARCH
-    fi
     if [[ "${RUNTIME}" != "" ]]; then
         echo "runtime parameter is ignored when building for OS X"
         unset RUNTIME
     fi
     PLATFORM="darwin"
-    ARCH="amd64"
     if [[ ! $(type pkgbuild) ]]; then
         echo "You need to install pkgbuild"
         echo "Run: xcode-select --install"
@@ -120,14 +122,20 @@ else
         usage
     fi
 
+    if [[ -n "${b:-}" ]]; then
+        echo "bundle ID parameter can only be used for OS X packages"
+        exit 6
+    fi
+
     # set docker image appropriately
     if [[ "${PACKAGE_TYPE}" == "deb" ]]; then
-        DOCKER_IMAGE="public.ecr.aws/gravitational/fpm:debian8"
+        FPM_IMAGE="${FPM_IMAGE_DEB}"
     elif [[ "${PACKAGE_TYPE}" == "rpm" ]]; then
-        DOCKER_IMAGE="public.ecr.aws/gravitational/fpm:centos8"
+        FPM_IMAGE="${FPM_IMAGE_RPM}"
     fi
 fi
 
+PACKAGE_ARCH=""
 # handle differences between 'gravitational' arch and system arch
 if [[ "${ARCH}" == "386" || "${ARCH}" == "i386" ]]; then
     TEXT_ARCH="32-bit x86"
@@ -139,6 +147,7 @@ if [[ "${ARCH}" == "386" || "${ARCH}" == "i386" ]]; then
 elif [[ "${ARCH}" == "amd64" || "${ARCH}" == "x86_64" ]]; then
     TEXT_ARCH="64-bit x86"
     TARBALL_ARCH="amd64"
+    PACKAGE_ARCH="amd64"
     DEB_PACKAGE_ARCH="amd64"
     DEB_OUTPUT_ARCH="amd64"
     RPM_PACKAGE_ARCH="x86_64"
@@ -154,10 +163,14 @@ elif [[ "${ARCH}" == "arm" ]]; then
 elif [[ "${ARCH}" == "arm64" ]]; then
     TEXT_ARCH="64-bit ARM"
     TARBALL_ARCH="arm64"
+    PACKAGE_ARCH="arm64"
     DEB_PACKAGE_ARCH="arm64"
     DEB_OUTPUT_ARCH="arm64"
     RPM_PACKAGE_ARCH="aarch64"
     RPM_OUTPUT_ARCH="arm64" # backwards compatibility
+elif [[ "${ARCH}" == "universal" ]]; then
+    TARBALL_ARCH="universal"
+    PACKAGE_ARCH="universal"
 fi
 
 # amd64 RPMs should use CentOS 7 compatible artifacts
@@ -170,6 +183,11 @@ if [[ "${RUNTIME}" == "fips" ]]; then
     OPTIONAL_RUNTIME_SECTION+="-fips"
 fi
 
+# After install is --after-install except for RPM, we use --rpm-posttrans.
+# This is because RPM runs after install scrips before the old package removal,
+# so old Teleport are still here and we cannot run our teleport-update symlink logic.
+AFTER_INSTALL_TARGET="--after-install"
+
 # set variables appropriately depending on type of package being built
 if [[ "${TELEPORT_TYPE}" == "ent" ]]; then
     TARBALL_FILENAME="teleport-ent-v${TELEPORT_VERSION}-${PLATFORM}-${TARBALL_ARCH}${OPTIONAL_TARBALL_SECTION}${OPTIONAL_RUNTIME_SECTION}-bin.tar.gz"
@@ -181,6 +199,7 @@ if [[ "${TELEPORT_TYPE}" == "ent" ]]; then
     else
         TYPE_DESCRIPTION="[${TEXT_ARCH} Enterprise edition]"
     fi
+    LICENSE_STANZA=()
 else
     TARBALL_FILENAME="teleport-v${TELEPORT_VERSION}-${PLATFORM}-${TARBALL_ARCH}${OPTIONAL_TARBALL_SECTION}${OPTIONAL_RUNTIME_SECTION}-bin.tar.gz"
     TAR_PATH="teleport"
@@ -191,21 +210,32 @@ else
     else
         TYPE_DESCRIPTION="[${TEXT_ARCH} Open source edition]"
     fi
+    TYPE_DESCRIPTION="${TYPE_DESCRIPTION} Distributed under the ${LICENSE}"
+    LICENSE_STANZA=(--license "${LICENSE}")
 fi
 
 # set file list
 if [[ "${PACKAGE_TYPE}" == "pkg" ]]; then
+    if [[ -z "${PACKAGE_ARCH}" ]]; then
+        echo "Unsupported architecture: ${ARCH}"
+        exit 1
+    fi
+    # No architecture tag on package filename for universal (multi-arch) binaries.
+    ARCH_TAG=""
+    if [[ "${PACKAGE_ARCH}" != "universal" ]]; then
+        ARCH_TAG="-${PACKAGE_ARCH}"
+    fi
     SIGN_PKG="true"
-    FILE_LIST="${TAR_PATH}/tsh ${TAR_PATH}/tctl ${TAR_PATH}/teleport ${TAR_PATH}/tbot"
-    BUNDLE_ID="com.gravitational.teleport"
+    FILE_LIST="${TAR_PATH}/teleport ${TAR_PATH}/tbot ${TAR_PATH}/fdpass-teleport"
+    BUNDLE_ID="${b:-com.gravitational.teleport}"
     if [[ "${TELEPORT_TYPE}" == "ent" ]]; then
-        PKG_FILENAME="teleport-ent-${TELEPORT_VERSION}.${PACKAGE_TYPE}"
+        PKG_FILENAME="teleport-ent-bin-${TELEPORT_VERSION}${ARCH_TAG}.${PACKAGE_TYPE}"
     else
-        PKG_FILENAME="teleport-${TELEPORT_VERSION}.${PACKAGE_TYPE}"
+        PKG_FILENAME="teleport-bin-${TELEPORT_VERSION}${ARCH_TAG}.${PACKAGE_TYPE}"
     fi
 else
-    FILE_LIST="${TAR_PATH}/tsh ${TAR_PATH}/tctl ${TAR_PATH}/teleport ${TAR_PATH}/tbot ${TAR_PATH}/examples/systemd/teleport.service"
-    LINUX_BINARY_FILE_LIST="${TAR_PATH}/tsh ${TAR_PATH}/tctl ${TAR_PATH}/tbot ${TAR_PATH}/teleport"
+    FILE_LIST="${TAR_PATH}/tsh ${TAR_PATH}/tctl ${TAR_PATH}/teleport ${TAR_PATH}/tbot ${TAR_PATH}/fdpass-teleport ${TAR_PATH}/teleport-update ${TAR_PATH}/examples/systemd/teleport.service ${TAR_PATH}/examples/systemd/post-install ${TAR_PATH}/examples/systemd/before-remove"
+    LINUX_BINARY_FILE_LIST="${TAR_PATH}/tsh ${TAR_PATH}/tctl ${TAR_PATH}/tbot ${TAR_PATH}/fdpass-teleport ${TAR_PATH}/teleport ${TAR_PATH}/teleport-update"
     LINUX_SYSTEMD_FILE_LIST="${TAR_PATH}/examples/systemd/teleport.service"
     EXTRA_DOCKER_OPTIONS=""
     RPM_SIGN_STANZA=""
@@ -215,6 +245,8 @@ else
         FILE_PERMISSIONS_STANZA="--rpm-user root --rpm-group root --rpm-use-file-permissions "
         # the rpm/rpmmacros file suppresses the creation of .build-id files (see https://github.com/gravitational/teleport/issues/7040)
         EXTRA_DOCKER_OPTIONS="-v $(pwd)/rpm/rpmmacros:/root/.rpmmacros"
+
+        AFTER_INSTALL_TARGET="--rpm-posttrans"
         # if we set this environment variable, don't sign RPMs (can be useful for building test RPMs
         # without having the signing keys)
         if [ "${UNSIGNED_RPM}" == "true" ]; then
@@ -225,7 +257,7 @@ else
             # it needs to contain the "Gravitational, Inc" private key and signing key.
             # we also use the rpm-sign/rpmmacros file instead which contains extra directives used for signing.
             EXTRA_DOCKER_OPTIONS="-v $(pwd)/rpm-sign/rpmmacros:/root/.rpmmacros -v $(pwd)/rpm-sign/popt-override:/etc/popt.d/rpmsign-override -v ${GNUPG_DIR}:/root/.gnupg"
-            RPM_SIGN_STANZA="--rpm-sign"
+            RPM_SIGN_STANZA="--rpm-sign --rpm-digest sha256"
         fi
     elif [[ "${PACKAGE_TYPE}" == "deb" ]]; then
         PACKAGE_ARCH="${DEB_PACKAGE_ARCH}"
@@ -268,6 +300,16 @@ if [[ "${PACKAGE_TYPE}" != "pkg" ]]; then
         mv -v ${LINUX_CONFIG_FILE} ${PACKAGE_TEMPDIR}/buildroot${LINUX_CONFIG_DIR}
         CONFIG_FILE_STANZA="--config-files /src/buildroot${LINUX_CONFIG_DIR}/${LINUX_CONFIG_FILE} "
     fi
+    if [[ "${PACKAGE_TYPE}" == "deb" ]]; then
+        mkdir -p ${PACKAGE_TEMPDIR}/buildroot/etc/needrestart/conf.d
+        # shellcheck disable=SC2016 # the single quotes are deliberate, we don't expect variable expansion on $nrconf
+        printf '# necessary for needrestart before 3.9\npush(@{$nrconf{blacklist}}, qr(^/memfd:teleport-));\n' > ${PACKAGE_TEMPDIR}/buildroot/etc/needrestart/conf.d/teleport.conf
+    fi
+
+    # include post-install and before-remove script
+    mv -v ${TAR_PATH}/examples/systemd/post-install ${PACKAGE_TEMPDIR}
+    mv -v ${TAR_PATH}/examples/systemd/before-remove ${PACKAGE_TEMPDIR}
+
     # /var/lib/teleport
     # shellcheck disable=SC2174
     mkdir -p -m0700 ${PACKAGE_TEMPDIR}/buildroot${LINUX_DATA_DIR}
@@ -325,7 +367,7 @@ else
     rm -vf ${OUTPUT_FILENAME}
 
     # build for other platforms
-    docker run -v ${PACKAGE_TEMPDIR}:/src --rm ${EXTRA_DOCKER_OPTIONS} ${DOCKER_IMAGE} \
+    docker run -v ${PACKAGE_TEMPDIR}:/src --rm ${EXTRA_DOCKER_OPTIONS} ${FPM_IMAGE} \
         fpm \
         --input-type dir \
         --output-type ${PACKAGE_TYPE} \
@@ -333,7 +375,6 @@ else
         --version "${TELEPORT_VERSION}" \
         --maintainer "${MAINTAINER}" \
         --url "${DOCS_URL}" \
-        --license "${LICENSE}" \
         --vendor "${VENDOR}" \
         --description "${DESCRIPTION} ${TYPE_DESCRIPTION}" \
         --architecture ${PACKAGE_ARCH} \
@@ -343,8 +384,11 @@ else
         --provides teleport \
         --prefix / \
         --verbose \
+        "$AFTER_INSTALL_TARGET" /src/post-install \
+        --before-remove /src/before-remove \
         ${CONFIG_FILE_STANZA} \
         ${FILE_PERMISSIONS_STANZA} \
+        "${LICENSE_STANZA[@]}" \
         ${RPM_SIGN_STANZA} .
 
     # copy created package back to current directory

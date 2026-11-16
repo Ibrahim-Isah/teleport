@@ -1,31 +1,43 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React, { useImperativeHandle, useRef, useState } from 'react';
+import React, {
+  ChangeEvent,
+  ComponentPropsWithoutRef,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from 'react';
+import { NavLink } from 'react-router';
 import styled from 'styled-components';
-import { NavLink } from 'react-router-dom';
+
+import { ButtonBorder, Flex, Indicator, Text } from 'design';
+import { ChevronDown } from 'design/Icon';
 import Menu, { MenuItem } from 'design/Menu';
-import { space } from 'design/system';
+import { space, SpaceProps } from 'design/system';
+import { Attempt, useAsync } from 'shared/hooks/useAsync';
 
-import { ButtonBorder, Flex, Indicator } from 'design';
-import { CarrotDown } from 'design/Icon';
-
-import { useAsync, Attempt } from 'shared/hooks/useAsync';
-
-import { MenuLoginProps, LoginItem, MenuLoginHandle } from './types';
+import {
+  LoginItem,
+  MenuInputType,
+  MenuLoginHandle,
+  MenuLoginProps,
+} from './types';
 
 export const MenuLogin = React.forwardRef<MenuLoginHandle, MenuLoginProps>(
   (props, ref) => {
@@ -33,25 +45,44 @@ export const MenuLogin = React.forwardRef<MenuLoginHandle, MenuLoginProps>(
       onSelect,
       anchorOrigin,
       transformOrigin,
+      alignButtonWidthToMenu = false,
+      inputType = MenuInputType.INPUT,
       required = true,
       width,
+      buttonWidth,
+      style,
     } = props;
-    const anchorRef = useRef<HTMLElement>();
+    const [filter, setFilter] = useState('');
+    const anchorRef = useRef<HTMLButtonElement>(null);
     const [isOpen, setIsOpen] = useState(false);
     const [getLoginItemsAttempt, runGetLoginItems] = useAsync(() =>
       Promise.resolve().then(() => props.getLoginItems())
     );
 
-    const placeholder = props.placeholder || 'Enter login name…';
+    const logins = getLoginItemsAttempt?.data || [];
+    const filteredLogins =
+      getLoginItemsAttempt?.data?.filter(item =>
+        item.login.toLocaleLowerCase().includes(filter)
+      ) || [];
+
+    const defaultPlaceholder =
+      inputType === MenuInputType.INPUT
+        ? 'Enter login name…'
+        : 'Search logins…';
+    const placeholder = props.placeholder || defaultPlaceholder;
+
     const onOpen = () => {
       if (!getLoginItemsAttempt.status) {
         runGetLoginItems();
       }
       setIsOpen(true);
     };
+
     const onClose = () => {
+      setFilter('');
       setIsOpen(false);
     };
+
     const onItemClick = (
       e: React.MouseEvent<HTMLAnchorElement>,
       login: string
@@ -59,8 +90,29 @@ export const MenuLogin = React.forwardRef<MenuLoginHandle, MenuLoginProps>(
       onClose();
       onSelect(e, login);
     };
+
+    const onChange = (event: ChangeEvent<HTMLInputElement>) => {
+      setFilter(event.target.value);
+    };
+
     const onKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
-      if (e.key === 'Enter' && (!required || e.currentTarget.value)) {
+      if (e.key !== 'Enter') {
+        return;
+      }
+      // if we are a filter type input, send in the first filtered item
+      // into onSelect
+      if (inputType === MenuInputType.FILTER) {
+        const firstFilteredItem = filteredLogins[0];
+        if (!firstFilteredItem) {
+          return;
+        }
+        onClose();
+        onSelect(e, firstFilteredItem.login);
+        return;
+      }
+
+      // otherwise, send in the currently typed value
+      if (!required || e.currentTarget.value) {
         onClose();
         onSelect(e, e.currentTarget.value);
       }
@@ -72,17 +124,21 @@ export const MenuLogin = React.forwardRef<MenuLoginHandle, MenuLoginProps>(
       },
     }));
 
+    const ButtonComponent = props.ButtonComponent || ButtonBorder;
+
     return (
       <React.Fragment>
-        <ButtonBorder
-          height="24px"
+        <ButtonComponent
+          width={alignButtonWidthToMenu ? width : buttonWidth}
+          textTransform={props.textTransform}
           size="small"
-          setRef={anchorRef}
+          ref={anchorRef}
           onClick={onOpen}
+          style={style}
         >
-          CONNECT
-          <CarrotDown ml={2} mr={-2} fontSize="2" color="text.secondary" />
-        </ButtonBorder>
+          {props.buttonText || 'Connect'}
+          <ChevronDown ml={1} size="small" color="text.slightlyMuted" />
+        </ButtonComponent>
         <Menu
           anchorOrigin={anchorOrigin}
           transformOrigin={transformOrigin}
@@ -90,13 +146,19 @@ export const MenuLogin = React.forwardRef<MenuLoginHandle, MenuLoginProps>(
           open={isOpen}
           onClose={onClose}
           getContentAnchorEl={null}
+          // The list of logins is updated asynchronously, so Popover inside Menu needs to account
+          // for LoginItemList changing in size.
+          updatePositionOnChildResize
         >
           <LoginItemList
             getLoginItemsAttempt={getLoginItemsAttempt}
+            items={inputType === MenuInputType.INPUT ? logins : filteredLogins}
             onKeyPress={onKeyPress}
+            onChange={onChange}
             onClick={onItemClick}
             placeholder={placeholder}
             width={width}
+            inputType={inputType}
           />
         </Menu>
       </React.Fragment>
@@ -108,34 +170,62 @@ const LoginItemList = ({
   getLoginItemsAttempt,
   onClick,
   onKeyPress,
+  onChange,
+  items,
   placeholder,
   width,
+  inputType,
 }: {
   getLoginItemsAttempt: Attempt<LoginItem[]>;
+  items: LoginItem[];
   onClick: (e: React.MouseEvent<HTMLAnchorElement>, login: string) => void;
   onKeyPress: (e: React.KeyboardEvent<HTMLInputElement>) => void;
+  onChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   placeholder: string;
-  width?: string;
+  width?: ComponentPropsWithoutRef<typeof Flex>['minWidth'];
+  inputType?: MenuInputType;
 }) => {
-  const content = getLoginItemListContent(getLoginItemsAttempt, onClick);
+  const content = getLoginItemListContent(items, getLoginItemsAttempt, onClick);
 
   return (
-    <Flex flexDirection="column" width={width}>
-      <Input
-        p="2"
-        m="2"
-        onKeyPress={onKeyPress}
-        type="text"
-        autoFocus
-        placeholder={placeholder}
-        autoComplete="off"
-      />
+    <Flex flexDirection="column" minWidth={width}>
+      {inputType === MenuInputType.NONE ? (
+        /* css and margin value matched with AWS Launch button <RoleItemList> */
+        <Text
+          px="2"
+          mb={2}
+          typography="body3"
+          color="text.main"
+          backgroundColor="spotBackground.2"
+        >
+          {placeholder}
+        </Text>
+      ) : (
+        <Input
+          p="2"
+          m="2"
+          // this prevents safari from adding the autofill options which would cover the available logins and make it
+          // impossible to select. "But why would it do that? this isn't a username or password field?".
+          // Safari includes parsed words in the placeholder as well to determine if that autofill should show.
+          // Since our placeholder has the word "login" in it, it thinks its a login form.
+          // https://github.com/gravitational/teleport/pull/31600
+          // https://stackoverflow.com/questions/22661977/disabling-safari-autofill-on-usernames-and-passwords
+          name="notsearch_password"
+          onKeyPress={onKeyPress}
+          onChange={onChange}
+          type="text"
+          autoFocus
+          placeholder={placeholder}
+          autoComplete="off"
+        />
+      )}
       {content}
     </Flex>
   );
 };
 
 function getLoginItemListContent(
+  items: LoginItem[],
   getLoginItemsAttempt: Attempt<LoginItem[]>,
   onClick: (e: React.MouseEvent<HTMLAnchorElement>, login: string) => void
 ) {
@@ -144,9 +234,10 @@ function getLoginItemListContent(
     case 'processing':
       return (
         <Indicator
-          css={({ theme }) => `
+          // Without this margin, <Indicator> would cause a scroll bar to pop up and hide repeatedly.
+          m={1}
+          css={`
             align-self: center;
-            color: ${theme.colors.secondary.dark}
           `}
         />
       );
@@ -155,10 +246,26 @@ function getLoginItemListContent(
       // space to show the error inside the menu.
       return null;
     case 'success':
-      const logins = getLoginItemsAttempt.data;
-
-      return logins.map((item, key) => {
-        const { login, url } = item;
+      return items.map((item, key) => {
+        const { login, url, isExternalUrl } = item;
+        if (isExternalUrl) {
+          return (
+            <StyledMenuItem
+              key={key}
+              as="a"
+              px="2"
+              mx="2"
+              href={url}
+              target="_blank"
+              title={login ? login : url}
+              onClick={(e: React.MouseEvent<HTMLAnchorElement>) => {
+                onClick(e, url);
+              }}
+            >
+              {login ? login : url}
+            </StyledMenuItem>
+          );
+        }
         return (
           <StyledMenuItem
             key={key}
@@ -178,6 +285,7 @@ function getLoginItemListContent(
 }
 
 const StyledButton = styled.button`
+  font-family: inherit;
   color: inherit;
   border: none;
   flex: 1;
@@ -185,39 +293,44 @@ const StyledButton = styled.button`
 
 const StyledMenuItem = styled(MenuItem)(
   ({ theme }) => `
-  color: ${theme.colors.grey[400]};
+  background: transparent;
   font-size: 12px;
-  border-bottom: 1px solid ${theme.colors.subtle};
+  border-bottom: 1px solid ${theme.colors.spotBackground[0]};
   min-height: 32px;
-  &:hover {
-    color: ${theme.colors.link};
-  }
 
-  :last-child {
+  /* displays ellipsis for longer string value */
+  display: inline-block;
+  text-align: left;
+  max-width: 450px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+
+  &:last-child {
     border-bottom: none;
     margin-bottom: 8px;
   }
 `
 );
 
-const Input = styled.input(
+const Input = styled.input<SpaceProps>(
   ({ theme }) => `
-  background: ${theme.colors.subtle};
-  border: 1px solid ${theme.colors.subtle};
+  background: transparent;
+  border: 1px solid ${theme.colors.text.muted};
   border-radius: 4px;
   box-sizing: border-box;
-  color: ${theme.colors.grey[900]};
+  color: ${theme.colors.text.main};
   height: 32px;
   outline: none;
 
-  &:focus {
-    background: ${theme.colors.light};
-    border 1px solid ${theme.colors.link};
-    box-shadow: inset 0 1px 3px rgba(0, 0, 0, .24);
+  &:focus, &:hover {
+    border 1px solid ${theme.colors.text.slightlyMuted};
+    outline: none;
   }
 
-  ::placeholder {
-    color: ${theme.colors.grey[100]};
+  &::placeholder {
+    color: ${theme.colors.text.muted};
+    opacity: 1;
   }
 `,
   space

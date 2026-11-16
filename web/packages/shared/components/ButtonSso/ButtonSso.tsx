@@ -1,71 +1,65 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { forwardRef } from 'react';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-import styled from 'styled-components';
-import Button from 'design/Button';
-import { darken, lighten } from 'design/theme/utils/colorManipulator';
+import { ButtonProps, ButtonSecondary } from 'design/Button';
 import * as Icons from 'design/Icon';
+import { ResourceIcon } from 'design/ResourceIcon';
+import { AuthProviderType, SSOType } from 'shared/services';
 
-import { AuthProviderType } from 'shared/services';
-
-const ButtonSso = (props: Props) => {
+const ButtonSso = forwardRef<HTMLButtonElement, Props>((props: Props, ref) => {
   const { ssoType = 'unknown', title, ...rest } = props;
-  const { color, Icon } = getSSOIcon(ssoType);
 
   return (
-    <StyledButton color={color} block {...rest}>
-      {Boolean(Icon) && (
-        <IconBox>
-          <Icon data-testid="icon" />
-        </IconBox>
-      )}
+    <ButtonSecondary gap={3} size="extra-large" block {...rest} ref={ref}>
+      <SSOIcon type={ssoType} />
       {title}
-    </StyledButton>
+    </ButtonSecondary>
   );
-};
+});
 
-type Props = {
+type Props = ButtonProps<'button'> & {
   ssoType: SSOType;
   title: string;
-  // TS: temporary handles ...styles
-  [key: string]: any;
 };
 
-type SSOType =
-  | 'microsoft'
-  | 'github'
-  | 'bitbucket'
-  | 'google'
-  | 'openid'
-  | 'unknown';
-
-function getSSOIcon(type: SSOType) {
+export function SSOIcon({ type }: { type: SSOType }) {
+  const commonResourceIconProps = {
+    width: '24px',
+    height: '24px',
+  };
   switch (type.toLowerCase()) {
     case 'microsoft':
-      return { color: '#2672ec', Icon: Icons.Windows, type };
+      return <ResourceIcon name="microsoft" {...commonResourceIconProps} />;
     case 'github':
-      return { color: '#444444', Icon: Icons.Github, type };
+      return <ResourceIcon name="github" {...commonResourceIconProps} />;
     case 'bitbucket':
-      return { color: '#205081', Icon: Icons.BitBucket, type };
+      return (
+        <ResourceIcon name="atlassianbitbucket" {...commonResourceIconProps} />
+      );
     case 'google':
-      return { color: '#dd4b39', Icon: Icons.Google, type };
+      return <ResourceIcon name="google" {...commonResourceIconProps} />;
+    case 'okta':
+      return <ResourceIcon name="okta" {...commonResourceIconProps} />;
     default:
       // provide default icon for unknown social providers
-      return { color: '#f7931e', Icon: Icons.OpenID };
+      return <Icons.Key data-testid="icon" />;
   }
 }
 
@@ -91,46 +85,15 @@ export function guessProviderType(
     return 'github';
   }
 
+  if (name.indexOf('okta') !== -1) {
+    return 'okta';
+  }
+
   if (providerType === 'oidc') {
     return 'openid';
   }
 
   return 'unknown';
 }
-
-const StyledButton = styled(Button)`
-  background-color: ${props => props.color};
-  display: block;
-  width: 100%;
-  border: 1px solid transparent;
-
-  &:hover,
-  &:focus {
-    background: ${props => darken(props.color, 0.1)};
-    border: 1px solid ${props => lighten(props.color, 0.4)};
-  }
-  height: 40px;
-  position: relative;
-  box-sizing: border-box;
-
-  ${Icons.default} {
-    font-size: 20px;
-    opacity: 0.87;
-  }
-`;
-
-const IconBox = styled.div`
-  align-items: center;
-  display: flex;
-  justify-content: center;
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 56px;
-  font-size: 24px;
-  text-align: center;
-  border-right: 1px solid rgba(0, 0, 0, 0.12);
-`;
 
 export default ButtonSso;

@@ -1,40 +1,43 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package alpnproxy
 
 import (
 	"context"
 	"crypto/tls"
-	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http/httpproxy"
 
+	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	awsapiutils "github.com/gravitational/teleport/api/utils/aws"
 	"github.com/gravitational/teleport/api/utils/azure"
 	"github.com/gravitational/teleport/api/utils/gcp"
+	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // IsConnectRequest returns true if the request is a HTTP CONNECT tunnel
@@ -93,7 +96,14 @@ func NewForwardProxy(cfg ForwardProxyConfig) (*ForwardProxy, error) {
 
 // Start starts serving on the listener.
 func (p *ForwardProxy) Start() error {
-	err := http.Serve(p.cfg.Listener, p)
+	server := &http.Server{
+		Handler:           p,
+		ReadTimeout:       apidefaults.DefaultIOTimeout,
+		ReadHeaderTimeout: defaults.ReadHeadersTimeout,
+		WriteTimeout:      apidefaults.DefaultIOTimeout,
+		IdleTimeout:       apidefaults.DefaultIdleTimeout,
+	}
+	err := server.Serve(p.cfg.Listener)
 	if err != nil && !utils.IsUseOfClosedNetworkError(err) {
 		return trace.Wrap(err)
 	}
@@ -102,7 +112,7 @@ func (p *ForwardProxy) Start() error {
 
 // Close closes the forward proxy.
 func (p *ForwardProxy) Close() error {
-	if err := p.cfg.Listener.Close(); err != nil {
+	if err := p.cfg.Listener.Close(); err != nil && !utils.IsUseOfClosedNetworkError(err) {
 		return trace.Wrap(err)
 	}
 	return nil
@@ -124,7 +134,7 @@ func (p *ForwardProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	clientConn := hijackClientConnection(rw)
 	if clientConn == nil {
-		log.Error("Failed to hijack client connection.")
+		slog.ErrorContext(req.Context(), "Failed to hijack client connection")
 		rw.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -165,14 +175,34 @@ func MatchAllRequests(req *http.Request) bool {
 // MatchAWSRequests is a MatchFunc that returns true if request is an AWS API
 // request.
 func MatchAWSRequests(req *http.Request) bool {
-	return awsapiutils.IsAWSEndpoint(req.Host)
+	return awsapiutils.IsAWSOwnedEndpoint(req.Host) &&
+		// Avoid proxying SSM session WebSocket requests and let the forward proxy
+		// send it directly to AWS.
+		//
+		// `aws ssm start-session` first calls ssm.<region>.amazonaws.com to get
+		// a stream URL and a token. Then it makes a wss connection with the
+		// provided token to the provided stream URL. The stream URL looks like:
+		// wss://ssmmessages.region.amazonaws.com/v1/data-channel/session-id?stream=(input|output)
+		//
+		// The wss request currently respects HTTPS_PROXY but does not
+		// respect local CA bundle we provided thus causing a failure. The
+		// request is not signed with SigV4 either.
+		//
+		// Reference:
+		// https://github.com/aws/session-manager-plugin/
+		!isAWSSSMWebsocketRequest(req)
+}
+
+func isAWSSSMWebsocketRequest(req *http.Request) bool {
+	return awsapiutils.IsAWSOwnedEndpoint(req.Host) &&
+		strings.HasPrefix(req.Host, "ssmmessages.")
 }
 
 // MatchAzureRequests is a MatchFunc that returns true if request is an Azure API
 // request.
 func MatchAzureRequests(req *http.Request) bool {
 	h := req.URL.Hostname()
-	return azure.IsAzureEndpoint(h) || types.TeleportAzureMSIEndpoint == h
+	return azure.IsAzureEndpoint(h) || types.TeleportAzureMSIEndpoint == h || types.TeleportAzureIdentityEndpoint == h
 }
 
 // MatchGCPRequests is a MatchFunc that returns true if request is an GCP API request.
@@ -216,7 +246,7 @@ func (h *ForwardToHostHandler) Handle(ctx context.Context, clientConn net.Conn, 
 
 	serverConn, err := net.Dial("tcp", host)
 	if err != nil {
-		log.WithError(err).Errorf("Failed to connect to host %q.", host)
+		slog.ErrorContext(req.Context(), "Failed to connect to host", "error", err, "host", host)
 		writeHeaderToHijackedConnection(clientConn, req, http.StatusServiceUnavailable)
 		return
 	}
@@ -227,7 +257,7 @@ func (h *ForwardToHostHandler) Handle(ctx context.Context, clientConn net.Conn, 
 		return
 	}
 
-	startForwardProxy(ctx, clientConn, serverConn, req.Host)
+	startForwardProxy(ctx, clientConn, serverConn, req.Host, slog.Default())
 }
 
 // ForwardToSystemProxyHandlerConfig is the config for
@@ -290,24 +320,25 @@ func (h *ForwardToSystemProxyHandler) Handle(ctx context.Context, clientConn net
 		return
 	}
 
+	logger := slog.With("proxy", logutils.StringerAttr(systemProxyURL))
 	serverConn, err := h.connectToSystemProxy(systemProxyURL)
 	if err != nil {
-		log.WithError(err).Errorf("Failed to connect to system proxy %q.", systemProxyURL.Host)
+		logger.ErrorContext(req.Context(), "Failed to connect to system proxy", "error", err)
 		writeHeaderToHijackedConnection(clientConn, req, http.StatusBadGateway)
 		return
 	}
 
 	defer serverConn.Close()
-	log.Debugf("Connected to system proxy %v.", systemProxyURL)
+	logger.DebugContext(req.Context(), "Connected to system proxy")
 
 	// Send original CONNECT request to system proxy.
 	if err = req.WriteProxy(serverConn); err != nil {
-		log.WithError(err).Errorf("Failed to send CONNTECT request to system proxy %q.", systemProxyURL.Host)
+		logger.ErrorContext(req.Context(), "Failed to send CONNECT request to system proxy", "error", err)
 		writeHeaderToHijackedConnection(clientConn, req, http.StatusBadGateway)
 		return
 	}
 
-	startForwardProxy(ctx, clientConn, serverConn, req.Host)
+	startForwardProxy(ctx, clientConn, serverConn, req.Host, logger)
 }
 
 // getSystemProxyURL returns the system proxy URL.
@@ -322,7 +353,7 @@ func (h *ForwardToSystemProxyHandler) getSystemProxyURL(req *http.Request) *url.
 
 	// If error exists, make a log for debugging purpose.
 	if err != nil {
-		log.WithError(err).Debugf("Failed to get system proxy.")
+		slog.DebugContext(req.Context(), "Failed to get system proxy", "error", err)
 	}
 	return nil
 }
@@ -355,42 +386,13 @@ func (h *ForwardToSystemProxyHandler) connectToSystemProxy(systemProxyURL *url.U
 }
 
 // startForwardProxy starts streaming between client and server.
-func startForwardProxy(ctx context.Context, clientConn, serverConn net.Conn, host string) {
-	log.Debugf("Started forwarding request for %q.", host)
-	defer log.Debugf("Stopped forwarding request for %q.", host)
+func startForwardProxy(ctx context.Context, clientConn, serverConn net.Conn, host string, logger *slog.Logger) {
+	logger.DebugContext(ctx, "Started forwarding request to host", "host", host)
+	defer logger.DebugContext(ctx, "Stopped forwarding request to host", "host", host)
 
-	closeContext, closeCancel := context.WithCancel(ctx)
-	defer closeCancel()
-
-	// Forcefully close connections when input context is done, to make sure
-	// the stream goroutines exit.
-	go func() {
-		<-closeContext.Done()
-
-		clientConn.Close()
-		serverConn.Close()
-	}()
-
-	wg := sync.WaitGroup{}
-	wg.Add(2)
-	stream := func(reader, writer net.Conn) {
-		_, err := io.Copy(reader, writer)
-		if err != nil && !utils.IsOKNetworkError(err) {
-			log.WithError(err).Errorf("Failed to stream from %q to %q.", reader.LocalAddr(), writer.LocalAddr())
-		}
-
-		// Close one side at a time.
-		if readerConn, ok := reader.(*net.TCPConn); ok {
-			readerConn.CloseRead()
-		}
-		if writerConn, ok := writer.(*net.TCPConn); ok {
-			writerConn.CloseWrite()
-		}
-		wg.Done()
+	if err := utils.ProxyConn(ctx, clientConn, serverConn); err != nil {
+		logger.ErrorContext(ctx, "Failed to proxy request", "error", err, "client_addr", clientConn.LocalAddr(), "server_addr", serverConn.LocalAddr())
 	}
-	go stream(clientConn, serverConn)
-	go stream(serverConn, clientConn)
-	wg.Wait()
 }
 
 // hijackClientConnection hijacks client connection.
@@ -414,7 +416,7 @@ func writeHeaderToHijackedConnection(conn net.Conn, req *http.Request, statusCod
 	}
 	err := resp.Write(conn)
 	if err != nil && !utils.IsOKNetworkError(err) {
-		log.WithError(err).Errorf("Failed to write status code %d to client connection.", statusCode)
+		slog.ErrorContext(req.Context(), "Failed to write status code to client connection", "error", err, "status_code", statusCode)
 		return false
 	}
 	return true

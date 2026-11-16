@@ -19,8 +19,11 @@ limitations under the License.
 package sshutils
 
 import (
+	"bytes"
+	"context"
 	"crypto"
 	"crypto/subtle"
+	"errors"
 	"io"
 	"net"
 	"regexp"
@@ -30,15 +33,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport/api/defaults"
-)
-
-const (
-	// ProxyHelloSignature is a string which Teleport proxy will send
-	// right after the initial SSH "handshake/version" message if it detects
-	// talking to a Teleport server.
-	//
-	// This is also leveraged by tsh to propagate its tracing span ID.
-	ProxyHelloSignature = "Teleport-Proxy"
+	apissh "github.com/gravitational/teleport/api/ssh"
 )
 
 // HandshakePayload structure is sent as a JSON blob by the teleport
@@ -76,7 +71,7 @@ func ParseKnownHosts(knownHosts [][]byte, matchHostnames ...string) ([]ssh.Publi
 	for _, line := range knownHosts {
 		for {
 			_, hosts, publicKey, _, bytes, err := ssh.ParseKnownHosts(line)
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			} else if err != nil {
 				return nil, trace.Wrap(err, "failed parsing known hosts: %v; raw line: %q", err, line)
@@ -147,15 +142,19 @@ func ParseAuthorizedKeys(authorizedKeys [][]byte) ([]ssh.PublicKey, error) {
 // If known_hosts are provided, they will be used in the config's HostKeyCallback.
 //
 // The config is set up to authenticate to proxy with the first available principal.
-func ProxyClientSSHConfig(sshCert *ssh.Certificate, priv crypto.Signer, knownHosts ...[]byte) (*ssh.ClientConfig, error) {
-	authMethod, err := AsAuthMethod(sshCert, priv)
+func ProxyClientSSHConfig(sshCert *ssh.Certificate, priv crypto.Signer, knownHosts ...[]byte) (apissh.ClientConfig, error) {
+	signer, err := SSHSigner(sshCert, priv)
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return apissh.ClientConfig{}, trace.Wrap(err)
 	}
 
-	cfg := &ssh.ClientConfig{
-		Auth:    []ssh.AuthMethod{authMethod},
-		Timeout: defaults.DefaultDialTimeout,
+	cfg := apissh.ClientConfig{
+		PublicKeyAuth: apissh.PublicKeyAuthConfig{
+			Signers: func() ([]ssh.Signer, error) {
+				return []ssh.Signer{signer}, nil
+			},
+		},
+		Timeout: defaults.DefaultIOTimeout,
 	}
 
 	// The KeyId is not always a valid principal, so we use the first valid principal instead.
@@ -167,12 +166,12 @@ func ProxyClientSSHConfig(sshCert *ssh.Certificate, priv crypto.Signer, knownHos
 	if len(knownHosts) > 0 {
 		trustedKeys, err := ParseKnownHosts(knownHosts)
 		if err != nil {
-			return nil, trace.Wrap(err)
+			return apissh.ClientConfig{}, trace.Wrap(err)
 		}
 
 		cfg.HostKeyCallback, err = HostKeyCallback(trustedKeys, false)
 		if err != nil {
-			return nil, trace.Wrap(err, "failed to convert certificate authorities to HostKeyCallback")
+			return apissh.ClientConfig{}, trace.Wrap(err, "failed to convert certificate authorities to HostKeyCallback")
 		}
 	}
 
@@ -258,4 +257,68 @@ var sshCertTypeRegex = regexp.MustCompile(`^[a-z0-9\-]+-cert-v[0-9]{2}@openssh\.
 // e.g. ssh-rsa-cert-v01@openssh.com.
 func IsSSHCertType(val string) bool {
 	return sshCertTypeRegex.MatchString(val)
+}
+
+type contextDialer func(ctx context.Context, network, addr string) (net.Conn, error)
+
+type runSSHOpts struct {
+	dialContext contextDialer
+}
+
+// RunSSHOption allows setting options as functional arguments to RunSSH.
+type RunSSHOption func(*runSSHOpts)
+
+// WithDialer connects to an SSH server with a custom dialer.
+func WithDialer(dialer contextDialer) RunSSHOption {
+	return func(opts *runSSHOpts) {
+		opts.dialContext = dialer
+	}
+}
+
+// RunSSH runs a command on an SSH server and returns the output.
+func RunSSH(ctx context.Context, addr, command string, cfg apissh.ClientConfig, opts ...RunSSHOption) ([]byte, []byte, error) {
+	var options runSSHOpts
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	conn, err := options.dialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	sshClient, err := apissh.NewClient(ctx, conn, addr, cfg)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+	defer sshClient.Close()
+	session, err := sshClient.NewSession(ctx)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+	defer session.Close()
+
+	// Execute the command.
+	var stdout bytes.Buffer
+	session.Stdout = &stdout
+	var stderr bytes.Buffer
+	session.Stderr = &stderr
+	err = session.Run(ctx, command)
+	return stdout.Bytes(), stderr.Bytes(), trace.Wrap(err)
+}
+
+// ChannelReadWriter represents the data streams of an ssh.Channel-like object.
+type ChannelReadWriter interface {
+	io.ReadWriter
+	Stderr() io.ReadWriter
+}
+
+// DiscardChannelData discards all data received from an ssh channel in the
+// background.
+func DiscardChannelData(ch ChannelReadWriter) {
+	if ch == nil {
+		return
+	}
+	go io.Copy(io.Discard, ch)
+	go io.Copy(io.Discard, ch.Stderr())
 }

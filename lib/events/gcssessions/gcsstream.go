@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gcssessions
 
@@ -20,6 +22,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -50,17 +53,20 @@ func (h *Handler) CreateUpload(ctx context.Context, sessionID session.ID) (*even
 
 	uploadPath := h.uploadPath(upload)
 
-	h.Logger.Debugf("Creating upload at %s", uploadPath)
+	h.logger.DebugContext(ctx, "Creating upload", "path", uploadPath)
 	// Make sure we don't overwrite an existing upload
-	_, err := h.gcsClient.Bucket(h.Config.Bucket).Object(uploadPath).Attrs(ctx)
-	if err != storage.ErrObjectNotExist {
+	uploadObject := h.gcsClient.Bucket(h.Config.Bucket).Object(uploadPath)
+	_, err := uploadObject.Attrs(ctx)
+	if !errors.Is(err, storage.ErrObjectNotExist) {
 		if err != nil {
 			return nil, convertGCSError(err)
 		}
 		return nil, trace.AlreadyExists("upload %v for session %q already exists in GCS", upload.ID, sessionID)
 	}
 
-	writer := h.gcsClient.Bucket(h.Config.Bucket).Object(uploadPath).NewWriter(ctx)
+	// Perform a conditional write in order to make the request idempotent.
+	// Idempotent requests will be automatically retried when. rate-limited.
+	writer := uploadObject.If(storage.Conditions{DoesNotExist: true}).NewWriter(ctx)
 	start := time.Now()
 	_, err = io.Copy(writer, strings.NewReader(string(sessionID)))
 	// Always close the writer, even if upload failed.
@@ -71,7 +77,11 @@ func (h *Handler) CreateUpload(ctx context.Context, sessionID session.ID) (*even
 	uploadLatencies.Observe(time.Since(start).Seconds())
 	uploadRequests.Inc()
 	if err != nil {
-		return nil, convertGCSError(err)
+		gcsErr := convertGCSError(err)
+		if trace.IsCompareFailed(gcsErr) {
+			return nil, trace.AlreadyExists("upload at %q already exists, this is a bug", uploadPath)
+		}
+		return nil, gcsErr
 	}
 	return &upload, nil
 }
@@ -83,7 +93,7 @@ func (h *Handler) UploadPart(ctx context.Context, upload events.StreamUpload, pa
 	}
 
 	partPath := h.partPath(upload, partNumber)
-	writer := h.gcsClient.Bucket(h.Config.Bucket).Object(partPath).NewWriter(ctx)
+	writer := h.gcsClient.Bucket(h.Config.Bucket).Object(partPath).If(storage.Conditions{DoesNotExist: true}).NewWriter(ctx)
 	start := time.Now()
 	_, err := io.Copy(writer, partBody)
 	// Always close the writer, even if upload failed.
@@ -94,9 +104,13 @@ func (h *Handler) UploadPart(ctx context.Context, upload events.StreamUpload, pa
 	uploadLatencies.Observe(time.Since(start).Seconds())
 	uploadRequests.Inc()
 	if err != nil {
-		return nil, convertGCSError(err)
+		gcsErr := convertGCSError(err)
+		if trace.IsCompareFailed(gcsErr) {
+			return nil, trace.AlreadyExists("part at %q already exists, create a new part instead", partPath)
+		}
+		return nil, gcsErr
 	}
-	return &events.StreamPart{Number: partNumber}, nil
+	return &events.StreamPart{Number: partNumber, LastModified: writer.Attrs().Created}, nil
 }
 
 // CompleteUpload completes the upload
@@ -106,9 +120,10 @@ func (h *Handler) CompleteUpload(ctx context.Context, upload events.StreamUpload
 	}
 
 	// If the session has been already created, move to cleanup
-	sessionPath := h.path(upload.SessionID)
-	_, err := h.gcsClient.Bucket(h.Config.Bucket).Object(sessionPath).Attrs(ctx)
-	if err != storage.ErrObjectNotExist {
+	bucket := h.gcsClient.Bucket(h.Config.Bucket)
+	sessionObject := bucket.Object(h.recordingPath(upload.SessionID))
+	_, err := sessionObject.Attrs(ctx)
+	if !errors.Is(err, storage.ErrObjectNotExist) {
 		if err != nil {
 			return convertGCSError(err)
 		}
@@ -117,9 +132,7 @@ func (h *Handler) CompleteUpload(ctx context.Context, upload events.StreamUpload
 
 	// Makes sure that upload has been properly initiated,
 	// checks the .upload file
-	uploadPath := h.uploadPath(upload)
-	bucket := h.gcsClient.Bucket(h.Config.Bucket)
-	_, err = bucket.Object(uploadPath).Attrs(ctx)
+	_, err = bucket.Object(h.uploadPath(upload)).Attrs(ctx)
 	if err != nil {
 		return convertGCSError(err)
 	}
@@ -131,26 +144,33 @@ func (h *Handler) CompleteUpload(ctx context.Context, upload events.StreamUpload
 
 	objects := h.partsToObjects(upload, parts)
 	for len(objects) > maxParts {
-		h.Logger.Debugf("Got %v objects for upload %v, performing temp merge.",
-			len(objects), upload)
+		h.logger.DebugContext(ctx, "Merging multiple objects for upload", "objects", len(objects), "upload", upload)
 		objectsToMerge := objects[:maxParts]
 		mergeID := hashOfNames(objectsToMerge)
 		mergePath := h.mergePath(upload, mergeID)
 		mergeObject := bucket.Object(mergePath)
-		composer := mergeObject.ComposerFrom(objectsToMerge...)
+		composer := mergeObject.If(storage.Conditions{DoesNotExist: true}).ComposerFrom(objectsToMerge...)
 		_, err = h.OnComposerRun(ctx, composer)
 		if err != nil {
-			return convertGCSError(err)
+			gcsErr := convertGCSError(err)
+			// If composer object already existed, no need to make it again.
+			if !trace.IsCompareFailed(gcsErr) {
+				return gcsErr
+			}
 		}
 		objects = append([]*storage.ObjectHandle{mergeObject}, objects[maxParts:]...)
 	}
-	composer := bucket.Object(sessionPath).ComposerFrom(objects...)
+	composer := sessionObject.If(storage.Conditions{DoesNotExist: true}).ComposerFrom(objects...)
 	_, err = h.OnComposerRun(ctx, composer)
 	if err != nil {
-		return convertGCSError(err)
+		gcsErr := convertGCSError(err)
+		if trace.IsCompareFailed(gcsErr) {
+			h.logger.WarnContext(ctx, "Upload attempted to replace a completed recording, will not overwrite", "upload", upload)
+		} else {
+			return gcsErr
+		}
 	}
-	h.Logger.Debugf("Got %v objects for upload %v, performed merge.",
-		len(objects), upload)
+	h.logger.DebugContext(ctx, "Completed upload after merging multiple objects", "objects", len(objects), "upload", upload)
 	return h.cleanupUpload(ctx, upload)
 }
 
@@ -169,19 +189,39 @@ func (h *Handler) cleanupUpload(ctx context.Context, upload events.StreamUpload)
 		i := bucket.Objects(ctx, &storage.Query{Prefix: prefix, Versions: false})
 		for {
 			attrs, err := i.Next()
-			if err == iterator.Done {
+			if errors.Is(err, iterator.Done) {
 				break
 			}
 			if err != nil {
 				return convertGCSError(err)
 			}
-			objects = append(objects, bucket.Object(attrs.Name))
+			objects = append(objects, bucket.Object(attrs.Name).Generation(0))
 		}
 	}
 
 	// batch delete objects to speed up the process
 	semCh := make(chan struct{}, maxParts)
 	errorsCh := make(chan error, maxParts)
+	// done indicates that all objects have been processed.
+	done := make(chan struct{})
+	var errors []error
+
+	// Start an error collection goroutine. Unless context gets canceled, this
+	// routine collects all the reported results and signals completion on the
+	// done channel.
+	go func() {
+		for range objects {
+			select {
+			case err := <-errorsCh:
+				if !trace.IsNotFound(err) {
+					errors = append(errors, err)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+		done <- struct{}{}
+	}()
 	for i := range objects {
 		select {
 		case semCh <- struct{}{}:
@@ -198,16 +238,11 @@ func (h *Handler) cleanupUpload(ctx context.Context, upload events.StreamUpload)
 		}
 	}
 
-	var errors []error
-	for range objects {
-		select {
-		case err := <-errorsCh:
-			if !trace.IsNotFound(err) {
-				errors = append(errors, err)
-			}
-		case <-ctx.Done():
-			return trace.ConnectionProblem(ctx.Err(), "context closed")
-		}
+	// Wait until either ctx is canceled or we're done collecting results.
+	select {
+	case <-ctx.Done():
+		return trace.ConnectionProblem(ctx.Err(), "context closed")
+	case <-done:
 	}
 	return trace.NewAggregate(errors...)
 }
@@ -215,7 +250,7 @@ func (h *Handler) cleanupUpload(ctx context.Context, upload events.StreamUpload)
 func (h *Handler) partsToObjects(upload events.StreamUpload, parts []events.StreamPart) []*storage.ObjectHandle {
 	objects := make([]*storage.ObjectHandle, len(parts))
 	bucket := h.gcsClient.Bucket(h.Config.Bucket)
-	for i := 0; i < len(parts); i++ {
+	for i := range parts {
 		objects[i] = bucket.Object(h.partPath(upload, parts[i].Number))
 	}
 	return objects
@@ -232,7 +267,7 @@ func (h *Handler) ListParts(ctx context.Context, upload events.StreamUpload) ([]
 	var parts []events.StreamPart
 	for {
 		attrs, err := i.Next()
-		if err == iterator.Done {
+		if errors.Is(err, iterator.Done) {
 			break
 		}
 		if err != nil {
@@ -246,6 +281,7 @@ func (h *Handler) ListParts(ctx context.Context, upload events.StreamUpload) ([]
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
+		part.LastModified = attrs.Updated
 		parts = append(parts, *part)
 	}
 	return parts, nil
@@ -260,7 +296,7 @@ func (h *Handler) ListUploads(ctx context.Context) ([]events.StreamUpload, error
 	var uploads []events.StreamUpload
 	for {
 		attrs, err := i.Next()
-		if err == iterator.Done {
+		if errors.Is(err, iterator.Done) {
 			break
 		}
 		if err != nil {
@@ -283,7 +319,7 @@ func (h *Handler) ListUploads(ctx context.Context) ([]events.StreamUpload, error
 // GetUploadMetadata gets the metadata for session upload
 func (h *Handler) GetUploadMetadata(s session.ID) events.UploadMetadata {
 	return events.UploadMetadata{
-		URL:       fmt.Sprintf("%v://%v/%v", teleport.SchemeGCS, h.path(s), string(s)),
+		URL:       fmt.Sprintf("%v://%v/%v", teleport.SchemeGCS, h.recordingPath(s), string(s)),
 		SessionID: s,
 	}
 }

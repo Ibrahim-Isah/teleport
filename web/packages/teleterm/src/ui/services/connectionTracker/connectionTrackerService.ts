@@ -1,39 +1,44 @@
-/*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import { useStore } from 'shared/libs/stores';
 
 import { ClustersService } from 'teleterm/ui/services/clusters';
+import { StatePersistenceService } from 'teleterm/ui/services/statePersistence';
 import {
   Document,
-  isDocumentTshNodeWithLoginHost,
+  DocumentOrigin,
   WorkspacesService,
 } from 'teleterm/ui/services/workspacesService';
-import { StatePersistenceService } from 'teleterm/ui/services/statePersistence';
+import * as uri from 'teleterm/ui/uri';
 import { RootClusterUri, routing } from 'teleterm/ui/uri';
+import { assertUnreachable } from 'teleterm/ui/utils';
 
 import { ImmutableStore } from '../immutableStore';
-
 import { TrackedConnectionOperationsFactory } from './trackedConnectionOperationsFactory';
 import {
+  createDesktopConnection,
   createGatewayConnection,
-  createKubeConnection,
+  createGatewayKubeConnection,
   createServerConnection,
+  getDesktopConnectionByDocument,
   getGatewayConnectionByDocument,
-  getKubeConnectionByDocument,
+  getGatewayKubeConnectionByDocument,
   getServerConnectionByDocument,
 } from './trackedConnectionUtils';
 import {
@@ -70,26 +75,49 @@ export class ConnectionTrackerService extends ImmutableStore<ConnectionTrackerSt
   }
 
   getConnections(): ExtendedTrackedConnection[] {
-    return this.state.connections.map(connection => {
-      const { rootClusterUri, leafClusterUri } =
-        this._trackedConnectionOperationsFactory.create(connection);
-      const clusterUri = leafClusterUri || rootClusterUri;
-      const clusterName =
-        this._clusterService.findCluster(clusterUri)?.name ||
-        routing.parseClusterName(clusterUri);
-      return { ...connection, clusterName };
-    });
+    return this.state.connections
+      .map(connection => {
+        const trackedConnection =
+          this._trackedConnectionOperationsFactory.create(connection);
+        // A connection is undefined when the state read from the disk
+        // contains a connection not supported by the given Connect version.
+        //
+        // For example, the user can open a desktop connection in Connect v18
+        // and then downgrade to a version that doesn't support desktops.
+        // That connection should be shown as 'UNKNOWN' in the connection list.
+        if (!trackedConnection) {
+          return;
+        }
+        const { rootClusterUri, leafClusterUri } = trackedConnection;
+        const clusterUri = leafClusterUri || rootClusterUri;
+        const clusterName =
+          this._clusterService.findCluster(clusterUri)?.name ||
+          routing.parseClusterName(clusterUri);
+        return { ...connection, clusterName };
+      })
+      .filter(Boolean);
   }
 
-  async activateItem(id: string): Promise<void> {
+  async activateItem(
+    id: string,
+    params: { origin: DocumentOrigin }
+  ): Promise<void> {
     const connection = this.state.connections.find(c => c.id === id);
     const { rootClusterUri, activate } =
       this._trackedConnectionOperationsFactory.create(connection);
 
     if (rootClusterUri !== this._workspacesService.getRootClusterUri()) {
-      await this._workspacesService.setActiveWorkspace(rootClusterUri);
+      const { isAtDesiredWorkspace } =
+        await this._workspacesService.setActiveWorkspace(rootClusterUri);
+      if (!isAtDesiredWorkspace) {
+        return;
+      }
     }
-    activate();
+    activate(params);
+  }
+
+  findConnection(id: string): TrackedConnection | undefined {
+    return this.state.connections.find(c => c.id === id);
   }
 
   findConnectionByDocument(document: Document): TrackedConnection {
@@ -98,13 +126,17 @@ export class ConnectionTrackerService extends ImmutableStore<ConnectionTrackerSt
         return this.state.connections.find(
           getServerConnectionByDocument(document)
         );
-      case 'doc.terminal_tsh_kube':
-        return this.state.connections.find(
-          getKubeConnectionByDocument(document)
-        );
       case 'doc.gateway':
         return this.state.connections.find(
           getGatewayConnectionByDocument(document)
+        );
+      case 'doc.gateway_kube':
+        return this.state.connections.find(
+          getGatewayKubeConnectionByDocument(document)
+        );
+      case 'doc.desktop_session':
+        return this.state.connections.find(
+          getDesktopConnectionByDocument(document)
         );
     }
   }
@@ -142,7 +174,7 @@ export class ConnectionTrackerService extends ImmutableStore<ConnectionTrackerSt
     });
   }
 
-  removeItemsBelongingToRootCluster(clusterUri: string): void {
+  removeItemsBelongingToRootCluster(clusterUri: uri.RootClusterUri): void {
     this.setState(draft => {
       draft.connections = draft.connections.filter(i => {
         const { rootClusterUri } =
@@ -150,6 +182,31 @@ export class ConnectionTrackerService extends ImmutableStore<ConnectionTrackerSt
         return rootClusterUri !== clusterUri;
       });
     });
+  }
+
+  async disconnectAndRemoveItemsBelongingToResource(
+    resourceUri: uri.ResourceUri
+  ): Promise<void> {
+    const connections = this.getConnections().filter(s => {
+      switch (s.kind) {
+        case 'connection.server':
+          return s.serverUri === resourceUri;
+        case 'connection.gateway':
+          return s.targetUri === resourceUri;
+        case 'connection.kube':
+          return s.kubeUri === resourceUri;
+        case 'connection.desktop':
+          return s.desktopUri === resourceUri;
+        default:
+          return assertUnreachable(s);
+      }
+    });
+    await Promise.all(
+      connections.map(async connection => {
+        await this.disconnectItem(connection.id);
+        await this.removeItem(connection.id);
+      })
+    );
   }
 
   dispose(): void {
@@ -161,10 +218,25 @@ export class ConnectionTrackerService extends ImmutableStore<ConnectionTrackerSt
     this.setState(draft => {
       // assign default "connected" values
       draft.connections.forEach(i => {
-        if (i.kind === 'connection.gateway') {
-          i.connected = !!this._clusterService.findGateway(i.gatewayUri);
-        } else {
-          i.connected = false;
+        switch (i.kind) {
+          case 'connection.gateway': {
+            i.connected = !!this._clusterService.findGatewayByConnectionParams({
+              targetUri: i.targetUri,
+              targetUser: i.targetUser,
+              targetSubresourceName: i.targetSubresourceName,
+            });
+            break;
+          }
+          case 'connection.kube': {
+            i.connected = !!this._clusterService.findGatewayByConnectionParams({
+              targetUri: i.kubeUri,
+            });
+            break;
+          }
+          default: {
+            i.connected = false;
+            break;
+          }
         }
       });
 
@@ -182,8 +254,9 @@ export class ConnectionTrackerService extends ImmutableStore<ConnectionTrackerSt
         .filter(
           d =>
             d.kind === 'doc.gateway' ||
+            d.kind === 'doc.gateway_kube' ||
             d.kind === 'doc.terminal_tsh_node' ||
-            d.kind === 'doc.terminal_tsh_kube'
+            d.kind === 'doc.desktop_session'
         );
 
       if (!docs) {
@@ -196,9 +269,11 @@ export class ConnectionTrackerService extends ImmutableStore<ConnectionTrackerSt
         switch (doc.kind) {
           // process gateway connections
           case 'doc.gateway': {
+            // Ignore freshly created docs which have no corresponding gateway yet.
             if (!doc.port) {
               break;
             }
+
             const gwConn = draft.connections.find(
               getGatewayConnectionByDocument(doc)
             ) as TrackedGatewayConnection;
@@ -207,22 +282,39 @@ export class ConnectionTrackerService extends ImmutableStore<ConnectionTrackerSt
               const newItem = createGatewayConnection(doc);
               draft.connections.push(newItem);
             } else {
-              gwConn.gatewayUri = doc.gatewayUri;
+              // In case the document changes, update the gateway title.
+              // Specifically, it addresses a case where we changed a title format
+              // for db gateway documents, and we wanted this change to be reflected
+              // in already created connections.
+              gwConn.title = doc.title;
               gwConn.targetSubresourceName = doc.targetSubresourceName;
               gwConn.port = doc.port;
+              gwConn.autoUserProvisioning = doc.autoUserProvisioning;
               gwConn.connected = !!this._clusterService.findGateway(
                 doc.gatewayUri
               );
             }
             break;
           }
+          // process kube gateway connections
+          case 'doc.gateway_kube': {
+            const kubeConn = draft.connections.find(
+              getGatewayKubeConnectionByDocument(doc)
+            );
+
+            if (kubeConn) {
+              kubeConn.connected =
+                !!this._clusterService.findGatewayByConnectionParams({
+                  targetUri: doc.targetUri,
+                });
+            } else {
+              const newItem = createGatewayKubeConnection(doc);
+              draft.connections.push(newItem);
+            }
+            break;
+          }
           // process tsh connections
           case 'doc.terminal_tsh_node': {
-            // DocumentTshNodeWithLoginHost is still in the process of resolving the hostname and
-            // doesn't have serverUri, so let's not create a connection for it.
-            if (isDocumentTshNodeWithLoginHost(doc)) {
-              break;
-            }
             const tshConn = draft.connections.find(
               getServerConnectionByDocument(doc)
             );
@@ -235,16 +327,15 @@ export class ConnectionTrackerService extends ImmutableStore<ConnectionTrackerSt
             }
             break;
           }
-          // process kube connections
-          case 'doc.terminal_tsh_kube': {
-            const kubeConn = draft.connections.find(
-              getKubeConnectionByDocument(doc)
+          case 'doc.desktop_session': {
+            const desktopConn = draft.connections.find(
+              getDesktopConnectionByDocument(doc)
             );
 
-            if (kubeConn) {
-              kubeConn.connected = doc.status === 'connected';
+            if (desktopConn) {
+              desktopConn.connected = doc.status === 'connected';
             } else {
-              const newItem = createKubeConnection(doc);
+              const newItem = createDesktopConnection(doc);
               draft.connections.push(newItem);
             }
             break;

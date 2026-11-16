@@ -1,0 +1,27 @@
+---
+title: Identity Governance Integrations
+sidebar_label: Integrations
+description: Shows you how to sync Teleport RBAC resources with third-party tools and services.
+tags:
+ - identity-governance
+ - privileged-access
+enterprise: Identity Governance
+---
+
+You can configure Teleport to sync role-based access control (RBAC) configurations with
+third-party software, such as AWS IAM Identity Center, Microsoft Entra ID, and
+Okta. Teleport creates resources such as roles and Access Lists based on
+resources it retrieves from the integration. This way, you can manage all access
+controls in your infrastructure from a single platform.
+
+<Admonition type="tip" title="Review imported access">
+Once an integration imports resources into Teleport, you can use Teleport
+Identity Security to review which identities can access them. See
+[Review Identity Access from the
+CLI](../../identity-security/cli/access-review.mdx) (`tctl access-review`).
+</Admonition>
+
+Read the following guides for how to configure the Identity Governance
+integration for your third-party solution:
+
+<DocCardList />

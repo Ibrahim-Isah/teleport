@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package helpers
 
@@ -21,23 +25,22 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/api/utils/retryutils"
 	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/reversetunnel"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
 )
 
 // WaitForTunnelConnections waits for remote tunnels connections
 func WaitForTunnelConnections(t *testing.T, authServer *auth.Server, clusterName string, expectedCount int) {
 	t.Helper()
 	var conns []types.TunnelConnection
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		// to speed things up a bit, bypass the auth cache
-		conns, err := authServer.Services.GetTunnelConnections(clusterName)
+		conns, err := authServer.Services.GetTunnelConnections(t.Context(), clusterName)
 		require.NoError(t, err)
 		if len(conns) == expectedCount {
 			return
@@ -54,20 +57,17 @@ func WaitForTunnelConnections(t *testing.T, authServer *auth.Server, clusterName
 // Duplicated in tool/tsh/tsh_test.go
 func TryCreateTrustedCluster(t *testing.T, authServer *auth.Server, trustedCluster types.TrustedCluster) {
 	t.Helper()
-	ctx := context.TODO()
-	for i := 0; i < 10; i++ {
-		log.Debugf("Will create trusted cluster %v, attempt %v.", trustedCluster, i)
-		_, err := authServer.UpsertTrustedCluster(ctx, trustedCluster)
+	ctx := t.Context()
+	for range 10 {
+		_, err := authServer.CreateTrustedCluster(ctx, trustedCluster)
 		if err == nil {
 			return
 		}
 		if trace.IsConnectionProblem(err) {
-			log.Debugf("Retrying on connection problem: %v.", err)
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 		if trace.IsAccessDenied(err) {
-			log.Debugf("Retrying on access denied: %v.", err)
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
@@ -76,68 +76,104 @@ func TryCreateTrustedCluster(t *testing.T, authServer *auth.Server, trustedClust
 	require.FailNow(t, "Timeout creating trusted cluster")
 }
 
-func WaitForClusters(tun reversetunnel.Server, expected int) func() bool {
-	return func() bool {
-		clusters, err := tun.GetSites()
+// TryUpdateTrustedCluster performs several attempts to update a trusted cluster,
+// retries on connection problems and access denied errors to let caches
+// propagate and services to start
+func TryUpdateTrustedCluster(t *testing.T, authServer *auth.Server, trustedCluster types.TrustedCluster) {
+	t.Helper()
+	ctx := t.Context()
+	for range 10 {
+		_, err := authServer.UpdateTrustedCluster(ctx, trustedCluster)
+		if err == nil {
+			return
+		}
+		if trace.IsConnectionProblem(err) {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if trace.IsAccessDenied(err) {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		require.FailNow(t, "Terminating on unexpected problem", "%v.", err)
+	}
+	require.FailNow(t, "Timeout creating trusted cluster")
+}
+
+// TryUpdateTrustedCluster performs several attempts to upsert a trusted cluster,
+// retries on connection problems and access denied errors to let caches
+// propagate and services to start
+func TryUpsertTrustedCluster(t *testing.T, authServer *auth.Server, trustedCluster types.TrustedCluster, skipNameValidation bool) {
+	t.Helper()
+	ctx := t.Context()
+	for range 10 {
+		var err error
+		if skipNameValidation {
+			_, err = authServer.UpsertTrustedCluster(ctx, trustedCluster)
+		} else {
+			_, err = authServer.UpsertTrustedClusterV2(ctx, trustedCluster)
+		}
+		if err == nil {
+			return
+		}
+		if trace.IsConnectionProblem(err) {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if trace.IsAccessDenied(err) {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		require.FailNow(t, "Terminating on unexpected problem", "%v.", err)
+	}
+	require.FailNow(t, "Timeout creating trusted cluster")
+}
+
+func WaitForClusters(tun reversetunnelclient.Server, expected int) func() bool {
+	// Clusters will always return the local site
+	expected++
+
+	return func() (ok bool) {
+		clusters, err := tun.Clusters(context.Background())
 		if err != nil {
 			return false
 		}
 
-		// Check the expected number of clusters are connected, and they have all
-		// connected with the past 10 seconds.
-		if len(clusters) >= expected {
-			for _, cluster := range clusters {
-				if time.Since(cluster.GetLastConnected()).Seconds() > 10.0 {
-					return false
-				}
+		if len(clusters) < expected {
+			return false
+		}
+
+		var live int
+		for _, cluster := range clusters {
+			if time.Since(cluster.GetLastConnected()) > 10*time.Second {
+				continue
+			}
+
+			live++
+			if live >= expected {
+				return true
 			}
 		}
 
-		return true
+		return false
 	}
-}
-
-// WaitForNodeCount waits for a certain number of nodes to show up in the remote site.
-func WaitForNodeCount(ctx context.Context, t *TeleInstance, clusterName string, count int) error {
-	const (
-		deadline     = time.Second * 30
-		iterWaitTime = time.Second
-	)
-
-	err := retryutils.RetryStaticFor(deadline, iterWaitTime, func() error {
-		remoteSite, err := t.Tunnel.GetSite(clusterName)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		accessPoint, err := remoteSite.CachingAccessPoint()
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		nodes, err := accessPoint.GetNodes(ctx, defaults.Namespace)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		if len(nodes) == count {
-			return nil
-		}
-		return trace.BadParameter("found %v nodes, but wanted to find %v nodes", len(nodes), count)
-	})
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	return nil
 }
 
 // WaitForActiveTunnelConnections waits for remote cluster to report a minimum number of active connections
-func WaitForActiveTunnelConnections(t *testing.T, tunnel reversetunnel.Server, clusterName string, expectedCount int) {
-	require.Eventually(t, func() bool {
-		cluster, err := tunnel.GetSite(clusterName)
-		if err != nil {
-			return false
-		}
-		return cluster.GetTunnelsCount() >= expectedCount
+func WaitForActiveTunnelConnections(t *testing.T, tunnel reversetunnelclient.Server, clusterName string, expectedCount int) {
+	ctx := t.Context()
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		cluster, err := tunnel.Cluster(ctx, clusterName)
+		require.NoError(t, err, "site not found")
+
+		require.GreaterOrEqual(t, cluster.GetTunnelsCount(), expectedCount, "missing tunnels for site")
+
+		require.Equal(t, teleport.RemoteClusterStatusOnline, cluster.GetStatus(), "cluster not online")
+
+		_, err = cluster.GetClient()
+		require.NoError(t, err, "cluster not yet available")
 	},
-		30*time.Second,
+		90*time.Second,
 		time.Second,
 		"Active tunnel connections did not reach %v in the expected time frame %v", expectedCount, 30*time.Second,
 	)
@@ -166,8 +202,6 @@ func CheckTrustedClustersCanConnect(ctx context.Context, t *testing.T, tcSetup T
 
 	// Wait for both cluster to see each other via reverse tunnels.
 	require.Eventually(t, WaitForClusters(main.Tunnel, 1), 10*time.Second, 1*time.Second,
-		"Two clusters do not see each other: tunnels are not working.")
-	require.Eventually(t, WaitForClusters(aux.Tunnel, 1), 10*time.Second, 1*time.Second,
 		"Two clusters do not see each other: tunnels are not working.")
 
 	// Try and connect to a node in the Aux cluster from the Main cluster using
@@ -203,7 +237,7 @@ func CheckTrustedClustersCanConnect(ctx context.Context, t *testing.T, tcSetup T
 	cmd := []string{"echo", "hello world"}
 
 	require.Eventually(t, func() bool {
-		return tc.SSH(ctx, cmd, false) == nil
+		return tc.SSH(ctx, cmd) == nil
 	}, 10*time.Second, 1*time.Second, "Two clusters cannot connect to each other")
 
 	require.Equal(t, "hello world\n", output.String())

@@ -1,25 +1,32 @@
-/*
-Copyright 2019-2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 export enum EventType {
   START = 'session.start',
   JOIN = 'session.join',
   END = 'session.end',
+  EXEC = 'exec',
   PRINT = 'print',
   RESIZE = 'resize',
+  FILE_TRANSFER_REQUEST = 'file_transfer_request',
+  FILE_TRANSFER_DECISION = 'file_transfer_decision',
+  FILE_TRANSFER_REQUEST_APPROVE = 'file_transfer_request_approve',
+  FILE_TRANSFER_REQUEST_DENY = 'file_transfer_request_deny',
 }
 
 export enum TermEvent {
@@ -29,7 +36,9 @@ export enum TermEvent {
   SESSION = 'terminal.new_session',
   DATA = 'terminal.data',
   CONN_CLOSE = 'connection.close',
-  WEBAUTHN_CHALLENGE = 'terminal.webauthn',
+  MFA_CHALLENGE = 'terminal.webauthn',
+  LATENCY = 'terminal.latency',
+  KUBE_EXEC = 'terminal.kube_exec',
 }
 
 // Websocket connection close codes.

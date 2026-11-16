@@ -1,20 +1,25 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package webauthnwin
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"syscall"
@@ -22,38 +27,67 @@ import (
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/gravitational/trace"
+
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
 )
 
-func assertOptionsToCType(in protocol.PublicKeyCredentialRequestOptions, loginOpts *LoginOpts) (*webauthnAuthenticatorGetAssertionOptions, error) {
+func assertOptionsToCType(in wantypes.PublicKeyCredentialRequestOptions, loginOpts *LoginOpts) (*webauthnAuthenticatorGetAssertionOptions, error) {
 	allowCredList, err := credentialsExToCType(in.AllowedCredentials)
 	if err != nil {
 		return nil, err
 	}
 
 	var dwAuthenticatorAttachment uint32
+	var credentialHint string
 	if loginOpts != nil {
 		switch loginOpts.AuthenticatorAttachment {
 		case AttachmentPlatform:
-			dwAuthenticatorAttachment = 1
+			dwAuthenticatorAttachment = webauthnAttachmentPlatform
+			getPackageLogger().DebugContext(context.Background(),
+				"Using platform attachment",
+				"attachment", dwAuthenticatorAttachment,
+			)
 		case AttachmentCrossPlatform:
-			dwAuthenticatorAttachment = 2
+			dwAuthenticatorAttachment = webauthnAttachmentCrossPlatform
+			// If we are setting cross-platform we imply a physical security-key (not
+			// a phone).
+			// See https://github.com/gravitational/teleport/issues/62060.
+			credentialHint = webauthnCredentialHintSecurityKey
+			getPackageLogger().DebugContext(context.Background(),
+				"Using cross-platform attachment with security-key hint",
+				"attachment", dwAuthenticatorAttachment,
+				"credential_hint", credentialHint,
+			)
 		}
+	}
+
+	var cCredentialHints uint32  // number of hints
+	var pCredentialHints *uint16 // pointer to array of NULL-terminated UTF-16 strings
+	if credentialHint != "" {
+		var err error
+		pCredentialHints, err = utf16PtrFromString(credentialHint)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		cCredentialHints = 1
 	}
 
 	return &webauthnAuthenticatorGetAssertionOptions{
 		// https://github.com/microsoft/webauthn/blob/7ab979cc833bfab9a682ed51761309db57f56c8c/webauthn.h#L36-L97
 		// contains information about different versions.
 		// We can set newest version and it still works on older APIs.
-		dwVersion:                     6,
+		dwVersion:                     9,
 		dwTimeoutMilliseconds:         uint32(in.Timeout),
 		dwAuthenticatorAttachment:     dwAuthenticatorAttachment,
 		dwUserVerificationRequirement: userVerificationToCType(in.UserVerification),
 		// TODO(tobiaszheller): support U2fAppId.
 		pAllowCredentialList: allowCredList,
+		cCredentialHints:     cCredentialHints,
+		ppwszCredentialHints: pCredentialHints,
 	}, nil
 }
 
-func rpToCType(in protocol.RelyingPartyEntity) (*webauthnRPEntityInformation, error) {
+func rpToCType(in wantypes.RelyingPartyEntity) (*webauthnRPEntityInformation, error) {
 	if in.ID == "" {
 		return nil, trace.BadParameter("missing RelyingPartyEntity.Id")
 	}
@@ -68,22 +102,14 @@ func rpToCType(in protocol.RelyingPartyEntity) (*webauthnRPEntityInformation, er
 	if err != nil {
 		return nil, err
 	}
-	var icon *uint16
-	if in.Icon != "" {
-		icon, err = utf16PtrFromString(in.Icon)
-		if err != nil {
-			return nil, err
-		}
-	}
 	return &webauthnRPEntityInformation{
 		dwVersion: 1,
 		pwszID:    id,
 		pwszName:  name,
-		pwszIcon:  icon,
 	}, nil
 }
 
-func userToCType(in protocol.UserEntity) (*webauthnUserEntityInformation, error) {
+func userToCType(in wantypes.UserEntity) (*webauthnUserEntityInformation, error) {
 	if len(in.ID) == 0 {
 		return nil, trace.BadParameter("missing UserEntity.Id")
 	}
@@ -102,24 +128,16 @@ func userToCType(in protocol.UserEntity) (*webauthnUserEntityInformation, error)
 			return nil, err
 		}
 	}
-	var icon *uint16
-	if in.Icon != "" {
-		icon, err = utf16PtrFromString(in.Icon)
-		if err != nil {
-			return nil, err
-		}
-	}
 	return &webauthnUserEntityInformation{
 		dwVersion:       1,
 		cbID:            uint32(len(in.ID)),
 		pbID:            &in.ID[0],
 		pwszName:        name,
 		pwszDisplayName: displayName,
-		pwszIcon:        icon,
 	}, nil
 }
 
-func credParamToCType(in []protocol.CredentialParameter) (*webauthnCoseCredentialParameters, error) {
+func credParamToCType(in []wantypes.CredentialParameter) (*webauthnCoseCredentialParameters, error) {
 	if len(in) == 0 {
 		return nil, trace.BadParameter("missing CredentialParameter")
 	}
@@ -174,7 +192,7 @@ func clientDataToCType(challenge, origin, cdType string) (*webauthnClientData, [
 	}, jsonCD, nil
 }
 
-func credentialsExToCType(in []protocol.CredentialDescriptor) (*webauthnCredentialList, error) {
+func credentialsExToCType(in []wantypes.CredentialDescriptor) (*webauthnCredentialList, error) {
 	exCredList := make([]*webauthnCredentialEX, 0, len(in))
 	for _, e := range in {
 		if e.Type == "" {
@@ -270,7 +288,7 @@ func userVerificationToCType(in protocol.UserVerificationRequirement) uint32 {
 	}
 }
 
-func requirePreferResidentKey(in protocol.AuthenticatorSelection) (requireRK bool, preferRK bool) {
+func requirePreferResidentKey(in wantypes.AuthenticatorSelection) (requireRK bool, preferRK bool) {
 	switch in.ResidentKey {
 	case protocol.ResidentKeyRequirementRequired:
 		return true, false
@@ -286,7 +304,7 @@ func requirePreferResidentKey(in protocol.AuthenticatorSelection) (requireRK boo
 	}
 }
 
-func makeCredOptionsToCType(in protocol.PublicKeyCredentialCreationOptions) (*webauthnAuthenticatorMakeCredentialOptions, error) {
+func makeCredOptionsToCType(in wantypes.PublicKeyCredentialCreationOptions) (*webauthnAuthenticatorMakeCredentialOptions, error) {
 	exCredList, err := credentialsExToCType(in.CredentialExcludeList)
 	if err != nil {
 		return nil, err

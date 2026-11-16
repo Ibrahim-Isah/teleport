@@ -1,23 +1,26 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package inventory
 
 import (
 	"hash/maphash"
+	"iter"
 	"sync"
 	"sync/atomic"
 )
@@ -61,22 +64,37 @@ func (s *Store) Get(serverID string) (handle UpstreamHandle, ok bool) {
 	return s.getShard(serverID).get(serverID)
 }
 
+// Handles attempts to load all known handlers for the given server ID.
+// If you only need one handler, use Get instead.
+func (s *Store) Handles(serverID string) iter.Seq[UpstreamHandle] {
+	return s.getShard(serverID).handles(serverID)
+}
+
 // Insert adds a new handle to the store.
 func (s *Store) Insert(handle UpstreamHandle) {
-	s.getShard(handle.Hello().ServerID).insert(handle)
+	s.getShard(handle.Hello().GetServerID()).insert(handle)
 }
 
 // Remove removes the handle from the store.
 func (s *Store) Remove(handle UpstreamHandle) {
-	s.getShard(handle.Hello().ServerID).remove(handle)
+	s.getShard(handle.Hello().GetServerID()).remove(handle)
 }
 
-// Iter iterates across all handles registered with this store.
-// note: if multiple handles are registered for a given server, only
+// UniqueHandles iterates across unique handles registered with this store.
+// If multiple handles are registered for a given server, only
 // one handle is selected pseudorandomly to be observed.
-func (s *Store) Iter(fn func(UpstreamHandle)) {
+func (s *Store) UniqueHandles(fn func(UpstreamHandle)) {
 	for _, shard := range s.shards {
 		shard.iter(fn)
+	}
+}
+
+// AllHandles iterates across all handles registered with this
+// store. If multiple handles are registered for a given server,
+// all of them will be observed.
+func (s *Store) AllHandles(fn func(UpstreamHandle)) {
+	for _, shard := range s.shards {
+		shard.iterWithDuplicates(fn)
 	}
 }
 
@@ -133,6 +151,26 @@ func (s *shard) get(serverID string) (handle UpstreamHandle, ok bool) {
 	return handle, true
 }
 
+// handles gets all handles registered for a given hostID.
+// To get a random handle, use get() instead.
+func (s *shard) handles(serverID string) iter.Seq[UpstreamHandle] {
+	return func(yield func(UpstreamHandle) bool) {
+		s.rw.RLock()
+		defer s.rw.RUnlock()
+
+		entry, ok := s.m[serverID]
+		if !ok {
+			return
+		}
+
+		for _, handle := range entry.handles {
+			if !yield(handle) {
+				return
+			}
+		}
+	}
+}
+
 func (s *shard) iter(fn func(UpstreamHandle)) {
 	s.rw.RLock()
 	defer s.rw.RUnlock()
@@ -143,13 +181,23 @@ func (s *shard) iter(fn func(UpstreamHandle)) {
 	}
 }
 
+func (s *shard) iterWithDuplicates(fn func(UpstreamHandle)) {
+	s.rw.RLock()
+	defer s.rw.RUnlock()
+	for _, entry := range s.m {
+		for _, handle := range entry.handles {
+			fn(handle)
+		}
+	}
+}
+
 func (s *shard) insert(handle UpstreamHandle) {
 	s.rw.Lock()
 	defer s.rw.Unlock()
-	e, ok := s.m[handle.Hello().ServerID]
+	e, ok := s.m[handle.Hello().GetServerID()]
 	if !ok {
 		e = &entry{}
-		s.m[handle.Hello().ServerID] = e
+		s.m[handle.Hello().GetServerID()] = e
 	}
 	e.handles = append(e.handles, handle)
 }
@@ -157,7 +205,7 @@ func (s *shard) insert(handle UpstreamHandle) {
 func (s *shard) remove(handle UpstreamHandle) {
 	s.rw.Lock()
 	defer s.rw.Unlock()
-	e, ok := s.m[handle.Hello().ServerID]
+	e, ok := s.m[handle.Hello().GetServerID()]
 	if !ok {
 		return
 	}
@@ -165,7 +213,7 @@ func (s *shard) remove(handle UpstreamHandle) {
 		if handle == h {
 			e.handles = swapRemove(e.handles, i)
 			if len(e.handles) == 0 {
-				delete(s.m, handle.Hello().ServerID)
+				delete(s.m, handle.Hello().GetServerID())
 			}
 			return
 		}

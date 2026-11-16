@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package multiplexer
 
@@ -21,10 +23,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"io"
 	"net"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
@@ -46,14 +50,26 @@ var (
 	// source=127.0.0.1:12345 destination=127.0.0.2:42
 	sampleIPv4Addresses = []byte{0x7F, 0x00, 0x00, 0x01, 0x7F, 0x00, 0x00, 0x02, 0x30, 0x39, 0x00, 0x2A}
 	// {0x21, 0x11, 0x00, 0x0C} - 4 bits version, 4 bits command, 4 bits address family, 4 bits protocol, 16 bits length
-	sampleProxyV2Line = bytes.Join([][]byte{proxyV2Prefix, {0x21, 0x11, 0x00, 0x0C}, sampleIPv4Addresses}, nil)
+	sampleProxyV2Line = bytes.Join([][]byte{ProxyV2Prefix, {0x21, 0x11, 0x00, 0x0C}, sampleIPv4Addresses}, nil)
 	// Proxy line with LOCAL command
-	sampleProxyV2LineLocal    = bytes.Join([][]byte{proxyV2Prefix, {0x20, 0x11, 0x00, 0x00}}, nil)
+	sampleProxyV2LineLocal    = bytes.Join([][]byte{ProxyV2Prefix, {0x20, 0x11, 0x00, 0x00}}, nil)
 	sampleTLV                 = []byte{byte(PP2TypeTeleport), 0x00, 0x03, 0x01, 0x02, 0x03}
 	sampleEmptyTLV            = []byte{byte(PP2TypeTeleport), 0x00, 0x00}
-	sampleProxyV2LineTLV      = bytes.Join([][]byte{proxyV2Prefix, {0x21, 0x11, 0x00, 0x12}, sampleIPv4Addresses, sampleTLV}, nil)
-	sampleProxyV2LineEmptyTLV = bytes.Join([][]byte{proxyV2Prefix, {0x21, 0x11, 0x00, 0x0F}, sampleIPv4Addresses, sampleEmptyTLV}, nil)
+	sampleProxyV2LineTLV      = bytes.Join([][]byte{ProxyV2Prefix, {0x21, 0x11, 0x00, 0x12}, sampleIPv4Addresses, sampleTLV}, nil)
+	sampleProxyV2LineEmptyTLV = bytes.Join([][]byte{ProxyV2Prefix, {0x21, 0x11, 0x00, 0x0F}, sampleIPv4Addresses, sampleEmptyTLV}, nil)
 )
+
+func TestPPv2SizeConsts(t *testing.T) {
+	//nolint:staticcheck // the fact that the two types are the same is precisely the point here
+	var (
+		_ [proxyV2Address4Size]struct{} = [unsafe.Sizeof(proxyV2Address4{})]struct{}{}
+		_ [proxyV2Address6Size]struct{} = [unsafe.Sizeof(proxyV2Address6{})]struct{}{}
+	)
+
+	// double-check the runtime size as measured by binary.Size
+	require.Equal(t, proxyV2Address4Size, binary.Size(proxyV2Address4{}))
+	require.Equal(t, proxyV2Address6Size, binary.Size(proxyV2Address6{}))
+}
 
 func TestReadProxyLine(t *testing.T) {
 	t.Parallel()
@@ -66,7 +82,7 @@ func TestReadProxyLine(t *testing.T) {
 		_, err := ReadProxyLine(bufio.NewReader(bytes.NewReader([]byte("GIBBERISH\r\n"))))
 		require.ErrorIs(t, err, trace.BadParameter("malformed PROXY line protocol string"))
 	})
-	t.Run("successfully read proxy v1 line", func(t *testing.T) {
+	t.Run("successfully read proxy v1 IPv4 line", func(t *testing.T) {
 		pl, err := ReadProxyLine(bufio.NewReader(bytes.NewReader([]byte(sampleProxyV1Line))))
 		require.NoError(t, err)
 
@@ -75,6 +91,29 @@ func TestReadProxyLine(t *testing.T) {
 		require.Equal(t, "127.0.0.2:42", pl.Destination.String())
 		require.Nil(t, pl.TLVs)
 		require.Equal(t, sampleProxyV1Line, pl.String())
+	})
+	t.Run("successfully read proxy v1 IPv6 line", func(t *testing.T) {
+		line := "PROXY TCP6 fe80::a00:27ff:fe8e:8aa8 fe80::a00:27ff:fe8e:8aa9 12345 42\r\n"
+		pl, err := ReadProxyLine(bufio.NewReader(bytes.NewReader([]byte(line))))
+		require.NoError(t, err)
+
+		require.Equal(t, TCP6, pl.Protocol)
+		require.Equal(t, "[fe80::a00:27ff:fe8e:8aa8]:12345", pl.Source.String())
+		require.Equal(t, "[fe80::a00:27ff:fe8e:8aa9]:42", pl.Destination.String())
+		require.Nil(t, pl.TLVs)
+		require.Equal(t, line, pl.String())
+	})
+	t.Run("IPv6 address with TCP4 protocol is rejected", func(t *testing.T) {
+		line := "PROXY TCP4 fe80::a00:27ff:fe8e:8aa8 fe80::a00:27ff:fe8e:8aa9 12345 42\r\n"
+		_, err := ReadProxyLine(bufio.NewReader(bytes.NewReader([]byte(line))))
+		require.Error(t, err)
+		require.ErrorContains(t, err, "for IPV4 proto")
+	})
+	t.Run("IPv4 address with TCP6 protocol is rejected", func(t *testing.T) {
+		line := "PROXY TCP6 127.0.0.1 127.0.0.2 12345 42\r\n"
+		_, err := ReadProxyLine(bufio.NewReader(bytes.NewReader([]byte(line))))
+		require.Error(t, err)
+		require.ErrorContains(t, err, "for IPV6 proto")
 	})
 }
 
@@ -94,7 +133,7 @@ func TestReadProxyLineV2(t *testing.T) {
 		require.ErrorContains(t, err, "unrecognized signature")
 	})
 	t.Run("malformed PROXY v2 header", func(t *testing.T) {
-		_, err := ReadProxyLineV2(bufio.NewReader(bytes.NewReader(append(proxyV2Prefix, []byte("JIBBERISH")...))))
+		_, err := ReadProxyLineV2(bufio.NewReader(bytes.NewReader(append(ProxyV2Prefix, []byte("JIBBERISH")...))))
 		require.ErrorContains(t, err, "unsupported version")
 	})
 	t.Run("successfully read proxy v2 line without TLV", func(t *testing.T) {
@@ -118,7 +157,7 @@ func TestReadProxyLineV2(t *testing.T) {
 		require.Equal(t, "127.0.0.1:12345", pl.Source.String())
 		require.Equal(t, "127.0.0.2:42", pl.Destination.String())
 		require.NotNil(t, pl.TLVs)
-		require.Equal(t, 1, len(pl.TLVs))
+		require.Len(t, pl.TLVs, 1)
 		require.Equal(t, PP2TypeTeleport, pl.TLVs[0].Type)
 		require.Equal(t, []byte{0x01, 0x02, 0x03}, pl.TLVs[0].Value)
 
@@ -134,7 +173,7 @@ func TestReadProxyLineV2(t *testing.T) {
 		require.Equal(t, "127.0.0.1:12345", pl.Source.String())
 		require.Equal(t, "127.0.0.2:42", pl.Destination.String())
 		require.NotNil(t, pl.TLVs)
-		require.Equal(t, 1, len(pl.TLVs))
+		require.Len(t, pl.TLVs, 1)
 		require.Equal(t, PP2TypeTeleport, pl.TLVs[0].Type)
 		require.Equal(t, []byte{}, pl.TLVs[0].Value)
 
@@ -179,7 +218,7 @@ func TestProxyLine_Bytes(t *testing.T) {
 
 		b, err := pl.Bytes()
 		assert.NoError(t, err)
-		assert.Equal(t, 28, len(b))
+		assert.Len(t, b, 28)
 		assert.Equal(t, sampleProxyV2Line, b)
 
 		pl2, err := ReadProxyLineV2(bufio.NewReader(bytes.NewBuffer(b)))
@@ -187,7 +226,7 @@ func TestProxyLine_Bytes(t *testing.T) {
 		assert.Equal(t, TCP4, pl2.Protocol)
 		assert.Equal(t, "127.0.0.1:12345", pl2.Source.String())
 		assert.Equal(t, "127.0.0.2:42", pl2.Destination.String())
-		assert.Equal(t, 0, len(pl2.TLVs))
+		assert.Empty(t, pl2.TLVs)
 	})
 
 	t.Run("with TLV", func(t *testing.T) {
@@ -203,14 +242,14 @@ func TestProxyLine_Bytes(t *testing.T) {
 
 		b, err := pl.Bytes()
 		assert.NoError(t, err)
-		assert.Equal(t, 35, len(b))
+		assert.Len(t, b, 35)
 
 		pl2, err := ReadProxyLineV2(bufio.NewReader(bytes.NewBuffer(b)))
 		assert.NoError(t, err)
 		assert.Equal(t, TCP4, pl2.Protocol)
 		assert.Equal(t, "127.0.0.1:12345", pl2.Source.String())
 		assert.Equal(t, "127.0.0.2:42", pl2.Destination.String())
-		assert.Equal(t, 1, len(pl2.TLVs))
+		assert.Len(t, pl2.TLVs, 1)
 		assert.Equal(t, PP2TypeTeleport, pl2.TLVs[0].Type)
 		assert.Equal(t, []byte("0123"), pl2.TLVs[0].Value)
 	})
@@ -401,7 +440,7 @@ func TestProxyLine_AddSignature(t *testing.T) {
 				TLVs: tt.inputTLVs,
 			}
 
-			err := pl.AddSignature([]byte(tt.signature), []byte(tt.cert))
+			err := pl.AddTeleportTLVs([]byte(tt.signature), []byte(tt.cert), nil)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr, "Didn't find expected error")
 			} else {
@@ -420,12 +459,33 @@ func TestProxyLine_VerifySignature(t *testing.T) {
 	tlsProxyCert, casGetter, jwtSigner := getTestCertCAsGetterAndSigner(t, clusterName)
 
 	ip := "1.2.3.4"
+	ipV6 := "::1"
 	sAddr := net.TCPAddr{IP: net.ParseIP(ip), Port: 444}
 	dAddr := net.TCPAddr{IP: net.ParseIP(ip), Port: 555}
+
+	sAddrV6 := net.TCPAddr{IP: net.ParseIP(ipV6), Port: 888}
+	dAddrV6 := net.TCPAddr{IP: net.ParseIP(ipV6), Port: 999}
+
+	sAddrPseudo, err := getPseudoIPV4(sAddrV6)
+	require.NoError(t, err)
 
 	signature, err := jwtSigner.SignPROXYJWT(jwt.PROXYSignParams{
 		ClusterName:        clusterName,
 		SourceAddress:      sAddr.String(),
+		DestinationAddress: dAddr.String(),
+	})
+	require.NoError(t, err)
+
+	signatureV6, err := jwtSigner.SignPROXYJWT(jwt.PROXYSignParams{
+		ClusterName:        clusterName,
+		SourceAddress:      sAddrV6.String(),
+		DestinationAddress: dAddrV6.String(),
+	})
+	require.NoError(t, err)
+
+	signatureDowngrade, err := jwtSigner.SignPROXYJWT(jwt.PROXYSignParams{
+		ClusterName:        clusterName,
+		SourceAddress:      sAddrV6.String(),
 		DestinationAddress: dAddr.String(),
 	})
 	require.NoError(t, err)
@@ -444,7 +504,7 @@ func TestProxyLine_VerifySignature(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	ca, err := casGetter.GetCertAuthority(context.Background(), types.CertAuthID{
+	ca, err := casGetter(context.Background(), types.CertAuthID{
 		Type:       types.HostCA,
 		DomainName: clusterName,
 	}, false)
@@ -460,6 +520,7 @@ func TestProxyLine_VerifySignature(t *testing.T) {
 
 		sAddr            net.TCPAddr
 		dAddr            net.TCPAddr
+		originalSAddr    *net.TCPAddr
 		hostCACert       []byte
 		localClusterName string
 		signature        string
@@ -547,15 +608,48 @@ func TestProxyLine_VerifySignature(t *testing.T) {
 			cert:             tlsProxyCert,
 			wantErr:          "",
 		},
+		{
+			desc:             "success v6",
+			sAddr:            sAddrV6,
+			dAddr:            dAddrV6,
+			hostCACert:       hostCACert,
+			localClusterName: clusterName,
+			signature:        signatureV6,
+			cert:             tlsProxyCert,
+			wantErr:          "",
+		},
+		{
+			desc:             "success ipv6->ipv4 downgrade",
+			sAddr:            sAddrPseudo,
+			dAddr:            dAddr,
+			originalSAddr:    &sAddrV6,
+			hostCACert:       hostCACert,
+			localClusterName: clusterName,
+			signature:        signatureDowngrade,
+			cert:             tlsProxyCert,
+			wantErr:          "",
+		},
+		{
+			desc:             "failure ipv6->ipv4 downgrade, pseudo source address does not match signed ipv6",
+			sAddr:            sAddr,
+			dAddr:            dAddr,
+			originalSAddr:    &sAddrV6,
+			hostCACert:       hostCACert,
+			localClusterName: clusterName,
+			signature:        signatureDowngrade,
+			cert:             tlsProxyCert,
+			wantErr:          "mismatched pseudo IPv4 source and original IPv6 in proxy line",
+		},
 	}
 
 	for _, tt := range testCases {
 		t.Run(tt.desc, func(t *testing.T) {
 			pl := ProxyLine{
-				Source:      sAddr,
-				Destination: dAddr,
+				Source:      tt.sAddr,
+				Destination: tt.dAddr,
 			}
-			err := pl.AddSignature([]byte(tt.signature), tt.cert)
+
+			err := pl.AddTeleportTLVs([]byte(tt.signature), tt.cert, tt.originalSAddr)
 			require.NoError(t, err)
 
 			ca, err := types.NewCertAuthority(types.CertAuthoritySpecV2{
@@ -570,9 +664,11 @@ func TestProxyLine_VerifySignature(t *testing.T) {
 					},
 				},
 			})
-			mockCAGetter := &mockCAsGetter{HostCA: ca}
-
 			require.NoError(t, err)
+
+			mockCAGetter := func(ctx context.Context, id types.CertAuthID, loadKeys bool) (types.CertAuthority, error) {
+				return ca, nil
+			}
 
 			err = pl.VerifySignature(context.Background(), mockCAGetter, tt.localClusterName, clock)
 			if tt.wantErr != "" {
@@ -582,6 +678,16 @@ func TestProxyLine_VerifySignature(t *testing.T) {
 			}
 		})
 	}
+}
+
+func FuzzReadProxyLineV1(f *testing.F) {
+	f.Add([]byte(sampleProxyV1Line))
+
+	f.Fuzz(func(t *testing.T, b []byte) {
+		require.NotPanics(t, func() {
+			_, _ = ReadProxyLine(bufio.NewReader(bytes.NewReader(b)))
+		})
+	})
 }
 
 func FuzzReadProxyLineV2(f *testing.F) {

@@ -1,38 +1,76 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"context"
+	"iter"
+	"time"
 
 	"github.com/gravitational/teleport/api/client/proto"
+	presencev1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/presence/v1"
+	"github.com/gravitational/teleport/api/internalutils/stream"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/backend"
 )
 
 // ProxyGetter is a service that gets proxies.
 type ProxyGetter interface {
 	// GetProxies returns a list of registered proxies.
+	//
+	// Deprecated: Prefer paginated variant [ListProxyServers].
+	//
+	// TODO(kiosion): DELETE IN 21.0.0
 	GetProxies() ([]types.Server, error)
+	// ListProxyServers returns a paginated list of registered Proxy servers.
+	ListProxyServers(ctx context.Context, pageSize int, pageToken string) ([]types.Server, string, error)
 }
 
 // NodesGetter is a service that gets nodes.
 type NodesGetter interface {
 	// GetNodes returns a list of registered servers.
 	GetNodes(ctx context.Context, namespace string) ([]types.Server, error)
+
+	// ListSSHServers returns a page of registered nodes with the ability to apply
+	// scope filters.
+	ListSSHServers(ctx context.Context, req *presencev1.ListSSHServersRequest) ([]types.Server, string, error)
+
+	// RangeSSHServers returns a sequence of nodes filtered by the given
+	// scope filter.
+	RangeSSHServers(ctx context.Context, req *presencev1.ListSSHServersRequest) iter.Seq2[types.Server, error]
+}
+
+// DatabaseServersGetter is a service that gets database servers.
+type DatabaseServersGetter interface {
+	// GetDatabaseServers returns all registered database proxy servers.
+	GetDatabaseServers(ctx context.Context, namespace string, opts ...MarshalOption) ([]types.DatabaseServer, error)
+}
+
+// AppServersGetter is a service that gets application servers.
+type AppServersGetter interface {
+	GetApplicationServers(ctx context.Context, namespace string) ([]types.AppServer, error)
+}
+
+// NodesStreamGetter is a service that gets nodes.
+type NodesStreamGetter interface {
+	// GetNodeStream returns a list of registered servers.
+	GetNodeStream(ctx context.Context, namespace string) stream.Stream[types.Server]
 }
 
 // Presence records and reports the presence of all components
@@ -45,145 +83,84 @@ type Presence interface {
 	// Semaphores is responsible for semaphore handling
 	types.Semaphores
 
-	// GetNode returns a node by name and namespace.
-	GetNode(ctx context.Context, namespace, name string) (types.Server, error)
+	// GetSSHServer returns a scoped or unscoped node by name.
+	GetSSHServer(ctx context.Context, req *presencev1.GetSSHServerRequest) (types.Server, error)
 
 	// NodesGetter gets nodes
 	NodesGetter
 
-	// DeleteAllNodes deletes all nodes in a namespace.
+	// DeleteAllNodes deletes all scoped and unscoped nodes.
 	DeleteAllNodes(ctx context.Context, namespace string) error
 
-	// DeleteNode deletes node in a namespace
-	DeleteNode(ctx context.Context, namespace, name string) error
+	// DeleteNode removes a specific scoped or unscoped node.
+	DeleteSSHServer(ctx context.Context, req *presencev1.DeleteSSHServerRequest) error
 
 	// UpsertNode registers node presence, permanently if TTL is 0 or for the
 	// specified duration with second resolution if it's >= 1 second.
 	UpsertNode(ctx context.Context, server types.Server) (*types.KeepAlive, error)
 
-	// DELETE IN: 5.1.0
-	//
-	// This logic has been moved to KeepAliveServer.
-	//
-	// KeepAliveNode updates node TTL in the storage
-	KeepAliveNode(ctx context.Context, h types.KeepAlive) error
-
 	// GetAuthServers returns a list of registered servers
+	//
+	// Deprecated: Prefer paginated variant [ListAuthServers].
+	//
+	// TODO(kiosion): DELETE IN 21.0.0
 	GetAuthServers() ([]types.Server, error)
+
+	// ListAuthServers returns a paginated list of registered auth servers.
+	ListAuthServers(ctx context.Context, pageSize int, pageToken string) ([]types.Server, string, error)
 
 	// UpsertAuthServer registers auth server presence, permanently if ttl is 0 or
 	// for the specified duration with second resolution if it's >= 1 second
-	UpsertAuthServer(server types.Server) error
+	UpsertAuthServer(ctx context.Context, server types.Server) error
 
 	// DeleteAuthServer deletes auth server by name
 	DeleteAuthServer(name string) error
 
-	// DeleteAllAuthServers deletes all auth servers
-	DeleteAllAuthServers() error
-
-	// UpsertProxy registers proxy server presence, permanently if ttl is 0 or
-	// for the specified duration with second resolution if it's >= 1 second
-	UpsertProxy(server types.Server) error
-
 	// ProxyGetter gets a list of proxies
 	ProxyGetter
 
-	// DeleteProxy deletes proxy by name
-	DeleteProxy(name string) error
-
-	// DeleteAllProxies deletes all proxies
-	DeleteAllProxies() error
+	// DeleteProxyServer deletes proxy by name
+	DeleteProxyServer(ctx context.Context, name string) error
 
 	// UpsertReverseTunnel upserts reverse tunnel entry temporarily or permanently
-	UpsertReverseTunnel(tunnel types.ReverseTunnel) error
+	UpsertReverseTunnel(ctx context.Context, tunnel types.ReverseTunnel) (types.ReverseTunnel, error)
 
 	// GetReverseTunnel returns reverse tunnel by name
-	GetReverseTunnel(name string, opts ...MarshalOption) (types.ReverseTunnel, error)
+	GetReverseTunnel(ctx context.Context, name string) (types.ReverseTunnel, error)
 
-	// GetReverseTunnels returns a list of registered servers
-	GetReverseTunnels(ctx context.Context, opts ...MarshalOption) ([]types.ReverseTunnel, error)
+	// DeleteReverseTunnel deletes reverse tunnel by its domain name
+	DeleteReverseTunnel(ctx context.Context, domainName string) error
 
-	// DeleteReverseTunnel deletes reverse tunnel by it's domain name
-	DeleteReverseTunnel(domainName string) error
+	// ListReverseTunnels returns a page of ReverseTunnels.
+	ListReverseTunnels(ctx context.Context, pageSize int, pageToken string) ([]types.ReverseTunnel, string, error)
 
-	// DeleteAllReverseTunnels deletes all reverse tunnels
-	DeleteAllReverseTunnels() error
+	// GetServerInfos returns a stream of ServerInfos.
+	GetServerInfos(ctx context.Context) stream.Stream[types.ServerInfo]
 
-	// GetNamespaces returns a list of namespaces
-	GetNamespaces() ([]types.Namespace, error)
+	// GetServerInfo returns a ServerInfo by name.
+	GetServerInfo(ctx context.Context, name string) (types.ServerInfo, error)
 
-	// GetNamespace returns namespace by name
-	GetNamespace(name string) (*types.Namespace, error)
+	// UpsertServerInfo upserts a ServerInfo.
+	UpsertServerInfo(ctx context.Context, si types.ServerInfo) error
 
-	// DeleteAllNamespaces deletes all namespaces
-	DeleteAllNamespaces() error
+	// DeleteServerInfo deletes a ServerInfo by name.
+	DeleteServerInfo(ctx context.Context, name string) error
 
-	// UpsertNamespace upserts namespace
-	UpsertNamespace(types.Namespace) error
-
-	// DeleteNamespace deletes namespace by name
-	DeleteNamespace(name string) error
-
-	// UpsertTrustedCluster creates or updates a TrustedCluster in the backend.
-	UpsertTrustedCluster(ctx context.Context, tc types.TrustedCluster) (types.TrustedCluster, error)
-
-	// GetTrustedCluster returns a single TrustedCluster by name.
-	GetTrustedCluster(ctx context.Context, name string) (types.TrustedCluster, error)
-
-	// GetTrustedClusters returns all TrustedClusters in the backend.
-	GetTrustedClusters(ctx context.Context) ([]types.TrustedCluster, error)
-
-	// DeleteTrustedCluster removes a TrustedCluster from the backend by name.
-	DeleteTrustedCluster(ctx context.Context, name string) error
-
-	// UpsertTunnelConnection upserts tunnel connection
-	UpsertTunnelConnection(types.TunnelConnection) error
-
-	// GetTunnelConnections returns tunnel connections for a given cluster
-	GetTunnelConnections(clusterName string, opts ...MarshalOption) ([]types.TunnelConnection, error)
-
-	// GetAllTunnelConnections returns all tunnel connections
-	GetAllTunnelConnections(opts ...MarshalOption) ([]types.TunnelConnection, error)
-
-	// DeleteTunnelConnection deletes tunnel connection by name
-	DeleteTunnelConnection(clusterName string, connName string) error
-
-	// DeleteTunnelConnections deletes all tunnel connections for cluster
-	DeleteTunnelConnections(clusterName string) error
-
-	// DeleteAllTunnelConnections deletes all tunnel connections for cluster
-	DeleteAllTunnelConnections() error
-
-	// CreateRemoteCluster creates a remote cluster
-	CreateRemoteCluster(types.RemoteCluster) error
-
-	// UpdateRemoteCluster updates a remote cluster
-	UpdateRemoteCluster(ctx context.Context, rc types.RemoteCluster) error
-
-	// GetRemoteClusters returns a list of remote clusters
-	GetRemoteClusters(opts ...MarshalOption) ([]types.RemoteCluster, error)
-
-	// GetRemoteCluster returns a remote cluster by name
-	GetRemoteCluster(clusterName string) (types.RemoteCluster, error)
-
-	// DeleteRemoteCluster deletes remote cluster by name
-	DeleteRemoteCluster(clusterName string) error
-
-	// DeleteAllRemoteClusters deletes all remote clusters
-	DeleteAllRemoteClusters() error
-
-	// UpsertKubeService registers kubernetes service presence.
-	// DELETE in 11.0. Deprecated, use UpsertKubeServiceV2
-	UpsertKubeService(context.Context, types.Server) error
-
-	// UpsertKubeServiceV2 registers kubernetes service presence
-	UpsertKubeServiceV2(context.Context, types.Server) (*types.KeepAlive, error)
+	// DeleteAllServerInfos deletes all ServerInfos.
+	DeleteAllServerInfos(ctx context.Context) error
 
 	// GetApplicationServers returns all registered application servers.
 	GetApplicationServers(context.Context, string) ([]types.AppServer, error)
 	// UpsertApplicationServer registers an application server.
 	UpsertApplicationServer(context.Context, types.AppServer) (*types.KeepAlive, error)
-	// DeleteApplicationServer deletes specified application server.
+	// DeleteAppServer removes a scoped or unscoped application server.
+	DeleteAppServer(ctx context.Context, req *presencev1.DeleteAppServerRequest) error
+
+	// DeleteApplicationServer removes an unscoped application server.
+	//
+	// Deprecated: use DeleteAppServer instead. Kept temporarily so
+	// gravitational/teleport.e compiles across the rename; remove once e
+	// has migrated.
 	DeleteApplicationServer(ctx context.Context, namespace, hostID, name string) error
 	// DeleteAllApplicationServers removes all registered application servers.
 	DeleteAllApplicationServers(context.Context, string) error
@@ -200,23 +177,11 @@ type Presence interface {
 	// KeepAliveServer updates TTL of the server resource in the backend.
 	KeepAliveServer(ctx context.Context, h types.KeepAlive) error
 
-	// GetKubeServices returns a list of registered kubernetes services.
-	// DELETE IN 13.0. Deprecated, use GetKubernetesServers.
-	GetKubeServices(context.Context) ([]types.Server, error)
-
-	// DeleteKubeService deletes a named kubernetes service.
-	// DELETE IN 13.0. Deprecated, use DeleteKubernetesServer.
-	DeleteKubeService(ctx context.Context, name string) error
-
-	// DeleteAllKubeServices deletes all registered kubernetes services.
-	// DELETE IN 13.0. Deprecated, use DeleteAllKubernetesServers.
-	DeleteAllKubeServices(context.Context) error
-
 	// GetKubernetesServers returns a list of registered kubernetes servers.
 	GetKubernetesServers(context.Context) ([]types.KubeServer, error)
 
-	// DeleteKubernetesServer deletes a named kubernetes servers.
-	DeleteKubernetesServer(ctx context.Context, hostID, name string) error
+	// DeleteKubeServer deletes a named kubernetes servers.
+	DeleteKubeServer(ctx context.Context, req *presencev1.DeleteKubeServerRequest) error
 
 	// DeleteAllKubernetesServers deletes all registered kubernetes servers.
 	DeleteAllKubernetesServers(context.Context) error
@@ -235,6 +200,13 @@ type Presence interface {
 	// DeleteAllWindowsDesktopServices removes all Windows desktop services.
 	DeleteAllWindowsDesktopServices(context.Context) error
 
+	// GetRelayServer returns the relay server heartbeat with a given name.
+	GetRelayServer(ctx context.Context, name string) (*presencev1.RelayServer, error)
+	// ListRelayServers returns a paginated list of relay server heartbeats.
+	ListRelayServers(ctx context.Context, pageSize int, pageToken string) (_ []*presencev1.RelayServer, nextPageToken string, _ error)
+	// DeleteRelayServer deletes a relay server heartbeat by name.
+	DeleteRelayServer(ctx context.Context, name string) error
+
 	// ListResources returns a paginated list of resources.
 	ListResources(ctx context.Context, req proto.ListResourcesRequest) (*types.ListResourcesResponse, error)
 }
@@ -243,4 +215,47 @@ type Presence interface {
 type PresenceInternal interface {
 	Presence
 	InventoryInternal
+
+	// UpsertProxyServer registers proxy server presence, permanently if ttl is
+	// 0 or for the specified duration with second resolution if it's >= 1
+	// second. It returns the upserted server with its revision populated.
+	UpsertProxyServer(ctx context.Context, server types.Server) (types.Server, error)
+
+	UpsertHostUserInteractionTime(ctx context.Context, name string, loginTime time.Time) error
+	GetHostUserInteractionTime(ctx context.Context, name string) (time.Time, error)
+	UpdateNode(ctx context.Context, server types.Server) (types.Server, error)
+
+	// UpsertRelayServer creates or updates a relay server heartbeat, unconditionally.
+	UpsertRelayServer(ctx context.Context, relayServer *presencev1.RelayServer) (*presencev1.RelayServer, error)
+
+	// UnconditionalUpdateApplicationServer writes an app_server if one with the
+	// same host ID and name exists in storage, no matter its contents (i.e., it
+	// doesn't check the revision of the app_server in storage).
+	UnconditionalUpdateApplicationServer(ctx context.Context, server types.AppServer) (types.AppServer, error)
+
+	// RangeApplicationServersWithName returns an iterator over application servers for a given app name.
+	RangeApplicationServersWithName(ctx context.Context, appName string) iter.Seq2[types.AppServer, error]
+
+	// AppendPutNodeActions adds conditional actions to an atomic write to create
+	// or update a node resource.
+	AppendPutNodeActions(
+		actions []backend.ConditionalAction,
+		server types.Server,
+		condition backend.Condition,
+	) ([]backend.ConditionalAction, error)
+
+	// AppendDeleteNodeActions adds conditional actions to an atomic write to
+	// delete a node resource.
+	AppendDeleteNodeActions(
+		actions []backend.ConditionalAction,
+		namespace string,
+		name string,
+		condition backend.Condition,
+	) ([]backend.ConditionalAction, error)
+
+	// RangeDatabaseServersWithName returns an iterator over database proxy servers for a given database name.
+	RangeDatabaseServersWithName(ctx context.Context, databaseName string) iter.Seq2[types.DatabaseServer, error]
+
+	// RangeKubernetesServersWithName returns an iterator over kubernetes servers for a given cluster name.
+	RangeKubernetesServersWithName(ctx context.Context, clusterName string) iter.Seq2[types.KubeServer, error]
 }

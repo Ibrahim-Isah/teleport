@@ -1,32 +1,35 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package cassandra
 
 import (
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	awssession "github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sigv4-auth-cassandra-gocql-driver-plugin/sigv4"
+	"context"
+
 	"github.com/datastax/go-cassandra-native-protocol/frame"
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/datastax/go-cassandra-native-protocol/primitive"
 	"github.com/gocql/gocql"
 	"github.com/gravitational/trace"
 
+	"github.com/gravitational/teleport/lib/cloud/awsconfig"
 	"github.com/gravitational/teleport/lib/srv/db/cassandra/protocol"
+	"github.com/gravitational/teleport/lib/srv/db/cassandra/sigv4"
 	"github.com/gravitational/teleport/lib/srv/db/common"
 	awsutils "github.com/gravitational/teleport/lib/utils/aws"
 )
@@ -45,7 +48,7 @@ const (
 // Client -> Server: AuthResponse
 // Server <- Client: Ready/ErrorResponse/AuthSuccess
 type handshakeHandler interface {
-	handleHandshake(clientConn, serverConn *protocol.Conn) error
+	handleHandshake(ctx context.Context, clientConn, serverConn *protocol.Conn) error
 }
 
 // basicHandshake is a basic handshake handler that does not perform any
@@ -54,7 +57,7 @@ type basicHandshake struct {
 	ses *common.Session
 }
 
-func (pp *basicHandshake) handleHandshake(clientConn, serverConn *protocol.Conn) error {
+func (pp *basicHandshake) handleHandshake(_ context.Context, clientConn, serverConn *protocol.Conn) error {
 	for {
 		// Read a packet from the cassandra client.
 		req, err := clientConn.ReadPacket()
@@ -187,27 +190,44 @@ func sendAuthenticationErrorMessage(authErr error, clientConn *protocol.Conn, in
 
 // authHandler is a handler that performs the Cassandra authentication flow.
 type authAWSSigV4Auth struct {
-	ses *common.Session
+	ses       *common.Session
+	awsConfig awsconfig.Provider
 }
 
-func (a *authAWSSigV4Auth) getSigV4Authenticator(username string) (gocql.Authenticator, error) {
-	session, err := awssession.NewSessionWithOptions(awssession.Options{
-		SharedConfigState: awssession.SharedConfigEnable,
-	})
+func (a *authAWSSigV4Auth) getSigV4Authenticator(ctx context.Context) (gocql.Authenticator, error) {
+	meta := a.ses.Database.GetAWS()
+	roleARN, err := awsutils.BuildRoleARN(a.ses.DatabaseUser, meta.Region, meta.AccountID)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	region := a.ses.Database.GetAWS().Region
-	accountID := a.ses.Database.GetAWS().AccountID
-	cred, err := stscreds.NewCredentials(session, awsutils.BuildRoleARN(username, region, accountID)).Get()
+	// ExternalID should only be used in one of the assumed roles. If the
+	// configuration doesn't specify the AssumeRoleARN, it should be used for
+	// the database role.
+	var dbRoleExternalID string
+	if meta.AssumeRoleARN == "" {
+		dbRoleExternalID = meta.ExternalID
+	}
+	awsCfg, err := a.awsConfig.GetConfig(ctx, meta.Region,
+		awsconfig.WithAssumeRole(meta.AssumeRoleARN, meta.ExternalID),
+		awsconfig.WithAssumeRole(roleARN, dbRoleExternalID),
+		awsconfig.WithAmbientCredentials(),
+	)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	auth := sigv4.NewAwsAuthenticator()
-	auth.Region = region
-	auth.AccessKeyId = cred.AccessKeyID
-	auth.SessionToken = cred.SessionToken
-	auth.SecretAccessKey = cred.SecretAccessKey
+	cred, err := awsCfg.Credentials.Retrieve(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	auth := sigv4.AwsAuthenticator{
+		// AWS Keyspaces databases do require region to be specified in the AWS
+		// metadata so there is no need to grab it from config or environment
+		// variables.
+		Region:          meta.Region,
+		AccessKeyId:     cred.AccessKeyID,
+		SessionToken:    cred.SessionToken,
+		SecretAccessKey: cred.SecretAccessKey,
+	}
 	return auth, nil
 }
 
@@ -227,7 +247,7 @@ func (a *authAWSSigV4Auth) initPasswordAuth(clientConn *protocol.Conn, req *prot
 	return pkt, nil
 }
 
-func (a *authAWSSigV4Auth) handleStartupMessage(clientConn, serverConn *protocol.Conn, req *protocol.Packet) error {
+func (a *authAWSSigV4Auth) handleStartupMessage(ctx context.Context, clientConn, serverConn *protocol.Conn, req *protocol.Packet) error {
 	authResp, err := a.initPasswordAuth(clientConn, req)
 	if err != nil {
 		return trace.Wrap(err)
@@ -243,7 +263,7 @@ func (a *authAWSSigV4Auth) handleStartupMessage(clientConn, serverConn *protocol
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if err := a.handleAuth(clientConn, serverConn, authFrame.Frame()); err != nil {
+	if err := a.handleAuth(ctx, clientConn, serverConn, authFrame.Frame()); err != nil {
 		// Likely the agent is not authorized to access AWS resources or
 		// the AWS configuration doesn't allow the agent to assume the role.
 		userErr := trace.AccessDenied(
@@ -274,7 +294,7 @@ func (a *authAWSSigV4Auth) handleStartupMessage(clientConn, serverConn *protocol
 // Client    Engine -> AWS: AuthResponse
 // Client    Engine <- AWS: AuthSuccess
 // Client <- Engine    AWS: AuthSuccess
-func (a *authAWSSigV4Auth) handleHandshake(clientConn, serverConn *protocol.Conn) error {
+func (a *authAWSSigV4Auth) handleHandshake(ctx context.Context, clientConn, serverConn *protocol.Conn) error {
 	for {
 		req, err := clientConn.ReadPacket()
 		if err != nil {
@@ -282,7 +302,7 @@ func (a *authAWSSigV4Auth) handleHandshake(clientConn, serverConn *protocol.Conn
 		}
 		switch req.Header().OpCode {
 		case primitive.OpCodeStartup:
-			if err := a.handleStartupMessage(clientConn, serverConn, req); err != nil {
+			if err := a.handleStartupMessage(ctx, clientConn, serverConn, req); err != nil {
 				return trace.Wrap(err)
 			}
 			return nil
@@ -304,12 +324,12 @@ func (a *authAWSSigV4Auth) handleHandshake(clientConn, serverConn *protocol.Conn
 // handleAuth is a function that handles the authentication flow with AWS Keyspaces.
 // Signature V4 is used to authenticate with AWS Keyspaces where the username is the role ARN.
 // STS AWS is used to get temporary credentials for the role.
-func (a *authAWSSigV4Auth) handleAuth(_, serverConn *protocol.Conn, fr *frame.Frame) error {
+func (a *authAWSSigV4Auth) handleAuth(ctx context.Context, _, serverConn *protocol.Conn, fr *frame.Frame) error {
 	authMsg, ok := fr.Body.Message.(*message.Authenticate)
 	if !ok {
 		return trace.BadParameter("unexpected message type %T", fr.Body.Message)
 	}
-	awsAuth, err := a.getSigV4Authenticator(a.ses.DatabaseUser)
+	awsAuth, err := a.getSigV4Authenticator(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}

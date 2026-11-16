@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gcp
 
@@ -18,22 +22,22 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
 	gcpcredentials "cloud.google.com/go/iam/credentials/apiv1"
 	"cloud.google.com/go/iam/credentials/apiv1/credentialspb"
 	"github.com/googleapis/gax-go/v2"
-	"github.com/gravitational/oxy/forward"
-	oxyutils "github.com/gravitational/oxy/utils"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/utils/gcp"
-	"github.com/gravitational/teleport/lib/cloud"
+	libgcp "github.com/gravitational/teleport/lib/cloud/gcp"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/httplib"
+	"github.com/gravitational/teleport/lib/httplib/reverseproxy"
 	"github.com/gravitational/teleport/lib/srv/app/common"
 	"github.com/gravitational/teleport/lib/utils"
 )
@@ -64,8 +68,8 @@ var _ cloudClientGCP = (*cloudClientGCPImpl[iamCredentialsClient])(nil)
 type HandlerConfig struct {
 	// RoundTripper is the underlying transport given to an oxy Forwarder.
 	RoundTripper http.RoundTripper
-	// Log is the Logger.
-	Log logrus.FieldLogger
+	// Log is a logger for the handler.
+	Log *slog.Logger
 	// Clock is used to override time in tests.
 	Clock clockwork.Clock
 	// cloudClientGCP holds a reference to GCP IAM client. Normally set in CheckAndSetDefaults, it is overridden in tests.
@@ -85,11 +89,12 @@ func (s *HandlerConfig) CheckAndSetDefaults() error {
 		s.Clock = clockwork.NewRealClock()
 	}
 	if s.Log == nil {
-		s.Log = logrus.WithField(trace.Component, "gcp:fwd")
+		s.Log = slog.With(teleport.ComponentKey, "gcp:fwd")
 	}
 	if s.cloudClientGCP == nil {
-		clients := cloud.NewClients()
-		s.cloudClientGCP = &cloudClientGCPImpl[*gcpcredentials.IamCredentialsClient]{getGCPIAMClient: clients.GetGCPIAMClient}
+		// TODO (Tener): clients should be closed when no longer in use.
+		clients := libgcp.NewClients()
+		s.cloudClientGCP = &cloudClientGCPImpl[*gcpcredentials.IamCredentialsClient]{getGCPIAMClient: clients.GetIAMClient}
 	}
 	return nil
 }
@@ -101,7 +106,7 @@ type handler struct {
 	HandlerConfig
 
 	// fwd is used to forward requests to GCP API after the handler has rewritten them.
-	fwd *forward.Forwarder
+	fwd *reverseproxy.Forwarder
 
 	// tokenCache caches access tokens.
 	tokenCache *utils.FnCache
@@ -132,22 +137,19 @@ func newGCPHandler(ctx context.Context, config HandlerConfig) (*handler, error) 
 		tokenCache:    tokenCache,
 	}
 
-	fwd, err := forward.New(
-		forward.RoundTripper(config.RoundTripper),
-		forward.ErrorHandler(oxyutils.ErrorHandlerFunc(svc.formatForwardResponseError)),
-		// Explicitly passing false here to be clear that we always want the host
-		// header to be the same as the outbound request's URL host.
-		forward.PassHostHeader(false),
+	svc.fwd, err = reverseproxy.New(
+		reverseproxy.WithRoundTripper(config.RoundTripper),
+		reverseproxy.WithLogger(config.Log),
+		reverseproxy.WithErrorHandler(svc.formatForwardResponseError),
 	)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	svc.fwd = fwd
-	return svc, nil
+	return svc, trace.Wrap(err)
 }
 
 // RoundTrip handles incoming requests and forwards them to the proper API.
 func (s *handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Body != nil {
+		req.Body = utils.MaxBytesReader(w, req.Body, teleport.MaxHTTPRequestSize)
+	}
 	if err := s.serveHTTP(w, req); err != nil {
 		s.formatForwardResponseError(w, req, err)
 		return
@@ -160,7 +162,10 @@ func (s *handler) serveHTTP(w http.ResponseWriter, req *http.Request) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	s.Log.Debugf("Processing request, sessionId = %q, gcpServiceAccount = %q", sessionCtx.Identity.RouteToApp.SessionID, sessionCtx.Identity.RouteToApp.GCPServiceAccount)
+	s.Log.DebugContext(req.Context(), "Processing request",
+		"session_id", sessionCtx.Identity.RouteToApp.SessionID,
+		"gcp_service_account", sessionCtx.Identity.RouteToApp.GCPServiceAccount,
+	)
 
 	fwdRequest, err := s.prepareForwardRequest(req, sessionCtx)
 	if err != nil {
@@ -172,13 +177,13 @@ func (s *handler) serveHTTP(w http.ResponseWriter, req *http.Request) error {
 
 	if err := sessionCtx.Audit.OnRequest(req.Context(), sessionCtx, fwdRequest, status, nil); err != nil {
 		// log but don't return the error, because we already handed off request/response handling to the oxy forwarder.
-		s.Log.WithError(err).Warn("Failed to emit audit event.")
+		s.Log.WarnContext(req.Context(), "Failed to emit audit event.", "error", err)
 	}
 	return nil
 }
 
 func (s *handler) formatForwardResponseError(rw http.ResponseWriter, r *http.Request, err error) {
-	s.Log.WithError(err).Debugf("Failed to process request.")
+	s.Log.DebugContext(r.Context(), "Failed to process request.", "error", err)
 	common.SetTeleportAPIErrorHeader(rw, err)
 
 	// Convert trace error type to HTTP and write response.
@@ -188,8 +193,10 @@ func (s *handler) formatForwardResponseError(rw http.ResponseWriter, r *http.Req
 
 // prepareForwardRequest prepares a request for forwarding, updating headers and target host. Several checks are made along the way.
 func (s *handler) prepareForwardRequest(r *http.Request, sessionCtx *common.SessionContext) (*http.Request, error) {
-	forwardedHost := r.Header.Get("X-Forwarded-Host")
-	if !gcp.IsGCPEndpoint(forwardedHost) {
+	forwardedHost, err := utils.GetSingleHeader(r.Header, "X-Forwarded-Host")
+	if err != nil {
+		return nil, trace.AccessDenied("%s", err)
+	} else if !gcp.IsGCPEndpoint(forwardedHost) {
 		return nil, trace.AccessDenied("%q is not a GCP endpoint", forwardedHost)
 	}
 
@@ -218,7 +225,7 @@ func (s *handler) prepareForwardRequest(r *http.Request, sessionCtx *common.Sess
 func (s *handler) replaceAuthHeaders(r *http.Request, sessionCtx *common.SessionContext, reqCopy *http.Request) error {
 	auth := reqCopy.Header.Get("Authorization")
 	if auth == "" {
-		s.Log.Debugf("No Authorization header present, skipping replacement.")
+		s.Log.DebugContext(r.Context(), "No Authorization header present, skipping replacement.")
 		return nil
 	}
 
@@ -254,28 +261,30 @@ var defaultScopeList = []string{
 func (s *handler) getToken(ctx context.Context, serviceAccount string) (*credentialspb.GenerateAccessTokenResponse, error) {
 	key := cacheKey{serviceAccount}
 
-	cancelCtx, cancel := context.WithCancel(ctx)
+	type result struct {
+		token *credentialspb.GenerateAccessTokenResponse
+		err   error
+	}
+	resultChan := make(chan result, 1)
+
+	ctx, cancel := context.WithTimeout(ctx, getTokenTimeout)
 	defer cancel()
 
-	var tokenResult *credentialspb.GenerateAccessTokenResponse
-	var errorResult error
-
-	// call Clock.After() before FnCacheGet gets called in a different go-routine.
-	// this ensures there is no race condition in the timeout tests
-	timeoutChan := s.Clock.After(getTokenTimeout)
-
 	go func() {
-		tokenResult, errorResult = utils.FnCacheGet(cancelCtx, s.tokenCache, key, func(ctx context.Context) (*credentialspb.GenerateAccessTokenResponse, error) {
+		token, err := utils.FnCacheGet(ctx, s.tokenCache, key, func(ctx context.Context) (*credentialspb.GenerateAccessTokenResponse, error) {
 			return s.generateAccessToken(ctx, serviceAccount, defaultScopeList)
 		})
-		cancel()
+		resultChan <- result{
+			token: token,
+			err:   err,
+		}
 	}()
 
 	select {
-	case <-timeoutChan:
-		return nil, trace.Wrap(context.DeadlineExceeded, "timeout waiting for access token for %v", getTokenTimeout)
-	case <-cancelCtx.Done():
-		return tokenResult, errorResult
+	case <-ctx.Done():
+		return nil, trace.Wrap(ctx.Err())
+	case result := <-resultChan:
+		return result.token, trace.Wrap(result.err)
 	}
 }
 

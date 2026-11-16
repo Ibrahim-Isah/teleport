@@ -1,18 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package mocku2f
 
@@ -30,6 +32,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/json"
 	"math/big"
 	"time"
 
@@ -48,6 +51,11 @@ type Key struct {
 	// Cert is the Key attestation certificate.
 	Cert []byte
 
+	// UserHandle is the WebAuthn User ID.
+	// Saved from passwordless registrations and set on passwordless assertions.
+	// Requires a passwordless-configured Key (see [Key.SetPasswordless]).
+	UserHandle []byte
+
 	// PreferRPID instructs the Key to use favor using the RPID for Webauthn
 	// ceremonies, even if the U2F App ID extension is present.
 	PreferRPID bool
@@ -59,14 +67,68 @@ type Key struct {
 	// SetUV should be paired only with WebAuthn login/registration methods, as
 	// it makes Key mimic a WebAuthn device.
 	SetUV bool
+	// SetBackupFlags sets BE=1 and BS=1 in assertion responses.
+	// - https://w3c.github.io/webauthn/#authdata-flags-be
+	// - https://w3c.github.io/webauthn/#authdata-flags-bs
+	SetBackupFlags bool
 	// AllowResidentKey allows creation of resident credentials.
 	// There's no actual change in Key's behavior other than allowing such requests
 	// to proceed.
 	// AllowResidentKey should be paired only with WebAuthn registration methods,
 	// as it makes Key mimic a WebAuthn device.
 	AllowResidentKey bool
+	// ReplyWithCredProps sets the credProps extension (rk=true) in
+	// SignCredentialCreation responses, regardless of other parameters.
+	// Useful for extension testing.
+	ReplyWithCredProps bool
 
 	counter uint32
+}
+
+var (
+	_ json.Marshaler   = (*Key)(nil)
+	_ json.Unmarshaler = (*Key)(nil)
+)
+
+func (k *Key) MarshalJSON() ([]byte, error) {
+	type alias Key
+
+	privateKey, err := x509.MarshalECPrivateKey(k.PrivateKey)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	s := struct {
+		PrivateKey []byte `json:"PrivateKey"`
+		Counter    uint32 `json:"Counter"`
+		*alias
+	}{
+		PrivateKey: privateKey,
+		Counter:    k.counter,
+		alias:      (*alias)(k),
+	}
+	return json.Marshal(s)
+}
+
+func (k *Key) UnmarshalJSON(data []byte) error {
+	type alias Key
+	var s struct {
+		PrivateKey []byte `json:"PrivateKey"`
+		Counter    uint32 `json:"Counter"`
+		*alias
+	}
+	if err := json.Unmarshal(data, &s); err != nil {
+		return trace.Wrap(err)
+	}
+
+	privateKey, err := x509.ParseECPrivateKey(s.PrivateKey)
+	if err != nil {
+		return trace.Wrap(err, "parsing private key")
+	}
+
+	*k = Key(*s.alias)
+	k.PrivateKey = privateKey
+	k.counter = s.Counter
+	return nil
 }
 
 func selfSignPublicKey(keyToSign *ecdsa.PublicKey) (cert []byte, err error) {
@@ -149,14 +211,20 @@ type signRegisterResult struct {
 }
 
 func (muk *Key) signRegister(appIDHash, clientDataHash []byte) (*signRegisterResult, error) {
-	pubKey := elliptic.Marshal(elliptic.P256(), muk.PrivateKey.PublicKey.X, muk.PrivateKey.PublicKey.Y)
+	// Marshal pubKey into the uncompressed "4||X||Y" form.
+	ecdhPubKey, err := muk.PrivateKey.PublicKey.ECDH()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	pubKey := ecdhPubKey.Bytes()
 
-	var dataToSign []byte
-	dataToSign = append(dataToSign[:], 0)
-	dataToSign = append(dataToSign[:], appIDHash[:]...)
-	dataToSign = append(dataToSign[:], clientDataHash[:]...)
-	dataToSign = append(dataToSign[:], muk.KeyHandle[:]...)
-	dataToSign = append(dataToSign[:], pubKey[:]...)
+	cap := 1 + len(appIDHash) + len(clientDataHash) + len(muk.KeyHandle) + len(pubKey)
+	dataToSign := make([]byte, 0, cap)
+	dataToSign = append(dataToSign, 0)
+	dataToSign = append(dataToSign, appIDHash...)
+	dataToSign = append(dataToSign, clientDataHash...)
+	dataToSign = append(dataToSign, muk.KeyHandle...)
+	dataToSign = append(dataToSign, pubKey...)
 
 	dataHash := sha256.Sum256(dataToSign)
 
@@ -171,14 +239,19 @@ func (muk *Key) signRegister(appIDHash, clientDataHash []byte) (*signRegisterRes
 		// Mimic WebAuthn flags if SetUV is true.
 		flags = uint8(protocol.FlagUserPresent | protocol.FlagUserVerified | protocol.FlagAttestedCredentialData)
 	}
+	if muk.SetBackupFlags {
+		flags |= uint8(protocol.FlagBackupEligible)
+		flags |= uint8(protocol.FlagBackupState)
+	}
 
-	var regData []byte
+	cap = 1 + len(pubKey) + 1 + len(muk.KeyHandle) + len(muk.Cert) + len(sig)
+	regData := make([]byte, 0, cap)
 	regData = append(regData, flags)
-	regData = append(regData, pubKey[:]...)
+	regData = append(regData, pubKey...)
 	regData = append(regData, byte(len(muk.KeyHandle)))
-	regData = append(regData, muk.KeyHandle[:]...)
-	regData = append(regData, muk.Cert[:]...)
-	regData = append(regData, sig[:]...)
+	regData = append(regData, muk.KeyHandle...)
+	regData = append(regData, muk.Cert...)
+	regData = append(regData, sig...)
 
 	return &signRegisterResult{
 		RawResp:   regData,
@@ -216,6 +289,10 @@ func (muk *Key) signAuthn(appIDHash, clientDataHash []byte) (*signAuthnResult, e
 	flags := uint8(protocol.FlagUserPresent)
 	if muk.SetUV {
 		flags |= uint8(protocol.FlagUserVerified)
+	}
+	if muk.SetBackupFlags {
+		flags |= uint8(protocol.FlagBackupEligible)
+		flags |= uint8(protocol.FlagBackupState)
 	}
 
 	var authData []byte

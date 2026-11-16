@@ -1,21 +1,22 @@
 //go:build !windows
-// +build !windows
 
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
@@ -29,6 +30,8 @@ import (
 	"syscall"
 
 	"github.com/gravitational/trace"
+
+	hostuser "github.com/gravitational/teleport/session/host/user"
 )
 
 // PercentUsed returns percentage of disk space used. The percentage of disk
@@ -44,6 +47,21 @@ func PercentUsed(path string) (float64, error) {
 	return Round(ratio * 100), nil
 }
 
+// FreeDiskWithReserve returns the available disk space (in bytes) on the disk at dir, minus `reservedFreeDisk`.
+func FreeDiskWithReserve(dir string, reservedFreeDisk uint64) (uint64, error) {
+	var stat syscall.Statfs_t
+	err := syscall.Statfs(dir, &stat)
+	if err != nil {
+		return 0, trace.Wrap(err)
+	}
+	//nolint:unconvert // The cast is only necessary for linux platform.
+	avail := uint64(stat.Bavail) * uint64(stat.Bsize)
+	if reservedFreeDisk > avail {
+		return 0, trace.Errorf("no free space left")
+	}
+	return avail - reservedFreeDisk, nil
+}
+
 // CanUserWriteTo attempts to check if a user has write access to certain path.
 // It also works around the program being run as root and tries to check
 // the permissions of the user who executed the program as root.
@@ -54,7 +72,7 @@ func CanUserWriteTo(path string) (bool, error) {
 	var fileInfo os.FileInfo
 	var err error
 
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		fileInfo, err = os.Stat(path)
 		if err == nil {
 			break
@@ -77,12 +95,12 @@ func CanUserWriteTo(path string) (bool, error) {
 
 	var usr *user.User
 	if ogUser := os.Getenv("SUDO_USER"); ogUser != "" {
-		usr, err = user.Lookup(ogUser)
+		usr, err = hostuser.Lookup(ogUser)
 		if err != nil {
 			return false, trace.NotFound("could not determine original user: %+v", err)
 		}
 	} else {
-		usr, err = user.Current()
+		usr, err = hostuser.Current()
 		if err != nil {
 			return false, trace.NotFound("could not determine current user: %+v", err)
 		}
@@ -100,7 +118,7 @@ func CanUserWriteTo(path string) (bool, error) {
 	}
 
 	// file and user have a group in common
-	groupIDs, err := usr.GroupIds()
+	groupIDs, err := hostuser.GroupIds(usr)
 	if err != nil {
 		return false, trace.NotFound("could not determine current user group ids: %+v", err)
 	}

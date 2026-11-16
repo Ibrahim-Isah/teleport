@@ -1,27 +1,32 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import React from 'react';
-import { Box, Flex, ButtonIcon, ButtonText, Text } from 'design';
+
+import { Box, ButtonIcon, Flex, Text } from 'design';
 import * as Icons from 'design/Icon';
+import { inputGeometry } from 'design/Input/Input';
+import { ButtonWithAddIcon } from 'shared/components/ButtonWithAddIcon';
 import FieldInput from 'shared/components/FieldInput';
 import { useValidation, Validator } from 'shared/components/Validation';
 import { requiredField } from 'shared/components/Validation/rules';
 
-import { AgentLabel } from 'teleport/services/agents';
+import { ResourceLabel } from 'teleport/services/agents';
 
 export function LabelsCreater({
   labels = [],
@@ -29,12 +34,14 @@ export function LabelsCreater({
   disableBtns = false,
   isLabelOptional = false,
   noDuplicateKey = false,
+  autoFocus = false,
 }: {
   labels: DiscoverLabel[];
   setLabels(l: DiscoverLabel[]): void;
   disableBtns?: boolean;
   isLabelOptional?: boolean;
   noDuplicateKey?: boolean;
+  autoFocus?: boolean;
 }) {
   const validator = useValidation() as Validator;
 
@@ -71,7 +78,7 @@ export function LabelsCreater({
   const handleChange = (
     event: React.ChangeEvent<HTMLInputElement>,
     index: number,
-    labelField: keyof AgentLabel
+    labelField: keyof ResourceLabel
   ) => {
     const { value } = event.target;
     const newList = [...labels];
@@ -94,10 +101,11 @@ export function LabelsCreater({
     }
     return {
       valid: !notValid,
-      message: '', // err msg doesn't matter as it isn't diaplsyed.
+      message: 'required',
     };
   };
 
+  const inputSize = 'medium';
   return (
     <>
       {labels.length > 0 && (
@@ -120,11 +128,11 @@ export function LabelsCreater({
         {labels.map((label, index) => {
           return (
             <Box mb={2} key={index}>
-              <Flex alignItems="center">
+              <Flex alignItems="start">
                 <FieldInput
-                  Input
+                  size={inputSize}
                   rule={requiredUniqueKey}
-                  autoFocus
+                  autoFocus={autoFocus}
                   value={label.name}
                   placeholder="label key"
                   width="170px"
@@ -135,6 +143,7 @@ export function LabelsCreater({
                   markAsError={label.isDupKey}
                 />
                 <FieldInput
+                  size={inputSize}
                   rule={requiredField('required')}
                   value={label.value}
                   placeholder="label value"
@@ -145,24 +154,33 @@ export function LabelsCreater({
                   readonly={disableBtns || label.isFixed}
                 />
                 {!label.isFixed && (
-                  <ButtonIcon
-                    size={1}
-                    title="Remove Label"
-                    onClick={() => removeLabel(index)}
-                    css={`
-                      &:disabled {
-                        opacity: 0.65;
-                        pointer-events: none;
-                      }
-                    `}
-                    disabled={disableBtns}
+                  // Force the trash button container to be the same height as
+                  // an input. We can't just set `alignItems="center"` on the
+                  // parent flex container above, because the field can expand
+                  // when showing a validation error.
+                  <Flex
+                    alignItems="center"
+                    height={inputGeometry[inputSize].height}
                   >
-                    <Icons.Trash />
-                  </ButtonIcon>
+                    <ButtonIcon
+                      size={1}
+                      title="Remove Label"
+                      onClick={() => removeLabel(index)}
+                      css={`
+                        &:disabled {
+                          opacity: 0.65;
+                          pointer-events: none;
+                        }
+                      `}
+                      disabled={disableBtns}
+                    >
+                      <Icons.Trash size="medium" />
+                    </ButtonIcon>
+                  </Flex>
                 )}
               </Flex>
               {label.isDupKey && (
-                <Text color="red" fontSize="12px">
+                <Text color="red" typography="body3">
                   Duplicate key not allowed
                 </Text>
               )}
@@ -170,38 +188,16 @@ export function LabelsCreater({
           );
         })}
       </Box>
-      <ButtonText
+      <ButtonWithAddIcon
+        label={labels.length === 0 ? 'Add a Label' : 'Add Another Label'}
         onClick={addLabel}
-        css={`
-          padding-left: 0px;
-          &:disabled {
-            .icon-add {
-              opacity: 0.35;
-            }
-            pointer-events: none;
-          }
-        `}
         disabled={disableBtns}
-      >
-        <Icons.Add
-          className="icon-add"
-          disabled={disableBtns}
-          css={`
-            font-weight: bold;
-            letter-spacing: 4px;
-            margin-top: -2px;
-            &:after {
-              content: ' ';
-            }
-          `}
-        />
-        Add New Label
-      </ButtonText>
+      />
     </>
   );
 }
 
-export type DiscoverLabel = AgentLabel & {
+export type DiscoverLabel = ResourceLabel & {
   // isFixed is a flag to mean label is
   // unmodifiable and undeletable.
   isFixed?: boolean;

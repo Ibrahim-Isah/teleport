@@ -1,29 +1,32 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package fetchers
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"slices"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/cloud/azure"
 	"github.com/gravitational/teleport/lib/services"
@@ -45,7 +48,11 @@ type AKSFetcherConfig struct {
 	// FilterLabels are the filter criteria.
 	FilterLabels types.Labels
 	// Log is the logger.
-	Log logrus.FieldLogger
+	Logger *slog.Logger
+	// DiscoveryConfigName is the name of the DiscoveryConfig that created this Fetcher.
+	DiscoveryConfigName string
+	// Integration is the name of Azure integration used for auth.
+	Integration string
 }
 
 // CheckAndSetDefaults validates and sets the defaults values.
@@ -61,8 +68,8 @@ func (c *AKSFetcherConfig) CheckAndSetDefaults() error {
 		return trace.BadParameter("missing FilterLabels field")
 	}
 
-	if c.Log == nil {
-		c.Log = logrus.WithField(trace.Component, "fetcher:aks")
+	if c.Logger == nil {
+		c.Logger = slog.With(teleport.ComponentKey, "fetcher:aks")
 	}
 	return nil
 }
@@ -85,25 +92,34 @@ func (a *aksFetcher) Get(ctx context.Context) (types.ResourcesWithLabels, error)
 	var kubeClusters types.KubeClusters
 	for _, cluster := range clusters {
 		if !a.isRegionSupported(cluster.Location) {
-			a.Log.Debugf("Cluster region %q does not match with allowed values.", cluster.Location)
+			a.Logger.DebugContext(ctx, "Cluster region does not match with allowed values", "region", cluster.Location)
 			continue
 		}
-		if match, reason, err := services.MatchLabels(a.FilterLabels, cluster.Tags); err != nil {
-			a.Log.WithError(err).Warn("Unable to match AKS cluster labels against match labels.")
+		kubeCluster, err := common.NewKubeClusterFromAzureAKS(cluster)
+		if err != nil {
+			a.Logger.WarnContext(ctx, "Unable to create Kubernetes cluster from azure.AKSCluster", "error", err)
+			continue
+		}
+		if match, reason, err := services.MatchLabels(a.FilterLabels, kubeCluster.GetAllLabels()); err != nil {
+			a.Logger.WarnContext(ctx, "Unable to match AKS cluster labels against match labels", "error", err)
 			continue
 		} else if !match {
-			a.Log.Debugf("AKS cluster labels does not match the selector: %s.", reason)
+			a.Logger.DebugContext(ctx, "AKS cluster labels does not match the selector", "reason", reason)
 			continue
 		}
 
-		kubeCluster, err := services.NewKubeClusterFromAzureAKS(cluster)
-		if err != nil {
-			a.Log.WithError(err).Warn("Unable to create Kubernetes cluster from azure.AKSCluster.")
-			continue
-		}
 		kubeClusters = append(kubeClusters, kubeCluster)
 	}
+
+	a.rewriteKubeClusters(kubeClusters)
 	return kubeClusters.AsResources(), nil
+}
+
+// rewriteKubeClusters rewrites the discovered kube clusters.
+func (a *aksFetcher) rewriteKubeClusters(clusters types.KubeClusters) {
+	for _, c := range clusters {
+		common.ApplyAKSNameSuffix(c)
+	}
 }
 
 func (a *aksFetcher) getAKSClusters(ctx context.Context) ([]*azure.AKSCluster, error) {
@@ -138,6 +154,18 @@ func (a *aksFetcher) ResourceType() string {
 
 func (a *aksFetcher) Cloud() string {
 	return types.CloudAzure
+}
+
+func (a *aksFetcher) IntegrationName() string {
+	return a.Integration
+}
+
+func (a *aksFetcher) GetDiscoveryConfigName() string {
+	return a.DiscoveryConfigName
+}
+
+func (a *aksFetcher) FetcherType() string {
+	return types.AzureMatcherKubernetes
 }
 
 func (a *aksFetcher) String() string {

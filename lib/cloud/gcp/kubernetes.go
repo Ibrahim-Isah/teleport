@@ -1,22 +1,25 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gcp
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -184,7 +187,7 @@ func (g *gkeClient) ListClusters(ctx context.Context, projectID string, location
 		},
 	)
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, trace.Wrap(convertAPIError(err))
 	}
 	var clusters []GKECluster
 	for _, cluster := range res.Clusters {
@@ -224,7 +227,7 @@ func (g *gkeClient) GetClusterRestConfig(ctx context.Context, cfg ClusterDetails
 		},
 	)
 	if err != nil {
-		return nil, time.Time{}, trace.Wrap(err)
+		return nil, time.Time{}, trace.Wrap(convertAPIError(err))
 	}
 
 	// Generate a SA Authentication Token.
@@ -251,19 +254,44 @@ func convertLocationToGCP(location string) string {
 // getTLSConfig creates a rest.Config for the given cluster with the specified
 // Bearer token for authentication.
 func getTLSConfig(cluster *containerpb.Cluster, tok string) (*rest.Config, error) {
-	if cluster.MasterAuth == nil {
-		return nil, trace.BadParameter("cluster.MasterAuth was not set and is required")
-	}
-	ca, err := base64.StdEncoding.DecodeString(cluster.MasterAuth.ClusterCaCertificate)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+	dnsConfig := cluster.GetControlPlaneEndpointsConfig().GetDnsEndpointConfig()
+	ipConfig := cluster.GetControlPlaneEndpointsConfig().GetIpEndpointsConfig()
+	switch {
+	case dnsConfig.GetAllowExternalTraffic():
+		if dnsConfig.GetEndpoint() == "" {
+			return nil, trace.BadParameter("dns endpoint was not set and is required")
+		}
 
-	return &rest.Config{
-		Host:        fmt.Sprintf("https://%s", cluster.Endpoint),
-		BearerToken: tok,
-		TLSClientConfig: rest.TLSClientConfig{
-			CAData: ca,
-		},
-	}, nil
+		return &rest.Config{
+			Host:        "https://" + dnsConfig.GetEndpoint(),
+			BearerToken: tok,
+		}, nil
+	case ipConfig.GetEnabled():
+		// If the cluster has IP access, we need to set the CA certificate for
+		// authentication as cluster.Endpoint always points to the IP address.
+		// Only set the CA certificate if the cluster has IP access enabled
+		// and we will use it.
+		if cluster.MasterAuth == nil {
+			return nil, trace.BadParameter("cluster.MasterAuth was not set and is required")
+		}
+		ca, err := base64.StdEncoding.DecodeString(cluster.MasterAuth.ClusterCaCertificate)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		endpoint := cmp.Or(ipConfig.GetPublicEndpoint(), ipConfig.GetPrivateEndpoint())
+		if endpoint == "" {
+			return nil, trace.BadParameter("cluster endpoint was not set and is required")
+		}
+
+		return &rest.Config{
+			Host:        "https://" + endpoint,
+			BearerToken: tok,
+			TLSClientConfig: rest.TLSClientConfig{
+				CAData: ca,
+			},
+		}, nil
+	default:
+		return nil, trace.BadParameter("cluster does not have DNS or IP access enabled")
+	}
 }

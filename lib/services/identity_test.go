@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
@@ -24,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/defaults"
 )
 
 func TestSAMLAuthRequest_Check(t *testing.T) {
@@ -37,27 +40,27 @@ func TestSAMLAuthRequest_Check(t *testing.T) {
 		{
 			name: "normal request",
 			req: types.SAMLAuthRequest{
-				ConnectorID: "foo",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     60 * time.Minute,
+				ConnectorID:  "foo",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      60 * time.Minute,
 			},
 			wantErr: false,
 		},
 		{
 			name: "below min CertTTL",
 			req: types.SAMLAuthRequest{
-				ConnectorID: "foo",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     1 * time.Second,
+				ConnectorID:  "foo",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      1 * time.Second,
 			},
 			wantErr: true,
 		},
 		{
 			name: "above max CertTTL",
 			req: types.SAMLAuthRequest{
-				ConnectorID: "foo",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     1000 * time.Hour,
+				ConnectorID:  "foo",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      1000 * time.Hour,
 			},
 			wantErr: true,
 		},
@@ -72,10 +75,10 @@ func TestSAMLAuthRequest_Check(t *testing.T) {
 		{
 			name: "SSOTestFlow requires ConnectorSpec",
 			req: types.SAMLAuthRequest{
-				ConnectorID: "foo",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     60 * time.Minute,
-				SSOTestFlow: true,
+				ConnectorID:  "foo",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      60 * time.Minute,
+				SSOTestFlow:  true,
 			},
 			wantErr: true,
 		},
@@ -83,7 +86,7 @@ func TestSAMLAuthRequest_Check(t *testing.T) {
 			name: "ConnectorSpec requires SSOTestFlow",
 			req: types.SAMLAuthRequest{
 				ConnectorID:   "foo",
-				PublicKey:     []byte(exampleSSHCert),
+				SshPublicKey:  []byte(exampleSSHCert),
 				CertTTL:       60 * time.Minute,
 				ConnectorSpec: &types.SAMLConnectorSpecV2{Display: "dummy"},
 			},
@@ -93,7 +96,7 @@ func TestSAMLAuthRequest_Check(t *testing.T) {
 			name: "ConnectorSpec with SSOTestFlow works",
 			req: types.SAMLAuthRequest{
 				ConnectorID:   "foo",
-				PublicKey:     []byte(exampleSSHCert),
+				SshPublicKey:  []byte(exampleSSHCert),
 				CertTTL:       60 * time.Minute,
 				SSOTestFlow:   true,
 				ConnectorSpec: &types.SAMLConnectorSpecV2{Display: "dummy"},
@@ -126,39 +129,39 @@ func TestOIDCAuthRequest_Check(t *testing.T) {
 		{
 			name: "normal request",
 			req: types.OIDCAuthRequest{
-				ConnectorID: "foo",
-				StateToken:  "bar",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     60 * time.Minute,
+				ConnectorID:  "foo",
+				StateToken:   "bar",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      60 * time.Minute,
 			},
 			wantErr: false,
 		},
 		{
 			name: "missing state token",
 			req: types.OIDCAuthRequest{
-				ConnectorID: "foo",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     60 * time.Minute,
+				ConnectorID:  "foo",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      60 * time.Minute,
 			},
 			wantErr: true,
 		},
 		{
 			name: "below min CertTTL",
 			req: types.OIDCAuthRequest{
-				ConnectorID: "foo",
-				StateToken:  "bar",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     1 * time.Second,
+				ConnectorID:  "foo",
+				StateToken:   "bar",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      1 * time.Second,
 			},
 			wantErr: true,
 		},
 		{
 			name: "above max CertTTL",
 			req: types.OIDCAuthRequest{
-				ConnectorID: "foo",
-				StateToken:  "bar",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     1000 * time.Hour,
+				ConnectorID:  "foo",
+				StateToken:   "bar",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      1000 * time.Hour,
 			},
 			wantErr: true,
 		},
@@ -174,11 +177,11 @@ func TestOIDCAuthRequest_Check(t *testing.T) {
 		{
 			name: "SSOTestFlow requires ConnectorSpec",
 			req: types.OIDCAuthRequest{
-				ConnectorID: "foo",
-				StateToken:  "bar",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     60 * time.Minute,
-				SSOTestFlow: true,
+				ConnectorID:  "foo",
+				StateToken:   "bar",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      60 * time.Minute,
+				SSOTestFlow:  true,
 			},
 			wantErr: true,
 		},
@@ -187,7 +190,7 @@ func TestOIDCAuthRequest_Check(t *testing.T) {
 			req: types.OIDCAuthRequest{
 				ConnectorID:   "foo",
 				StateToken:    "bar",
-				PublicKey:     []byte(exampleSSHCert),
+				SshPublicKey:  []byte(exampleSSHCert),
 				CertTTL:       60 * time.Minute,
 				ConnectorSpec: &types.OIDCConnectorSpecV3{Display: "dummy"},
 			},
@@ -198,7 +201,7 @@ func TestOIDCAuthRequest_Check(t *testing.T) {
 			req: types.OIDCAuthRequest{
 				ConnectorID:   "foo",
 				StateToken:    "bar",
-				PublicKey:     []byte(exampleSSHCert),
+				SshPublicKey:  []byte(exampleSSHCert),
 				CertTTL:       60 * time.Minute,
 				SSOTestFlow:   true,
 				ConnectorSpec: &types.OIDCConnectorSpecV3{Display: "dummy"},
@@ -231,39 +234,39 @@ func TestGithubAuthRequest_Check(t *testing.T) {
 		{
 			name: "normal request",
 			req: types.GithubAuthRequest{
-				ConnectorID: "foo",
-				StateToken:  "bar",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     60 * time.Minute,
+				ConnectorID:  "foo",
+				StateToken:   "bar",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      60 * time.Minute,
 			},
 			wantErr: false,
 		},
 		{
 			name: "missing state token",
 			req: types.GithubAuthRequest{
-				ConnectorID: "foo",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     60 * time.Minute,
+				ConnectorID:  "foo",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      60 * time.Minute,
 			},
 			wantErr: true,
 		},
 		{
 			name: "below min CertTTL",
 			req: types.GithubAuthRequest{
-				ConnectorID: "foo",
-				StateToken:  "bar",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     1 * time.Second,
+				ConnectorID:  "foo",
+				StateToken:   "bar",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      1 * time.Second,
 			},
 			wantErr: true,
 		},
 		{
 			name: "above max CertTTL",
 			req: types.GithubAuthRequest{
-				ConnectorID: "foo",
-				StateToken:  "bar",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     1000 * time.Hour,
+				ConnectorID:  "foo",
+				StateToken:   "bar",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      1000 * time.Hour,
 			},
 			wantErr: true,
 		},
@@ -279,11 +282,11 @@ func TestGithubAuthRequest_Check(t *testing.T) {
 		{
 			name: "SSOTestFlow requires ConnectorSpec",
 			req: types.GithubAuthRequest{
-				ConnectorID: "foo",
-				StateToken:  "bar",
-				PublicKey:   []byte(exampleSSHCert),
-				CertTTL:     60 * time.Minute,
-				SSOTestFlow: true,
+				ConnectorID:  "foo",
+				StateToken:   "bar",
+				SshPublicKey: []byte(exampleSSHCert),
+				CertTTL:      60 * time.Minute,
+				SSOTestFlow:  true,
 			},
 			wantErr: true,
 		},
@@ -292,7 +295,7 @@ func TestGithubAuthRequest_Check(t *testing.T) {
 			req: types.GithubAuthRequest{
 				ConnectorID:   "foo",
 				StateToken:    "bar",
-				PublicKey:     []byte(exampleSSHCert),
+				SshPublicKey:  []byte(exampleSSHCert),
 				CertTTL:       60 * time.Minute,
 				ConnectorSpec: &types.GithubConnectorSpecV3{Display: "dummy"},
 			},
@@ -303,7 +306,7 @@ func TestGithubAuthRequest_Check(t *testing.T) {
 			req: types.GithubAuthRequest{
 				ConnectorID:   "foo",
 				StateToken:    "bar",
-				PublicKey:     []byte(exampleSSHCert),
+				SshPublicKey:  []byte(exampleSSHCert),
 				CertTTL:       60 * time.Minute,
 				SSOTestFlow:   true,
 				ConnectorSpec: &types.GithubConnectorSpecV3{Display: "dummy"},
@@ -315,6 +318,42 @@ func TestGithubAuthRequest_Check(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.req.Check()
+			if tt.wantErr {
+				require.Error(t, err)
+				require.True(t, trace.IsBadParameter(err))
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestVerifyPassword(t *testing.T) {
+	tests := []struct {
+		name    string
+		pass    []byte
+		wantErr bool
+	}{
+		{
+			name:    "password too short",
+			pass:    make([]byte, defaults.MinPasswordLength-1),
+			wantErr: true,
+		},
+		{
+			name:    "password just right",
+			pass:    make([]byte, defaults.MinPasswordLength),
+			wantErr: false,
+		},
+		{
+			name:    "password too long",
+			pass:    make([]byte, defaults.MaxPasswordLength+1),
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := VerifyPassword(tt.pass)
 			if tt.wantErr {
 				require.Error(t, err)
 				require.True(t, trace.IsBadParameter(err))

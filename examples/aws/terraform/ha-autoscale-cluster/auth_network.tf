@@ -87,7 +87,7 @@ resource "aws_security_group_rule" "auth_ingress_allow_cidr_traffic" {
 
 // Allow traffic from nodes to auth servers.
 // Teleport nodes heartbeat presence to auth server.
-// This rule uses CIDR as opposed to security group ip becasue traffic coming from NLB
+// This rule uses CIDR as opposed to security group ip because traffic coming from NLB
 // (network load balancer from Amazon)
 // is not marked with security group ID and rules using the security group ids do not work,
 // so CIDR ranges are necessary.
@@ -99,17 +99,6 @@ resource "aws_security_group_rule" "auth_ingress_allow_node_cidr_traffic" {
   protocol          = "tcp"
   cidr_blocks       = aws_subnet.node.*.cidr_block
   security_group_id = aws_security_group.auth.id
-}
-
-// This rule allows non NLB traffic originating directly from proxies
-resource "aws_security_group_rule" "auth_ingress_allow_public_traffic" {
-  description              = "Allow non-NLB traffic originating directly from proxies"
-  type                     = "ingress"
-  from_port                = 3025
-  to_port                  = 3025
-  protocol                 = "tcp"
-  source_security_group_id = aws_security_group.proxy.id
-  security_group_id        = aws_security_group.auth.id
 }
 
 // All egress traffic is allowed
@@ -143,6 +132,8 @@ resource "aws_lb_target_group" "auth" {
   port     = 3025
   vpc_id   = aws_vpc.teleport.id
   protocol = "TCP"
+  // required to allow the use of IP pinning
+  proxy_protocol_v2 = true
 }
 
 // 3025 is the Auth servers API server listener.

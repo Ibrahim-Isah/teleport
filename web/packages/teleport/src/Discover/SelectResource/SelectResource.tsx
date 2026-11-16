@@ -1,220 +1,370 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useState } from 'react';
-import SlideTabs from 'design/SlideTabs';
-import { Box, Flex, Image, Text } from 'design';
+import { useEffect, useMemo, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router';
+import styled from 'styled-components';
+
+import { Alert, Box, Flex, H3, Link, P3, Text } from 'design';
+import { Danger } from 'design/Alert';
+import InputSearch from 'design/DataTable/InputSearch';
+import { Magnifier } from 'design/Icon';
+import { getPlatform } from 'design/platform';
+import { MultiselectMenu } from 'shared/components/Controls/MultiselectMenu';
+import { PinningSupport } from 'shared/components/UnifiedResources';
+import { useAsync } from 'shared/hooks/useAsync';
 
 import AddApp from 'teleport/Apps/AddApp';
-import AddDatabase from 'teleport/Discover/Database/AddDatabaseModal';
+import { FeatureHeaderTitle } from 'teleport/components/Layout';
+import cfg from 'teleport/config';
+import { BASE_RESOURCES } from 'teleport/Discover/SelectResource/resources/resources';
+import { storageService } from 'teleport/services/storageService';
+import { DiscoverGuideId } from 'teleport/services/userPreferences/discoverPreference';
+import { useUser } from 'teleport/User/UserContext';
 import useTeleport from 'teleport/useTeleport';
 
-import { Acl } from 'teleport/services/user';
-
-import { ResourceKind, Header, HeaderSubtitle } from 'teleport/Discover/Shared';
+import { TextIcon } from '../Shared';
+import { SelectResourceSpec } from './resources';
+import { SAML_APPLICATIONS } from './resources/resourcesE';
+import { Tile } from './Tile';
+import { SearchResource } from './types';
+import { addHasAccessField } from './utils/checkAccess';
 import {
-  DiscoverEvent,
-  DiscoverEventStatus,
-} from 'teleport/services/userEvent';
+  filterBySupportedPlatformsAndAuthTypes,
+  filterResources,
+  Filters,
+  hostingPlatformOptions,
+  resourceTypeOptions,
+} from './utils/filters';
+import {
+  DiscoverResourcePreference,
+  getDefaultPins,
+  getPins,
+} from './utils/pins';
+import { sortResourcesByKind, sortResourcesByPreferences } from './utils/sort';
 
-import { ApplicationResource } from '../Application/ApplicationResource';
-import { DatabaseResource } from '../Database/DatabaseResource';
-import { DesktopResource } from '../Desktop/DesktopResource';
-import { KubernetesResource } from '../Kubernetes/KubernetesResource';
-import { ServerResource } from '../Server/ServerResource';
-import { DatabaseEngine, DatabaseLocation } from '../Database/resources';
-import { useDiscover } from '../useDiscover';
-
-import k8sIcon from './assets/kubernetes.png';
-import serverIcon from './assets/server.png';
-import databaseIcon from './assets/database.png';
-import applicationIcon from './assets/application.png';
-
-import type { TabComponent } from 'design/SlideTabs/SlideTabs';
-import type { Database } from '../Database/resources';
-
-function checkPermissions(acl: Acl, tab: Tab) {
-  const basePermissionsNeeded = [acl.tokens.create];
-
-  const permissionsNeeded = [
-    ...basePermissionsNeeded,
-    ...tab.permissionsNeeded,
-  ];
-
-  // if some (1+) are false, we do not have enough permissions
-  return permissionsNeeded.some(value => !value);
+interface SelectResourceProps {
+  onSelect: (resource: SelectResourceSpec) => void;
 }
 
-interface Tab extends TabComponent {
-  permissionsNeeded: boolean[];
-  kind: ResourceKind;
+type UrlLocationState = {
+  entity: SearchResource; // entity takes precedence over search keywords
+  searchKeywords: string;
+};
+
+function getDefaultResources(
+  includeEnterpriseResources: boolean
+): SelectResourceSpec[] {
+  const RESOURCES = includeEnterpriseResources
+    ? [...BASE_RESOURCES, ...SAML_APPLICATIONS]
+    : BASE_RESOURCES;
+  return RESOURCES;
 }
 
-interface SelectResourceProps<T = any> {
-  onSelect: (kind: ResourceKind) => void;
-  onNext: () => void;
-  selectedResourceKind: ResourceKind;
-  resourceState: T;
-}
-
-export function SelectResource(props: SelectResourceProps) {
+export function SelectResource({ onSelect }: SelectResourceProps) {
   const ctx = useTeleport();
-  const { emitEvent } = useDiscover();
+  const location = useLocation();
+  const state = location.state as UrlLocationState;
+  const navigate = useNavigate();
+  const { preferences, updateDiscoverResourcePreferences } = useUser();
 
-  const userContext = ctx.storeUser.state;
-  const { acl } = userContext;
-
-  const [showAddApp, setShowAddApp] = useState(false);
-  const [showAddDB, setShowAddDB] = useState(false);
-
-  const tabs: Tab[] = [
-    {
-      name: 'server',
-      kind: ResourceKind.Server,
-      component: <TabItem iconSrc={serverIcon} title="Server" />,
-      permissionsNeeded: [acl.nodes.list],
-    },
-
-    {
-      name: 'database',
-      kind: ResourceKind.Database,
-      component: <TabItem iconSrc={databaseIcon} title="Database" />,
-      permissionsNeeded: [acl.dbServers.read, acl.dbServers.list],
-    },
-
-    {
-      name: 'kubernetes',
-      kind: ResourceKind.Kubernetes,
-      component: <TabItem iconSrc={k8sIcon} title="Kubernetes" />,
-      permissionsNeeded: [acl.kubeServers.read, acl.kubeServers.list],
-    },
-
-    {
-      name: 'application',
-      kind: ResourceKind.Application,
-      component: <TabItem iconSrc={applicationIcon} title="Application" />,
-      permissionsNeeded: [acl.appServers.read, acl.appServers.list],
-    },
-    {
-      name: 'desktop',
-      kind: ResourceKind.Desktop,
-      component: <TabItem iconSrc={serverIcon} title="Desktop" />,
-      permissionsNeeded: [acl.desktops.read, acl.desktops.list],
-    },
-  ];
-
-  const index = tabs.findIndex(
-    component => component.kind === props.selectedResourceKind
+  const [filters, setFilters] = useState<Filters>({
+    resourceTypes: [],
+    hostingPlatforms: [],
+  });
+  const [updateDiscoverPreferenceAttempt, updateDiscoverPreference] = useAsync(
+    async (newPref: DiscoverResourcePreference) => {
+      await updateDiscoverResourcePreferences(newPref);
+    }
   );
-  const selectedTabIndex = Math.max(0, index);
 
-  const disabled = checkPermissions(acl, tabs[selectedTabIndex]);
+  const [search, setSearch] = useState('');
+  const { acl, authType } = ctx.storeUser.state;
+  const platform = getPlatform();
+
+  /**
+   * defaultResources does initial processing of all resource guides that will
+   * be used as base for dynamic filtering and determining default pins:
+   *   - sets the "hasAccess" field (checks user perms)
+   *   - sets the "pinned" field (checks user discover resource preference)
+   *   - filters out guides that are not supported by users
+   *     platform and auth settings (eg: "Connect My Computer" guide
+   *     has limited support for platforms and auth settings)
+   *   - sorts resources where preferred resources are at top of the list
+   *     (certain cloud editions renders a questionaire for new users asking
+   *     for their interest in resources)
+   */
+  const defaultResources: SelectResourceSpec[] = useMemo(() => {
+    const withHasAccessFieldResources = addHasAccessField(
+      acl,
+      filterBySupportedPlatformsAndAuthTypes(
+        platform,
+        authType,
+        getDefaultResources(cfg.isEnterprise)
+      )
+    );
+
+    return sortResourcesByPreferences(
+      withHasAccessFieldResources,
+      preferences,
+      storageService.getOnboardDiscover()
+    );
+  }, [acl, authType, platform, preferences]);
+
+  const [resources, setResources] = useState(defaultResources);
+
+  const filteredResources = useMemo(
+    () => filterResources(resources, filters),
+    [filters, resources]
+  );
+
+  // a user must be able to create tokens AND have access to create at least one
+  // type of resource in order to be considered eligible to "add resources"
+  const canAddResources =
+    acl.tokens.create && defaultResources.some(r => r.hasAccess);
+
+  const canConnectCloud =
+    acl.integrations.create && acl.tokens.create && acl.discoverConfigs.create;
+
+  const showCloudCTA = canConnectCloud && cfg.isCloud;
+
+  const [showApp, setShowApp] = useState(false);
+
+  function onSearch(s: string, customList?: SelectResourceSpec[]) {
+    const list = customList || defaultResources;
+    if (s == '') {
+      navigate(location.pathname, { replace: true, state: {} }); // Clear any loc state.
+      setResources(list);
+      setSearch(s);
+      return;
+    }
+    const search = s.split(' ').map(s => s.toLowerCase());
+    const found = list.filter(r =>
+      search.every(s => r.keywords.some(k => k.toLowerCase().includes(s)))
+    );
+
+    setResources(found);
+    setSearch(s);
+  }
+
+  useEffect(() => {
+    // A user can come to this screen by clicking on
+    // a `add <specific-resource-type>` button.
+    // We sort the list by the specified resource type,
+    // and then apply a search filter to it to reduce
+    // the amount of results.
+    // We don't do this if the resource type is `unified_resource`,
+    // since we want to show all resources.
+    // TODO(bl-nero): remove this once the localstorage setting to disable unified resources is removed.
+    const resourceKindSpecifiedByUrlLoc = state?.entity;
+    if (
+      resourceKindSpecifiedByUrlLoc &&
+      resourceKindSpecifiedByUrlLoc !== SearchResource.UNIFIED_RESOURCE
+    ) {
+      const sortedResourcesByKind = sortResourcesByKind(
+        resourceKindSpecifiedByUrlLoc,
+        defaultResources
+      );
+      onSearch(resourceKindSpecifiedByUrlLoc, sortedResourcesByKind);
+      return;
+    }
+
+    const searchKeywordSpecifiedByUrlLoc = state?.searchKeywords;
+    if (searchKeywordSpecifiedByUrlLoc) {
+      onSearch(searchKeywordSpecifiedByUrlLoc, defaultResources);
+      return;
+    }
+
+    setResources(defaultResources);
+    // Processing of the lists should only happen once on init.
+    // User perms remain static and URL loc state does not change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function updatePinnedGuides(guideId: DiscoverGuideId) {
+    const { discoverResourcePreferences } = preferences;
+
+    let previousPins = discoverResourcePreferences?.discoverGuide?.pinned || [];
+
+    if (!discoverResourcePreferences?.discoverGuide) {
+      previousPins = getDefaultPins(defaultResources);
+    }
+
+    // Toggles pins.
+    let latestPins: string[];
+    if (previousPins.includes(guideId)) {
+      latestPins = previousPins.filter(p => p !== guideId);
+    } else {
+      latestPins = [...previousPins, guideId];
+    }
+
+    const newPreferences: DiscoverResourcePreference = {
+      discoverResourcePreferences: {
+        discoverGuide: { pinned: latestPins },
+      },
+    };
+
+    updateDiscoverPreference(newPreferences);
+  }
+
+  // TODO(kimlisa): DELETE IN 19.0 - only remove the check for "NotSupported".
+  let pinningSupport = preferences.discoverResourcePreferences
+    ? PinningSupport.Supported
+    : PinningSupport.NotSupported;
+
+  if (updateDiscoverPreferenceAttempt.status === 'processing') {
+    pinningSupport = PinningSupport.Disabled;
+  }
+
+  const pins = getPins(preferences);
+  let pinnedGuides: SelectResourceSpec[] = [];
+  if (pins.length > 0) {
+    pinnedGuides = filteredResources.filter(r => pins.includes(r.id));
+  }
 
   return (
     <Box>
-      <Header>Select Resource Type</Header>
-      <HeaderSubtitle>
-        Users are able to add and access many different types of resources
-        through Teleport. Start by selecting the type of resource you want to
-        add.
-      </HeaderSubtitle>
-      <SlideTabs
-        initialSelected={selectedTabIndex}
-        tabs={tabs}
-        onChange={index => props.onSelect(tabs[index].kind)}
-      />
-      {props.selectedResourceKind === ResourceKind.Database && (
-        <DatabaseResource
-          disabled={disabled}
-          onProceed={() => {
-            const state = props.resourceState as Database;
-            if (state.location === DatabaseLocation.SelfHosted) {
-              if (
-                state.engine === DatabaseEngine.PostgreSQL ||
-                state.engine === DatabaseEngine.MySQL
-              ) {
-                props.onNext();
-                return;
-              }
-            }
-
-            if (state.location === DatabaseLocation.AWS) {
-              if (
-                state.engine === DatabaseEngine.PostgreSQL ||
-                state.engine === DatabaseEngine.MySQL
-              ) {
-                props.onNext();
-                return;
-              }
-            }
-
-            // Unsupported databases will default to the modal popup.
-            emitEvent({ stepStatus: DiscoverEventStatus.Success });
-            return setShowAddDB(true);
+      {!canAddResources && (
+        <Alert kind="info" mt={5}>
+          You cannot add new resources. Reach out to your Teleport administrator
+          for additional permissions.
+        </Alert>
+      )}
+      {updateDiscoverPreferenceAttempt.status === 'error' && (
+        <Danger mt={5} details={updateDiscoverPreferenceAttempt.statusText}>
+          Could not update pinned resources
+        </Danger>
+      )}
+      <Box my={3}>
+        <FeatureHeaderTitle>Enroll a New Resource</FeatureHeaderTitle>
+        <Text>
+          Teleport can integrate with most, if not all, of your infrastructure.
+          Search below for resources you want to add.
+        </Text>
+      </Box>
+      <Flex gap={3} justifyContent="space-between">
+        <Box mb={3} width="600px">
+          <InputSearch
+            searchValue={search}
+            setSearchValue={onSearch}
+            placeholder="Search for a resource"
+            autoFocus
+          />
+        </Box>
+      </Flex>
+      {showCloudCTA && (
+        <Alert
+          kind="cta"
+          dismissible={true}
+          details={
+            'Use Terraform to connect your AWS, Azure, or GCP accounts to Teleport and automatically discover your resources.'
+          }
+          primaryAction={{
+            content: 'Connect Cloud Account',
+            linkTo: cfg.getIntegrationsEnrollRoute({ tags: ['terraform'] }),
           }}
+          linkColor="buttons.primary.text"
+        >
+          Automatically Discover
+        </Alert>
+      )}
+      <Flex gap={3} mb={3}>
+        <MultiselectMenu
+          options={resourceTypeOptions}
+          onChange={resourceTypes => setFilters({ ...filters, resourceTypes })}
+          selected={filters.resourceTypes || []}
+          label="Resource Type"
+          tooltip="Filter by resource type"
         />
-      )}
-      {props.selectedResourceKind === ResourceKind.Application && (
-        <ApplicationResource
-          disabled={disabled}
-          onProceed={() => {
-            setShowAddApp(true);
-            emitEvent(
-              { stepStatus: DiscoverEventStatus.Success },
-              { eventName: DiscoverEvent.ResourceSelection }
-            );
-          }}
+        <MultiselectMenu
+          options={hostingPlatformOptions}
+          onChange={hostingPlatforms =>
+            setFilters({ ...filters, hostingPlatforms })
+          }
+          selected={filters.hostingPlatforms || []}
+          label="Hosting Platform"
+          tooltip="Filter by hosting platform"
         />
+      </Flex>
+      {!filteredResources.length && (
+        <TextIcon>
+          <Magnifier size="small" />
+          No results found
+        </TextIcon>
       )}
-      {props.selectedResourceKind === ResourceKind.Desktop && (
-        <DesktopResource disabled={disabled} onProceed={() => props.onNext()} />
+      {pinnedGuides.length > 0 && (
+        <Box mb={4}>
+          <H3 mb={3}>Pinned</H3>
+          <Grid role="grid" pinnedSection={true}>
+            {pinnedGuides.map(r => (
+              <Tile
+                key={r.id}
+                resourceSpec={r}
+                size="large"
+                onChangeShowApp={setShowApp}
+                onSelectResource={onSelect}
+                pinningSupport={pinningSupport}
+                onChangePin={updatePinnedGuides}
+                isPinned={true}
+              />
+            ))}
+          </Grid>
+        </Box>
       )}
-      {props.selectedResourceKind === ResourceKind.Kubernetes && (
-        <KubernetesResource
-          disabled={disabled}
-          onProceed={() => props.onNext()}
-        />
+      {filteredResources.length > 0 && (
+        <>
+          {pinnedGuides.length > 0 && <H3 mb={3}>All Resources</H3>}
+          <Grid role="grid">
+            {filteredResources.map(r => (
+              <Tile
+                key={r.id}
+                resourceSpec={r}
+                onChangeShowApp={setShowApp}
+                onSelectResource={onSelect}
+                pinningSupport={pinningSupport}
+                onChangePin={updatePinnedGuides}
+                isPinned={pins.includes(r.id)}
+              />
+            ))}
+          </Grid>
+          <P3 my={6}>
+            Looking for something else?{' '}
+            <Link
+              href="https://github.com/gravitational/teleport/issues/new?assignees=&labels=feature-request&template=feature_request.md"
+              target="_blank"
+              ml={2}
+            >
+              Request a feature
+            </Link>
+          </P3>
+        </>
       )}
-      {props.selectedResourceKind === ResourceKind.Server && (
-        <ServerResource disabled={disabled} onProceed={() => props.onNext()} />
-      )}
-      {showAddApp && <AddApp onClose={() => setShowAddApp(false)} />}
-      {showAddDB && (
-        <AddDatabase
-          isEnterprise={ctx.isEnterprise}
-          username={userContext.username}
-          version={userContext.cluster.authVersion}
-          authType={userContext.authType}
-          onClose={() => setShowAddDB(false)}
-          selectedDb={props.resourceState}
-        />
-      )}
+      {showApp && <AddApp onClose={() => setShowApp(false)} />}
     </Box>
   );
 }
 
-const TabItem = ({ iconSrc, title }: { iconSrc: string; title: string }) => (
-  <Flex
-    css={`
-      align-items: center;
-    `}
-  >
-    <Image src={iconSrc} width="32px" mr={2} />
-    <Text bold typography="h5">
-      {title}
-    </Text>
-  </Flex>
-);
+const Grid = styled.div<{ pinnedSection?: boolean }>`
+  display: grid;
+  grid-template-columns: repeat(
+    auto-fill,
+    ${p => (p.pinnedSection ? '250px' : '320px')}
+  );
+  column-gap: 10px;
+  row-gap: 15px;
+`;

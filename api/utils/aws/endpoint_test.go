@@ -24,6 +24,76 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestIsAWSEndpoint(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		for _, endpoint := range []string{
+			"aurora-instance-1.abcdefghijklmnop.us-west-1.rds.amazonaws.com",
+			"example.amazonaws.com",
+			"foo.amazonaws.com.cn",
+			"example.amazonaws.com:12345", // port numbers must be allowed here
+		} {
+			require.True(t, IsAWSEndpoint(endpoint))
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		for _, endpoint := range []string{
+			"example.com",
+			"foo.amazonaws.com.cn.example.com",
+			"bad.amazonaws.com.example.com",
+			// api.aws endpoints are deliberately excluded, they are matched by
+			// IsAWSAPIEndpoint so legacy endpoint parsers never see them.
+			"aws-mcp.us-east-1.api.aws",
+		} {
+			require.False(t, IsAWSEndpoint(endpoint))
+		}
+	})
+}
+
+func TestIsAWSOwnedEndpoint(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		for _, endpoint := range []string{
+			"example.amazonaws.com",
+			"foo.amazonaws.com.cn",
+			"aws-mcp.us-east-1.api.aws",
+			"kms-fips.us-east-1.api.aws:443",
+		} {
+			require.True(t, IsAWSOwnedEndpoint(endpoint))
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		for _, endpoint := range []string{
+			"example.com",
+			"evil-api.aws",
+			"foo.api.aws.example.com",
+			"bad.amazonaws.com.example.com",
+		} {
+			require.False(t, IsAWSOwnedEndpoint(endpoint))
+		}
+	})
+}
+
+func TestIsAWSAPIEndpoint(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		for _, endpoint := range []string{
+			"aws-mcp.us-east-1.api.aws",
+			"kms-fips.us-east-1.api.aws:443",
+		} {
+			require.True(t, IsAWSAPIEndpoint(endpoint))
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		for _, endpoint := range []string{
+			"example.com",
+			"example.amazonaws.com",
+			"api.aws",
+			"evil-api.aws",
+			"foo.api.aws.example.com",
+		} {
+			require.False(t, IsAWSAPIEndpoint(endpoint))
+		}
+	})
+}
+
 func TestParseRDSEndpoint(t *testing.T) {
 	tests := []struct {
 		name                string
@@ -37,8 +107,9 @@ func TestParseRDSEndpoint(t *testing.T) {
 			endpoint:            "aurora-instance-1.abcdefghijklmnop.us-west-1.rds.amazonaws.com:5432",
 			expectIsRDSEndpoint: true,
 			expectDetails: &RDSEndpointDetails{
-				InstanceID: "aurora-instance-1",
-				Region:     "us-west-1",
+				InstanceID:   "aurora-instance-1",
+				Region:       "us-west-1",
+				EndpointType: "instance",
 			},
 		},
 		{
@@ -46,8 +117,9 @@ func TestParseRDSEndpoint(t *testing.T) {
 			endpoint:            "aurora-instance-2.abcdefghijklmnop.rds.cn-north-1.amazonaws.com.cn",
 			expectIsRDSEndpoint: true,
 			expectDetails: &RDSEndpointDetails{
-				InstanceID: "aurora-instance-2",
-				Region:     "cn-north-1",
+				InstanceID:   "aurora-instance-2",
+				Region:       "cn-north-1",
+				EndpointType: "instance",
 			},
 		},
 		{
@@ -55,8 +127,19 @@ func TestParseRDSEndpoint(t *testing.T) {
 			endpoint:            "my-cluster.cluster-abcdefghijklmnop.us-west-1.rds.amazonaws.com:5432",
 			expectIsRDSEndpoint: true,
 			expectDetails: &RDSEndpointDetails{
-				ClusterID: "my-cluster",
-				Region:    "us-west-1",
+				ClusterID:    "my-cluster",
+				Region:       "us-west-1",
+				EndpointType: "primary",
+			},
+		},
+		{
+			name:                "RDS cluster reader",
+			endpoint:            "my-cluster.cluster-ro-abcdefghijklmnop.us-west-1.rds.amazonaws.com:5432",
+			expectIsRDSEndpoint: true,
+			expectDetails: &RDSEndpointDetails{
+				ClusterID:    "my-cluster",
+				Region:       "us-west-1",
+				EndpointType: "reader",
 			},
 		},
 		{
@@ -66,6 +149,7 @@ func TestParseRDSEndpoint(t *testing.T) {
 			expectDetails: &RDSEndpointDetails{
 				ClusterCustomEndpointName: "my-custom",
 				Region:                    "us-west-1",
+				EndpointType:              "custom",
 			},
 		},
 		{
@@ -308,6 +392,73 @@ func TestParseElastiCacheEndpoint(t *testing.T) {
 	}
 }
 
+func TestParseElastiCacheServerlessEndpoint(t *testing.T) {
+	tests := []struct {
+		name        string
+		inputURI    string
+		expectInfo  *RedisEndpointInfo
+		expectError bool
+	}{
+		{
+			name:     "normal endpoint",
+			inputURI: "example-asdf123.serverless.cac1.cache.amazonaws.com:6379",
+			expectInfo: &RedisEndpointInfo{
+				ID:                       "example",
+				Region:                   "ca-central-1",
+				TransitEncryptionEnabled: true,
+				EndpointType:             ElastiCacheConfigurationEndpoint,
+			},
+		},
+		{
+			name:     "CN endpoint",
+			inputURI: "example-asdf123.serverless.cnn1.cache.amazonaws.com.cn:6379",
+			expectInfo: &RedisEndpointInfo{
+				ID:                       "example",
+				Region:                   "cn-north-1",
+				TransitEncryptionEnabled: true,
+				EndpointType:             ElastiCacheConfigurationEndpoint,
+			},
+		},
+		{
+			name:     "endpoint with schema and parameters",
+			inputURI: "redis://example-asdf123.serverless.cac1.cache.amazonaws.com:6379?a=b&c=d",
+			expectInfo: &RedisEndpointInfo{
+				ID:                       "example",
+				Region:                   "ca-central-1",
+				TransitEncryptionEnabled: true,
+				EndpointType:             ElastiCacheConfigurationEndpoint,
+			},
+		},
+		{
+			name:        "invalid suffix",
+			inputURI:    "example.serverless.cac1.cache.amazonaws.io:6379",
+			expectError: true,
+		},
+		{
+			name:        "invalid url",
+			inputURI:    "://example.serverless.cac1.cache.amazonaws.com:6379",
+			expectError: true,
+		},
+		{
+			name:        "invalid format",
+			inputURI:    "example.serverless.cache.amazonaws.com:6379",
+			expectError: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actualInfo, err := ParseElastiCacheServerlessEndpoint(test.inputURI)
+			if test.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, test.expectInfo, actualInfo)
+			}
+		})
+	}
+}
+
 func TestParseMemoryDBEndpoint(t *testing.T) {
 	t.Parallel()
 
@@ -449,12 +600,11 @@ func TestCassandraEndpointRegion(t *testing.T) {
 				require.False(t, IsKeyspacesEndpoint(test.inputURI))
 			} else {
 				require.NoError(t, err)
-				require.Equal(t, got, test.wantRegion)
+				require.Equal(t, test.wantRegion, got)
 				require.True(t, IsKeyspacesEndpoint(test.inputURI))
 			}
 		})
 	}
-
 }
 
 func TestRedshiftServerlessEndpoint(t *testing.T) {
@@ -513,30 +663,39 @@ func TestRedshiftServerlessEndpoint(t *testing.T) {
 func TestDynamoDBURIForRegion(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		desc    string
-		region  string
-		wantURI string
+		desc          string
+		region        string
+		wantURI       string
+		wantPartition string
 	}{
 		{
-			desc:    "region is in correct AWS partition",
-			region:  "us-east-1",
-			wantURI: "aws://dynamodb.us-east-1.amazonaws.com",
+			desc:          "region is in correct AWS partition",
+			region:        "us-east-1",
+			wantURI:       "aws://dynamodb.us-east-1.amazonaws.com",
+			wantPartition: ".amazonaws.com",
 		},
 		{
-			desc:    "china north region is in correct AWS partition",
-			region:  "cn-north-1",
-			wantURI: "aws://dynamodb.cn-north-1.amazonaws.com.cn",
+			desc:          "china north region is in correct AWS partition",
+			region:        "cn-north-1",
+			wantURI:       "aws://dynamodb.cn-north-1.amazonaws.com.cn",
+			wantPartition: ".amazonaws.com.cn",
 		},
 		{
-			desc:    "china northwest region is in correct AWS partition",
-			region:  "cn-northwest-1",
-			wantURI: "aws://dynamodb.cn-northwest-1.amazonaws.com.cn",
+			desc:          "china northwest region is in correct AWS partition",
+			region:        "cn-northwest-1",
+			wantURI:       "aws://dynamodb.cn-northwest-1.amazonaws.com.cn",
+			wantPartition: ".amazonaws.com.cn",
 		},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.desc, func(t *testing.T) {
 			require.Equal(t, tt.wantURI, DynamoDBURIForRegion(tt.region))
+			info, err := ParseDynamoDBEndpoint(tt.wantURI)
+			require.NoError(t, err, "endpoint generated from region could not be parsed.")
+			require.Equal(t, tt.region, info.Region)
+			require.Equal(t, "dynamodb", info.Service)
+			require.Equal(t, tt.wantPartition, info.Partition)
 		})
 	}
 }
@@ -630,9 +789,119 @@ func TestParseDynamoDBEndpoint(t *testing.T) {
 	}
 	for _, tt := range tests {
 		tt := tt
-		t.Run("detects invalid endpoint with"+tt.desc, func(t *testing.T) {
+		t.Run("detects invalid endpoint with "+tt.desc, func(t *testing.T) {
 			t.Parallel()
 			info, err := ParseDynamoDBEndpoint(tt.endpoint)
+			require.Error(t, err, "endpoint %s should be invalid", tt.endpoint)
+			require.Nil(t, info)
+		})
+	}
+}
+
+func TestParseOpensearchEndpoint(t *testing.T) {
+	t.Parallel()
+
+	t.Run("fixed example", func(t *testing.T) {
+		want := &OpenSearchEndpointInfo{
+			Service:   OpenSearchServiceName,
+			Region:    "eu-central-1",
+			Partition: AWSEndpointSuffix,
+		}
+
+		endpoint := "https://search-my-opensearch-instance-xxxxxxxxxxxxxxxx.eu-central-1.es.amazonaws.com:443"
+
+		out, err := ParseOpensearchEndpoint(endpoint)
+		require.NoError(t, err)
+		require.Equal(t, want, out)
+	})
+
+	t.Run("parses valid endpoint", func(t *testing.T) {
+		t.Parallel()
+		for _, parts := range []struct {
+			services  []string
+			regions   []string
+			partition string
+		}{
+			{
+				services:  []string{OpenSearchServiceName},
+				regions:   []string{"us-east-1", "us-gov-east-1"},
+				partition: AWSEndpointSuffix,
+			},
+			{
+				services:  []string{OpenSearchServiceName},
+				regions:   []string{"cn-north-1", "cn-northwest-1"},
+				partition: AWSCNEndpointSuffix,
+			},
+		} {
+			parts := parts
+			for _, svc := range parts.services {
+				svc := svc
+				for _, region := range parts.regions {
+					region := region
+					endpoint := fmt.Sprintf("opensearch-instance-foo.%s.%s%s", region, svc, parts.partition)
+					t.Run(endpoint, func(t *testing.T) {
+						t.Parallel()
+						info, err := ParseOpensearchEndpoint(endpoint)
+						require.NoError(t, err)
+						wantInfo := OpenSearchEndpointInfo{
+							Service:   svc,
+							Region:    region,
+							Partition: parts.partition,
+						}
+						require.NotNil(t, info)
+						require.Equal(t, wantInfo, *info)
+					})
+				}
+			}
+		}
+	})
+
+	tests := []struct {
+		desc     string
+		endpoint string
+	}{
+		{
+			desc:     "empty uri",
+			endpoint: "",
+		},
+		{
+			desc:     "not AWS uri",
+			endpoint: "localhost",
+		},
+		{
+			desc:     "missing region",
+			endpoint: "amazonaws.com",
+		},
+		{
+			desc:     "missing china region",
+			endpoint: "amazonaws.com.cn",
+		},
+		{
+			desc:     "unrecognized service subdomain",
+			endpoint: "foo.us-east-1.amazonaws.com",
+		},
+		{
+			desc:     "unrecognized opensearch service subdomain",
+			endpoint: "foo.opensearch.us-east-1.amazonaws.com",
+		},
+		{
+			desc:     "unrecognized streams service subdomain",
+			endpoint: "streams.foo.us-east-1.amazonaws.com",
+		},
+		{
+			desc:     "mismatched us region and china partition",
+			endpoint: "streams.opensearch.us-east-1.amazonaws.com.cn",
+		},
+		{
+			desc:     "mismatched china region and non-china partition",
+			endpoint: "streams.opensearch.cn-north-1.amazonaws.com",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run("detects invalid endpoint with "+tt.desc, func(t *testing.T) {
+			t.Parallel()
+			info, err := ParseOpensearchEndpoint(tt.endpoint)
 			require.Error(t, err, "endpoint %s should be invalid", tt.endpoint)
 			require.Nil(t, info)
 		})

@@ -1,42 +1,46 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
+	"context"
+	"log/slog"
+
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/sql/armsql"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/cloud/azure"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
 // newAzureManagedSQLServerFetcher creates a fetcher for Azure SQL Servers.
 func newAzureManagedSQLServerFetcher(config azureFetcherConfig) (common.Fetcher, error) {
-	return newAzureFetcher[*armsql.ManagedInstance, azure.ManagedSQLServerClient](config, &azureManagedSQLServerFetcher{})
+	return newAzureFetcher(config, &azureManagedSQLServerFetcher{})
 }
 
 // azureManagedSQLServerFetcher implements azureFetcherPlugin for Azure Managed
 // SQL Servers.
-type azureManagedSQLServerFetcher struct {
-}
+type azureManagedSQLServerFetcher struct{}
 
-func (f *azureManagedSQLServerFetcher) GetListClient(cfg *azureFetcherConfig, subID string) (azure.ManagedSQLServerClient, error) {
-	client, err := cfg.AzureClients.GetAzureManagedSQLServerClient(subID)
+func (f *azureManagedSQLServerFetcher) GetListClient(ctx context.Context, cfg *azureFetcherConfig, subID string) (azure.ManagedSQLServerClient, error) {
+	client, err := cfg.AzureClients.GetManagedSQLServerClient(ctx, subID)
 	return client, trace.Wrap(err)
 }
 
@@ -44,17 +48,20 @@ func (f *azureManagedSQLServerFetcher) GetServerLocation(server *armsql.ManagedI
 	return azure.StringVal(server.Location)
 }
 
-func (f *azureManagedSQLServerFetcher) NewDatabaseFromServer(server *armsql.ManagedInstance, log logrus.FieldLogger) types.Database {
+func (f *azureManagedSQLServerFetcher) NewDatabaseFromServer(ctx context.Context, server *armsql.ManagedInstance, logger *slog.Logger) types.Database {
 	if !f.isAvailable(server) {
-		log.Debugf("The current status of Azure Managed SQL server %q is %q. Skipping.",
-			azure.StringVal(server.Name),
-			azure.StringVal(server.Properties.ProvisioningState))
+		logger.DebugContext(ctx, "Skipping unavailable Azure Managed SQL server",
+			"server", azure.StringVal(server.Name),
+			"provisioning_state", azure.StringVal(server.Properties.ProvisioningState))
 		return nil
 	}
 
-	database, err := services.NewDatabaseFromAzureManagedSQLServer(server)
+	database, err := common.NewDatabaseFromAzureManagedSQLServer(server)
 	if err != nil {
-		log.Warnf("Could not convert Azure Managed SQL server %q to database resource: %v.", azure.StringVal(server.Name), err)
+		logger.WarnContext(ctx, "Could not convert Azure Managed SQL server to database resource",
+			"server", azure.StringVal(server.Name),
+			"error", err,
+		)
 		return nil
 	}
 
@@ -83,9 +90,9 @@ func (f *azureManagedSQLServerFetcher) isAvailable(server *armsql.ManagedInstanc
 		armsql.ManagedInstancePropertiesProvisioningStateUpdating:
 		return true
 	default:
-		logrus.Warnf("Unknown status type: %q. Assuming Managed SQL Server %q is available.",
-			azure.StringVal(server.Properties.ProvisioningState),
-			azure.StringVal(server.Name),
+		slog.WarnContext(context.Background(), "Assuming Managed SQL Server with unknown status type is available",
+			"status", azure.StringVal(server.Properties.ProvisioningState),
+			"server", azure.StringVal(server.Name),
 		)
 		return true
 	}

@@ -7,38 +7,47 @@ This directory contains the source code for:
 - the Electron app of [Teleport Connect](https://goteleport.com/connect/)
   - [`packages/teleterm`](packages/teleterm)
 
-The code is organized in terms of independent yarn packages which reside in
+The code is organized in terms of independent packages (workspaces) which reside in
 the [packages directory](packages).
 
 ## Getting Started with Teleport Web UI
 
-You can make production builds locally or you can use Docker to do that.
+You can make production builds locally, or you can use Docker to do that.
 
 ### Local Build
 
-Make sure that [you have yarn installed](https://yarnpkg.com/lang/en/docs/install/#debian-stable)
-on your system since this monorepo uses the yarn package manager.
+Install Node.js (you can take the version by executing
+`make -C build.assets print-node-version` from the root directory).
+After that, run `corepack enable pnpm` to enable installing a package manager.
 
-Then you need download and initialize these repository dependencies.
+Then you need to download and initialize JavaScript dependencies.
 
 ```
-$ yarn install
+pnpm install
 ```
+
+You will also need the following tools installed:
+* The `Rust` and `Cargo` version in [build.assets/Makefile](https://github.com/gravitational/teleport/blob/master/build.assets/versions.mk#L11) (search for `RUST_VERSION`) are required.
 
 To build the Teleport open source version
 
 ```
-$ yarn build-ui-oss
+pnpm build-ui-oss
 ```
 
-The resulting output will be in the `packages/{package-name}/dist/` folders respectively.
+The resulting output will be in the `webassets` folder. By default, the webassets are compressed with Brotli. If you
+want to disable this for faster local builds, set the environment variable `VITE_DISABLE_COMPRESSION` to any value:
+
+```
+VITE_DISABLE_COMPRESSION=1 pnpm build-ui-oss
+```
 
 ### Docker Build
 
 To build the Teleport community version
 
 ```
-$ make docker-ui
+make docker-ui
 ```
 
 ## Getting Started with Teleport Connect
@@ -47,18 +56,68 @@ See [`README.md` in `packages/teleterm`](packages/teleterm#readme).
 
 ## Development
 
+### Local HTTPS
+
+To run `vite` for either Teleport or Teleport enterprise, you'll need to generate local
+self-signed certificates. The recommended way of doing this is via [mkcert](https://github.com/FiloSottile/mkcert).
+
+You can install mkcert via
+
+```
+brew install mkcert
+```
+
+After you've done this, run:
+
+```
+mkcert -install
+```
+
+This will generate a root CA on your machine and automatically trust it (you'll be prompted for your password).
+
+Once you've generated a root CA, you'll need to generate a certificate for local usage.
+
+Run the following from the `web/` directory, replacing `localhost` if you're using a different hostname.
+
+```
+mkdir -p certs && mkcert -cert-file certs/server.crt -key-file certs/server.key localhost "*.localhost"
+```
+
+(Note: the `certs/` directory in this repo is ignored by git, so you can place your certificate/keys
+in there without having to worry that they'll end up in a commit.)
+
+#### Certificates in an alternative location
+
+If you already have local certificates, you can set the environment variables:
+
+- `VITE_HTTPS_CERT` **(required)** - absolute path to the certificate
+- `VITE_HTTPS_KEY` **(required)** - absolute path to the key
+
+You can set these in your `~/.zshrc`, `~/.bashrc`, etc.
+
+```
+export VITE_HTTPS_CERT=/Users/you/certs/server.crt
+export VITE_HTTPS_KEY=/Users/you/certs/server.key
+```
+
 ### Web UI
 
 To avoid having to install a dedicated Teleport cluster,
 you can use a local development server which can proxy network requests
 to an existing cluster.
 
-For example, if `https://example.com:3080/web` is the URL of your cluster then:
+For example, if `https://example.com:3080` is the URL of your cluster then:
 
 To start your local Teleport development server
 
 ```
-$ yarn start-teleport --target=https://example.com:3080/web
+PROXY_TARGET=example.com:3080 pnpm start-teleport
+```
+
+If you're running a local cluster at `https://localhost:3080`, you can just run
+
+```
+pnpm start-teleport
 ```
 
 This service will serve your local javascript files and proxy network
@@ -67,188 +126,92 @@ requests to the given target.
 > Keep in mind that you have to use a local user because social
 > logins (google/github) are not supported by development server.
 
-#### Caching
-
-By default, Webpack will store a cache in `node_modules/.cache/webpack` during development. This
-makes starting `webpack-dev-server` really quick after having ran it once, as it will re-use the
-cache from the last time it was running.
-
-If you want to change the location of the cache, you can set `WEBPACK_CACHE_DIRECTORY` to an
-absolute file path of the folder where you want to store Webpack's cache.
-
-If you wish to disable the cache, you can set `WEBPACK_CACHE_DISABLED` to `yes`.
-
-#### Source Maps
-
-During development, Webpack will default to generating source maps using `eval-source-map`.
-This can be overridden by setting the `WEBPACK_SOURCE_MAP` environment variable to one of the
-[available values that Webpack offers](https://webpack.js.org/configuration/devtool/#devtool).
-
-To turn them off, set `WEBPACK_SOURCE_MAP` to `none` -
-
-```
-$ WEBPACK_SOURCE_MAP=none yarn start-teleport --target=https://example.com:3080/web
-```
-
-#### Changing the port Webpack runs on
-
-To make Webpack listen on a different port, you can set the `WEBPACK_PORT` environment variable
-to whatever port you need.
-
-```
-$ WEBPACK_PORT=6060 yarn start-teleport --target=https://example.com:3080/web
-```
-
-#### Custom HTTPS configuration
-
-If you'd like to provide your own key/certificate for Webpack's development server, you can
-override the default behavior by setting some environment variables.
-
-You should either set:
-
-- `WEBPACK_HTTPS_CERT` **(required)** - absolute path to the certificate
-- `WEBPACK_HTTPS_KEY` **(required)** - absolute path to the key
-- `WEBPACK_HTTPS_CA` - absolute path to the ca
-- `WEBPACK_HTTPS_PASSPHRASE` - the passphrase
-
-Or:
-
-- `WEBPACK_HTTPS_PFX` **(required)** - absolute path to the certificate
-- `WEBPACK_HTTPS_PASSPHRASE` - the passphrase
-
-You can set these in your `~/.zshrc`, `~/.bashrc`, etc.
-
-```
-export WEBPACK_HTTPS_CERT=/Users/you/go/src/github.com/gravitational/webapps/certs/server.crt
-export WEBPACK_HTTPS_KEY=/Users/you/go/src/github.com/gravitational/webapps/certs/server.key
-```
-
-The `certs/` directory in this repo is ignored by git, so you can place your certificate/keys
-in there without having to worry that they'll end up in a commit.
-
-#### Making application access work locally
-
-For application access to work, you should have it set so you're running Webpack on the same machine
-as Teleport. This is so you can access both Webpack and Teleport via the same domain.
-
-Imagine you're using the domain `go.teleport` instead of `localhost`.
-
-You should setup `/etc/hosts.yml` like so:
-
-```
-0.0.0.0 go.teleport
-0.0.0.0 dumper.go.teleport
-```
-
-Then, run Webpack with the environment variable `WEBPACK_PROXY_APP_ACCESS` set to `true`. This will
-check the incoming `Host` header and compare it against the hostname of the given target flag.
-
-```
-WEBPACK_PROXY_APP_ACCESS=true yarn start-teleport --target=https://go.teleport:3080/web
-```
-
-Going to `go.teleport`, Webpack will compare the `Host` header (`go.teleport`) and the hostname of the target (also
-`go.teleport`). It will therefore only proxy API requests through to Teleport, and serve the Webpack content for all
-other requests.
-
-Going to `dumper.go.teleport`, comparing the `Host` header (`dumper.go.teleport`) and the hostname of the target
-(`go.teleport`). It will proxy every request for this host through to Teleport, making application access work properly.
-
-Note: this only works for local Teleport instances, and won't work for Cloud.
-
-#### Analyzing Webpack's bundle output
-
-To see what is being included in each bundle via [webpack-bundle-analyzer](https://github.com/webpack-contrib/webpack-bundle-analyzer), you can set `WEBPACK_ANALYZE_BUNDLE` to `true` to have it running at `localhost:8888`.
-
-```
-$ WEBPACK_ANALYZE_BUNDLE=true yarn start-teleport --target=https://example.com:3080/web
-```
-
-And then go to http://localhost:8888.
-
 ### Unit-Tests
 
-We use [jest](https://jestjs.io/) as our testing framework.
+We are migrating from [jest](https://jestjs.io/) to [vitest](https://vitest.dev/). Vitest owns
+`*.vitest.{ts,tsx}` files. Everything still on `*.test.{ts,tsx}` runs under jest.
 
-To run all jest unit-tests:
-
-```
-$ yarn run test
-```
-
-To run jest in watch-mode
+To run all unit-tests under both runners:
 
 ```
-$ yarn run tdd
+pnpm test
+```
+
+`pnpm test` also takes paths and file names, routing each to the runner that owns it.
+
+To drive a runner directly, including watch-mode:
+
+```
+pnpm jest --watch
+pnpm vitest
 ```
 
 ### Interactive Testing
 
-We use [storybook](https://storybook.js.org/) for our interactive testing.
+We use [Storybook](https://storybook.js.org/) for our interactive testing.
 It allows us to browse our component library, view the different states of
 each component, and interactively develop and test components.
 
-To start a storybook:
+> [!IMPORTANT]
+> In order to start Storybook, you need to have certs in `web/certs`.
+> See [Local HTTPS](#local-https) for how to set them up.
+
+To start Storybook:
 
 ```
-$ yarn run storybook
+pnpm storybook
 ```
 
-This command will open a new browser window with storybook in it. There
+This command will open a new browser window with Storybook in it. There
 you will see components from all packages so it makes it faster to work
 and iterate on shared functionality.
 
-### Setup Prettier on VSCode
+### Browser compatibility
 
-1. Install plugin: https://github.com/prettier/prettier-vscode
-1. Go to Command Palette: CMD/CTRL + SHIFT + P (or F1)
-1. Type `open settings`
-1. Select `Open Settings (JSON)`
-1. Include the below snippet and save:
+We are targeting last 2 versions of all major browsers. To quickly find out which ones exactly, use the following command:
 
-```js
+```
+pnpm dlx browserslist 'last 2 chrome version, last 2 edge version, last 2 firefox version, last 2 safari version'
+```
 
-    // Set the default
-    "editor.formatOnSave": false,
-    // absolute config path
-    "prettier.configPath": ".prettierrc",
-    // enable per-language
-    "[html]": {
-        "editor.formatOnSave": true,
-        "editor.defaultFormatter": "esbenp.prettier-vscode"
-    },
-    "[javascript]": {
-        "editor.formatOnSave": true,
-        "editor.defaultFormatter": "esbenp.prettier-vscode"
-    },
-    "[javascriptreact]": {
-        "editor.formatOnSave": true,
-        "editor.defaultFormatter": "esbenp.prettier-vscode",
-    },
-    "[typescript]": {
-        "editor.formatOnSave": true,
-        "editor.defaultFormatter": "esbenp.prettier-vscode"
-    },
-    "[typescriptreact]": {
-        "editor.formatOnSave": true,
-        "editor.defaultFormatter": "esbenp.prettier-vscode",
-    },
-    "[json]": {
-        "editor.formatOnSave": true,
-        "editor.defaultFormatter": "vscode.json-language-features"
-    },
-    "[jsonc]": {
-        "editor.formatOnSave": true,
-        "editor.defaultFormatter": "vscode.json-language-features"
-    },
-    "[markdown]": {
-        "editor.formatOnSave": true,
-        "editor.defaultFormatter": "esbenp.prettier-vscode",
-    },
+### Setup Oxfmt in Your Editor
+
+We use [oxfmt](https://oxc.rs/docs/guide/usage/formatter) for code formatting.
+
+**VSCode:**
+Install the [oxc-vscode](https://oxc.rs/docs/contribute/vscode) extension from the Visual Studio Marketplace, then add to your settings:
+
+```json
+    "editor.formatOnSave": true,
     "editor.tabSize": 2,
 ```
 
+**JetBrains (WebStorm, IntelliJ, etc.):**
+Install the [Oxc plugin](https://plugins.jetbrains.com/plugin/27061-oxc) from the JetBrains Marketplace.
+
+**CLI:**
+```bash
+pnpm format        # format all files
+pnpm format-check  # check without writing
+```
+
+### Unused Exports
+
+[Knip](https://knip.dev/) runs in CI as part of `pnpm lint` and fails on exports that nothing
+imports. If an unused export has to stay (for example, an upcoming PR depends on it), tag it:
+
+```ts
+/** @allowunused TODO(your-github-username): remove once X lands. */
+export function futureThing() {}
+```
+
+The owner is required so suppressions don't accumulate with nobody responsible for removing them.
+A lint rule (`teleport/allowunused-todo`) enforces the format. Knip only reads JSDoc, so the tag
+must be in a `/** */` comment attached to the export.
+
 ### MFA Development
+
+#### Local cluster with nip.io
 
 When developing MFA sections of the codebase, you may need to configure the `teleport.yaml` of your target teleport cluster to accept hardware keys registered over the local development setup. Webauthn can get tempermental if you try to use localhost as your `rp_id`, but you can get around this by using https://nip.io/. For example, if you want to configure optional `webauthn` mfa, you can set up your auth service like so:
 
@@ -266,30 +229,84 @@ proxy_service:
   public_addr: ['proxy.127.0.0.1.nip.io']
 ```
 
-Then start the dev server like `yarn start-teleport --target=https://proxy.127.0.0.1.nip.io:3080` and access it at https://proxy.127.0.0.1.nip.io:8080.
+Then start the dev server like `PROXY_TARGET=https://proxy.127.0.0.1.nip.io:3080 pnpm start-teleport` and access it at https://proxy.127.0.0.1.nip.io:8080.
+
+#### Local cluster with /etc/hosts
+
+Unlike the method above, this one requires no changes to an existing local cluster.
+
+If you have entries for your cluster in `/etc/hosts` and your cluster is configured to use something
+like `teleport.test:3080` as the public address of the proxy service, you can just set a proxy
+target to that public address. Then instead of accessing the Vite proxy at `localhost:8080`, you can
+access it at `teleport.test:8080`. MFA will work fine since RP ID will still be `teleport.test`.
+
+#### Remote cluster with socat
+
+Update `/etc/hosts` to override DNS resolution of your proxy addr, e.g my proxy is at alpha.devteleport.com:
+
+```
+::1 alpha.devteleport.com
+127.0.0.1 alpha.devteleport.com
+```
+
+Assuming you've properly configured DNS with a wildcard subdomain record: start a transparent TCP
+proxy that forwards to the Teleport proxy using whatever sub-sub domain (has to be nested twice to
+avoid being routed to teleport app access). AWS route53 wildcard records work for any subdomain
+nesting level. Alternatively, hardcode the real teleport proxy's IP. e.g. with `socat` (`brew install
+socat`):
+
+```
+sudo socat -d2 TCP-LISTEN:443,reuseaddr,fork TCP:x.y.alpha.devteleport.com:443
+```
+
+Generate certs for your proxy's domain as described in [Local HTTPS](#local-https). Start the local
+dev UI server:
+
+```
+PROXY_TARGET=alpha.devteleport.com:443 pnpm start-teleport
+```
+
+This makes your browser, tsh, and anything else on your system that respects `/etc/hosts` think it's
+talking to your proxy directly, but it's actually being forwarded without TLS termination by
+`socat`, allowing Webauthn to work as well as TLS verification. You can now go to either port 443 or
+3000 with your actual teleport proxy address - 443 will go to the remote proxy's web UI, 3000 will
+go to the local dev web UI. This can be used to run a dev web UI even for Teleport clusters you do
+not own.
 
 ### Adding Packages/Dependencies
 
-We use Yarn Workspaces to manage dependencies.
+We use [pnpm workspaces](https://pnpm.io/workspaces) to manage dependencies.
 
-- [Introducing Workspaces](https://yarnpkg.com/blog/2017/08/02/introducing-workspaces)
-- [Workspaces Documentation](https://yarnpkg.com/en/docs/workspaces)
+To add a package to the workspace, run `pnpm --filter=<workspace-name> add <package-name>`.
+Alternatively, you can add a line to the workspace's `package.json` file and then
+run `pnpm install` (or `pnpm i`) from the root of this repository.
 
-The easiest way to add a package is to add a line to the workspace's `package.json` file and then run `yarn install` from
-the root of this repository.
+Dependencies should generally be added to the specific workspaces that use them.
+For instance, if you need a new dependency for Web UI, add it to `packages/teleport/package.json`.
+Similarly, if you're adding a new ESLint plugin, include it in `packages/build/package.json`.
+If a dependency is imported in, for example, `packages/shared` and `packages/teleterm`
+add it to both of them (that's what we'd have to do if they were real packages
+published to a registry).
 
-Keep in mind that there should only be a single `yarn.lock` in this repository, here at the top level. If you add packages
-via `yarn workspace <workspace-name> add <package-name>`, it will create a `packages/<package-name>/yarn.lock` file, which should not be checked in.
+However, there are cases where dependencies should be added not in a workspace, but
+in the root `package.json`:
+
+1. Dependencies imported in `e` code (we can't declare dependencies in `e/web/teleport/package.json`
+to avoid generating a different lockfile when `e` isn't cloned).
+For example, `react` - it is imported in every package (in `e` too), so it
+needs to be kept in the root.
+2. CLI tools which are run from the root of the repo, like `oxfmt`.
 
 ### Adding an Audit Event
 
 When a new event is added to Teleport, the web UI has to be updated to display it correctly:
 
-1. Add a new entry to [`eventCodes`](https://github.com/gravitational/webapps/blob/8a0201667f045be7a46606189a6deccdaee2fe1f/packages/teleport/src/services/audit/types.ts).
-2. Add a new entry to [`RawEvents`](https://github.com/gravitational/webapps/blob/8a0201667f045be7a46606189a6deccdaee2fe1f/packages/teleport/src/services/audit/types.ts) using the event you just created as the key. The fields should match the fields of the metadata fields on `events.proto` on Teleport repository.
-3. Add a new entry in [Formatters](https://github.com/gravitational/webapps/blob/8a0201667f045be7a46606189a6deccdaee2fe1f/packages/teleport/src/services/audit/makeEvent.ts) to format the event on the events table. The `format` function will receive the event you added to `RawEvents` as parameter.
-4. Define an icon to the event on [`EventIconMap`](https://github.com/gravitational/webapps/blob/8a0201667f045be7a46606189a6deccdaee2fe1f/packages/teleport/src/Audit/EventList/EventTypeCell.tsx).
-5. Add an entry to the [`events`](https://github.com/gravitational/webapps/blob/8a0201667f045be7a46606189a6deccdaee2fe1f/packages/teleport/src/Audit/fixtures/index.ts) array so it will show up on the [`AllEvents` story](https://github.com/gravitational/webapps/blob/8a0201667f045be7a46606189a6deccdaee2fe1f/packages/teleport/src/Audit/Audit.story.tsx)
-6. Check fixture is rendered in storybook, then update snapshot for `Audit.story.test.tsx` using `yarn test-update-snapshot`.
+1. Add a new entry to [`eventCodes`](https://github.com/gravitational/teleport/blob/master/web/packages/teleport/src/services/audit/types.ts).
+2. Add a new entry to [`RawEvents`](https://github.com/gravitational/teleport/blob/master/web/packages/teleport/src/services/audit/types.ts) using the event you just created as the key. The fields should match the fields of the metadata fields on `events.proto` on Teleport repository.
+3. Add a new entry in [`formatters`](https://github.com/gravitational/teleport/blob/master/web/packages/teleport/src/services/audit/makeEvent.ts) to format the event on the events table. The `format` function will receive the event you added to `RawEvents` as parameter.
+4. Define an icon to the event on [`EventIconMap`](https://github.com/gravitational/teleport/blob/master/web/packages/teleport/src/Audit/EventList/EventTypeCell.tsx).
+5. Add an entry to the [`events`](https://github.com/gravitational/teleport/blob/master/web/packages/teleport/src/Audit/fixtures/index.ts) array so it will show up on the [`AllPossibleEvents` story](https://github.com/gravitational/teleport/blob/master/web/packages/teleport/src/Audit/Audit.story.tsx). Keep in mind that we generate the audit event reference in the documentation from audit event fixtures, so the fixture should be something you are comfortable including as an example in public-facing documentation (see the [generator](https://github.com/gravitational/teleport/tree/master/web/packages/teleport/src/services/audit/gen-event-reference)).
+6. Check that the fixture is rendered in storybook, then update the snapshot for `Audit.story.test.tsx` using `pnpm test-update-snapshot`.
+7. Run `make audit-event-reference`
 
-You can see an example in [this pr](https://github.com/gravitational/webapps/pull/561).
+You can see an example in [this PR](https://github.com/gravitational/teleport/pull/39872).

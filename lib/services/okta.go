@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
@@ -21,9 +23,20 @@ import (
 
 	"github.com/gravitational/trace"
 
+	"github.com/gravitational/teleport/api/client/okta"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/utils"
 )
+
+// Compile time checks for the Okta client.
+var _ OktaImportRules = (*okta.Client)(nil)
+var _ OktaAssignments = (*okta.Client)(nil)
+
+// Okta is an Okta interface for both the rules and assignments.
+type Okta interface {
+	OktaImportRules
+	OktaAssignments
+}
 
 // OktaImportRules defines an interface for managing OktaImportRules.
 type OktaImportRules interface {
@@ -32,37 +45,45 @@ type OktaImportRules interface {
 	// GetOktaImportRule returns the specified Okta import rule resources.
 	GetOktaImportRule(ctx context.Context, name string) (types.OktaImportRule, error)
 	// CreateOktaImportRule creates a new Okta import rule resource.
-	CreateOktaImportRule(context.Context, types.OktaImportRule) error
+	CreateOktaImportRule(context.Context, types.OktaImportRule) (types.OktaImportRule, error)
 	// UpdateOktaImportRule updates an existing Okta import rule resource.
-	UpdateOktaImportRule(context.Context, types.OktaImportRule) error
+	UpdateOktaImportRule(context.Context, types.OktaImportRule) (types.OktaImportRule, error)
 	// DeleteOktaImportRule removes the specified Okta import rule resource.
 	DeleteOktaImportRule(ctx context.Context, name string) error
 	// DeleteAllOktaImportRules removes all Okta import rules.
 	DeleteAllOktaImportRules(context.Context) error
 }
 
-// OktaAssignments defines an interface for managing OktaAssignments.
-type OktaAssignments interface {
+// OktaAssignmentsGetter defines an interface for reading OktaAssignments.
+type OktaAssignmentsGetter interface {
 	// ListOktaAssignments returns a paginated list of all Okta assignment resources.
 	ListOktaAssignments(context.Context, int, string) ([]types.OktaAssignment, string, error)
-	// GetOktaAssignmentreturns the specified Okta assignment resources.
+	// GetOktaAssignment returns the specified Okta assignment resources.
 	GetOktaAssignment(ctx context.Context, name string) (types.OktaAssignment, error)
-	// CreateOktaAssignmentcreates a new Okta assignment resource.
-	CreateOktaAssignment(context.Context, types.OktaAssignment) error
-	// UpdateOktaAssignmentupdates an existing Okta assignment resource.
-	UpdateOktaAssignment(context.Context, types.OktaAssignment) error
-	// DeleteOktaAssignmentremoves the specified Okta assignment resource.
+}
+
+// OktaAssignments defines an interface for managing OktaAssignments.
+type OktaAssignments interface {
+	OktaAssignmentsGetter
+
+	// CreateOktaAssignment creates a new Okta assignment resource.
+	CreateOktaAssignment(context.Context, types.OktaAssignment) (types.OktaAssignment, error)
+	// UpdateOktaAssignment updates an existing Okta assignment resource.
+	UpdateOktaAssignment(context.Context, types.OktaAssignment) (types.OktaAssignment, error)
+	// ConditionalUpdateOktaAssignment updates an existing Okta assignment resource, protected by optimistic locking.
+	ConditionalUpdateOktaAssignment(context.Context, types.OktaAssignment) (types.OktaAssignment, error)
+	// UpsertOktaAssignment upsert an Okta assignment.
+	UpsertOktaAssignment(context.Context, types.OktaAssignment) (types.OktaAssignment, error)
+	// DeleteOktaAssignment removes the specified Okta assignment resource.
 	DeleteOktaAssignment(ctx context.Context, name string) error
+	// ConditionalDeleteOktaAssignment removes the specified Okta assignment resource, protected by optimistic locking.
+	ConditionalDeleteOktaAssignment(ctx context.Context, name, revision string) error
 	// DeleteAllOktaAssignments removes all Okta assignments.
 	DeleteAllOktaAssignments(context.Context) error
 }
 
 // MarshalOktaImportRule marshals the Okta import rule resource to JSON.
 func MarshalOktaImportRule(importRule types.OktaImportRule, opts ...MarshalOption) ([]byte, error) {
-	if err := importRule.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	cfg, err := CollectOptions(opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -70,12 +91,11 @@ func MarshalOktaImportRule(importRule types.OktaImportRule, opts ...MarshalOptio
 
 	switch i := importRule.(type) {
 	case *types.OktaImportRuleV1:
-		if !cfg.PreserveResourceID {
-			copy := *i
-			copy.SetResourceID(0)
-			i = &copy
+		if err := i.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		return utils.FastMarshal(i)
+
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, i))
 	default:
 		return nil, trace.BadParameter("unsupported Okta import rule resource %T", i)
 	}
@@ -98,13 +118,13 @@ func UnmarshalOktaImportRule(data []byte, opts ...MarshalOption) (types.OktaImpo
 	case types.V1:
 		var i types.OktaImportRuleV1
 		if err := utils.FastUnmarshal(data, &i); err != nil {
-			return nil, trace.BadParameter(err.Error())
+			return nil, trace.BadParameter("%s", err)
 		}
 		if err := i.CheckAndSetDefaults(); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		if cfg.ID != 0 {
-			i.SetResourceID(cfg.ID)
+		if cfg.Revision != "" {
+			i.SetRevision(cfg.Revision)
 		}
 		if !cfg.Expires.IsZero() {
 			i.SetExpiry(cfg.Expires)
@@ -116,10 +136,6 @@ func UnmarshalOktaImportRule(data []byte, opts ...MarshalOption) (types.OktaImpo
 
 // MarshalOktaAssignment marshals the Okta assignment resource to JSON.
 func MarshalOktaAssignment(assignment types.OktaAssignment, opts ...MarshalOption) ([]byte, error) {
-	if err := assignment.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	cfg, err := CollectOptions(opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -127,12 +143,11 @@ func MarshalOktaAssignment(assignment types.OktaAssignment, opts ...MarshalOptio
 
 	switch a := assignment.(type) {
 	case *types.OktaAssignmentV1:
-		if !cfg.PreserveResourceID {
-			copy := *a
-			copy.SetResourceID(0)
-			a = &copy
+		if err := a.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		return utils.FastMarshal(a)
+
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, a))
 	default:
 		return nil, trace.BadParameter("unsupported Okta assignment resource %T", a)
 	}
@@ -155,13 +170,13 @@ func UnmarshalOktaAssignment(data []byte, opts ...MarshalOption) (types.OktaAssi
 	case types.V1:
 		var a types.OktaAssignmentV1
 		if err := utils.FastUnmarshal(data, &a); err != nil {
-			return nil, trace.BadParameter(err.Error())
+			return nil, trace.BadParameter("%s", err)
 		}
 		if err := a.CheckAndSetDefaults(); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		if cfg.ID != 0 {
-			a.SetResourceID(cfg.ID)
+		if cfg.Revision != "" {
+			a.SetRevision(cfg.Revision)
 		}
 		if !cfg.Expires.IsZero() {
 			a.SetExpiry(cfg.Expires)

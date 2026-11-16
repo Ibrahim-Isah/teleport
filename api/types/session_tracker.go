@@ -17,6 +17,7 @@ limitations under the License.
 package types
 
 import (
+	"slices"
 	"time"
 
 	"github.com/gravitational/trace"
@@ -24,22 +25,37 @@ import (
 	"github.com/gravitational/teleport/api/defaults"
 )
 
-const (
-	SSHSessionKind            SessionKind            = "ssh"
-	KubernetesSessionKind     SessionKind            = "k8s"
-	DatabaseSessionKind       SessionKind            = "db"
-	AppSessionKind            SessionKind            = "app"
-	WindowsDesktopSessionKind SessionKind            = "desktop"
-	SessionObserverMode       SessionParticipantMode = "observer"
-	SessionModeratorMode      SessionParticipantMode = "moderator"
-	SessionPeerMode           SessionParticipantMode = "peer"
-)
-
 // SessionKind is a type of session.
 type SessionKind string
 
+// These represent the possible values for the kind field in session trackers.
+const (
+	// SSHSessionKind is the kind used for session tracking with the
+	// session_tracker resource used in Teleport 9+. Note that it is
+	// different from the legacy [types.KindSSHSession] value that was
+	// used prior to the introduction of moderated sessions.
+	SSHSessionKind            SessionKind = "ssh"
+	KubernetesSessionKind     SessionKind = "k8s"
+	DatabaseSessionKind       SessionKind = "db"
+	AppSessionKind            SessionKind = "app"
+	WindowsDesktopSessionKind SessionKind = "desktop"
+	LinuxDesktopSessionKind   SessionKind = "linuxdesktop"
+	GitSessionKind            SessionKind = "git"
+	UnknownSessionKind        SessionKind = ""
+
+	// BeamSummarySessionKind is a synthetic session kind used to select an
+	// InferencePolicy for beam activity summarization.
+	BeamSummarySessionKind SessionKind = "beam"
+)
+
 // SessionParticipantMode is the mode that determines what you can do when you join a session.
 type SessionParticipantMode string
+
+const (
+	SessionObserverMode  SessionParticipantMode = "observer"
+	SessionModeratorMode SessionParticipantMode = "moderator"
+	SessionPeerMode      SessionParticipantMode = "peer"
+)
 
 // SessionTracker is a resource which tracks an active session.
 type SessionTracker interface {
@@ -94,7 +110,7 @@ type SessionTracker interface {
 	RemoveParticipant(string) error
 
 	// UpdatePresence updates presence timestamp of a participant.
-	UpdatePresence(string) error
+	UpdatePresence(username string, cluster string, t time.Time) error
 
 	// GetKubeCluster returns the name of the kubernetes cluster the session is running in.
 	GetKubeCluster() string
@@ -118,6 +134,15 @@ type SessionTracker interface {
 
 	// GetLastActive returns the time at which the session was last active (i.e used by any participant).
 	GetLastActive() time.Time
+
+	// HostID is the target host id that created the session tracker.
+	GetHostID() string
+
+	// GetTargetSubKind returns the sub kind of the target server.
+	GetTargetSubKind() string
+
+	// GetCommand returns the command that initiated the session.
+	GetCommand() []string
 }
 
 func NewSessionTracker(spec SessionTrackerSpecV1) (SessionTracker, error) {
@@ -252,7 +277,7 @@ func (s *SessionTrackerV1) AddParticipant(participant Participant) {
 func (s *SessionTrackerV1) RemoveParticipant(id string) error {
 	for i, participant := range s.Spec.Participants {
 		if participant.ID == id {
-			s.Spec.Participants = append(s.Spec.Participants[:i], s.Spec.Participants[i+1:]...)
+			s.Spec.Participants[i], s.Spec.Participants = s.Spec.Participants[len(s.Spec.Participants)-1], s.Spec.Participants[:len(s.Spec.Participants)-1]
 			return nil
 		}
 	}
@@ -265,6 +290,11 @@ func (s *SessionTrackerV1) RemoveParticipant(id string) error {
 // This is only valid for kubernetes sessions.
 func (s *SessionTrackerV1) GetKubeCluster() string {
 	return s.Spec.KubernetesCluster
+}
+
+// HostID is the target host id that created the session tracker.
+func (s *SessionTrackerV1) GetHostID() string {
+	return s.Spec.HostID
 }
 
 // GetDesktopName returns the name of the Windows desktop the session is running in.
@@ -295,15 +325,22 @@ func (s *SessionTrackerV1) GetHostUser() string {
 }
 
 // UpdatePresence updates presence timestamp of a participant.
-func (s *SessionTrackerV1) UpdatePresence(user string) error {
-	for _, participant := range s.Spec.Participants {
-		if participant.User == user {
-			participant.LastActive = time.Now().UTC()
-			return nil
-		}
+func (s *SessionTrackerV1) UpdatePresence(user, userCluster string, t time.Time) error {
+	idx := slices.IndexFunc(s.Spec.Participants, func(participant Participant) bool {
+		// participant.Cluster == "" is a legacy participant that was created
+		// before cluster field was added, so we allow updating presence for
+		// such participants as well.
+		// TODO(tigrato): Remove this in version 20.0.0
+		// TODO(tigrato): DELETE IN 20.0.0
+		return participant.User == user && (participant.Cluster == userCluster || participant.Cluster == "")
+	})
+
+	if idx < 0 {
+		return trace.NotFound("participant %v not found", user)
 	}
 
-	return trace.NotFound("participant %v not found", user)
+	s.Spec.Participants[idx].LastActive = t
+	return nil
 }
 
 // GetHostPolicySets returns a list of policy sets held by the host user at the time of session creation.
@@ -323,6 +360,16 @@ func (s *SessionTrackerV1) GetLastActive() time.Time {
 	}
 
 	return last
+}
+
+// GetTargetSubKind returns the sub kind of the target server.
+func (s *SessionTrackerV1) GetTargetSubKind() string {
+	return s.Spec.TargetSubKind
+}
+
+// GetCommand returns command that intiated the session.
+func (s *SessionTrackerV1) GetCommand() []string {
+	return s.Spec.InitialCommand
 }
 
 // Match checks if a given session tracker matches this filter.

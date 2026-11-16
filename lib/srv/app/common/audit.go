@@ -1,33 +1,37 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 
-	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
 	awsutils "github.com/gravitational/teleport/lib/utils/aws"
 )
@@ -41,9 +45,11 @@ type Audit interface {
 	// OnSessionChunk is called when a new session chunk is created.
 	OnSessionChunk(ctx context.Context, serverID, chunkID string, identity *tlsca.Identity, app types.Application) error
 	// OnRequest is called when an app request is sent during the session and a response is received.
-	OnRequest(ctx context.Context, sessionCtx *SessionContext, req *http.Request, status uint32, re *endpoints.ResolvedEndpoint) error
+	OnRequest(ctx context.Context, sessionCtx *SessionContext, req *http.Request, status uint32, re *AWSResolvedEndpoint) error
 	// OnDynamoDBRequest is called when app request for a DynamoDB API is sent and a response is received.
-	OnDynamoDBRequest(ctx context.Context, sessionCtx *SessionContext, req *http.Request, status uint32, re *endpoints.ResolvedEndpoint) error
+	OnDynamoDBRequest(ctx context.Context, sessionCtx *SessionContext, req *http.Request, status uint32, re *AWSResolvedEndpoint) error
+	// OnLLMRequest is called when app request for LLM inference endpoint is sent and a response is received.
+	OnLLMRequest(ctx context.Context, sessionCtx *SessionContext, req *http.Request, llmReq LLMRequest, llmResp LLMResponse) error
 	// EmitEvent emits the provided audit event.
 	EmitEvent(ctx context.Context, event apievents.AuditEvent) error
 }
@@ -52,12 +58,17 @@ type Audit interface {
 type AuditConfig struct {
 	// Emitter is used to emit audit events.
 	Emitter apievents.Emitter
+	// Recorder is used to record session events.
+	Recorder events.SessionPreparerRecorder
 }
 
 // Check validates the config.
 func (c *AuditConfig) Check() error {
 	if c.Emitter == nil {
 		return trace.BadParameter("missing Emitter")
+	}
+	if c.Recorder == nil {
+		return trace.BadParameter("missing Recorder")
 	}
 	return nil
 }
@@ -67,7 +78,7 @@ type audit struct {
 	// cfg is the audit events emitter configuration.
 	cfg AuditConfig
 	// log is used for logging
-	log logrus.FieldLogger
+	log *slog.Logger
 }
 
 // NewAudit returns a new instance of the audit events emitter.
@@ -77,8 +88,16 @@ func NewAudit(config AuditConfig) (Audit, error) {
 	}
 	return &audit{
 		cfg: config,
-		log: logrus.WithField(trace.Component, "app:audit"),
+		log: slog.With(teleport.ComponentKey, "app:audit"),
 	}, nil
+}
+
+func getSessionMetadata(identity *tlsca.Identity) apievents.SessionMetadata {
+	return apievents.SessionMetadata{
+		SessionID:        identity.RouteToApp.SessionID,
+		WithMFA:          identity.MFAVerified,
+		PrivateKeyPolicy: string(identity.PrivateKeyPolicy),
+	}
 }
 
 // OnSessionStart is called when new app session starts.
@@ -90,14 +109,12 @@ func (a *audit) OnSessionStart(ctx context.Context, serverID string, identity *t
 			ClusterName: identity.RouteToApp.ClusterName,
 		},
 		ServerMetadata: apievents.ServerMetadata{
+			ServerVersion:   teleport.Version,
 			ServerID:        serverID,
 			ServerNamespace: apidefaults.Namespace,
 		},
-		SessionMetadata: apievents.SessionMetadata{
-			SessionID: identity.RouteToApp.SessionID,
-			WithMFA:   identity.MFAVerified,
-		},
-		UserMetadata: identity.GetUserMetadata(),
+		SessionMetadata: getSessionMetadata(identity),
+		UserMetadata:    identity.GetUserMetadata(),
 		ConnectionMetadata: apievents.ConnectionMetadata{
 			RemoteAddr: identity.LoginIP,
 		},
@@ -105,6 +122,7 @@ func (a *audit) OnSessionStart(ctx context.Context, serverID string, identity *t
 			AppURI:        app.GetURI(),
 			AppPublicAddr: app.GetPublicAddr(),
 			AppName:       app.GetName(),
+			AppTargetPort: uint32(identity.RouteToApp.TargetPort),
 		},
 	}
 	return trace.Wrap(a.EmitEvent(ctx, event))
@@ -119,14 +137,12 @@ func (a *audit) OnSessionEnd(ctx context.Context, serverID string, identity *tls
 			ClusterName: identity.RouteToApp.ClusterName,
 		},
 		ServerMetadata: apievents.ServerMetadata{
+			ServerVersion:   teleport.Version,
 			ServerID:        serverID,
 			ServerNamespace: apidefaults.Namespace,
 		},
-		SessionMetadata: apievents.SessionMetadata{
-			SessionID: identity.RouteToApp.SessionID,
-			WithMFA:   identity.MFAVerified,
-		},
-		UserMetadata: identity.GetUserMetadata(),
+		SessionMetadata: getSessionMetadata(identity),
+		UserMetadata:    identity.GetUserMetadata(),
 		ConnectionMetadata: apievents.ConnectionMetadata{
 			RemoteAddr: identity.LoginIP,
 		},
@@ -134,6 +150,7 @@ func (a *audit) OnSessionEnd(ctx context.Context, serverID string, identity *tls
 			AppURI:        app.GetURI(),
 			AppPublicAddr: app.GetPublicAddr(),
 			AppName:       app.GetName(),
+			AppTargetPort: uint32(identity.RouteToApp.TargetPort),
 		},
 	}
 	return trace.Wrap(a.EmitEvent(ctx, event))
@@ -141,6 +158,14 @@ func (a *audit) OnSessionEnd(ctx context.Context, serverID string, identity *tls
 
 // OnSessionChunk is called when a new session chunk is created.
 func (a *audit) OnSessionChunk(ctx context.Context, serverID, chunkID string, identity *tlsca.Identity, app types.Application) error {
+	// Enforce IP Pinning if it is present in the user's certificate.
+	var clientAddr string
+	if clientSrcAddr, err := authz.ClientSrcAddrFromContext(ctx); err == nil {
+		clientAddr = clientSrcAddr.String()
+	} else {
+		clientAddr = identity.LoginIP
+	}
+
 	event := &apievents.AppSessionChunk{
 		Metadata: apievents.Metadata{
 			Type:        events.AppSessionChunkEvent,
@@ -148,26 +173,40 @@ func (a *audit) OnSessionChunk(ctx context.Context, serverID, chunkID string, id
 			ClusterName: identity.RouteToApp.ClusterName,
 		},
 		ServerMetadata: apievents.ServerMetadata{
+			ServerVersion:   teleport.Version,
 			ServerID:        serverID,
 			ServerNamespace: apidefaults.Namespace,
 		},
-		SessionMetadata: apievents.SessionMetadata{
-			SessionID: identity.RouteToApp.SessionID,
-			WithMFA:   identity.MFAVerified,
+		ConnectionMetadata: apievents.ConnectionMetadata{
+			LocalAddr:  clientAddr,
+			RemoteAddr: app.GetURI(),
+			Protocol:   events.EventProtocolApp,
 		},
-		UserMetadata: identity.GetUserMetadata(),
+		SessionMetadata: getSessionMetadata(identity),
+		UserMetadata:    identity.GetUserMetadata(),
 		AppMetadata: apievents.AppMetadata{
 			AppURI:        app.GetURI(),
 			AppPublicAddr: app.GetPublicAddr(),
 			AppName:       app.GetName(),
+			AppLabels:     app.GetAllLabels(),
+			// Session chunks are not created for TCP apps, so there's no need to pass TargetPort here.
 		},
 		SessionChunkID: chunkID,
+		Participants: []string{services.UsernameForCluster(
+			services.UsernameForClusterConfig{
+				User:              identity.Username,
+				OriginClusterName: identity.OriginClusterName,
+				LocalClusterName:  identity.TeleportCluster,
+			},
+		)},
 	}
 	return trace.Wrap(a.EmitEvent(ctx, event))
 }
 
 // OnRequest is called when an app request is sent during the session and a response is received.
-func (a *audit) OnRequest(ctx context.Context, sessionCtx *SessionContext, req *http.Request, status uint32, re *endpoints.ResolvedEndpoint) error {
+//
+// This event only goes to app session recording (chunk).
+func (a *audit) OnRequest(ctx context.Context, sessionCtx *SessionContext, req *http.Request, status uint32, re *AWSResolvedEndpoint) error {
 	event := &apievents.AppSessionRequest{
 		Metadata: apievents.Metadata{
 			Type: events.AppSessionRequestEvent,
@@ -180,16 +219,16 @@ func (a *audit) OnRequest(ctx context.Context, sessionCtx *SessionContext, req *
 		StatusCode:         status,
 		AWSRequestMetadata: *MakeAWSRequestMetadata(req, re),
 	}
-	return trace.Wrap(a.EmitEvent(ctx, event))
+	return trace.Wrap(a.recordEvent(ctx, event))
 }
 
 // OnDynamoDBRequest is called when a DynamoDB app request is sent during the session.
-func (a *audit) OnDynamoDBRequest(ctx context.Context, sessionCtx *SessionContext, req *http.Request, status uint32, re *endpoints.ResolvedEndpoint) error {
+func (a *audit) OnDynamoDBRequest(ctx context.Context, sessionCtx *SessionContext, req *http.Request, status uint32, re *AWSResolvedEndpoint) error {
 	// Try to read the body and JSON unmarshal it.
 	// If this fails, we still want to emit the rest of the event info; the request event Body is nullable, so it's ok if body is left nil here.
 	body, err := awsutils.UnmarshalRequestBody(req)
 	if err != nil {
-		a.log.WithError(err).Warn("Failed to read request body as JSON, omitting the body from the audit event.")
+		a.log.WarnContext(ctx, "Failed to read request body as JSON, omitting the body from the audit event.", "error", err)
 	}
 	// get the API target from the request header, according to the API request format documentation:
 	// https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Programming.LowLevelAPI.html#Programming.LowLevelAPI.RequestFormat
@@ -213,9 +252,56 @@ func (a *audit) OnDynamoDBRequest(ctx context.Context, sessionCtx *SessionContex
 	return trace.Wrap(a.EmitEvent(ctx, event))
 }
 
-// EmitEvent emits the provided audit event.
-func (a *audit) EmitEvent(ctx context.Context, event apievents.AuditEvent) error {
-	return trace.Wrap(a.cfg.Emitter.EmitAuditEvent(ctx, event))
+// OnLLMRequest is called when app request for LLM inference endpoint is sent and a response is received.
+//
+// This event only goes to app session recording (chunk).
+func (a *audit) OnLLMRequest(ctx context.Context, sessionCtx *SessionContext, req *http.Request, llmReq LLMRequest, llmResp LLMResponse) error {
+	event := &apievents.AppSessionLLMRequest{
+		Metadata: apievents.Metadata{
+			Type: events.AppSessionLLMRequestSuccessEvent,
+			Code: events.AppSessionLLMRequestSuccessCode,
+		},
+		Status: apievents.Status{
+			Success: true,
+		},
+		AppMetadata:      *MakeAppMetadata(sessionCtx.App),
+		Method:           req.Method,
+		Path:             req.URL.Path,
+		Provider:         llmReq.Provider,
+		Model:            llmReq.Model,
+		RequestedModel:   llmReq.RequestedModel,
+		InputTokenCount:  int64(llmResp.InputTokenCount),
+		OutputTokenCount: int64(llmResp.OutputTokenCount),
+	}
+	if llmResp.Error != nil {
+		event.Metadata.Type = events.AppSessionLLMRequestFailureEvent
+		event.Metadata.Code = events.AppSessionLLMRequestFailureCode
+		event.Status.Success = false
+		event.Status.Error = llmResp.Error.Error()
+	}
+	return trace.Wrap(a.recordEvent(ctx, event))
+}
+
+// EmitEvent emits and records the provided audit event.
+func (a *audit) EmitEvent(ctx context.Context, e apievents.AuditEvent) error {
+	preparedEvent, err := a.cfg.Recorder.PrepareSessionEvent(e)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	return trace.NewAggregate(
+		a.cfg.Recorder.RecordEvent(ctx, preparedEvent),
+		a.cfg.Emitter.EmitAuditEvent(ctx, preparedEvent.GetAuditEvent()),
+	)
+}
+
+func (a *audit) recordEvent(ctx context.Context, e apievents.AuditEvent) error {
+	preparedEvent, err := a.cfg.Recorder.PrepareSessionEvent(e)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	return trace.Wrap(a.cfg.Recorder.RecordEvent(ctx, preparedEvent))
 }
 
 // MakeAppMetadata returns common server metadata for database session.
@@ -229,7 +315,7 @@ func MakeAppMetadata(app types.Application) *apievents.AppMetadata {
 
 // MakeAWSRequestMetadata is a helper to build AWSRequestMetadata from the provided request and endpoint.
 // If the aws endpoint is nil, returns an empty request metadata.
-func MakeAWSRequestMetadata(req *http.Request, awsEndpoint *endpoints.ResolvedEndpoint) *apievents.AWSRequestMetadata {
+func MakeAWSRequestMetadata(req *http.Request, awsEndpoint *AWSResolvedEndpoint) *apievents.AWSRequestMetadata {
 	if awsEndpoint == nil {
 		return &apievents.AWSRequestMetadata{}
 	}

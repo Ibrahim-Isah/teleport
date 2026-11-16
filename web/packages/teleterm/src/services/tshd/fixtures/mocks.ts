@@ -1,121 +1,137 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+import { Timestamp } from 'gen-proto-ts/google/protobuf/timestamp_pb';
+import { ClientVersionStatus } from 'gen-proto-ts/teleport/lib/teleterm/v1/auth_settings_pb';
+
 import {
-  Application,
-  AuthSettings,
-  AccessRequest,
-  Cluster,
-  CreateAccessRequestParams,
-  CreateGatewayParams,
-  Database,
-  Gateway,
-  GetDatabasesResponse,
-  GetKubesResponse,
-  GetRequestableRolesParams,
-  GetServersResponse,
-  Kube,
-  LoginLocalParams,
-  LoginPasswordlessParams,
-  LoginSsoParams,
-  ReviewAccessRequestParams,
-  Server,
-  ServerSideParams,
-  TshAbortController,
-  TshAbortSignal,
-  TshClient,
-  GetRequestableRolesResponse,
-} from '../types';
+  makeApp,
+  makeAppGateway,
+  makeRootCluster,
+} from 'teleterm/services/tshd/testHelpers';
+import { getDefaultUnifiedResourcePreferences } from 'teleterm/ui/services/workspacesService';
 
-export class MockTshClient implements TshClient {
-  listRootClusters: () => Promise<Cluster[]>;
-  listLeafClusters: (clusterUri: string) => Promise<Cluster[]>;
-  listApps: (clusterUri: string) => Promise<Application[]>;
-  getAllKubes: (clusterUri: string) => Promise<Kube[]>;
-  getKubes: (params: ServerSideParams) => Promise<GetKubesResponse>;
-  getAllDatabases: (clusterUri: string) => Promise<Database[]>;
-  getDatabases: (params: ServerSideParams) => Promise<GetDatabasesResponse>;
-  listDatabaseUsers: (dbUri: string) => Promise<string[]>;
-  getAllServers: (clusterUri: string) => Promise<Server[]>;
-  getRequestableRoles: (
-    params: GetRequestableRolesParams
-  ) => Promise<GetRequestableRolesResponse>;
-  getServers: (params: ServerSideParams) => Promise<GetServersResponse>;
-  assumeRole: (
-    clusterUri: string,
-    requestIds: string[],
-    dropIds: string[]
-  ) => Promise<void>;
-  deleteAccessRequest: (clusterUri: string, requestId: string) => Promise<void>;
-  getAccessRequests: (clusterUri: string) => Promise<AccessRequest[]>;
-  getAccessRequest: (
-    clusterUri: string,
-    requestId: string
-  ) => Promise<AccessRequest>;
-  reviewAccessRequest: (
-    clusterUri: string,
-    params: ReviewAccessRequestParams
-  ) => Promise<AccessRequest>;
-  createAccessRequest: (
-    params: CreateAccessRequestParams
-  ) => Promise<AccessRequest>;
-  listServers: (clusterUri: string) => Promise<Server[]>;
-  createAbortController: () => TshAbortController;
-  addRootCluster: (addr: string) => Promise<Cluster>;
+import { MockedUnaryCall } from '../cloneableClient';
+import { TshdClient, VnetClient } from '../createClient';
 
-  listGateways: () => Promise<Gateway[]>;
-  createGateway: (params: CreateGatewayParams) => Promise<Gateway>;
-  removeGateway: (gatewayUri: string) => Promise<undefined>;
-  setGatewayTargetSubresourceName: (
-    gatewayUri: string,
-    targetSubresourceName: string
-  ) => Promise<Gateway>;
-  setGatewayLocalPort: (
-    gatewayUri: string,
-    localPort: string
-  ) => Promise<Gateway>;
-
-  getCluster: (clusterUri: string) => Promise<Cluster>;
-  getAuthSettings: (clusterUri: string) => Promise<AuthSettings>;
-  removeCluster: (clusterUri: string) => Promise<undefined>;
-  loginLocal: (
-    params: LoginLocalParams,
-    abortSignal?: TshAbortSignal
-  ) => Promise<undefined>;
-  loginSso: (
-    params: LoginSsoParams,
-    abortSignal?: TshAbortSignal
-  ) => Promise<undefined>;
-  loginPasswordless: (
-    params: LoginPasswordlessParams,
-    abortSignal?: TshAbortSignal
-  ) => Promise<undefined>;
-  logout: (clusterUri: string) => Promise<undefined>;
-  transferFile: () => undefined;
-  reportUsageEvent: () => undefined;
+export class MockTshClient implements TshdClient {
+  listRootClusters = () => new MockedUnaryCall({ clusters: [] });
+  listLeafClusters = () => new MockedUnaryCall({ clusters: [] });
+  getRequestableRoles = () =>
+    new MockedUnaryCall({
+      roles: [],
+      applicableRoles: [],
+    });
+  assumeRole = () => new MockedUnaryCall({});
+  deleteAccessRequest = () => new MockedUnaryCall({});
+  getAccessRequests = () =>
+    new MockedUnaryCall({
+      requests: [],
+      totalCount: 0,
+      startKey: '',
+    });
+  getAccessRequest = () => new MockedUnaryCall({});
+  reviewAccessRequest = () => new MockedUnaryCall({});
+  createAccessRequest = () => new MockedUnaryCall({});
+  addCluster = () => new MockedUnaryCall(makeRootCluster());
+  listGateways = () => new MockedUnaryCall({ gateways: [] });
+  createGateway = () => new MockedUnaryCall(makeAppGateway());
+  removeGateway = () => new MockedUnaryCall({});
+  setGatewayTargetSubresourceName = () => new MockedUnaryCall(makeAppGateway());
+  setGatewayLocalPort = () => new MockedUnaryCall(makeAppGateway());
+  getCluster = () => new MockedUnaryCall(makeRootCluster());
+  getAuthSettings = () =>
+    new MockedUnaryCall({
+      localAuthEnabled: true,
+      authProviders: [],
+      messageOfTheDay: '',
+      authType: 'local',
+      allowPasswordless: false,
+      localConnectorName: '',
+      clientVersionStatus: ClientVersionStatus.OK,
+    });
+  login = () => new MockedUnaryCall({});
+  loginPasswordless = undefined;
+  logout = () => new MockedUnaryCall({});
+  clearStaleClusterClients = () => new MockedUnaryCall({});
+  transferFile = undefined;
+  reportUsageEvent = () => new MockedUnaryCall({});
+  createConnectMyComputerRole = () =>
+    new MockedUnaryCall({ certsReloaded: true });
+  createConnectMyComputerNodeToken = () =>
+    new MockedUnaryCall({ token: 'abc', labelsList: [] });
+  waitForConnectMyComputerNodeJoin = () => new MockedUnaryCall({});
+  updateHeadlessAuthenticationState = () => new MockedUnaryCall({});
+  deleteConnectMyComputerNode = () => new MockedUnaryCall({});
+  getConnectMyComputerNodeName = () => new MockedUnaryCall({ name: '' });
+  listUnifiedResources = () =>
+    new MockedUnaryCall({ resources: [], nextKey: '' });
+  listKubernetesResources = () =>
+    new MockedUnaryCall({ resources: [], nextKey: '' });
+  listKubernetesServers = () =>
+    new MockedUnaryCall({ resources: [], nextPageToken: '' });
+  listDatabaseServers = () =>
+    new MockedUnaryCall({ resources: [], nextKey: '' });
+  getUserPreferences = () =>
+    new MockedUnaryCall({
+      userPreferences: {
+        unifiedResourcePreferences: getDefaultUnifiedResourcePreferences(),
+        clusterPreferences: { pinnedResources: { resourceIds: [] } },
+      },
+    });
+  updateUserPreferences = () => new MockedUnaryCall({});
+  getSuggestedAccessLists = () => new MockedUnaryCall({ accessLists: [] });
+  promoteAccessRequest = () => new MockedUnaryCall({});
+  updateTshdEventsServerAddress = () => new MockedUnaryCall({});
+  authenticateWebDevice = () =>
+    new MockedUnaryCall({
+      confirmationToken: {
+        id: '123456789',
+        token: '7c8e7438-abe1-4cbc-b3e6-bd233bba967c',
+      },
+    });
+  startHeadlessWatcher = () => new MockedUnaryCall({});
+  getApp = () => new MockedUnaryCall({ app: makeApp() });
+  connectToDesktop = undefined;
+  setSharedDirectoryForDesktopSession = () => new MockedUnaryCall({});
 }
 
-export const gateway: Gateway = {
-  uri: '/gateways/gateway1',
-  targetName: 'postgres',
-  targetUri: '/clusters/teleport-local/dbs/postgres',
-  targetUser: 'alice',
-  targetSubresourceName: '',
-  localAddress: 'localhost',
-  localPort: '59116',
-  protocol: 'postgres',
-  cliCommand: 'psql postgres://alice@localhost:59116',
-};
+export class MockVnetClient implements VnetClient {
+  start = () => new MockedUnaryCall({});
+  stop = () => new MockedUnaryCall({});
+  getServiceInfo = () =>
+    new MockedUnaryCall({
+      appDnsZones: [],
+      clusters: [],
+      sshConfigured: false,
+      vnetSshConfigPath:
+        '/Users/user/Library/Application Support/Teleport Connect/tsh/vnet_ssh_config',
+    });
+  getBackgroundItemStatus = () => new MockedUnaryCall({ status: 0 });
+  checkInstallTimeRequirements = () =>
+    new MockedUnaryCall({ status: { oneofKind: undefined } });
+  runDiagnostics() {
+    return new MockedUnaryCall({
+      report: {
+        checks: [],
+        createdAt: Timestamp.fromDate(new Date(2025, 0, 1, 12, 0)),
+      },
+    });
+  }
+  autoConfigureSSH = () => new MockedUnaryCall({});
+}

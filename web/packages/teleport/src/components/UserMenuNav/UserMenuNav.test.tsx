@@ -1,39 +1,41 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
 import { MemoryRouter } from 'react-router';
 
 import {
-  render as testingRender,
-  screen,
   fireEvent,
+  screen,
+  render as testingRender,
 } from 'design/utils/testing';
 
 import cfg from 'teleport/config';
-
-import { FeaturesContextProvider } from 'teleport/FeaturesContext';
 import { getOSSFeatures } from 'teleport/features';
-
-import TeleportContextProvider from 'teleport/TeleportContextProvider';
-import TeleportContext from 'teleport/teleportContext';
-
+import { FeaturesContextProvider } from 'teleport/FeaturesContext';
 import { makeUserContext } from 'teleport/services/user';
+import TeleportContext from 'teleport/teleportContext';
+import TeleportContextProvider from 'teleport/TeleportContextProvider';
+import { makeTestUserContext } from 'teleport/User/testHelpers/makeTestUserContext';
+import { mockUserContextProviderWith } from 'teleport/User/testHelpers/mockUserContextWith';
 
 import { UserMenuNav } from './UserMenuNav';
+
+beforeEach(() => mockUserContextProviderWith(makeTestUserContext()));
 
 describe('navigation items rendering', () => {
   test.each`
@@ -42,13 +44,11 @@ describe('navigation items rendering', () => {
     ${cfg.routes.support} | ${'Help & Support'}
   `(
     'there is an element `$menuName` that links to `$path`',
-    ({ path, menuName }) => {
+    async ({ path, menuName }) => {
       render(path);
 
-      // Click on dropdown menu.
-      fireEvent.click(screen.getByText(/llama/i));
+      fireEvent.click(screen.getByRole('button', { name: 'User Menu' }));
 
-      // Only one checkmark should be rendered at a time.
       const targetEl = screen.getByText(menuName);
 
       expect(targetEl).toBeInTheDocument();
@@ -57,10 +57,53 @@ describe('navigation items rendering', () => {
   );
 });
 
-function render(path: string) {
+describe('user identity rendering', () => {
+  test('shows display primary over username and suppresses secondary', () => {
+    render('/', {
+      userName: '123456',
+      displayPrimary: 'Jane Garcia',
+      displaySecondary: 'jane@example.com',
+    });
+
+    expect(screen.getByText('Jane Garcia')).toBeInTheDocument();
+    expect(screen.getByText('123456')).toBeInTheDocument();
+    expect(screen.queryByText('jane@example.com')).not.toBeInTheDocument();
+    expect(screen.getByText('J')).toBeInTheDocument();
+  });
+
+  test('shows username over secondary when primary is absent', () => {
+    render('/', {
+      userName: 'casey',
+      displaySecondary: 'casey@example.com',
+    });
+
+    expect(screen.getByText('casey')).toBeInTheDocument();
+    expect(screen.getByText('casey@example.com')).toBeInTheDocument();
+    expect(screen.getByText('C')).toBeInTheDocument();
+  });
+
+  test('shows username only when display values are absent', () => {
+    render('/', { userName: 'llama' });
+
+    expect(screen.getAllByText('llama')).toHaveLength(1);
+    expect(screen.getByText('L')).toBeInTheDocument();
+  });
+});
+
+type UserContextOverrides = Partial<{
+  userName: string;
+  displayPrimary: string;
+  displaySecondary: string;
+}>;
+
+function render(path: string, userContext: UserContextOverrides = {}) {
   const ctx = new TeleportContext();
 
   ctx.storeUser.state = makeUserContext({
+    userName: 'llama',
+    displayPrimary: '',
+    displaySecondary: '',
+    ...userContext,
     cluster: {
       name: 'test-cluster',
       lastConnected: Date.now(),
@@ -71,7 +114,7 @@ function render(path: string) {
     <MemoryRouter initialEntries={[path]}>
       <TeleportContextProvider ctx={ctx}>
         <FeaturesContextProvider value={getOSSFeatures()}>
-          <UserMenuNav username="llama" />
+          <UserMenuNav />
         </FeaturesContextProvider>
       </TeleportContextProvider>
     </MemoryRouter>

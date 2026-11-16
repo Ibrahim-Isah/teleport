@@ -1,131 +1,108 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
 	"context"
-	"fmt"
+	"log/slog"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/redshift"
-	"github.com/aws/aws-sdk-go/service/redshift/redshiftiface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/redshift"
+	redshifttypes "github.com/aws/aws-sdk-go-v2/service/redshift/types"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 	libcloudaws "github.com/gravitational/teleport/lib/cloud/aws"
-	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/cloud/awsconfig"
 	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
-// redshiftFetcherConfig is the Redshift databases fetcher configuration.
-type redshiftFetcherConfig struct {
-	// Labels is a selector to match cloud databases.
-	Labels types.Labels
-	// Redshift is the Redshift API client.
-	Redshift redshiftiface.RedshiftAPI
-	// Region is the AWS region to query databases in.
-	Region string
+// RedshiftClient is a subset of the AWS Redshift API.
+type RedshiftClient interface {
+	redshift.DescribeClustersAPIClient
 }
 
-// CheckAndSetDefaults validates the config and sets defaults.
-func (c *redshiftFetcherConfig) CheckAndSetDefaults() error {
-	if len(c.Labels) == 0 {
-		return trace.BadParameter("missing parameter Labels")
-	}
-	if c.Redshift == nil {
-		return trace.BadParameter("missing parameter Redshift")
-	}
-	if c.Region == "" {
-		return trace.BadParameter("missing parameter Region")
-	}
-	return nil
+// newRedshiftFetcher returns a new AWS fetcher for Redshift databases.
+func newRedshiftFetcher(cfg awsFetcherConfig) (common.Fetcher, error) {
+	return newAWSFetcher(cfg, &redshiftPlugin{})
 }
 
-// redshiftFetcher retrieves Redshift databases.
-type redshiftFetcher struct {
-	awsFetcher
+// redshiftPlugin retrieves Redshift databases.
+type redshiftPlugin struct{}
 
-	cfg redshiftFetcherConfig
-	log logrus.FieldLogger
-}
-
-// newRedshiftFetcher returns a new Redshift databases fetcher instance.
-func newRedshiftFetcher(config redshiftFetcherConfig) (common.Fetcher, error) {
-	if err := config.CheckAndSetDefaults(); err != nil {
+// GetDatabases returns Redshift databases matching the watcher's selectors.
+func (f *redshiftPlugin) GetDatabases(ctx context.Context, cfg *awsFetcherConfig) (types.Databases, error) {
+	awsCfg, err := cfg.AWSConfigProvider.GetConfig(ctx, cfg.Region,
+		awsconfig.WithAssumeRole(cfg.AssumeRole.RoleARN, cfg.AssumeRole.ExternalID),
+		awsconfig.WithCredentialsMaybeIntegration(awsconfig.IntegrationMetadata{Name: cfg.Integration}),
+	)
+	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return &redshiftFetcher{
-		cfg: config,
-		log: logrus.WithFields(logrus.Fields{
-			trace.Component: "watch:redshift",
-			"labels":        config.Labels,
-			"region":        config.Region,
-		}),
-	}, nil
-}
-
-// Get returns Redshift and Aurora databases matching the watcher's selectors.
-func (f *redshiftFetcher) Get(ctx context.Context) (types.ResourcesWithLabels, error) {
-	clusters, err := getRedshiftClusters(ctx, f.cfg.Redshift)
+	clusters, err := getRedshiftClusters(ctx, cfg.awsClients.GetRedshiftClient(awsCfg), cfg.Logger)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	var databases types.Databases
 	for _, cluster := range clusters {
-		if !services.IsRedshiftClusterAvailable(cluster) {
-			f.log.Debugf("The current status of Redshift cluster %q is %q. Skipping.",
-				aws.StringValue(cluster.ClusterIdentifier),
-				aws.StringValue(cluster.ClusterStatus))
+		if !libcloudaws.IsRedshiftClusterAvailable(&cluster) {
+			cfg.Logger.DebugContext(ctx, "Skipping unavailable Redshift cluster",
+				"cluster", aws.ToString(cluster.ClusterIdentifier),
+				"status", aws.ToString(cluster.ClusterStatus),
+			)
 			continue
 		}
 
-		database, err := services.NewDatabaseFromRedshiftCluster(cluster)
+		database, err := common.NewDatabaseFromRedshiftCluster(&cluster)
 		if err != nil {
-			f.log.Infof("Could not convert Redshift cluster %q to database resource: %v.",
-				aws.StringValue(cluster.ClusterIdentifier), err)
+			cfg.Logger.InfoContext(ctx, "Could not convert Redshift cluster to database resource",
+				"cluster", aws.ToString(cluster.ClusterIdentifier),
+				"error", err,
+			)
 			continue
 		}
 
 		databases = append(databases, database)
 	}
-	return filterDatabasesByLabels(databases, f.cfg.Labels, f.log).AsResources(), nil
+	return databases, nil
 }
 
-// String returns the fetcher's string description.
-func (f *redshiftFetcher) String() string {
-	return fmt.Sprintf("redshiftFetcher(Region=%v, Labels=%v)",
-		f.cfg.Region, f.cfg.Labels)
+func (f *redshiftPlugin) ComponentShortName() string {
+	return "redshift"
 }
 
 // getRedshiftClusters fetches all Reshift clusters using the provided client,
 // up to the specified max number of pages
-func getRedshiftClusters(ctx context.Context, redshiftClient redshiftiface.RedshiftAPI) ([]*redshift.Cluster, error) {
-	var clusters []*redshift.Cluster
-	var pageNum int
-	err := redshiftClient.DescribeClustersPagesWithContext(
-		ctx,
+func getRedshiftClusters(ctx context.Context, clt RedshiftClient, log *slog.Logger) ([]redshifttypes.Cluster, error) {
+	pager := redshift.NewDescribeClustersPaginator(clt,
 		&redshift.DescribeClustersInput{},
-		func(page *redshift.DescribeClustersOutput, lastPage bool) bool {
-			pageNum++
-			clusters = append(clusters, page.Clusters...)
-			return pageNum <= maxAWSPages
+		func(dcpo *redshift.DescribeClustersPaginatorOptions) {
+			dcpo.StopOnDuplicateToken = true
 		},
 	)
-	return clusters, trace.Wrap(libcloudaws.ConvertRequestFailureError(err))
+	var clusters []redshifttypes.Cluster
+	for page, err := range pagesWithLimit(ctx, pager, log) {
+		if err != nil {
+			return nil, libcloudaws.ConvertRequestFailureError(err)
+		}
+		clusters = append(clusters, page.Clusters...)
+	}
+	return clusters, nil
 }

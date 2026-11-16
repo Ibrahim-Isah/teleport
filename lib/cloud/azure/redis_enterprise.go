@@ -1,31 +1,33 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package azure
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/redisenterprise/armredisenterprise"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 )
 
 // armRedisEnterpriseDatabaseClient is an interface defines a subset of
@@ -51,7 +53,6 @@ type redisEnterpriseClient struct {
 // NewRedisEnterpriseClient creates a new Azure Redis Enterprise client by
 // subscription and credentials.
 func NewRedisEnterpriseClient(subscription string, cred azcore.TokenCredential, options *arm.ClientOptions) (RedisEnterpriseClient, error) {
-	logrus.Debug("Initializing Azure Redis Enterprise client.")
 	clusterAPI, err := armredisenterprise.NewClient(subscription, cred, options)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -158,9 +159,14 @@ func (c *redisEnterpriseClient) listDatabasesByClusters(ctx context.Context, clu
 		databases, err := c.listDatabasesByCluster(ctx, cluster)
 		if err != nil {
 			if trace.IsAccessDenied(err) || trace.IsNotFound(err) {
-				logrus.Debugf("Failed to listDatabasesByCluster on Redis Enterprise cluster %v: %v.", StringVal(cluster.Name), err.Error())
+				slog.DebugContext(ctx, "Failed to listDatabasesByCluster on Redis Enterprise cluster",
+					"cluster", StringVal(cluster.Name),
+					"error", err)
 			} else {
-				logrus.Warnf("Failed to listDatabasesByCluster on Redis Enterprise cluster %v: %v.", StringVal(cluster.Name), err.Error())
+				slog.WarnContext(ctx, "Failed to listDatabasesByCluster on Redis Enterprise cluster",
+					"cluster", StringVal(cluster.Name),
+					"error", err,
+				)
 			}
 			continue
 		}
@@ -174,7 +180,7 @@ func (c *redisEnterpriseClient) listDatabasesByClusters(ctx context.Context, clu
 func (c *redisEnterpriseClient) listDatabasesByCluster(ctx context.Context, cluster *armredisenterprise.Cluster) ([]*RedisEnterpriseDatabase, error) {
 	resourceID, err := arm.ParseResourceID(StringVal(cluster.ID))
 	if err != nil {
-		return nil, trace.BadParameter(err.Error())
+		return nil, trace.BadParameter("%s", err)
 	}
 
 	var databases []*RedisEnterpriseDatabase

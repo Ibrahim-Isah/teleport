@@ -1,22 +1,26 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+import { makeServer } from 'teleterm/services/tshd/testHelpers';
 import { ImmutableStore } from 'teleterm/ui/services/immutableStore';
 
 import { DocumentsService } from './documentsService';
+import { makeDocumentCluster, makeDocumentPtySession } from './testHelpers';
 import { Document, DocumentGateway, DocumentTshNode } from './types';
 
 function getMockedDocuments(): Document[] {
@@ -77,6 +81,10 @@ describe('document should be added', () => {
     targetUri: '/clusters/bar/dbs/quux',
     targetName: 'quux',
     targetUser: 'foo',
+    targetSubresourceName: undefined,
+    origin: 'resource_table',
+    status: '',
+    autoUserProvisioning: undefined,
   };
 
   test('at the specific position', () => {
@@ -131,6 +139,7 @@ test('only TSH node documents should be returned', () => {
     status: 'connecting',
     rootClusterId: '',
     leafClusterId: undefined,
+    origin: 'resource_table',
   };
 
   service.add(tshNodeDocument);
@@ -150,6 +159,10 @@ test('only gateway documents should be returned', () => {
     targetUri: '/clusters/bar/dbs/quux',
     targetName: 'quux',
     targetUser: 'foo',
+    targetSubresourceName: undefined,
+    origin: 'resource_table',
+    status: '',
+    autoUserProvisioning: undefined,
   };
 
   service.add(gatewayDocument);
@@ -211,4 +224,37 @@ test('duplicate PTY doc and activate it', () => {
   expect(service.getActive()).toStrictEqual(
     service.getDocuments()[ptyToDuplicateIndex + 1]
   );
+});
+
+describe('openExistingOrAddNew', () => {
+  it('opens an existing doc if exists', () => {
+    const docCluster = makeDocumentCluster();
+    const docPty = makeDocumentPtySession();
+    const service = createService([docCluster, docPty]);
+
+    const addNew = jest.fn();
+    const actualDocUri = service.openExistingOrAddNew(
+      d => d.kind === 'doc.terminal_shell',
+      addNew
+    );
+    expect(actualDocUri).toEqual(docPty.uri);
+    expect(service.getLocation()).toEqual(docPty.uri);
+    expect(addNew).not.toHaveBeenCalled();
+  });
+
+  it('creates a new doc if existing one could not have been found', () => {
+    const docCluster = makeDocumentCluster();
+    const service = createService([docCluster]);
+
+    const actualDocUri = service.openExistingOrAddNew(
+      d => d.kind === 'doc.terminal_tsh_node',
+      () =>
+        service.createTshNodeDocument(makeServer().uri, {
+          origin: 'resource_table',
+        })
+    );
+    const activeDoc = service.getActive();
+    expect(actualDocUri).toEqual(activeDoc.uri);
+    expect(activeDoc.kind).toEqual('doc.terminal_tsh_node');
+  });
 });

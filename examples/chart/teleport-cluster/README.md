@@ -1,13 +1,16 @@
 # Teleport Cluster
 
-This chart sets up a single node Teleport cluster.
-It uses a persistent volume claim for storage.
-Great for getting started with Teleport.
+This chart sets up a Teleport cluster composed of at least 1 Proxy instance
+and 1 Auth instance. When applicable, the chart will default to 2 pods to
+provide high-availability.
 
 ## Important Notices
 
 - The chart version follows the Teleport version. e.g. chart v10.x can run Teleport v10.x and v11.x, but is not compatible with Teleport 9.x
-- Teleport does mutual TLS to authenticate clients. It currently does not support running behind a L7 LoadBalancer, like a Kubernetes `Ingress`. It requires being exposed through a L4 LoadBalancer (Kubernetes `Service`).
+- Teleport does mutual TLS to authenticate clients. Establishing mTLS through a L7
+  LoadBalancer, like a Kubernetes `Ingress` [requires ALPN support](https://goteleport.com/docs/reference/architecture/tls-routing/#working-with-layer-7-load-balancers-or-reverse-proxies).
+  Exposing Teleport through a `Service` with type `LoadBalancer` is still recommended
+  because its the most flexible and least complex setup.
 
 ## Getting Started
 
@@ -34,15 +37,16 @@ or by installing [cert-manager](https://cert-manager.io/docs/) and setting the `
 
 ### Replicated setup guides
 
-- [Running an HA Teleport cluster in Kubernetes using an AWS EKS Cluster](https://goteleport.com/docs/deploy-a-cluster/helm-deployments/aws/)
-- [Running an HA Teleport cluster in Kubernetes using a Google Cloud GKE cluster](https://goteleport.com/docs/deploy-a-cluster/helm-deployments/gcp/)
-- [Running a Teleport cluster in Kubernetes with a custom Teleport config](https://goteleport.com/docs/deploy-a-cluster/helm-deployments/custom/)
+- [Running an HA Teleport cluster in Kubernetes using an AWS EKS Cluster](https://goteleport.com/docs/zero-trust-access/deploy-a-cluster/helm-deployments/aws/)
+- [Running an HA Teleport cluster in Kubernetes using an Google Cloud GKE cluster](https://goteleport.com/docs/zero-trust-access/deploy-a-cluster/helm-deployments/gcp/)
+- [Running an HA Teleport cluster in Kubernetes using an Azure AKS cluster](https://goteleport.com/docs/zero-trust-access/deploy-a-cluster/helm-deployments/azure/)
+- [Running a Teleport cluster in Kubernetes with a custom Teleport config](https://goteleport.com/docs/zero-trust-access/deploy-a-cluster/helm-deployments/custom/)
 
 ### Creating first user
 
 The first user can be created by executing a command in one of the auth pods.
 
-```shell
+```code
 kubectl exec it -n teleport-cluster statefulset/teleport-cluster-auth -- tctl users add my-username --roles=editor,auditor,access
 ```
 
@@ -56,7 +60,7 @@ helm uninstall --namespace teleport-cluster teleport-cluster
 
 ## Documentation
 
-See https://goteleport.com/docs/kubernetes-access/helm/guides/ for guides on setting up HA Teleport clusters
+See https://goteleport.com/docs/zero-trust-access/deploy-a-cluster/helm-deployments/ for guides on setting up HA Teleport clusters
 in EKS or GKE, plus a comprehensive chart reference.
 
 ## Contributing to the chart

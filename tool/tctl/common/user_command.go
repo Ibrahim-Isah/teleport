@@ -1,63 +1,82 @@
 /*
-Copyright 2015-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
+	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gravitational/kingpin"
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/mfa"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/asciitable"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/service"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/gcp"
+	commonclient "github.com/gravitational/teleport/tool/tctl/common/client"
+	tctlcfg "github.com/gravitational/teleport/tool/tctl/common/config"
 )
 
 // UserCommand implements `tctl users` set of commands
 // It implements CLICommand interface
 type UserCommand struct {
-	config                    *service.Config
+	config                    *servicecfg.Config
 	login                     string
 	allowedLogins             []string
 	allowedWindowsLogins      []string
+	allowedLinuxDesktopLogins []string
 	allowedKubeUsers          []string
 	allowedKubeGroups         []string
 	allowedDatabaseUsers      []string
 	allowedDatabaseNames      []string
+	allowedDatabaseRoles      []string
 	allowedAWSRoleARNs        []string
 	allowedAzureIdentities    []string
 	allowedGCPServiceAccounts []string
 	allowedRoles              []string
+	allowedMCPTools           []string
+	hostUserUID               string
+	hostUserUIDProvided       bool
+	hostUserGID               string
+	hostUserGIDProvided       bool
+	defaultRelayAddr          string
+	defaultRelayAddrProvided  bool
 
 	ttl time.Duration
 
-	// format is the output format, e.g. text or json
+	// format is the output format, e.g. text, json, or yaml.
 	format string
 
 	userAdd           *kingpin.CmdClause
@@ -68,34 +87,40 @@ type UserCommand struct {
 }
 
 // Initialize allows UserCommand to plug itself into the CLI parser
-func (u *UserCommand) Initialize(app *kingpin.Application, config *service.Config) {
-	const helpPrefix string = "[Teleport DB users only]"
+func (u *UserCommand) Initialize(app *kingpin.Application, _ *tctlcfg.GlobalCLIFlags, config *servicecfg.Config) {
+	const helpPrefix string = "[Teleport local users only]"
 
 	u.config = config
-	users := app.Command("users", "Manage user accounts")
+	users := app.Command("users", "Manage user accounts.")
 
-	u.userAdd = users.Command("add", "Generate a user invitation token "+helpPrefix)
+	u.userAdd = users.Command("add", "Generate a user invitation token "+helpPrefix+".")
 	u.userAdd.Arg("account", "Teleport user account name").Required().StringVar(&u.login)
 
 	u.userAdd.Flag("logins", "List of allowed SSH logins for the new user").StringsVar(&u.allowedLogins)
 	u.userAdd.Flag("windows-logins", "List of allowed Windows logins for the new user").StringsVar(&u.allowedWindowsLogins)
+	u.userAdd.Flag("linux-desktop-logins", "List of allowed Linux desktop logins for the new user").StringsVar(&u.allowedLinuxDesktopLogins)
 	u.userAdd.Flag("kubernetes-users", "List of allowed Kubernetes users for the new user").StringsVar(&u.allowedKubeUsers)
 	u.userAdd.Flag("kubernetes-groups", "List of allowed Kubernetes groups for the new user").StringsVar(&u.allowedKubeGroups)
 	u.userAdd.Flag("db-users", "List of allowed database users for the new user").StringsVar(&u.allowedDatabaseUsers)
 	u.userAdd.Flag("db-names", "List of allowed database names for the new user").StringsVar(&u.allowedDatabaseNames)
+	u.userAdd.Flag("db-roles", "List of database roles for automatic database user provisioning").StringsVar(&u.allowedDatabaseRoles)
 	u.userAdd.Flag("aws-role-arns", "List of allowed AWS role ARNs for the new user").StringsVar(&u.allowedAWSRoleARNs)
 	u.userAdd.Flag("azure-identities", "List of allowed Azure identities for the new user").StringsVar(&u.allowedAzureIdentities)
 	u.userAdd.Flag("gcp-service-accounts", "List of allowed GCP service accounts for the new user").StringsVar(&u.allowedGCPServiceAccounts)
+	u.userAdd.Flag("host-user-uid", "UID for auto provisioned host users to use").IsSetByUser(&u.hostUserUIDProvided).StringVar(&u.hostUserUID)
+	u.userAdd.Flag("host-user-gid", "GID for auto provisioned host users to use").IsSetByUser(&u.hostUserGIDProvided).StringVar(&u.hostUserGID)
+	u.userAdd.Flag("mcp-tools", "List of allowed MCP tools for the new user").StringsVar(&u.allowedMCPTools)
+	u.userAdd.Flag("default-relay-addr", "Relay address that clients should use by default").StringVar(&u.defaultRelayAddr)
 
 	u.userAdd.Flag("roles", "List of roles for the new user to assume").Required().StringsVar(&u.allowedRoles)
 
 	u.userAdd.Flag("ttl", fmt.Sprintf("Set expiration time for token, default is %v, maximum is %v",
 		defaults.SignupTokenTTL, defaults.MaxSignupTokenTTL)).
 		Default(fmt.Sprintf("%v", defaults.SignupTokenTTL)).DurationVar(&u.ttl)
-	u.userAdd.Flag("format", "Output format, 'text' or 'json'").Hidden().Default(teleport.Text).StringVar(&u.format)
+	u.userAdd.Flag("format", "Output format.").Default(teleport.Text).EnumVar(&u.format, teleport.Text, teleport.JSON, teleport.YAML)
 	u.userAdd.Alias(AddUserHelp)
 
-	u.userUpdate = users.Command("update", "Update user account")
+	u.userUpdate = users.Command("update", "Update user account.")
 	u.userUpdate.Arg("account", "Teleport user account name").Required().StringVar(&u.login)
 	u.userUpdate.Flag("set-roles", "List of roles for the user to assume, replaces current roles").
 		StringsVar(&u.allowedRoles)
@@ -103,6 +128,8 @@ func (u *UserCommand) Initialize(app *kingpin.Application, config *service.Confi
 		StringsVar(&u.allowedLogins)
 	u.userUpdate.Flag("set-windows-logins", "List of allowed Windows logins for the user, replaces current Windows logins").
 		StringsVar(&u.allowedWindowsLogins)
+	u.userUpdate.Flag("set-linux-desktop-logins", "List of allowed Linux desktop logins for the user, replaces current Linux logins").
+		StringsVar(&u.allowedLinuxDesktopLogins)
 	u.userUpdate.Flag("set-kubernetes-users", "List of allowed Kubernetes users for the user, replaces current Kubernetes users").
 		StringsVar(&u.allowedKubeUsers)
 	u.userUpdate.Flag("set-kubernetes-groups", "List of allowed Kubernetes groups for the user, replaces current Kubernetes groups").
@@ -111,60 +138,74 @@ func (u *UserCommand) Initialize(app *kingpin.Application, config *service.Confi
 		StringsVar(&u.allowedDatabaseUsers)
 	u.userUpdate.Flag("set-db-names", "List of allowed database names for the user, replaces current database names").
 		StringsVar(&u.allowedDatabaseNames)
+	u.userUpdate.Flag("set-db-roles", "List of allowed database roles for automatic database user provisioning, replaces current database roles").
+		StringsVar(&u.allowedDatabaseRoles)
 	u.userUpdate.Flag("set-aws-role-arns", "List of allowed AWS role ARNs for the user, replaces current AWS role ARNs").
 		StringsVar(&u.allowedAWSRoleARNs)
 	u.userUpdate.Flag("set-azure-identities", "List of allowed Azure identities for the user, replaces current Azure identities").
 		StringsVar(&u.allowedAzureIdentities)
 	u.userUpdate.Flag("set-gcp-service-accounts", "List of allowed GCP service accounts for the user, replaces current service accounts").
 		StringsVar(&u.allowedGCPServiceAccounts)
+	u.userUpdate.Flag("set-host-user-uid", "UID for auto provisioned host users to use. Value can be reset by providing an empty string").IsSetByUser(&u.hostUserUIDProvided).StringVar(&u.hostUserUID)
+	u.userUpdate.Flag("set-host-user-gid", "GID for auto provisioned host users to use. Value can be reset by providing an empty string").IsSetByUser(&u.hostUserGIDProvided).StringVar(&u.hostUserGID)
+	u.userUpdate.Flag("set-mcp-tools", "List of allowed MCP tools for the user, replaces current allowed MCP tools.").StringsVar(&u.allowedMCPTools)
+	u.userUpdate.Flag("set-default-relay-addr", "Relay address that clients should use by default. Value can be reset by providing an empty string").IsSetByUser(&u.defaultRelayAddrProvided).StringVar(&u.defaultRelayAddr)
 
 	u.userList = users.Command("ls", "Lists all user accounts.")
-	u.userList.Flag("format", "Output format, 'text' or 'json'").Hidden().Default(teleport.Text).StringVar(&u.format)
+	u.userList.Flag("format", "Output format.").Default(teleport.Text).EnumVar(&u.format, teleport.Text, teleport.JSON, teleport.YAML)
 
-	u.userDelete = users.Command("rm", "Deletes user accounts").Alias("del")
+	u.userDelete = users.Command("rm", "Deletes user accounts.").Alias("del")
 	u.userDelete.Arg("logins", "Comma-separated list of user logins to delete").
 		Required().StringVar(&u.login)
 
-	u.userResetPassword = users.Command("reset", "Reset user password and generate a new token "+helpPrefix)
+	u.userResetPassword = users.Command("reset", "Reset user password and generate a new token "+helpPrefix+".")
 	u.userResetPassword.Arg("account", "Teleport user account name").Required().StringVar(&u.login)
 	u.userResetPassword.Flag("ttl", fmt.Sprintf("Set expiration time for token, default is %v, maximum is %v",
 		defaults.ChangePasswordTokenTTL, defaults.MaxChangePasswordTokenTTL)).
 		Default(fmt.Sprintf("%v", defaults.ChangePasswordTokenTTL)).DurationVar(&u.ttl)
-	u.userResetPassword.Flag("format", "Output format, 'text' or 'json'").Hidden().Default(teleport.Text).StringVar(&u.format)
+	u.userResetPassword.Flag("format", "Output format.").Default(teleport.Text).EnumVar(&u.format, teleport.Text, teleport.JSON, teleport.YAML)
 }
 
 // TryRun takes the CLI command as an argument (like "users add") and executes it.
-func (u *UserCommand) TryRun(ctx context.Context, cmd string, client auth.ClientI) (match bool, err error) {
+func (u *UserCommand) TryRun(ctx context.Context, cmd string, clientFunc commonclient.InitFunc) (match bool, err error) {
+	var commandFunc func(ctx context.Context, client *authclient.Client) error
 	switch cmd {
 	case u.userAdd.FullCommand():
-		err = u.Add(ctx, client)
+		commandFunc = u.Add
 	case u.userUpdate.FullCommand():
-		err = u.Update(ctx, client)
+		commandFunc = u.Update
 	case u.userList.FullCommand():
-		err = u.List(ctx, client)
+		commandFunc = u.List
 	case u.userDelete.FullCommand():
-		err = u.Delete(ctx, client)
+		commandFunc = u.Delete
 	case u.userResetPassword.FullCommand():
-		err = u.ResetPassword(ctx, client)
+		commandFunc = u.ResetPassword
 	default:
 		return false, nil
 	}
+	client, closeFn, err := clientFunc(ctx)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+	err = commandFunc(ctx, client)
+	closeFn(ctx)
+
 	return true, trace.Wrap(err)
 }
 
 // ResetPassword resets user password and generates a token to setup new password
-func (u *UserCommand) ResetPassword(ctx context.Context, client auth.ClientI) error {
-	req := auth.CreateUserTokenRequest{
+func (u *UserCommand) ResetPassword(ctx context.Context, client *authclient.Client) error {
+	req := authclient.CreateUserTokenRequest{
 		Name: u.login,
 		TTL:  u.ttl,
-		Type: auth.UserTokenTypeResetPassword,
+		Type: authclient.UserTokenTypeResetPassword,
 	}
 	token, err := client.CreateResetPasswordToken(ctx, req)
 	if err != nil {
 		return err
 	}
 
-	err = u.PrintResetPasswordToken(token, u.format)
+	err = u.PrintResetPasswordToken(token)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -173,9 +214,8 @@ func (u *UserCommand) ResetPassword(ctx context.Context, client auth.ClientI) er
 }
 
 // PrintResetPasswordToken prints ResetPasswordToken
-func (u *UserCommand) PrintResetPasswordToken(token types.UserToken, format string) error {
+func (u *UserCommand) PrintResetPasswordToken(token types.UserToken) error {
 	err := u.printResetPasswordToken(token,
-		format,
 		"User %q has been reset. Share this URL with the user to complete password reset, link is valid for %v:\n%v\n\n",
 	)
 	if err != nil {
@@ -186,9 +226,8 @@ func (u *UserCommand) PrintResetPasswordToken(token types.UserToken, format stri
 }
 
 // PrintResetPasswordTokenAsInvite prints ResetPasswordToken as Invite
-func (u *UserCommand) PrintResetPasswordTokenAsInvite(token types.UserToken, format string) error {
+func (u *UserCommand) PrintResetPasswordTokenAsInvite(token types.UserToken) error {
 	err := u.printResetPasswordToken(token,
-		format,
 		"User %q has been created but requires a password. Share this URL with the user to complete user setup, link is valid for %v:\n%v\n\n")
 	if err != nil {
 		return trace.Wrap(err)
@@ -198,14 +237,16 @@ func (u *UserCommand) PrintResetPasswordTokenAsInvite(token types.UserToken, for
 }
 
 // PrintResetPasswordToken prints ResetPasswordToken
-func (u *UserCommand) printResetPasswordToken(token types.UserToken, format string, messageFormat string) (err error) {
+func (u *UserCommand) printResetPasswordToken(token types.UserToken, messageFormat string) (err error) {
 	switch strings.ToLower(u.format) {
 	case teleport.JSON:
 		err = printTokenAsJSON(token)
+	case teleport.YAML:
+		err = printTokenAsYAML(token)
 	case teleport.Text:
 		err = printTokenAsText(token, messageFormat)
 	default:
-		err = printTokenAsText(token, messageFormat)
+		err = trace.BadParameter("unknown format %q", u.format)
 	}
 
 	if err != nil {
@@ -217,10 +258,11 @@ func (u *UserCommand) printResetPasswordToken(token types.UserToken, format stri
 
 // Add implements `tctl users add` for the enterprise edition. Unlike the OSS
 // version, this one requires --roles flag to be set
-func (u *UserCommand) Add(ctx context.Context, client auth.ClientI) error {
+func (u *UserCommand) Add(ctx context.Context, client *authclient.Client) error {
 	u.allowedRoles = flattenSlice(u.allowedRoles)
 	u.allowedLogins = flattenSlice(u.allowedLogins)
 	u.allowedWindowsLogins = flattenSlice(u.allowedWindowsLogins)
+	u.allowedLinuxDesktopLogins = flattenSlice(u.allowedLinuxDesktopLogins)
 
 	// Validate roles (server does not do this yet).
 	for _, roleName := range u.allowedRoles {
@@ -246,16 +288,36 @@ func (u *UserCommand) Add(ctx context.Context, client auth.ClientI) error {
 		}
 	}
 
+	if u.hostUserUIDProvided && u.hostUserUID != "" {
+		if _, err := strconv.Atoi(u.hostUserUID); err != nil {
+			return trace.BadParameter("host user UID must be a numeric ID")
+		}
+	}
+	if u.hostUserGIDProvided && u.hostUserGID != "" {
+		if _, err := strconv.Atoi(u.hostUserGID); err != nil {
+			return trace.BadParameter("host user GID must be a numeric ID")
+		}
+	}
+
 	traits := map[string][]string{
 		constants.TraitLogins:             u.allowedLogins,
 		constants.TraitWindowsLogins:      u.allowedWindowsLogins,
+		constants.TraitLinuxDesktopLogins: u.allowedLinuxDesktopLogins,
 		constants.TraitKubeUsers:          flattenSlice(u.allowedKubeUsers),
 		constants.TraitKubeGroups:         flattenSlice(u.allowedKubeGroups),
 		constants.TraitDBUsers:            flattenSlice(u.allowedDatabaseUsers),
 		constants.TraitDBNames:            flattenSlice(u.allowedDatabaseNames),
+		constants.TraitDBRoles:            flattenSlice(u.allowedDatabaseRoles),
 		constants.TraitAWSRoleARNs:        flattenSlice(u.allowedAWSRoleARNs),
 		constants.TraitAzureIdentities:    azureIdentities,
 		constants.TraitGCPServiceAccounts: gcpServiceAccounts,
+		constants.TraitHostUserUID:        {u.hostUserUID},
+		constants.TraitHostUserGID:        {u.hostUserGID},
+		constants.TraitMCPTools:           flattenSlice(u.allowedMCPTools),
+	}
+
+	if u.defaultRelayAddr != "" {
+		traits[constants.TraitDefaultRelayAddr] = []string{u.defaultRelayAddr}
 	}
 
 	user, err := types.NewUser(u.login)
@@ -266,20 +328,34 @@ func (u *UserCommand) Add(ctx context.Context, client auth.ClientI) error {
 	user.SetTraits(traits)
 	user.SetRoles(u.allowedRoles)
 
-	if err := client.CreateUser(ctx, user); err != nil {
+	// Prompt for admin action MFA if required, allowing reuse for CreateResetPasswordToken.
+	mfaResponse, err := mfa.PerformAdminActionMFACeremony(ctx, client.PerformMFACeremony, true /*allowReuse*/)
+	if err == nil {
+		ctx = mfa.ContextWithMFAResponse(ctx, mfaResponse)
+	} else if !errors.Is(err, &mfa.ErrMFANotRequired) && !errors.Is(err, &mfa.ErrMFANotSupported) {
 		return trace.Wrap(err)
 	}
 
-	token, err := client.CreateResetPasswordToken(ctx, auth.CreateUserTokenRequest{
+	if _, err := client.CreateUser(ctx, user); err != nil {
+		if trace.IsAlreadyExists(err) {
+			fmt.Printf(`NOTE: To update an existing local user:
+> tctl users update %v --set-roles %v # replace roles
+
+`, u.login, strings.Join(u.allowedRoles, ","))
+		}
+		return trace.Wrap(err)
+	}
+
+	token, err := client.CreateResetPasswordToken(ctx, authclient.CreateUserTokenRequest{
 		Name: u.login,
 		TTL:  u.ttl,
-		Type: auth.UserTokenTypeResetPasswordInvite,
+		Type: authclient.UserTokenTypeResetPasswordInvite,
 	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	if err := u.PrintResetPasswordTokenAsInvite(token, u.format); err != nil {
+	if err := u.PrintResetPasswordTokenAsInvite(token); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -290,7 +366,7 @@ func (u *UserCommand) Add(ctx context.Context, client auth.ClientI) error {
 // ["one", "two", "three"]
 func flattenSlice(slice []string) (retval []string) {
 	for i := range slice {
-		for _, role := range strings.Split(slice[i], ",") {
+		for role := range strings.SplitSeq(slice[i], ",") {
 			retval = append(retval, strings.TrimSpace(role))
 		}
 	}
@@ -306,6 +382,10 @@ func printTokenAsJSON(token types.UserToken) error {
 	return nil
 }
 
+func printTokenAsYAML(token types.UserToken) error {
+	return trace.Wrap(utils.WriteYAML(os.Stdout, token), "failed to marshal reset password token")
+}
+
 func printTokenAsText(token types.UserToken, messageFormat string) error {
 	url, err := url.Parse(token.GetURL())
 	if err != nil {
@@ -319,8 +399,8 @@ func printTokenAsText(token types.UserToken, messageFormat string) error {
 }
 
 // Update updates existing user
-func (u *UserCommand) Update(ctx context.Context, client auth.ClientI) error {
-	user, err := client.GetUser(u.login, false)
+func (u *UserCommand) Update(ctx context.Context, client *authclient.Client) error {
+	user, err := client.GetUser(ctx, u.login, false)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -346,6 +426,11 @@ func (u *UserCommand) Update(ctx context.Context, client auth.ClientI) error {
 		user.SetWindowsLogins(windowsLogins)
 		updateMessages["Windows logins"] = windowsLogins
 	}
+	if len(u.allowedLinuxDesktopLogins) > 0 {
+		linuxDesktopLogins := flattenSlice(u.allowedLinuxDesktopLogins)
+		user.SetLinuxDesktopLogins(linuxDesktopLogins)
+		updateMessages["Linux desktop logins"] = linuxDesktopLogins
+	}
 	if len(u.allowedKubeUsers) > 0 {
 		kubeUsers := flattenSlice(u.allowedKubeUsers)
 		user.SetKubeUsers(kubeUsers)
@@ -365,6 +450,14 @@ func (u *UserCommand) Update(ctx context.Context, client auth.ClientI) error {
 		dbNames := flattenSlice(u.allowedDatabaseNames)
 		user.SetDatabaseNames(dbNames)
 		updateMessages["database names"] = dbNames
+	}
+	if len(u.allowedDatabaseRoles) > 0 {
+		dbRoles := flattenSlice(u.allowedDatabaseRoles)
+		if slices.Contains(dbRoles, types.Wildcard) {
+			return trace.BadParameter("database role can't be a wildcard")
+		}
+		user.SetDatabaseRoles(dbRoles)
+		updateMessages["database roles"] = dbRoles
 	}
 	if len(u.allowedAWSRoleARNs) > 0 {
 		awsRoleARNs := flattenSlice(u.allowedAWSRoleARNs)
@@ -395,16 +488,47 @@ func (u *UserCommand) Update(ctx context.Context, client auth.ClientI) error {
 		updateMessages["GCP service accounts"] = accounts
 	}
 
+	if u.hostUserUIDProvided && u.hostUserUID != "" {
+		if _, err := strconv.Atoi(u.hostUserUID); err != nil {
+			return trace.BadParameter("host user UID must be a numeric ID")
+		}
+
+		user.SetHostUserUID(u.hostUserUID)
+		updateMessages["Host user UID"] = []string{u.hostUserUID}
+	}
+	if u.hostUserGIDProvided && u.hostUserGID != "" {
+		if _, err := strconv.Atoi(u.hostUserGID); err != nil {
+			return trace.BadParameter("host user GID must be a numeric ID")
+		}
+		user.SetHostUserGID(u.hostUserGID)
+		updateMessages["Host user GID"] = []string{u.hostUserGID}
+	}
+
+	if len(u.allowedMCPTools) > 0 {
+		mcpTools := flattenSlice(u.allowedMCPTools)
+		user.SetMCPTools(mcpTools)
+		updateMessages["MCP tools"] = mcpTools
+	}
+
+	if u.defaultRelayAddrProvided {
+		user.SetDefaultRelayAddr(u.defaultRelayAddr)
+		updateMessages["default relay address"] = []string{u.defaultRelayAddr}
+	}
+
 	if len(updateMessages) == 0 {
 		return trace.BadParameter("Nothing to update. Please provide at least one --set flag.")
 	}
 
 	for _, roleName := range user.GetRoles() {
 		if _, err := client.GetRole(ctx, roleName); err != nil {
-			log.Warnf("Error checking role %q when upserting user %q: %v", roleName, user.GetName(), err)
+			slog.WarnContext(ctx, "Error checking role when upserting user",
+				"role", roleName,
+				"user", user.GetName(),
+				"error", err,
+			)
 		}
 	}
-	if err := client.UpsertUser(user); err != nil {
+	if _, err := client.UpsertUser(ctx, user); err != nil {
 		return trace.Wrap(err)
 	}
 	fmt.Printf("User %v has been updated:\n", user.GetName())
@@ -415,12 +539,14 @@ func (u *UserCommand) Update(ctx context.Context, client auth.ClientI) error {
 }
 
 // List prints all existing user accounts
-func (u *UserCommand) List(ctx context.Context, client auth.ClientI) error {
-	users, err := client.GetUsers(false)
+func (u *UserCommand) List(ctx context.Context, client *authclient.Client) error {
+	users, err := client.GetUsers(ctx, false)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if u.format == teleport.Text {
+
+	switch u.format {
+	case teleport.Text:
 		if len(users) == 0 {
 			fmt.Println("No users found")
 			return nil
@@ -432,20 +558,26 @@ func (u *UserCommand) List(ctx context.Context, client auth.ClientI) error {
 			})
 		}
 		fmt.Println(t.AsBuffer().String())
-	} else {
-		out, err := json.MarshalIndent(users, "", "  ")
+	case teleport.JSON:
+		err := utils.WriteJSONArray(os.Stdout, users)
 		if err != nil {
 			return trace.Wrap(err, "failed to marshal users")
 		}
-		fmt.Print(string(out))
+	case teleport.YAML:
+		err := utils.WriteYAML(os.Stdout, users)
+		if err != nil {
+			return trace.Wrap(err, "failed to marshal users")
+		}
+	default:
+		return trace.BadParameter("unknown format %q", u.format)
 	}
 	return nil
 }
 
 // Delete deletes teleport user(s). User IDs are passed as a comma-separated
 // list in UserCommand.login
-func (u *UserCommand) Delete(ctx context.Context, client auth.ClientI) error {
-	for _, l := range strings.Split(u.login, ",") {
+func (u *UserCommand) Delete(ctx context.Context, client *authclient.Client) error {
+	for l := range strings.SplitSeq(u.login, ",") {
 		if err := client.DeleteUser(ctx, l); err != nil {
 			return trace.Wrap(err)
 		}

@@ -17,25 +17,28 @@ package transportv1
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/rsa"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/gravitational/trace/trail"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
 	transportv1pb "github.com/gravitational/teleport/api/gen/proto/go/teleport/transport/v1"
+	"github.com/gravitational/teleport/api/trail"
+	"github.com/gravitational/teleport/api/utils/grpc/interceptors"
 	streamutils "github.com/gravitational/teleport/api/utils/grpc/stream"
 )
 
@@ -72,18 +75,25 @@ func (s fakeServer) ProxyCluster(stream transportv1pb.TransportService_ProxyClus
 func TestClient_ClusterDetails(t *testing.T) {
 	t.Parallel()
 
+	pack := newServer(t, fakeServer{
+		details: func() fakeGetClusterDetailsServer {
+			var i atomic.Bool
+			return func(ctx context.Context, request *transportv1pb.GetClusterDetailsRequest) (*transportv1pb.GetClusterDetailsResponse, error) {
+				if i.CompareAndSwap(false, true) {
+					return &transportv1pb.GetClusterDetailsResponse{Details: &transportv1pb.ClusterDetails{FipsEnabled: true}}, nil
+				}
+
+				return nil, trail.ToGRPC(trace.NotImplemented("not implemented"))
+			}
+		}(),
+	})
+
 	tests := []struct {
 		name      string
-		server    fakeServer
 		assertion func(t *testing.T, response *transportv1pb.ClusterDetails, err error)
 	}{
 		{
 			name: "details retrieved successfully",
-			server: fakeServer{
-				details: func(ctx context.Context, request *transportv1pb.GetClusterDetailsRequest) (*transportv1pb.GetClusterDetailsResponse, error) {
-					return &transportv1pb.GetClusterDetailsResponse{Details: &transportv1pb.ClusterDetails{FipsEnabled: true}}, nil
-				},
-			},
 			assertion: func(t *testing.T, response *transportv1pb.ClusterDetails, err error) {
 				require.NoError(t, err)
 				require.NotNil(t, response)
@@ -92,11 +102,6 @@ func TestClient_ClusterDetails(t *testing.T) {
 		},
 		{
 			name: "error getting details",
-			server: fakeServer{
-				details: func(ctx context.Context, request *transportv1pb.GetClusterDetailsRequest) (*transportv1pb.GetClusterDetailsResponse, error) {
-					return nil, trail.ToGRPC(trace.NotImplemented("not implemented"))
-				},
-			},
 			assertion: func(t *testing.T, response *transportv1pb.ClusterDetails, err error) {
 				require.ErrorIs(t, err, trace.NotImplemented("not implemented"))
 				require.Nil(t, response)
@@ -105,12 +110,7 @@ func TestClient_ClusterDetails(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			pack := newServer(t, test.server)
-
 			resp, err := pack.Client.ClusterDetails(context.Background())
 			test.assertion(t, resp, err)
 		})
@@ -123,19 +123,45 @@ func TestClient_ClusterDetails(t *testing.T) {
 func TestClient_DialCluster(t *testing.T) {
 	t.Parallel()
 
+	pack := newServer(t, fakeServer{
+		cluster: func(server transportv1pb.TransportService_ProxyClusterServer) error {
+			req, err := server.Recv()
+			if err != nil {
+				return trail.ToGRPC(err)
+			}
+
+			switch req.Cluster {
+			case "":
+				return trail.ToGRPC(trace.BadParameter("first message must contain a cluster"))
+			case "not-implemented":
+				return trail.ToGRPC(trace.NotImplemented("not implemented"))
+			case "echo":
+				// get the payload written
+				req, err = server.Recv()
+				if err != nil {
+					return trail.ToGRPC(err)
+				}
+
+				// echo the data back
+				if err := server.Send(&transportv1pb.ProxyClusterResponse{Frame: &transportv1pb.Frame{Payload: req.Frame.Payload}}); err != nil {
+					return trail.ToGRPC(err)
+				}
+
+				return nil
+			default:
+				return trace.NotFound("unknown cluster: %q", req.Cluster)
+			}
+		},
+	})
+
 	tests := []struct {
 		name      string
 		cluster   string
-		server    fakeServer
 		assertion func(t *testing.T, conn net.Conn, err error)
 	}{
 		{
-			name: "stream terminated",
-			server: fakeServer{
-				cluster: func(server transportv1pb.TransportService_ProxyClusterServer) error {
-					return trail.ToGRPC(trace.NotImplemented("not implemented"))
-				},
-			},
+			name:    "stream terminated",
+			cluster: "not-implemented",
 			assertion: func(t *testing.T, conn net.Conn, err error) {
 				require.NoError(t, err)
 				require.NotNil(t, conn)
@@ -148,20 +174,6 @@ func TestClient_DialCluster(t *testing.T) {
 		{
 			name:    "invalid cluster name",
 			cluster: "unknown",
-			server: fakeServer{
-				cluster: func(server transportv1pb.TransportService_ProxyClusterServer) error {
-					req, err := server.Recv()
-					if err != nil {
-						return trace.Wrap(err)
-					}
-
-					if req.Cluster == "" {
-						return trace.BadParameter("first message must contain a cluster")
-					}
-
-					return trace.NotFound("unknown cluster: %q", req.Cluster)
-				},
-			},
 			assertion: func(t *testing.T, conn net.Conn, err error) {
 				require.NoError(t, err)
 				require.NotNil(t, conn)
@@ -173,32 +185,7 @@ func TestClient_DialCluster(t *testing.T) {
 		},
 		{
 			name:    "connection successfully established",
-			cluster: "test",
-			server: fakeServer{
-				cluster: func(server transportv1pb.TransportService_ProxyClusterServer) error {
-					req, err := server.Recv()
-					if err != nil {
-						return trace.Wrap(err)
-					}
-
-					if req.Cluster == "" {
-						return trace.BadParameter("first message must contain a cluster")
-					}
-
-					// get the payload written
-					req, err = server.Recv()
-					if err != nil {
-						return trace.Wrap(err)
-					}
-
-					// echo the data back
-					if err := server.Send(&transportv1pb.ProxyClusterResponse{Frame: &transportv1pb.Frame{Payload: req.Frame.Payload}}); err != nil {
-						return trace.Wrap(err)
-					}
-
-					return nil
-				},
-			},
+			cluster: "echo",
 			assertion: func(t *testing.T, conn net.Conn, err error) {
 				require.NoError(t, err)
 				require.NotNil(t, conn)
@@ -206,12 +193,12 @@ func TestClient_DialCluster(t *testing.T) {
 				msg := []byte("hello")
 				n, err := conn.Write(msg)
 				require.NoError(t, err)
-				require.Equal(t, len(msg), n)
+				require.Len(t, msg, n)
 
 				out := make([]byte, n)
 				n, err = conn.Read(out)
 				require.NoError(t, err)
-				require.Equal(t, len(msg), n)
+				require.Len(t, msg, n)
 				require.Equal(t, msg, out)
 
 				require.NoError(t, conn.Close())
@@ -220,12 +207,7 @@ func TestClient_DialCluster(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			pack := newServer(t, test.server)
-
 			conn, err := pack.Client.DialCluster(context.Background(), test.cluster, nil)
 			test.assertion(t, conn, err)
 		})
@@ -240,243 +222,117 @@ func TestClient_DialHost(t *testing.T) {
 
 	keyring := newKeyring(t)
 
-	tests := []struct {
-		name      string
-		cluster   string
-		target    string
-		server    fakeServer
-		keyring   agent.ExtendedAgent
-		assertion func(t *testing.T, conn net.Conn, details *transportv1pb.ClusterDetails, err error)
-	}{
-		{
-			name: "stream terminated",
-			server: fakeServer{
-				ssh: func(server transportv1pb.TransportService_ProxySSHServer) error {
-					return trail.ToGRPC(trace.NotImplemented("not implemented"))
-				},
-			},
-			assertion: func(t *testing.T, conn net.Conn, details *transportv1pb.ClusterDetails, err error) {
-				require.ErrorIs(t, err, trace.NotImplemented("not implemented"))
-				require.Nil(t, conn)
-				require.Nil(t, details)
-			},
-		},
-		{
-			name: "invalid dial target",
-			server: fakeServer{
-				ssh: func(server transportv1pb.TransportService_ProxySSHServer) error {
-					req, err := server.Recv()
-					if err != nil {
-						return trail.ToGRPC(err)
-					}
+	pack := newServer(t, fakeServer{
+		ssh: func(server transportv1pb.TransportService_ProxySSHServer) error {
+			req, err := server.Recv()
+			if err != nil {
+				return trail.ToGRPC(err)
+			}
 
-					if req == nil {
-						return trail.ToGRPC(trace.BadParameter("first message must contain a dial target"))
-					}
+			switch {
+			case req == nil:
+				return trail.ToGRPC(trace.BadParameter("first message must contain a dial target"))
+			case req.DialTarget.Cluster == "":
+				return trail.ToGRPC(trace.BadParameter("first message must contain a cluster"))
+			case req.DialTarget.HostPort == "":
+				return trail.ToGRPC(trace.BadParameter("invalid dial target"))
+			case req.DialTarget.Cluster == "not-implemented":
+				return trail.ToGRPC(trace.NotImplemented("not implemented"))
+			case req.DialTarget.Cluster == "payload-too-large":
+				// send the initial cluster details
+				if err := server.Send(&transportv1pb.ProxySSHResponse{Details: &transportv1pb.ClusterDetails{FipsEnabled: true}}); err != nil && !errors.Is(err, io.EOF) {
+					return trail.ToGRPC(trace.Wrap(err))
+				}
 
-					return trail.ToGRPC(trace.BadParameter("invalid dial target"))
-				},
-			},
-			assertion: func(t *testing.T, conn net.Conn, details *transportv1pb.ClusterDetails, err error) {
-				require.ErrorIs(t, err, trace.BadParameter("invalid dial target"))
-				require.Nil(t, conn)
-				require.Nil(t, details)
-			},
-		},
-		{
-			name:    "connection terminated when receive returns an error",
-			cluster: "test",
-			server: fakeServer{
-				ssh: func(server transportv1pb.TransportService_ProxySSHServer) error {
-					req, err := server.Recv()
-					if err != nil {
-						return trail.ToGRPC(trace.Wrap(err))
-					}
+				// wait for the first ssh frame
+				req, err = server.Recv()
+				if err != nil {
+					return trail.ToGRPC(trace.Wrap(err))
+				}
 
-					if req.DialTarget == nil {
-						return trail.ToGRPC(trace.BadParameter("first message must contain a cluster"))
-					}
-
-					if err := server.Send(&transportv1pb.ProxySSHResponse{Details: &transportv1pb.ClusterDetails{FipsEnabled: true}}); err != nil {
-						return trail.ToGRPC(err)
-					}
-
-					req, err = server.Recv()
-					if err != nil {
-						return trail.ToGRPC(trace.Wrap(err))
-					}
-
-					switch f := req.Frame.(type) {
-					case *transportv1pb.ProxySSHRequest_Ssh:
-						if err := server.Send(&transportv1pb.ProxySSHResponse{
-							Details: nil,
-							Frame:   &transportv1pb.ProxySSHResponse_Ssh{Ssh: &transportv1pb.Frame{Payload: f.Ssh.Payload}},
-						}); err != nil {
-							return trail.ToGRPC(trace.Wrap(err))
-						}
-					case *transportv1pb.ProxySSHRequest_Agent:
-					}
-
+				// write too much data to terminate the stream
+				switch req.Frame.(type) {
+				case *transportv1pb.ProxySSHRequest_Ssh:
 					if err := server.Send(&transportv1pb.ProxySSHResponse{
 						Details: nil,
 						Frame:   &transportv1pb.ProxySSHResponse_Ssh{Ssh: &transportv1pb.Frame{Payload: bytes.Repeat([]byte{0}, 1001)}},
-					}); err != nil {
+					}); err != nil && !errors.Is(err, io.EOF) {
 						return trail.ToGRPC(trace.Wrap(err))
 					}
+				case *transportv1pb.ProxySSHRequest_Agent:
+					return trail.ToGRPC(trace.BadParameter("test expects first frame to be ssh. got an agent frame"))
+				}
 
-					return nil
-				},
-			},
-			assertion: func(t *testing.T, conn net.Conn, details *transportv1pb.ClusterDetails, err error) {
-				require.NoError(t, err)
-				require.NotNil(t, conn)
+				return nil
+			case req.DialTarget.Cluster == "echo":
+				// send the initial cluster details
+				if err := server.Send(&transportv1pb.ProxySSHResponse{Details: &transportv1pb.ClusterDetails{FipsEnabled: true}}); err != nil && !errors.Is(err, io.EOF) {
+					return trail.ToGRPC(trace.Wrap(err))
+				}
 
-				msg := []byte("hello")
-				n, err := conn.Write(msg)
-				require.NoError(t, err)
-				require.Equal(t, len(msg), n)
+				// wait for the client to write some data
+				req, err = server.Recv()
+				if err != nil {
+					if errors.Is(err, io.EOF) {
+						return nil
+					}
+					return trail.ToGRPC(trace.Wrap(err))
+				}
 
-				out := make([]byte, n)
-				n, err = conn.Read(out)
-				require.NoError(t, err)
-				require.Equal(t, len(msg), n)
-				require.Equal(t, msg, out)
-
-				n, err = conn.Read(out)
-				require.True(t, trace.IsConnectionProblem(err))
-				require.Zero(t, n)
-
-				require.NoError(t, conn.Close())
-			},
-		},
-		{
-			name:    "connection successfully established without agent forwarding",
-			cluster: "test",
-			server: fakeServer{
-				ssh: func(server transportv1pb.TransportService_ProxySSHServer) error {
-					req, err := server.Recv()
-					if err != nil {
+				// echo the received payload back to the client
+				switch f := req.Frame.(type) {
+				case *transportv1pb.ProxySSHRequest_Ssh:
+					if err := server.Send(&transportv1pb.ProxySSHResponse{
+						Details: nil,
+						Frame:   &transportv1pb.ProxySSHResponse_Ssh{Ssh: &transportv1pb.Frame{Payload: f.Ssh.Payload}},
+					}); err != nil && !errors.Is(err, io.EOF) {
 						return trail.ToGRPC(trace.Wrap(err))
 					}
+				case *transportv1pb.ProxySSHRequest_Agent:
+					return trail.ToGRPC(trace.BadParameter("test expects first frame to be ssh. got an agent frame"))
+				}
 
-					if req.DialTarget == nil {
-						return trail.ToGRPC(trace.BadParameter("first message must contain a cluster"))
-					}
+				// wait for the client to reply again before exiting the handler
+				// to ensure that the client processed the echo.
+				_, err = server.Recv()
+				return trail.ToGRPC(trace.Wrap(err))
+			case req.DialTarget.Cluster == "forward":
+				// send the initial cluster details
+				if err := server.Send(&transportv1pb.ProxySSHResponse{Details: &transportv1pb.ClusterDetails{FipsEnabled: true}}); err != nil && !errors.Is(err, io.EOF) {
+					return trail.ToGRPC(trace.Wrap(err))
+				}
 
-					if err := server.Send(&transportv1pb.ProxySSHResponse{Details: &transportv1pb.ClusterDetails{FipsEnabled: true}}); err != nil {
-						return trail.ToGRPC(err)
-					}
+				// wait for the first ssh frame
+				req, err = server.Recv()
+				if err != nil {
+					return trail.ToGRPC(trace.Wrap(err))
+				}
 
-					req, err = server.Recv()
-					if err != nil {
+				// echo the data back on an ssh frame
+				switch f := req.Frame.(type) {
+				case *transportv1pb.ProxySSHRequest_Ssh:
+					if err := server.Send(&transportv1pb.ProxySSHResponse{
+						Details: nil,
+						Frame:   &transportv1pb.ProxySSHResponse_Ssh{Ssh: &transportv1pb.Frame{Payload: f.Ssh.Payload}},
+					}); err != nil && !errors.Is(err, io.EOF) {
 						return trail.ToGRPC(trace.Wrap(err))
 					}
+				case *transportv1pb.ProxySSHRequest_Agent:
+					return trail.ToGRPC(trace.BadParameter("test expects first frame to be ssh. got an agent frame"))
+				}
 
-					switch f := req.Frame.(type) {
-					case *transportv1pb.ProxySSHRequest_Ssh:
-						if err := server.Send(&transportv1pb.ProxySSHResponse{
-							Details: nil,
-							Frame:   &transportv1pb.ProxySSHResponse_Ssh{Ssh: &transportv1pb.Frame{Payload: f.Ssh.Payload}},
-						}); err != nil {
-							return trail.ToGRPC(trace.Wrap(err))
-						}
-					case *transportv1pb.ProxySSHRequest_Agent:
-					}
+				// create an agent stream and writer to communicate agent protocol on
+				agentStream := newServerStream(server, func(payload []byte) *transportv1pb.ProxySSHResponse {
+					return &transportv1pb.ProxySSHResponse{Frame: &transportv1pb.ProxySSHResponse_Agent{Agent: &transportv1pb.Frame{Payload: payload}}}
+				})
+				agentStreamRW, err := streamutils.NewReadWriter(agentStream)
+				if err != nil {
+					return trail.ToGRPC(trace.Wrap(err, "failed constructing ssh agent streamer"))
+				}
 
-					return nil
-				},
-			},
-			assertion: func(t *testing.T, conn net.Conn, details *transportv1pb.ClusterDetails, err error) {
-				require.NoError(t, err)
-				require.NotNil(t, conn)
-
-				msg := []byte("hello")
-				n, err := conn.Write(msg)
-				require.NoError(t, err)
-				require.Equal(t, len(msg), n)
-
-				out := make([]byte, n)
-				n, err = conn.Read(out)
-				require.NoError(t, err)
-				require.Equal(t, len(msg), n)
-				require.Equal(t, msg, out)
-
-				n, err = conn.Read(out)
-				require.ErrorIs(t, err, io.EOF)
-				require.Zero(t, n)
-
-				require.NoError(t, conn.Close())
-			},
-		},
-		{
-			name:    "connection successfully established with agent forwarding",
-			cluster: "test",
-			keyring: keyring,
-			server: fakeServer{
-				ssh: func(server transportv1pb.TransportService_ProxySSHServer) error {
-					req, err := server.Recv()
-					if err != nil {
-						return trail.ToGRPC(trace.Wrap(err))
-					}
-
-					if req.DialTarget == nil {
-						return trail.ToGRPC(trace.BadParameter("first message must contain a cluster"))
-					}
-
-					// send the initial cluster details
-					if err := server.Send(&transportv1pb.ProxySSHResponse{Details: &transportv1pb.ClusterDetails{FipsEnabled: true}}); err != nil {
-						return trail.ToGRPC(trace.Wrap(err))
-					}
-
-					// wait for the first ssh frame
-					req, err = server.Recv()
-					if err != nil {
-						return trail.ToGRPC(trace.Wrap(err))
-					}
-
-					// echo the data back on an ssh frame
-					switch f := req.Frame.(type) {
-					case *transportv1pb.ProxySSHRequest_Ssh:
-						if err := server.Send(&transportv1pb.ProxySSHResponse{
-							Details: nil,
-							Frame:   &transportv1pb.ProxySSHResponse_Ssh{Ssh: &transportv1pb.Frame{Payload: f.Ssh.Payload}},
-						}); err != nil {
-							return trail.ToGRPC(trace.Wrap(err))
-						}
-					case *transportv1pb.ProxySSHRequest_Agent:
-						return trail.ToGRPC(trace.BadParameter("test expects first frame to be ssh. got an agent frame"))
-					}
-
-					// create an agent stream and writer to communicate agent protocol on
-					agentStream := newServerStream(server, func(payload []byte) *transportv1pb.ProxySSHResponse {
-						return &transportv1pb.ProxySSHResponse{Frame: &transportv1pb.ProxySSHResponse_Agent{Agent: &transportv1pb.Frame{Payload: payload}}}
-					})
-					agentStreamRW, err := streamutils.NewReadWriter(agentStream)
-					if err != nil {
-						return trail.ToGRPC(trace.Wrap(err, "failed constructing ssh agent streamer"))
-					}
-
-					// read in agent frames
-					go func() {
-						for {
-							req, err := server.Recv()
-							if err != nil {
-								if errors.Is(err, io.EOF) {
-									return
-								}
-
-								return
-							}
-
-							switch frame := req.Frame.(type) {
-							case *transportv1pb.ProxySSHRequest_Agent:
-								agentStream.incomingC <- frame.Agent.Payload
-							default:
-								continue
-							}
-						}
-					}()
-
+				// process agent frames
+				eg, _ := errgroup.WithContext(t.Context())
+				eg.Go(func() error {
 					// create an agent that will communicate over the agent frames
 					// and list the keys from the client
 					clt := agent.NewClient(agentStreamRW)
@@ -494,13 +350,123 @@ func TestClient_DialHost(t *testing.T) {
 					if err := server.Send(&transportv1pb.ProxySSHResponse{
 						Details: nil,
 						Frame:   &transportv1pb.ProxySSHResponse_Ssh{Ssh: &transportv1pb.Frame{Payload: keys[0].Blob}},
-					}); err != nil {
+					}); err != nil && !errors.Is(err, io.EOF) {
 						return trail.ToGRPC(trace.Wrap(err))
 					}
 
 					return nil
-				},
+				})
+
+				for {
+					req, err := server.Recv()
+					switch {
+					case errors.Is(err, io.EOF):
+						if err := eg.Wait(); err != nil {
+							return trail.ToGRPC(trace.Wrap(err))
+						}
+
+						return nil
+					case err != nil:
+						return trace.Wrap(err)
+					}
+
+					switch frame := req.Frame.(type) {
+					case *transportv1pb.ProxySSHRequest_Agent:
+						agentStream.incomingC <- frame.Agent.Payload
+					default:
+						continue
+					}
+				}
+			default:
+				return trail.ToGRPC(trace.BadParameter("invalid cluster"))
+			}
+		},
+	})
+
+	tests := []struct {
+		name      string
+		cluster   string
+		target    string
+		keyring   agent.ExtendedAgent
+		assertion func(t *testing.T, conn net.Conn, details *transportv1pb.ClusterDetails, err error)
+	}{
+		{
+			name:    "stream terminated",
+			cluster: "not-implemented",
+			target:  "127.0.0.1:8080",
+			assertion: func(t *testing.T, conn net.Conn, details *transportv1pb.ClusterDetails, err error) {
+				require.ErrorIs(t, err, trace.NotImplemented("not implemented"))
+				require.Nil(t, conn)
+				require.Nil(t, details)
 			},
+		},
+		{
+			name:    "invalid dial target",
+			cluster: "valid",
+			assertion: func(t *testing.T, conn net.Conn, details *transportv1pb.ClusterDetails, err error) {
+				require.ErrorIs(t, err, trace.BadParameter("invalid dial target"))
+				require.Nil(t, conn)
+				require.Nil(t, details)
+			},
+		},
+		{
+			name:    "connection terminated when receive returns an error",
+			cluster: "payload-too-large",
+			target:  "127.0.0.1:8080",
+			assertion: func(t *testing.T, conn net.Conn, details *transportv1pb.ClusterDetails, err error) {
+				require.NoError(t, err)
+				require.NotNil(t, conn)
+
+				msg := []byte("hello")
+				n, err := conn.Write(msg)
+				require.NoError(t, err)
+				require.Len(t, msg, n)
+
+				out := make([]byte, 10)
+				n, err = conn.Read(out)
+				require.True(t, trace.IsConnectionProblem(err))
+				require.Zero(t, n)
+
+				require.NoError(t, conn.Close())
+			},
+		},
+		{
+			name:    "connection successfully established without agent forwarding",
+			cluster: "echo",
+			target:  "127.0.0.1:8080",
+			assertion: func(t *testing.T, conn net.Conn, details *transportv1pb.ClusterDetails, err error) {
+				require.NoError(t, err)
+				require.NotNil(t, conn)
+
+				// Write the message and expect it is echoed back.
+				msg := []byte("hello")
+				n, err := conn.Write(msg)
+				require.NoError(t, err)
+				require.Len(t, msg, n)
+				out := make([]byte, n)
+				n, err = conn.Read(out)
+				require.NoError(t, err)
+				require.Len(t, msg, n)
+				require.Equal(t, msg, out)
+
+				// Write the same message again to trigger the server to shut down.
+				n, err = conn.Write(msg)
+				require.NoError(t, err)
+				require.Len(t, msg, n)
+
+				// Expect subsequent reads result in an EOF.
+				n, err = conn.Read(out)
+				require.ErrorIs(t, err, io.EOF)
+				require.Zero(t, n)
+
+				require.NoError(t, conn.Close())
+			},
+		},
+		{
+			name:    "connection successfully established with agent forwarding",
+			cluster: "forward",
+			target:  "127.0.0.1:8080",
+			keyring: keyring,
 			assertion: func(t *testing.T, conn net.Conn, details *transportv1pb.ClusterDetails, err error) {
 				require.NoError(t, err)
 				require.NotNil(t, conn)
@@ -510,13 +476,13 @@ func TestClient_DialHost(t *testing.T) {
 				msg := []byte("hello")
 				n, err := conn.Write(msg)
 				require.NoError(t, err)
-				require.Equal(t, len(msg), n)
+				require.Len(t, msg, n)
 
 				// read data via ssh frames
 				out := make([]byte, n)
 				n, err = conn.Read(out)
 				require.NoError(t, err)
-				require.Equal(t, len(msg), n)
+				require.Len(t, msg, n)
 				require.Equal(t, msg, out)
 
 				// get the keys from our local keyring
@@ -526,13 +492,13 @@ func TestClient_DialHost(t *testing.T) {
 
 				// the server performs a remote list of keys
 				// via ssh frames. to prevent the test from terminating
-				// before it can complete it will write the blob of the
+				// before it can complete, it will write the blob of the
 				// listed key back on the ssh frame. verify that the key
 				// it received matches the one from out local keyring.
 				out = make([]byte, len(keys[0].Blob))
 				n, err = conn.Read(out)
 				require.NoError(t, err)
-				require.Equal(t, len(keys[0].Blob), n)
+				require.Len(t, keys[0].Blob, n)
 				require.Equal(t, keys[0].Blob, out)
 
 				// close the stream
@@ -542,13 +508,8 @@ func TestClient_DialHost(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			pack := newServer(t, test.server)
-
-			conn, details, err := pack.Client.DialHost(context.Background(), test.cluster, test.target, nil, test.keyring)
+			conn, details, err := pack.Client.DialHost(t.Context(), test.target, test.cluster, nil, test.keyring)
 			test.assertion(t, conn, details, err)
 		})
 	}
@@ -588,7 +549,7 @@ func newServer(t *testing.T, srv transportv1pb.TransportServiceServer) testPack 
 	}()
 
 	// gRPC client.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	cc, err := grpc.DialContext(ctx, "unused",
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
@@ -596,6 +557,8 @@ func newServer(t *testing.T, srv transportv1pb.TransportServiceServer) testPack 
 		}),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(1000)),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(interceptors.GRPCClientUnaryErrorInterceptor),
+		grpc.WithStreamInterceptor(interceptors.GRPCClientStreamErrorInterceptor),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -611,7 +574,7 @@ func newServer(t *testing.T, srv transportv1pb.TransportServiceServer) testPack 
 // newKeyring returns an [agent.ExtendedAgent] that has
 // one key populated in it.
 func newKeyring(t *testing.T) agent.ExtendedAgent {
-	private, err := rsa.GenerateKey(rand.Reader, 2048)
+	_, private, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
 
 	keyring := agent.NewKeyring()

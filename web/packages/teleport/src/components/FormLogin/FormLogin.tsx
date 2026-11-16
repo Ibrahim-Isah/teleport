@@ -1,124 +1,149 @@
-/*
-Copyright 2019-2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React, { useState, useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import styled from 'styled-components';
+
 import {
-  Card,
-  Text,
-  Flex,
+  Box,
+  Button,
   ButtonLink,
   ButtonPrimary,
-  Box,
+  ButtonSecondary,
   ButtonText,
+  Card,
+  Flex,
+  Text,
 } from 'design';
-import { Key, ArrowForward } from 'design/Icon';
 import * as Alerts from 'design/Alert';
+import * as Icon from 'design/Icon';
+import { StepComponentProps, StepSlider } from 'design/StepSlider';
+import { P } from 'design/Text/Text';
+import FieldInput from 'shared/components/FieldInput';
+import { FieldSelect } from 'shared/components/FieldSelect';
+import Validation, { Validator } from 'shared/components/Validation';
 import {
-  AuthProvider,
+  requiredField,
+  requiredToken,
+} from 'shared/components/Validation/rules';
+import { useAttempt, useRefAutoFocus } from 'shared/hooks';
+import {
   Auth2faType,
+  AuthProvider,
   PreferredMfaType,
   PrimaryAuthType,
 } from 'shared/services';
-import { useAttempt, useRefAutoFocus } from 'shared/hooks';
-import Validation, { Validator } from 'shared/components/Validation';
-import FieldInput from 'shared/components/FieldInput';
-import FieldSelect from 'shared/components/FieldSelect';
-import {
-  requiredToken,
-  requiredField,
-} from 'shared/components/Validation/rules';
 import createMfaOptions, { MfaOption } from 'shared/utils/createMfaOptions';
-import { StepSlider, StepComponentProps } from 'design/StepSlider';
 
-import { PrivateKeyLoginDisabledCard } from 'teleport/components/PrivateKeyPolicy';
+import cfg from 'teleport/config';
 import { UserCredentials } from 'teleport/services/auth';
+import history from 'teleport/services/history';
 
+import { PasskeyIcons } from '../Passkeys';
+import { FormIdentifierFirst, ViewSwitchButton } from './FormIdentifierFirst';
 import SSOButtonList from './SsoButtons';
+
+const allAuthTypes: PrimaryAuthType[] = ['passwordless', 'sso', 'local'];
 
 export default function LoginForm(props: Props) {
   const {
-    title,
     attempt,
     isLocalAuthEnabled = true,
+    isPasswordlessEnabled,
     authProviders = [],
-    privateKeyPolicyEnabled,
-    isRecoveryEnabled,
-    onRecover,
+    primaryAuthType,
+    title = 'Sign in to Teleport',
+    ssoTitle = 'Sign in to Teleport with SSO',
+    scope,
   } = props;
-  if (privateKeyPolicyEnabled) {
-    return (
-      <PrivateKeyLoginDisabledCard
-        title={title}
-        onRecover={isRecoveryEnabled ? onRecover : null}
-      />
-    );
-  }
+
+  const [showIdentifierFirstLogin, setShowIdentifierFirstLogin] = useState(
+    cfg?.auth?.identifierFirstLoginEnabled
+  );
 
   const ssoEnabled = authProviders?.length > 0;
 
   // If local auth was not enabled, disregard any primary auth type config
   // and display sso providers if any.
-  if (!isLocalAuthEnabled && ssoEnabled) {
-    return (
-      <Card bg="primary.light" my="5" mx="auto" width="464px" pb={4}>
-        <Text typography="h3" pt={4} textAlign="center" color="light">
-          {title}
-        </Text>
-        {attempt.isFailed && (
-          <Alerts.Danger m={5} mb={0}>
-            {attempt.message}
-          </Alerts.Danger>
-        )}
-        <SsoList {...props} />
-      </Card>
-    );
+  const actualPrimaryType = isLocalAuthEnabled ? primaryAuthType : 'sso';
+
+  const allowedAuthTypes = allAuthTypes.filter(t => {
+    if (!isLocalAuthEnabled) return ssoEnabled && t === 'sso';
+    if (!isPasswordlessEnabled && t === 'passwordless') return false;
+    if (!ssoEnabled && t === 'sso') return false;
+    return true;
+  });
+  const otherAuthTypes = allowedAuthTypes.filter(t => t !== actualPrimaryType);
+
+  let errorMessage = '';
+  if (allowedAuthTypes.length === 0) {
+    errorMessage = 'Login has not been enabled';
+  } else if (attempt.isFailed) {
+    errorMessage = attempt.message;
   }
 
-  if (!isLocalAuthEnabled) {
+  const showAccessChangedMessage = history.hasAccessChangedParam();
+
+  if (ssoEnabled && showIdentifierFirstLogin) {
     return (
-      <Card bg="primary.light" my="5" mx="auto" width="464px" px={5} pb={4}>
-        <Text typography="h3" pt={4} textAlign="center" color="light">
-          {title}
-        </Text>
-        <Alerts.Danger my={5}>Login has not been enabled</Alerts.Danger>
-        <Text mb={2} typography="paragraph2" width="100%">
-          The ability to login has not been enabled. Please contact your system
-          administrator for more information.
-        </Text>
-      </Card>
+      <FormIdentifierFirst
+        onLoginWithSso={props.onLoginWithSso}
+        onUseLocalLogin={() => setShowIdentifierFirstLogin(false)}
+        isLocalAuthEnabled={isLocalAuthEnabled}
+        title={title}
+        ssoTitle={ssoTitle}
+      />
     );
   }
 
   // Everything below requires local auth to be enabled.
   return (
-    <Card bg="primary.light" my="5" mx="auto" width={464} pb={4}>
-      <Text typography="h3" pt={4} textAlign="center" color="light">
+    <Card mb="5" mx="auto" maxWidth={500} minWidth={300} py={4}>
+      <Text typography="h1" mb={4} textAlign="center">
         {title}
       </Text>
-      {attempt.isFailed && (
-        <Alerts.Danger m={5} mb={0}>
-          {attempt.message}
-        </Alerts.Danger>
+      {scope && (
+        <Flex gap={2} alignItems="center" justifyContent="center">
+          <Icon.Contract aria-label="scope" />
+          <Text typography="body1">{scope}</Text>
+        </Flex>
       )}
-      <StepSlider<typeof loginViews>
-        flows={loginViews}
-        currFlow={'default'}
-        {...props}
-      />
+      {errorMessage && <Alerts.Danger m={4}>{errorMessage}</Alerts.Danger>}
+      {showAccessChangedMessage && (
+        <Alerts.Warning m={4}>
+          Your access has changed. Please re-login.
+        </Alerts.Warning>
+      )}
+      {allowedAuthTypes.length > 0 ? (
+        <StepSlider<typeof loginViews>
+          flows={loginViews}
+          currFlow={'default'}
+          otherAuthTypes={otherAuthTypes}
+          {...props}
+          setShowIdentifierFirstLogin={setShowIdentifierFirstLogin}
+          primaryAuthType={actualPrimaryType}
+        />
+      ) : (
+        <P mx={4}>
+          The ability to login has not been enabled. Please contact your system
+          administrator for more information.
+        </P>
+      )}
     </Card>
   );
 }
@@ -128,15 +153,31 @@ const SsoList = ({
   authProviders,
   onLoginWithSso,
   autoFocus = false,
-}: Props) => {
+  hasTransitionEnded,
+  setShowIdentifierFirstLogin,
+}: Props & { hasTransitionEnded?: boolean }) => {
+  const ref = useRefAutoFocus<HTMLButtonElement>({
+    shouldFocus: hasTransitionEnded && autoFocus,
+  });
   const { isProcessing } = attempt;
+
+  if (cfg?.auth?.identifierFirstLoginEnabled) {
+    return (
+      <ViewSwitchButton
+        onClick={() => setShowIdentifierFirstLogin(true)}
+        disabled={isProcessing}
+      >
+        Sign in using SSO
+      </ViewSwitchButton>
+    );
+  }
+
   return (
     <SSOButtonList
-      prefixText="Login with"
       isDisabled={isProcessing}
       providers={authProviders}
       onClick={onLoginWithSso}
-      autoFocus={autoFocus}
+      ref={ref}
     />
   );
 };
@@ -145,44 +186,39 @@ const Passwordless = ({
   onLoginWithWebauthn,
   attempt,
   autoFocus = false,
-}: Props) => {
-  // Firefox currently does not support passwordless and when
-  // logging in, it will return an ambigugous error.
-  // We display a soft warning because firefox may provide
-  // support in the near future: https://github.com/gravitational/webapps/pull/876
-  const isFirefox = window.navigator?.userAgent
-    ?.toLowerCase()
-    .includes('firefox');
+  hasTransitionEnded,
+  primary,
+}: Props & { hasTransitionEnded: boolean; primary: boolean }) => {
+  const ref = useRefAutoFocus<HTMLButtonElement>({
+    shouldFocus: hasTransitionEnded && autoFocus,
+  });
   return (
-    <Box px={5} pt={2} data-testid="passwordless" pb={1}>
-      {isFirefox && (
-        <Alerts.Info mt={3}>
-          Firefox may not support passwordless login. Please try Chrome or
-          Safari.
-        </Alerts.Info>
-      )}
-      <StyledPaswordlessBtn
-        mt={3}
-        py={2}
-        px={3}
-        width="100%"
-        onClick={() => onLoginWithWebauthn()}
-        disabled={attempt.isProcessing}
-        autoFocus={autoFocus}
+    <Box data-testid="passwordless">
+      <Flex
+        flexDirection="column"
+        border={1}
+        borderColor="interactive.tonal.neutral.2"
+        borderRadius={3}
+        p={3}
+        gap={3}
       >
-        <Flex alignItems="center" justifyContent="space-between">
-          <Flex alignItems="center">
-            <Key mr={3} fontSize={16} />
-            <Box>
-              <Text typography="h6">Passwordless</Text>
-              <Text fontSize={1} color="text.secondary">
-                Follow the prompt from your browser
-              </Text>
-            </Box>
-          </Flex>
-          <ArrowForward fontSize={16} />
-        </Flex>
-      </StyledPaswordlessBtn>
+        <div>
+          <PasskeyIcons />
+        </div>
+        <div>
+          <P>Your browser will prompt you for a device key.</P>
+        </div>
+        <Button
+          fill="filled"
+          intent={primary ? 'primary' : 'neutral'}
+          size="extra-large"
+          ref={ref}
+          disabled={attempt.isProcessing}
+          onClick={() => onLoginWithWebauthn()}
+        >
+          Sign in with a Passkey
+        </Button>
+      </Flex>
     </Box>
   );
 };
@@ -244,8 +280,6 @@ const LocalForm = ({
       {({ validator }) => (
         <Flex
           as="form"
-          px="5"
-          pt="3"
           justifyContent="center"
           flexDirection="column"
           borderBottomLeftRadius="3"
@@ -259,76 +293,81 @@ const LocalForm = ({
             value={user}
             onChange={e => setUser(e.target.value)}
             placeholder="Username"
+            disabled={attempt.isProcessing}
             mb={3}
           />
           <Box mb={isRecoveryEnabled ? 1 : 3}>
             <FieldInput
               rule={requiredField('Password is required')}
               label="Password"
+              helperText={
+                isRecoveryEnabled && (
+                  <ButtonLink
+                    style={{ padding: '0px', minHeight: 0 }}
+                    onClick={() => onRecover(true)}
+                  >
+                    Forgot Password?
+                  </ButtonLink>
+                )
+              }
               value={pass}
               onChange={e => setPass(e.target.value)}
               type="password"
               placeholder="Password"
+              disabled={attempt.isProcessing}
               mb={0}
               width="100%"
             />
-            {isRecoveryEnabled && (
-              <Box textAlign="right">
-                <ButtonLink
-                  style={{ padding: '0px', minHeight: 0 }}
-                  onClick={() => onRecover(true)}
-                >
-                  Forgot Password?
-                </ButtonLink>
-              </Box>
-            )}
           </Box>
           {auth2faType !== 'off' && (
             <Box mb={isRecoveryEnabled ? 2 : 3}>
-              <Flex alignItems="flex-end">
+              <Flex alignItems="flex-start">
                 <FieldSelect
                   maxWidth="50%"
                   width="100%"
                   data-testid="mfa-select"
-                  label="Two-factor type"
+                  label="Multi-factor Type"
+                  helperText={
+                    isRecoveryEnabled && (
+                      <ButtonLink
+                        style={{ padding: '0px', minHeight: 0 }}
+                        onClick={() => onRecover(false)}
+                      >
+                        Lost Two-Factor Device?
+                      </ButtonLink>
+                    )
+                  }
                   value={mfaType}
                   options={mfaOptions}
                   onChange={opt => onSetMfaOption(opt as MfaOption, validator)}
                   mr={3}
                   mb={0}
                   isDisabled={isProcessing}
-                  menuIsOpen={true}
+                  // Needed to prevent the menu from causing scroll bars to
+                  // appear.
+                  menuPosition="fixed"
                 />
                 {mfaType.value === 'otp' && (
                   <FieldInput
                     width="50%"
-                    label="Authenticator code"
+                    label="Authenticator Code"
                     rule={requiredToken}
                     autoComplete="one-time-code"
                     inputMode="numeric"
                     value={token}
                     onChange={e => setToken(e.target.value)}
                     placeholder="123 456"
+                    disabled={attempt.isProcessing}
                     mb={0}
                   />
                 )}
               </Flex>
-              {isRecoveryEnabled && (
-                <ButtonLink
-                  style={{ padding: '0px', minHeight: 0 }}
-                  onClick={() => onRecover(false)}
-                >
-                  Lost Two-Factor Device?
-                </ButtonLink>
-              )}
             </Box>
           )}
           <ButtonPrimary
             width="100%"
-            mt={3}
-            mb={1}
             type="submit"
-            size="large"
+            size="extra-large"
             onClick={e => onLoginClick(e, validator)}
             disabled={isProcessing}
           >
@@ -340,117 +379,84 @@ const LocalForm = ({
   );
 };
 
-// Primary determines which authentication type to display
-// on initial render of the login form.
-const Primary = ({
+// Displays the primary login options and a list of secondary options.
+const LoginOptions = ({
   next,
   refCallback,
-  hasTransitionEnded,
+  otherAuthTypes,
+  setShowIdentifierFirstLogin,
   ...otherProps
-}: Props & StepComponentProps) => {
-  const ssoEnabled = otherProps.authProviders?.length > 0;
-  let otherOptionsAvailable = true;
-  let $primary;
-
-  switch (otherProps.primaryAuthType) {
-    case 'passwordless':
-      $primary = <Passwordless {...otherProps} autoFocus={true} />;
-      break;
-    case 'sso':
-      $primary = <SsoList {...otherProps} autoFocus={true} />;
-      break;
-    case 'local':
-      otherOptionsAvailable = otherProps.isPasswordlessEnabled || ssoEnabled;
-      $primary = (
-        <LocalForm
-          {...otherProps}
-          hasTransitionEnded={hasTransitionEnded}
-          autoFocus={true}
-        />
-      );
-      break;
-  }
-
+}: { otherAuthTypes: PrimaryAuthType[] } & Props & StepComponentProps) => {
   return (
-    <Box ref={refCallback}>
-      {$primary}
-      {otherOptionsAvailable && (
-        <Box pt={3} mt={-1} textAlign="center">
-          <ButtonText
-            disabled={otherProps.attempt.isProcessing}
-            onClick={() => {
-              otherProps.clearAttempt();
-              next();
-            }}
-          >
-            Other sign-in options
-          </ButtonText>
-        </Box>
-      )}
-    </Box>
+    <Flex flexDirection="column" px={4} gap={3} ref={refCallback}>
+      <AuthMethod
+        {...otherProps}
+        setShowIdentifierFirstLogin={setShowIdentifierFirstLogin}
+        next={next}
+        refCallback={refCallback}
+        authType={otherProps.primaryAuthType}
+        primary
+        autoFocus
+      />
+      {otherAuthTypes.length > 0 && <Divider />}
+      {otherAuthTypes.map(authType => (
+        <AuthMethod
+          key={authType}
+          {...otherProps}
+          setShowIdentifierFirstLogin={setShowIdentifierFirstLogin}
+          next={next}
+          refCallback={refCallback}
+          authType={authType}
+        />
+      ))}
+    </Flex>
   );
 };
 
-// Secondary determines what other forms of authentication
-// is allowed for the user to login with.
-//
-// There can be multiple authn types available, which will
-// be visually separated by a divider.
-const Secondary = ({
+function AuthMethod({
+  authType,
+  primary,
+  autoFocus,
+  next,
+  ...otherProps
+}: {
+  authType: PrimaryAuthType;
+  primary?: boolean;
+} & Props &
+  StepComponentProps) {
+  switch (authType) {
+    case 'passwordless':
+      return (
+        <Passwordless {...otherProps} autoFocus={autoFocus} primary={primary} />
+      );
+    case 'sso':
+      return <SsoList {...otherProps} autoFocus={autoFocus} />;
+    case 'local':
+      return primary ? (
+        <LocalForm {...otherProps} autoFocus={true} />
+      ) : (
+        <Box py={2}>
+          <ButtonSecondary size="extra-large" block onClick={next}>
+            Sign in with Username and Password
+          </ButtonSecondary>
+        </Box>
+      );
+  }
+}
+
+// Displays a standalone local login form.
+const LocalLogin = ({
   prev,
   refCallback,
   ...otherProps
 }: Props & StepComponentProps) => {
-  const ssoEnabled = otherProps.authProviders?.length > 0;
-  const { primaryAuthType, isPasswordlessEnabled } = otherProps;
-
-  let $secondary;
-  switch (primaryAuthType) {
-    case 'passwordless':
-      if (ssoEnabled) {
-        $secondary = (
-          <>
-            <SsoList {...otherProps} autoFocus={true} />
-            <Divider />
-            <LocalForm {...otherProps} />
-          </>
-        );
-      } else {
-        $secondary = <LocalForm {...otherProps} autoFocus={true} />;
-      }
-      break;
-    case 'sso':
-      if (isPasswordlessEnabled) {
-        $secondary = (
-          <>
-            <Passwordless {...otherProps} autoFocus={true} />
-            <Divider />
-            <LocalForm {...otherProps} />
-          </>
-        );
-      } else {
-        $secondary = <LocalForm {...otherProps} autoFocus={true} />;
-      }
-      break;
-    case 'local':
-      if (isPasswordlessEnabled) {
-        $secondary = (
-          <>
-            <Passwordless {...otherProps} autoFocus={true} />
-            {otherProps.isPasswordlessEnabled && ssoEnabled && <Divider />}
-            {ssoEnabled && <SsoList {...otherProps} />}
-          </>
-        );
-      } else {
-        $secondary = <SsoList {...otherProps} autoFocus={true} />;
-      }
-      break;
-  }
   return (
-    <Box ref={refCallback}>
-      {$secondary}
+    <Box px={4} ref={refCallback}>
+      <LocalForm {...otherProps} autoFocus={true} />
       <Box pt={3} textAlign="center">
         <ButtonText
+          width="100%"
+          size="extra-large"
           disabled={otherProps.attempt.isProcessing}
           onClick={() => {
             otherProps.clearAttempt();
@@ -470,35 +476,15 @@ const Divider = () => (
     justifyContent="center"
     flexDirection="column"
     borderBottom={1}
-    borderColor="text.placeholder"
-    mx={5}
-    mt={5}
-    mb={2}
+    borderColor="text.muted"
+    my={3}
   >
     <StyledOr>Or</StyledOr>
   </Flex>
 );
 
-const StyledPaswordlessBtn = styled(ButtonText)`
-  display: block;
-  text-align: left;
-  border: 1px solid ${({ theme }) => theme.colors.text.placeholder};
-
-  &:hover,
-  &:active,
-  &:focus {
-    border-color: ${({ theme }) => theme.colors.action.active};
-    text-decoration: none;
-  }
-
-  &[disabled] {
-    pointer-events: none;
-    opacity: 0.7;
-  }
-`;
-
 const StyledOr = styled.div`
-  background: ${props => props.theme.colors.primary.light};
+  background: ${props => props.theme.colors.levels.surface};
   display: flex;
   align-items: center;
   font-size: 10px;
@@ -506,16 +492,20 @@ const StyledOr = styled.div`
   width: 32px;
   justify-content: center;
   position: absolute;
-  z-index: 1;
+  text-transform: uppercase;
 `;
 
-const loginViews = { default: [Primary, Secondary] };
+const loginViews = { default: [LoginOptions, LocalLogin] };
 
 export type Props = {
+  // Deprecated. TODO(bl-nero): Remove after e/ is updated.
   title?: string;
+  /**
+   * ssoTitle is the login form title for the identifier-first login view.
+   */
+  ssoTitle?: string;
   isLocalAuthEnabled?: boolean;
   isPasswordlessEnabled: boolean;
-  privateKeyPolicyEnabled: boolean;
   authProviders?: AuthProvider[];
   auth2faType?: Auth2faType;
   primaryAuthType: PrimaryAuthType;
@@ -524,10 +514,12 @@ export type Props = {
   isRecoveryEnabled?: boolean;
   onRecover?: (isRecoverPassword: boolean) => void;
   clearAttempt?: () => void;
-  onLoginWithSso(provider: AuthProvider): void;
+  onLoginWithSso(provider: AuthProvider, loginHint?: string): void;
   onLoginWithWebauthn(creds?: UserCredentials): void;
   onLogin(username: string, password: string, token: string): void;
   autoFocus?: boolean;
+  setShowIdentifierFirstLogin?: (value: boolean) => void;
+  scope: string;
 };
 
 type AttemptState = ReturnType<typeof useAttempt>[0];

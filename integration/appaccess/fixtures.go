@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package appaccess
 
@@ -20,33 +24,36 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/breaker"
 	"github.com/gravitational/teleport/integration/helpers"
-	"github.com/gravitational/teleport/lib"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
-	"github.com/gravitational/teleport/lib/service"
+	"github.com/gravitational/teleport/lib/modules/modulestest"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
 
 type AppTestOptions struct {
-	ExtraRootApps        []service.App
-	ExtraLeafApps        []service.App
+	ExtraRootApps        []servicecfg.App
+	ExtraLeafApps        []servicecfg.App
 	RootClusterListeners helpers.InstanceListenerSetupFunc
 	LeafClusterListeners helpers.InstanceListenerSetupFunc
-	Clock                clockwork.FakeClock
+	Clock                clockwork.Clock
 	MonitorCloseChannel  chan struct{}
 
-	RootConfig func(config *service.Config)
-	LeafConfig func(config *service.Config)
+	RootConfig func(config *servicecfg.Config)
+	LeafConfig func(config *servicecfg.Config)
 }
 
 // Setup configures all clusters and servers needed for a test.
@@ -59,50 +66,56 @@ func SetupWithOptions(t *testing.T, opts AppTestOptions) *Pack {
 	tr := utils.NewTracer(utils.ThisFunction()).Start()
 	defer tr.Stop()
 
-	log := utils.NewLoggerForTests()
-
-	// Insecure development mode needs to be set because the web proxy uses a
-	// self-signed certificate during tests.
-	lib.SetInsecureDevMode(true)
+	log := logtest.NewLogger()
 
 	p := &Pack{
 		rootAppName:        "app-01",
 		rootAppPublicAddr:  "app-01.example.com",
 		rootAppClusterName: "example.com",
-		rootMessage:        uuid.New().String(),
+		rootMessage:        uuidWithLabel("app-01"),
 
 		rootWSAppName:    "ws-01",
 		rootWSPublicAddr: "ws-01.example.com",
-		rootWSMessage:    uuid.New().String(),
+		rootWSMessage:    uuidWithLabel("ws-01"),
 
 		rootWSSAppName:    "wss-01",
 		rootWSSPublicAddr: "wss-01.example.com",
-		rootWSSMessage:    uuid.New().String(),
+		rootWSSMessage:    uuidWithLabel("wss-01"),
 
 		rootTCPAppName:    "tcp-01",
 		rootTCPPublicAddr: "tcp-01.example.com",
-		rootTCPMessage:    uuid.New().String(),
+		rootTCPMessage:    uuidWithLabel("tcp-01"),
 
 		rootTCPTwoWayAppName:    "tcp-twoway",
 		rootTCPTwoWayPublicAddr: "tcp-twoway.example.com",
-		rootTCPTwoWayMessage:    uuid.New().String(),
+		rootTCPTwoWayMessage:    uuidWithLabel("tcp-twoway"),
+
+		rootTCPMultiPortAppName:      "tcp-multiport-01",
+		rootTCPMultiPortPublicAddr:   "tcp-multiport-01.example.com",
+		rootTCPMultiPortMessageAlpha: uuidWithLabel("tcp-multiport-01-alpha"),
+		rootTCPMultiPortMessageBeta:  uuidWithLabel("tcp-multiport-01-beta"),
 
 		leafAppName:        "app-02",
 		leafAppPublicAddr:  "app-02.example.com",
 		leafAppClusterName: "leaf.example.com",
-		leafMessage:        uuid.New().String(),
+		leafMessage:        uuidWithLabel("app-02"),
 
 		leafWSAppName:    "ws-02",
 		leafWSPublicAddr: "ws-02.example.com",
-		leafWSMessage:    uuid.New().String(),
+		leafWSMessage:    uuidWithLabel("ws-02"),
 
 		leafWSSAppName:    "wss-02",
 		leafWSSPublicAddr: "wss-02.example.com",
-		leafWSSMessage:    uuid.New().String(),
+		leafWSSMessage:    uuidWithLabel("wss-02"),
 
 		leafTCPAppName:    "tcp-02",
 		leafTCPPublicAddr: "tcp-02.example.com",
-		leafTCPMessage:    uuid.New().String(),
+		leafTCPMessage:    uuidWithLabel("tcp-02"),
+
+		leafTCPMultiPortAppName:      "tcp-multiport-02",
+		leafTCPMultiPortPublicAddr:   "tcp-multiport-02.example.com",
+		leafTCPMultiPortMessageAlpha: uuidWithLabel("tcp-multiport-02-alpha"),
+		leafTCPMultiPortMessageBeta:  uuidWithLabel("tcp-multiport-02-beta"),
 
 		jwtAppName:        "app-03",
 		jwtAppPublicAddr:  "app-03.example.com",
@@ -170,6 +183,19 @@ func SetupWithOptions(t *testing.T, opts AppTestOptions) *Pack {
 		c.Close()
 	})
 	t.Cleanup(func() { rootTCPTwoWayServer.Close() })
+
+	// Two TCP servers for the multi-port TCP application in the root cluster.
+	rootTCPMultiPortServerAlpha := newTCPServer(t, func(c net.Conn) {
+		c.Write([]byte(p.rootTCPMultiPortMessageAlpha))
+		c.Close()
+	})
+	t.Cleanup(func() { rootTCPMultiPortServerAlpha.Close() })
+	rootTCPMultiPortServerBeta := newTCPServer(t, func(c net.Conn) {
+		c.Write([]byte(p.rootTCPMultiPortMessageBeta))
+		c.Close()
+	})
+	t.Cleanup(func() { rootTCPMultiPortServerBeta.Close() })
+
 	// HTTP server in leaf cluster.
 	leafServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, p.leafMessage)
@@ -193,6 +219,19 @@ func SetupWithOptions(t *testing.T, opts AppTestOptions) *Pack {
 		c.Close()
 	})
 	t.Cleanup(func() { leafTCPServer.Close() })
+
+	// Two TCP servers for the multi-port TCP application in the leaf cluster.
+	leafTCPMultiPortServerAlpha := newTCPServer(t, func(c net.Conn) {
+		c.Write([]byte(p.leafTCPMultiPortMessageAlpha))
+		c.Close()
+	})
+	t.Cleanup(func() { leafTCPMultiPortServerAlpha.Close() })
+	leafTCPMultiPortServerBeta := newTCPServer(t, func(c net.Conn) {
+		c.Write([]byte(p.leafTCPMultiPortMessageBeta))
+		c.Close()
+	})
+	t.Cleanup(func() { leafTCPMultiPortServerBeta.Close() })
+
 	// JWT server writes generated JWT token in the response.
 	jwtServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, r.Header.Get(teleport.AppJWTHeader))
@@ -239,22 +278,38 @@ func SetupWithOptions(t *testing.T, opts AppTestOptions) *Pack {
 	}))
 	t.Cleanup(flushServer.Close)
 
+	rootMultiPortHost, rootTCPMultiPortAppPortAlpha, err := splitHostPort(rootTCPMultiPortServerAlpha.Addr().String())
+	require.NoError(t, err)
+	_, rootTCPMultiPortAppPortBeta, err := splitHostPort(rootTCPMultiPortServerBeta.Addr().String())
+	require.NoError(t, err)
+
+	leafMultiPortHost, leafTCPMultiPortAppPortAlpha, err := splitHostPort(leafTCPMultiPortServerAlpha.Addr().String())
+	require.NoError(t, err)
+	_, leafTCPMultiPortAppPortBeta, err := splitHostPort(leafTCPMultiPortServerBeta.Addr().String())
+	require.NoError(t, err)
+
 	p.rootAppURI = rootServer.URL
 	p.rootWSAppURI = rootWSServer.URL
 	p.rootWSSAppURI = rootWSSServer.URL
 	p.rootTCPAppURI = fmt.Sprintf("tcp://%v", rootTCPServer.Addr().String())
 	p.rootTCPTwoWayAppURI = fmt.Sprintf("tcp://%v", rootTCPTwoWayServer.Addr().String())
+	p.rootTCPMultiPortAppURI = fmt.Sprintf("tcp://%v", rootMultiPortHost)
+	p.rootTCPMultiPortAppPortAlpha = rootTCPMultiPortAppPortAlpha
+	p.rootTCPMultiPortAppPortBeta = rootTCPMultiPortAppPortBeta
 	p.leafAppURI = leafServer.URL
 	p.leafWSAppURI = leafWSServer.URL
 	p.leafWSSAppURI = leafWSSServer.URL
 	p.leafTCPAppURI = fmt.Sprintf("tcp://%v", leafTCPServer.Addr().String())
+	p.leafTCPMultiPortAppURI = fmt.Sprintf("tcp://%v", leafMultiPortHost)
+	p.leafTCPMultiPortAppPortAlpha = leafTCPMultiPortAppPortAlpha
+	p.leafTCPMultiPortAppPortBeta = leafTCPMultiPortAppPortBeta
 	p.jwtAppURI = jwtServer.URL
 	p.headerAppURI = headerServer.URL
 	p.wsHeaderAppURI = wsHeaderServer.URL
 	p.flushAppURI = flushServer.URL
 	p.dumperAppURI = dumperServer.URL
 
-	privateKey, publicKey, err := testauthority.New().GenerateKeyPair()
+	privateKey, publicKey, err := testauthority.GenerateKeyPair()
 	require.NoError(t, err)
 
 	// Create a new Teleport instance with passed in configuration.
@@ -265,7 +320,8 @@ func SetupWithOptions(t *testing.T, opts AppTestOptions) *Pack {
 		NodeName:    helpers.Host,
 		Priv:        privateKey,
 		Pub:         publicKey,
-		Log:         log,
+		Logger:      log,
+		Modules:     modulestest.EnterpriseModules(),
 	}
 	if opts.RootClusterListeners != nil {
 		rootCfg.Listeners = opts.RootClusterListeners(t, &rootCfg.Fds)
@@ -280,16 +336,20 @@ func SetupWithOptions(t *testing.T, opts AppTestOptions) *Pack {
 		NodeName:    helpers.Host,
 		Priv:        privateKey,
 		Pub:         publicKey,
-		Log:         log,
+		Logger:      log,
+		Modules:     modulestest.EnterpriseModules(),
 	}
 	if opts.LeafClusterListeners != nil {
 		leafCfg.Listeners = opts.LeafClusterListeners(t, &leafCfg.Fds)
 	}
 	p.leafCluster = helpers.NewInstance(t, leafCfg)
 
-	rcConf := service.MakeDefaultConfig()
-	rcConf.Console = nil
-	rcConf.Log = log
+	rcConf := servicecfg.MakeDefaultConfig()
+	// Insecure development mode needs to be set because the web proxy uses a
+	// self-signed certificate during tests.
+	rcConf.Modules = rootCfg.Modules
+	rcConf.InsecureMode = true
+	rcConf.Logger = log
 	rcConf.DataDir = t.TempDir()
 	rcConf.Auth.Enabled = true
 	rcConf.Auth.Preference.SetSecondFactor("off")
@@ -305,9 +365,12 @@ func SetupWithOptions(t *testing.T, opts AppTestOptions) *Pack {
 	}
 	rcConf.Clock = opts.Clock
 
-	lcConf := service.MakeDefaultConfig()
-	lcConf.Console = nil
-	lcConf.Log = log
+	lcConf := servicecfg.MakeDefaultConfig()
+	lcConf.Modules = leafCfg.Modules
+	// Insecure development mode needs to be set because the web proxy uses a
+	// self-signed certificate during tests.
+	lcConf.InsecureMode = true
+	lcConf.Logger = log
 	lcConf.DataDir = t.TempDir()
 	lcConf.Auth.Enabled = true
 	lcConf.Auth.Preference.SetSecondFactor("off")
@@ -353,14 +416,13 @@ func SetupWithOptions(t *testing.T, opts AppTestOptions) *Pack {
 	p.initCertPool(t)
 
 	// Initialize Teleport client with the user's credentials.
-	p.initTeleportClient(t, opts)
+	p.initTeleportClient(t)
 
 	return p
 }
 
 var forwardedHeaderNames = []string{
 	teleport.AppJWTHeader,
-	teleport.AppCFHeader,
 	"X-Forwarded-Proto",
 	"X-Forwarded-Host",
 	"X-Forwarded-Server",
@@ -398,4 +460,26 @@ func newTCPServer(t *testing.T, handleConn func(net.Conn)) net.Listener {
 	}()
 
 	return listener
+}
+
+// uuidWithLabel returns a random UUID with a specific label in front of it.
+// It's mostly used to generate unique messages that various cluster app servers are going to
+// respond with. The labels make it easier to differentiate between apps when a connection gets
+// routed to the wrong app.
+func uuidWithLabel(label string) string {
+	return fmt.Sprintf("%s-%s", label, uuid.New().String())
+}
+
+func splitHostPort(hostport string) (string, int, error) {
+	host, portString, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return "", 0, trace.Wrap(err)
+	}
+
+	port, err := strconv.ParseUint(portString, 10, 16)
+	if err != nil {
+		return "", 0, trace.Wrap(err)
+	}
+
+	return host, int(port), nil
 }

@@ -1,23 +1,27 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"net"
@@ -29,6 +33,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/client"
+	"github.com/gravitational/teleport/lib/fixtures"
 	"github.com/gravitational/teleport/lib/utils/socks"
 )
 
@@ -37,8 +42,11 @@ func TestDialProxy(t *testing.T) {
 	ctx := context.Background()
 	dest := "remote-ip:3080"
 
+	tlsConfig, err := fixtures.LocalTLSConfig()
+	require.NoError(t, err)
+
 	cases := []struct {
-		proxy      func(chan error, net.Listener)
+		proxy      func(chan error, net.Listener, *tls.Config)
 		scheme     string
 		assertDial require.ErrorAssertionFunc
 	}{
@@ -53,7 +61,12 @@ func TestDialProxy(t *testing.T) {
 			assertDial: require.NoError,
 		},
 		{
-			proxy:      func(errChan chan error, l net.Listener) { close(errChan) },
+			proxy:      serveHTTPProxy,
+			scheme:     "https",
+			assertDial: require.NoError,
+		},
+		{
+			proxy:      func(errChan chan error, l net.Listener, _ *tls.Config) { close(errChan) },
 			scheme:     "unknown",
 			assertDial: require.Error,
 		},
@@ -71,12 +84,22 @@ func TestDialProxy(t *testing.T) {
 				require.NoError(t, err)
 			})
 
-			go tc.proxy(errChan, l)
+			var serverTLSConfig *tls.Config
+			if tc.scheme == "https" {
+				serverTLSConfig = tlsConfig.TLS
+			}
+			go tc.proxy(errChan, l, serverTLSConfig)
 
 			proxyURL, err := url.Parse(tc.scheme + "://" + l.Addr().String())
 			require.NoError(t, err)
 
-			conn, err := client.DialProxy(ctx, proxyURL, dest)
+			pool := x509.NewCertPool()
+			pool.AddCert(tlsConfig.Certificate)
+			clientTLSConfig := &tls.Config{
+				RootCAs: pool,
+			}
+
+			conn, err := client.DialProxy(ctx, proxyURL, dest, client.WithTLSConfig(clientTLSConfig))
 			tc.assertDial(t, err)
 
 			if conn != nil {
@@ -91,7 +114,7 @@ func TestDialProxy(t *testing.T) {
 
 // serveSOCKSProxy starts a limited SOCKS proxy on the supplied listener.
 // It performs the SOCKS5 handshake then writes back the requested remote address.
-func serveSOCKSProxy(errChan chan error, l net.Listener) {
+func serveSOCKSProxy(errChan chan error, l net.Listener, _ *tls.Config) {
 	defer close(errChan)
 
 	for {
@@ -122,9 +145,9 @@ func serveSOCKSProxy(errChan chan error, l net.Listener) {
 	}
 }
 
-// serveHTTPProxy starts a limited HTTP proxy on the supplied listener.
+// serveHTTPProxy starts a limited HTTP/HTTPS proxy on the supplied listener.
 // It performs the HTTP handshake then writes back the requested remote address.
-func serveHTTPProxy(errChan chan error, l net.Listener) {
+func serveHTTPProxy(errChan chan error, l net.Listener, tlsConfig *tls.Config) {
 	defer close(errChan)
 
 	s := &http.Server{
@@ -136,9 +159,17 @@ func serveHTTPProxy(errChan chan error, l net.Listener) {
 				http.Error(w, "handshake error", http.StatusBadRequest)
 			}
 		}),
+		TLSConfig: tlsConfig,
 	}
 
-	if err := s.Serve(l); !errors.Is(err, net.ErrClosed) {
+	var err error
+	if tlsConfig != nil {
+		err = s.ServeTLS(l, "", "")
+	} else {
+		err = s.Serve(l)
+	}
+
+	if !errors.Is(err, net.ErrClosed) {
 		errChan <- trace.Wrap(err)
 	}
 }

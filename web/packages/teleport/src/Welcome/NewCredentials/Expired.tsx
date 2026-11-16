@@ -1,50 +1,40 @@
-/*
-Copyright 2019-2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { H2, Link, P1 } from 'design';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-import styled from 'styled-components';
-import { Card, Text } from 'design';
+import { OnboardCard } from 'teleport/components/Onboard';
 
 export function Expired({ resetMode = false }) {
   const titleCodeTxt = resetMode ? 'Reset' : 'Invitation';
   const paraCodeTxt = resetMode ? 'reset' : 'invite';
 
   return (
-    <Card width="540px" color="text.onLight" p={6} bg="light" mt={6} mx="auto">
-      <Text typography="h1" textAlign="center" fontSize={8} color="text" mb={3}>
+    <OnboardCard>
+      <H2 textAlign="center" mb={3}>
         {titleCodeTxt} Code Expired
-      </Text>
-      <Text typography="paragraph" mb="2">
-        It appears that your {paraCodeTxt} code isn't valid any more. Please
+      </H2>
+      <P1>
+        It appears that your {paraCodeTxt} code isn&apos;t valid anymore. Please
         contact your account administrator and request another {paraCodeTxt}{' '}
-        link.
-      </Text>
-      <Text typography="paragraph">
-        If you believe this is an issue with the product, please create a
-        <GithubLink> GitHub issue</GithubLink>.
-      </Text>
-    </Card>
+        link or open a{' '}
+        <Link href="https://support.goteleport.com">support ticket</Link>.
+      </P1>
+    </OnboardCard>
   );
 }
-
-const GithubLink = styled.a.attrs({
-  href: 'https://github.com/gravitational/teleport/issues/new',
-})`
-  color: ${props => props.theme.colors.link};
-  &:visted {
-    color: ${props => props.theme.colors.link};
-  }
-`;

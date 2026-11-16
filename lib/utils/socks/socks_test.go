@@ -1,23 +1,27 @@
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package socks
 
 import (
+	"context"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"testing"
@@ -26,11 +30,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/proxy"
 
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
 
 func TestMain(m *testing.M) {
-	utils.InitLoggerForTests()
+	logtest.InitLogger(testing.Verbose)
 	os.Exit(m.Run())
 }
 
@@ -97,7 +101,7 @@ func (d *debugServer) Serve() {
 	for {
 		conn, err := d.ln.Accept()
 		if err != nil {
-			log.Debugf("Failed to accept connection: %v.", err)
+			slog.DebugContext(context.Background(), "Failed to accept connection", "error", err)
 			break
 		}
 
@@ -112,17 +116,17 @@ func (d *debugServer) handle(conn net.Conn) {
 
 	remoteAddr, err := Handshake(conn)
 	if err != nil {
-		log.Debugf("Handshake failed: %v.", err)
+		slog.DebugContext(context.Background(), "Handshake failed", "error", err)
 		return
 	}
 
 	n, err := conn.Write([]byte(remoteAddr))
 	if err != nil {
-		log.Debugf("Failed to write to connection: %v.", err)
+		slog.DebugContext(context.Background(), "Failed to write to connection", "error", err)
 		return
 	}
 	if n != len(remoteAddr) {
-		log.Debugf("Short write, wrote %v wanted %v.", n, len(remoteAddr))
+		slog.DebugContext(context.Background(), "Short write", "wrote", n, "wanted", len(remoteAddr))
 		return
 	}
 }

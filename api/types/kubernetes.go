@@ -18,20 +18,26 @@ package types
 
 import (
 	"fmt"
+	"regexp"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/gravitational/trace"
-	"golang.org/x/exp/slices"
 
+	"github.com/gravitational/teleport/api/types/compare"
 	"github.com/gravitational/teleport/api/utils"
 )
+
+var _ compare.IsEqual[KubeCluster] = (*KubernetesClusterV3)(nil)
 
 // KubeCluster represents a kubernetes cluster.
 type KubeCluster interface {
 	// ResourceWithLabels provides common resource methods.
 	ResourceWithLabels
+	// ResourceWithSecrets provides WithoutSecrets method.
+	ResourceWithSecrets
 	// GetNamespace returns the kube cluster namespace.
 	GetNamespace() string
 	// GetStaticLabels returns the kube cluster static labels.
@@ -46,8 +52,6 @@ type KubeCluster interface {
 	GetKubeconfig() []byte
 	// SetKubeconfig sets the kubeconfig.
 	SetKubeconfig([]byte)
-	// LabelsString returns all labels as a string.
-	LabelsString() string
 	// String returns string representation of the kube cluster.
 	String() string
 	// GetDescription returns the kube cluster description.
@@ -73,7 +77,30 @@ type KubeCluster interface {
 	// IsKubeconfig identifies if the KubeCluster contains kubeconfig data.
 	IsKubeconfig() bool
 	// Copy returns a copy of this kube cluster resource.
-	Copy() *KubernetesClusterV3
+	Copy() KubeCluster
+	// GetCloud gets the cloud this kube cluster is running on, or an empty string if it
+	// isn't running on a cloud provider.
+	GetCloud() string
+	// IsEqual determines if two Kubernetes cluster resources are equivalent.
+	IsEqual(KubeCluster) bool
+	// GetStatus gets the kube cluster status.
+	GetStatus() *KubernetesClusterStatus
+	// SetStatus sets the kube cluster status.
+	SetStatus(*KubernetesClusterStatus)
+	// GetScope gets the scope of the kube cluster.
+	GetScope() string
+}
+
+// DiscoveredEKSCluster represents a server discovered by EKS discovery fetchers.
+type DiscoveredEKSCluster interface {
+	// KubeCluster is base discovered cluster.
+	KubeCluster
+	// GetKubeCluster returns base cluster.
+	GetKubeCluster() KubeCluster
+	// GetIntegration returns integration name used when discovering this cluster.
+	GetIntegration() string
+	// GetKubeAppDiscovery returns setting showing if Kubernetes App Discovery show be enabled for the discovered cluster.
+	GetKubeAppDiscovery() bool
 }
 
 // NewKubernetesClusterV3FromLegacyCluster creates a new Kubernetes cluster resource
@@ -103,21 +130,34 @@ func NewKubernetesClusterV3WithoutSecrets(cluster KubeCluster) (*KubernetesClust
 	// Force a copy of the cluster to deep copy the Metadata fields.
 	copiedCluster := cluster.Copy()
 	clusterWithoutCreds, err := NewKubernetesClusterV3(
-		copiedCluster.Metadata,
+		copiedCluster.GetMetadata(),
 		KubernetesClusterSpecV3{
-			DynamicLabels: copiedCluster.Spec.DynamicLabels,
+			DynamicLabels: LabelsToV2(copiedCluster.GetDynamicLabels()),
 		},
+		KubeClusterWithScope(copiedCluster.GetScope()),
 	)
 	return clusterWithoutCreds, trace.Wrap(err)
 }
 
+type kubeClusterOpt func(*KubernetesClusterV3)
+
+// KubeClusterWithScope is an option that sets the scope when building a [KubernetesClusterV3].
+func KubeClusterWithScope(scope string) kubeClusterOpt {
+	return func(k *KubernetesClusterV3) {
+		k.Scope = scope
+	}
+}
+
 // NewKubernetesClusterV3 creates a new Kubernetes cluster resource.
-func NewKubernetesClusterV3(meta Metadata, spec KubernetesClusterSpecV3) (*KubernetesClusterV3, error) {
+func NewKubernetesClusterV3(meta Metadata, spec KubernetesClusterSpecV3, opts ...kubeClusterOpt) (*KubernetesClusterV3, error) {
 	k := &KubernetesClusterV3{
 		Metadata: meta,
 		Spec:     spec,
 	}
 
+	for _, opt := range opts {
+		opt(k)
+	}
 	if err := k.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -145,14 +185,14 @@ func (k *KubernetesClusterV3) SetSubKind(sk string) {
 	k.SubKind = sk
 }
 
-// GetResourceID returns the app resource ID.
-func (k *KubernetesClusterV3) GetResourceID() int64 {
-	return k.Metadata.ID
+// GetRevision returns the revision
+func (k *KubernetesClusterV3) GetRevision() string {
+	return k.Metadata.GetRevision()
 }
 
-// SetResourceID sets the resource ID.
-func (k *KubernetesClusterV3) SetResourceID(id int64) {
-	k.Metadata.ID = id
+// SetRevision sets the revision
+func (k *KubernetesClusterV3) SetRevision(rev string) {
+	k.Metadata.SetRevision(rev)
 }
 
 // GetMetadata returns the resource metadata.
@@ -195,6 +235,17 @@ func (k *KubernetesClusterV3) SetName(name string) {
 	k.Metadata.Name = name
 }
 
+// GetLabel retrieves the label with the provided key. If not found
+// value will be empty and ok will be false.
+func (k *KubernetesClusterV3) GetLabel(key string) (value string, ok bool) {
+	if cmd, ok := k.Spec.DynamicLabels[key]; ok {
+		return cmd.Result, ok
+	}
+
+	v, ok := k.Metadata.Labels[key]
+	return v, ok
+}
+
 // GetStaticLabels returns the static labels.
 func (k *KubernetesClusterV3) GetStaticLabels() map[string]string {
 	return k.Metadata.Labels
@@ -230,12 +281,7 @@ func (k *KubernetesClusterV3) SetDynamicLabels(dl map[string]CommandLabel) {
 
 // GetAllLabels returns the combined static and dynamic labels.
 func (k *KubernetesClusterV3) GetAllLabels() map[string]string {
-	return CombineLabels(k.Metadata.Labels, k.Spec.DynamicLabels)
-}
-
-// LabelsString returns all labels as a string.
-func (k *KubernetesClusterV3) LabelsString() string {
-	return LabelsAsString(k.Metadata.Labels, k.Spec.DynamicLabels)
+	return CombineLabels(nil, k.Metadata.Labels, k.Spec.DynamicLabels)
 }
 
 // GetDescription returns the description.
@@ -275,17 +321,32 @@ func (k *KubernetesClusterV3) SetGCPConfig(cfg KubeGCP) {
 
 // IsAzure indentifies if the KubeCluster contains Azure details.
 func (k *KubernetesClusterV3) IsAzure() bool {
-	return !protoKnownFieldsEqual(&k.Spec.Azure, &KubeAzure{})
+	return !deriveTeleportEqualKubeAzure(&k.Spec.Azure, &KubeAzure{})
 }
 
 // IsAWS indentifies if the KubeCluster contains AWS details.
 func (k *KubernetesClusterV3) IsAWS() bool {
-	return !protoKnownFieldsEqual(&k.Spec.AWS, &KubeAWS{})
+	return !deriveTeleportEqualKubeAWS(&k.Spec.AWS, &KubeAWS{})
 }
 
 // IsGCP indentifies if the KubeCluster contains GCP details.
 func (k *KubernetesClusterV3) IsGCP() bool {
-	return !protoKnownFieldsEqual(&k.Spec.GCP, &KubeGCP{})
+	return !deriveTeleportEqualKubeGCP(&k.Spec.GCP, &KubeGCP{})
+}
+
+// GetCloud gets the cloud this kube cluster is running on, or an empty string if it
+// isn't running on a cloud provider.
+func (k *KubernetesClusterV3) GetCloud() string {
+	switch {
+	case k.IsAzure():
+		return CloudAzure
+	case k.IsAWS():
+		return CloudAWS
+	case k.IsGCP():
+		return CloudGCP
+	default:
+		return ""
+	}
 }
 
 // IsKubeconfig identifies if the KubeCluster contains kubeconfig data.
@@ -300,8 +361,42 @@ func (k *KubernetesClusterV3) String() string {
 }
 
 // Copy returns a copy of this resource.
-func (k *KubernetesClusterV3) Copy() *KubernetesClusterV3 {
-	return proto.Clone(k).(*KubernetesClusterV3)
+func (k *KubernetesClusterV3) Copy() KubeCluster {
+	return utils.CloneProtoMsg(k)
+}
+
+// WithoutSecrets returns a shallow copy of this kube cluster with its kubeconfig removed. Note that this function
+// is a lot less aggressive than the existing [NewKubernetesClusterV3WithoutSecrets] which the heartbeat
+// path uses. That function removes all fields except for name/labels/scope.
+func (k *KubernetesClusterV3) WithoutSecrets() Resource {
+	if !k.IsKubeconfig() {
+		return k
+	}
+	k2 := *k
+	k2.Spec.Kubeconfig = nil
+	return &k2
+}
+
+// GetStatus gets the kube cluster status.
+func (k *KubernetesClusterV3) GetStatus() *KubernetesClusterStatus {
+	if k == nil {
+		return nil
+	}
+	return k.Status
+}
+
+// SetStatus sets the kube cluster status.
+func (k *KubernetesClusterV3) SetStatus(status *KubernetesClusterStatus) {
+	k.Status = status
+}
+
+// GetScope returns the scope of the kube cluster.
+func (k *KubernetesClusterV3) GetScope() string {
+	if k == nil {
+		return ""
+	}
+
+	return k.Scope
 }
 
 // MatchSearch goes through select field values and tries to
@@ -317,6 +412,18 @@ func (k *KubernetesClusterV3) setStaticFields() {
 	k.Version = V3
 }
 
+// validKubeClusterName filters the allowed characters in kubernetes cluster
+// names. We need this because cluster names are used for cert filenames on the
+// client side, in the ~/.tsh directory. Restricting characters helps with
+// sneaky cluster names being used for client directory traversal and exploits.
+var validKubeClusterName = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+// ValidateKubeClusterName returns an error if a given string is not a valid
+// KubeCluster name.
+func ValidateKubeClusterName(name string) error {
+	return ValidateResourceName(validKubeClusterName, name)
+}
+
 // CheckAndSetDefaults checks and sets default values for any missing fields.
 func (k *KubernetesClusterV3) CheckAndSetDefaults() error {
 	k.setStaticFields()
@@ -329,6 +436,10 @@ func (k *KubernetesClusterV3) CheckAndSetDefaults() error {
 		}
 	}
 
+	if err := ValidateKubeClusterName(k.Metadata.Name); err != nil {
+		return trace.Wrap(err, "invalid kubernetes cluster name")
+	}
+
 	if err := k.Spec.Azure.CheckAndSetDefaults(); err != nil && k.IsAzure() {
 		return trace.Wrap(err)
 	}
@@ -337,7 +448,19 @@ func (k *KubernetesClusterV3) CheckAndSetDefaults() error {
 		return trace.Wrap(err)
 	}
 
+	if err := k.Spec.GCP.CheckAndSetDefaults(); err != nil && k.IsGCP() {
+		return trace.Wrap(err)
+	}
+
 	return nil
+}
+
+// IsEqual determines if two Kubernetes cluster resources are equivalent.
+func (k *KubernetesClusterV3) IsEqual(i KubeCluster) bool {
+	if other, ok := i.(*KubernetesClusterV3); ok {
+		return deriveTeleportEqualKubernetesClusterV3(k, other)
+	}
+	return false
 }
 
 func (k KubeAzure) CheckAndSetDefaults() error {
@@ -367,6 +490,22 @@ func (k KubeAWS) CheckAndSetDefaults() error {
 
 	if len(k.AccountID) == 0 {
 		return trace.BadParameter("invalid AWS AccountID")
+	}
+
+	return nil
+}
+
+func (k KubeGCP) CheckAndSetDefaults() error {
+	if len(k.Location) == 0 {
+		return trace.BadParameter("invalid GCP Location")
+	}
+
+	if len(k.ProjectID) == 0 {
+		return trace.BadParameter("invalid GCP ProjectID")
+	}
+
+	if len(k.Name) == 0 {
+		return trace.BadParameter("invalid GCP Name")
 	}
 
 	return nil
@@ -466,28 +605,14 @@ func DeduplicateKubeClusters(kubeclusters []KubeCluster) []KubeCluster {
 
 var _ ResourceWithLabels = (*KubernetesResourceV1)(nil)
 
-// NewKubernetesPodV1 creates a new kubernetes resource with kind "pod".
-func NewKubernetesPodV1(meta Metadata, spec KubernetesResourceSpecV1) (*KubernetesResourceV1, error) {
-	pod := &KubernetesResourceV1{
-		Kind:     KindKubePod,
-		Metadata: meta,
-		Spec:     spec,
-	}
-
-	if err := pod.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return pod, nil
-}
-
 // NewKubernetesResourceV1 creates a new kubernetes resource .
-func NewKubernetesResourceV1(kind string, meta Metadata, spec KubernetesResourceSpecV1) (*KubernetesResourceV1, error) {
+func NewKubernetesResourceV1(kind string, namespaced bool, meta Metadata, spec KubernetesResourceSpecV1) (*KubernetesResourceV1, error) {
 	resource := &KubernetesResourceV1{
 		Kind:     kind,
 		Metadata: meta,
 		Spec:     spec,
 	}
-	if err := resource.CheckAndSetDefaults(); err != nil {
+	if err := resource.CheckAndSetDefaults(namespaced); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return resource, nil
@@ -538,28 +663,29 @@ func (k *KubernetesResourceV1) SetExpiry(expire time.Time) {
 	k.Metadata.SetExpiry(expire)
 }
 
-// GetResourceID returns resource ID.
-func (k *KubernetesResourceV1) GetResourceID() int64 {
-	return k.Metadata.ID
+// GetRevision returns the revision
+func (k *KubernetesResourceV1) GetRevision() string {
+	return k.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID.
-func (k *KubernetesResourceV1) SetResourceID(id int64) {
-	k.Metadata.ID = id
+// SetRevision sets the revision
+func (k *KubernetesResourceV1) SetRevision(rev string) {
+	k.Metadata.SetRevision(rev)
 }
 
 // CheckAndSetDefaults validates the Resource and sets any empty fields to
 // default values.
-func (k *KubernetesResourceV1) CheckAndSetDefaults() error {
+func (k *KubernetesResourceV1) CheckAndSetDefaults(namespaced bool) error {
 	k.setStaticFields()
-	if !slices.Contains(KubernetesResourcesKinds, k.Kind) {
-		return trace.BadParameter("invalid kind %q defined; allowed values: %v", k.Kind, KubernetesResourcesKinds)
+	if !slices.Contains(KubernetesResourcesKinds, k.Kind) && !strings.HasPrefix(k.Kind, AccessRequestPrefixKindKube) {
+		return trace.BadParameter("invalid kind %q defined; allowed values: %v, %s<kind>", k.Kind, KubernetesResourcesKinds, AccessRequestPrefixKindKube)
 	}
 	if err := k.Metadata.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}
 
-	if len(k.Spec.Namespace) == 0 {
+	// Unless the resource is cluster-wide, it must have a namespace.
+	if len(k.Spec.Namespace) == 0 && namespaced {
 		return trace.BadParameter("missing kubernetes namespace")
 	}
 
@@ -579,6 +705,13 @@ func (k *KubernetesResourceV1) Origin() string {
 // SetOrigin sets the origin value of the resource.
 func (k *KubernetesResourceV1) SetOrigin(origin string) {
 	k.Metadata.SetOrigin(origin)
+}
+
+// GetLabel retrieves the label with the provided key. If not found
+// value will be empty and ok will be false.
+func (k *KubernetesResourceV1) GetLabel(key string) (value string, ok bool) {
+	v, ok := k.Metadata.Labels[key]
+	return v, ok
 }
 
 // GetAllLabels returns all resource's labels.
@@ -663,4 +796,33 @@ func (k KubeResources) AsResources() ResourcesWithLabels {
 		resources = append(resources, ResourceWithLabels(resource))
 	}
 	return resources
+}
+
+// KubeResource represents either a KubernetesResource or RequestKubernetesResource.
+type KubeResource interface {
+	GetAPIGroup() string
+	GetKind() string
+	GetNamespace() string
+	SetAPIGroup(string)
+	SetKind(string)
+	SetNamespace(string)
+}
+
+// Setter/Getter to enable generics.
+func (m *RequestKubernetesResource) GetAPIGroup() string      { return m.APIGroup }
+func (m *KubernetesResource) GetAPIGroup() string             { return m.APIGroup }
+func (m *RequestKubernetesResource) SetAPIGroup(group string) { m.APIGroup = group }
+func (m *KubernetesResource) SetAPIGroup(group string)        { m.APIGroup = group }
+func (m *RequestKubernetesResource) GetKind() string          { return m.Kind }
+func (m *KubernetesResource) GetKind() string                 { return m.Kind }
+func (m *RequestKubernetesResource) SetKind(kind string)      { m.Kind = kind }
+func (m *KubernetesResource) SetKind(kind string)             { m.Kind = kind }
+func (m *RequestKubernetesResource) GetNamespace() string     { return "" }
+func (m *KubernetesResource) GetNamespace() string            { return m.Namespace }
+func (m *RequestKubernetesResource) SetNamespace(ns string)   {}
+func (m *KubernetesResource) SetNamespace(ns string)          { m.Namespace = ns }
+
+// IsEqual determines if two KubernetesClusterStatus are equivalent.
+func (c *KubernetesClusterStatus) IsEqual(other *KubernetesClusterStatus) bool {
+	return deriveTeleportEqualKubernetesClusterStatus(c, other)
 }

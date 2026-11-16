@@ -1,39 +1,51 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"path/filepath"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/events/auditqueue"
+	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
-// AsyncBufferSize is a default buffer size for async emitters
-const AsyncBufferSize = 1024
+const (
+	// AsyncBufferSize is a default buffer size for async emitters
+	AsyncBufferSize = 1024
+	// auditQueueDir is the directory where the audit queue resides.
+	auditQueueDir = "audit-queue"
+)
 
 // AsyncEmitterConfig provides parameters for emitter
 type AsyncEmitterConfig struct {
@@ -41,6 +53,16 @@ type AsyncEmitterConfig struct {
 	Inner apievents.Emitter
 	// BufferSize is a default buffer size for emitter
 	BufferSize int
+	// DataDir is the Teleport data directory. This is required for sqlite
+	// backed queues.
+	DataDir string
+	// EnableAuditQueue enables the audit queue subsystem. When false,
+	// the legacy in-memory channel is used.
+	EnableAuditQueue bool
+	// AuditQueueCfg holds the options from the Teleport yaml config.
+	AuditQueueCfg auditqueue.Config
+	// AuditQueueBackends is the ordered list of backends to try on startup.
+	AuditQueueBackends []auditqueue.Kind
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -56,35 +78,127 @@ func (c *AsyncEmitterConfig) CheckAndSetDefaults() error {
 
 // NewAsyncEmitter returns emitter that submits events
 // without blocking the caller. It will start losing events
-// on buffer overflow.
+// when the queue is full.
 func NewAsyncEmitter(cfg AsyncEmitterConfig) (*AsyncEmitter, error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
+
+	var queue auditqueue.Queue
+	if cfg.EnableAuditQueue {
+		var err error
+		queue, err = makeQueue(cfg.DataDir, cfg.AuditQueueCfg, cfg.AuditQueueBackends)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+	if queue == nil {
+		slog.InfoContext(context.TODO(), "Using default in-memory audit event channel. Audit queue is disabled.")
+	} else {
+		slog.InfoContext(context.TODO(), "Audit queue is enabled.")
+	}
+
+	deliveryTimeout := cfg.AuditQueueCfg.DeliveryTimeout
+	if deliveryTimeout <= 0 {
+		deliveryTimeout = auditqueue.DefaultDeliveryTimeout
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &AsyncEmitter{
-		cancel:   cancel,
-		ctx:      ctx,
-		eventsCh: make(chan apievents.AuditEvent, cfg.BufferSize),
-		cfg:      cfg,
+		cancel:          cancel,
+		ctx:             ctx,
+		eventsCh:        make(chan apievents.AuditEvent, cfg.BufferSize),
+		cfg:             cfg,
+		queue:           queue,
+		deliveryTimeout: deliveryTimeout,
 	}
-	go a.forward()
+	if queue != nil {
+		a.wg.Go(func() {
+			if err := queue.Run(ctx, a.deliver); err != nil && ctx.Err() == nil {
+				slog.ErrorContext(ctx, "Audit queue Run returned error.", "error", err)
+			}
+		})
+	} else {
+		// TODO(kkloberdanz): Remove this in v19 - We will only use the SQLite queue in future releases.
+		a.wg.Go(a.forward)
+	}
 	return a, nil
+}
+
+func makeQueue(dataDir string, queueCfg auditqueue.Config, backends []auditqueue.Kind) (auditqueue.Queue, error) {
+	queueCfg.Path = filepath.Join(dataDir, auditQueueDir, uuid.NewString())
+
+	if len(backends) == 0 {
+		backends = []auditqueue.Kind{auditqueue.KindSQLiteDisk}
+	}
+
+	var lastErr error
+	for i, backend := range backends {
+		q, err := auditqueue.New(backend, queueCfg)
+		if err == nil {
+			if i > 0 {
+				slog.WarnContext(context.TODO(),
+					"Using fallback audit queue backend.",
+					"backend", backend,
+				)
+			}
+			return q, nil
+		}
+		slog.WarnContext(context.TODO(),
+			"Failed to create audit queue backend, trying next.",
+			"backend", backend,
+			"error", err,
+		)
+		lastErr = err
+	}
+	return nil, trace.Wrap(lastErr)
 }
 
 // AsyncEmitter accepts events to a buffered channel and emits
 // events in a separate goroutine without blocking the caller.
 type AsyncEmitter struct {
-	cfg      AsyncEmitterConfig
-	eventsCh chan apievents.AuditEvent
-	cancel   context.CancelFunc
-	ctx      context.Context
+	cfg             AsyncEmitterConfig
+	eventsCh        chan apievents.AuditEvent
+	cancel          context.CancelFunc
+	ctx             context.Context
+	queue           auditqueue.Queue
+	deliveryTimeout time.Duration
+	wg              sync.WaitGroup
 }
 
 // Close closes emitter and cancels all in flight events.
 func (a *AsyncEmitter) Close() error {
 	a.cancel()
+	a.wg.Wait()
+	if a.queue != nil {
+		return trace.Wrap(a.queue.Close())
+	}
 	return nil
+}
+
+// Shutdown makes a best effort attempt to flush pending audit events to the
+// inner emitter before closing.
+func (a *AsyncEmitter) Shutdown(ctx context.Context) error {
+	if a.queue != nil {
+		if err := a.queue.Drain(ctx); err != nil {
+			slog.WarnContext(ctx,
+				"Audit queue drain returned an error during graceful shutdown.",
+				"error", err,
+			)
+		}
+		return trace.Wrap(a.Close())
+	}
+
+	return trace.Wrap(a.Close())
+}
+
+// Stats reports the current depth of the audit queue. It returns a zero Stats
+// when the audit queue is disabled.
+func (a *AsyncEmitter) Stats(ctx context.Context) (auditqueue.Stats, error) {
+	if a.queue == nil {
+		return auditqueue.Stats{}, nil
+	}
+	return a.queue.Stats(ctx)
 }
 
 func (a *AsyncEmitter) forward() {
@@ -95,22 +209,80 @@ func (a *AsyncEmitter) forward() {
 		case event := <-a.eventsCh:
 			err := a.cfg.Inner.EmitAuditEvent(a.ctx, event)
 			if err != nil {
-				log.WithError(err).Errorf("Failed to emit audit event.")
+				if a.ctx.Err() != nil {
+					return
+				}
+				slog.ErrorContext(a.ctx, "Failed to emit audit event.", "error", err)
 			}
 		}
 	}
 }
 
+// deliver is the handler function passed to queue.Run. It must return a list of
+// all of the events it was able to successfully deliver when forwarding the
+// event.
+func (a *AsyncEmitter) deliver(ctx context.Context, items []auditqueue.Item) []auditqueue.Item {
+	var successfullyDelivered []auditqueue.Item
+
+	ctx, cancel := context.WithTimeout(ctx, a.deliveryTimeout)
+	defer cancel()
+
+	// TODO(kkloberdanz): We plan to update the Emitter interface such that
+	// EmitAuditEvent will take a slice of events rather than a single event at
+	// a time. This will allow us to add batching as a native feature of this
+	// interface. I suspect that having first-class batching will have a greater
+	// improvement on performance over parallelism alone. It will also have less
+	// overhead than parallelism over multiple events.
+	var failed int
+	var firstErr error
+	for _, item := range items {
+		if ctx.Err() != nil {
+			break
+		}
+		if err := a.cfg.Inner.EmitAuditEvent(ctx, item.Event); err != nil {
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		successfullyDelivered = append(successfullyDelivered, item)
+	}
+	if failed > 0 && ctx.Err() == nil {
+		slog.ErrorContext(ctx, "Failed to emit audit events.",
+			"count", failed,
+			"error", firstErr,
+		)
+	}
+	return successfullyDelivered
+}
+
 // EmitAuditEvent emits audit event without blocking the caller. It will start
-// losing events on buffer overflow, but it never fails.
+// losing events when the queue fills, but it never fails.
 func (a *AsyncEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	// TODO: For v19, we will only use the `a.queue` code path.
+	if a.queue != nil {
+		err := a.queue.Enqueue(event)
+		if errors.Is(err, auditqueue.ErrQueueFull) {
+			slog.ErrorContext(
+				ctx,
+				"Failed to emit audit event. Audit queue is full.",
+				"event_type", event.GetType(),
+				"event_code", event.GetCode(),
+			)
+			return err
+		}
+		return trace.Wrap(err)
+	}
+
+	// TODO(kkloberdanz): Remove this in v19 - We will only use the SQLite queue in future releases.
 	select {
 	case a.eventsCh <- event:
 		return nil
 	case <-ctx.Done():
 		return trace.ConnectionProblem(ctx.Err(), "context canceled or closed")
 	default:
-		log.Errorf("Failed to emit audit event %v(%v). This server's connection to the auth service appears to be slow.", event.GetType(), event.GetCode())
+		slog.ErrorContext(ctx, "Failed to emit audit event. This server's connection to the auth service appears to be slow.", "event_type", event.GetType(), "event_code", event.GetCode())
 		return nil
 	}
 }
@@ -161,18 +333,63 @@ func (w *CheckingEmitterConfig) CheckAndSetDefaults() error {
 
 // EmitAuditEvent emits audit event
 func (r *CheckingEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	ctx = context.WithoutCancel(ctx)
 	auditEmitEvent.Inc()
+	auditEmitEventSizes.Observe(float64(event.Size()))
 	if err := checkAndSetEventFields(event, r.Clock, r.UIDGenerator, r.ClusterName); err != nil {
-		log.WithError(err).Errorf("Failed to emit audit event.")
+		slog.ErrorContext(ctx, "Failed to emit audit event.", "error", err)
 		AuditFailedEmit.Inc()
 		return trace.Wrap(err)
 	}
 	if err := r.Inner.EmitAuditEvent(ctx, event); err != nil {
 		AuditFailedEmit.Inc()
-		log.WithError(err).Errorf("Failed to emit audit event.")
+		slog.ErrorContext(ctx, "Failed to emit audit event of type", "event_type", event.GetType(), "error", err)
 		return trace.Wrap(err)
 	}
 	return nil
+}
+
+// CheckingAsyncEmitter is a CheckingEmitter wrapping an AsyncEmitter. This is to
+// ensure that audit log events have their fields set appropriately before they
+// are enqueued.
+type CheckingAsyncEmitter struct {
+	*CheckingEmitter
+	asyncEmitter *AsyncEmitter
+}
+
+func NewCheckingAsyncEmitter(checkingCfg CheckingEmitterConfig, asyncCfg AsyncEmitterConfig) (*CheckingAsyncEmitter, error) {
+	asyncEmitter, err := NewAsyncEmitter(asyncCfg)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	checkingCfg.Inner = asyncEmitter
+	checking, err := NewCheckingEmitter(checkingCfg)
+	if err != nil {
+		_ = asyncEmitter.Close()
+		return nil, trace.Wrap(err)
+	}
+	emitter := CheckingAsyncEmitter{
+		CheckingEmitter: checking,
+		asyncEmitter:    asyncEmitter,
+	}
+	return &emitter, nil
+}
+
+// Close closes the underlying AsyncEmitter.
+func (c *CheckingAsyncEmitter) Close() error {
+	return c.asyncEmitter.Close()
+}
+
+// Shutdown attempts to drain the underlying AsyncEmitter before closing.
+// See AsyncEmitter.Shutdown.
+func (c *CheckingAsyncEmitter) Shutdown(ctx context.Context) error {
+	return c.asyncEmitter.Shutdown(ctx)
+}
+
+// Stats reports the current depth of the underlying audit queue.
+// See AsyncEmitter.Stats.
+func (c *CheckingAsyncEmitter) Stats(ctx context.Context) (auditqueue.Stats, error) {
+	return c.asyncEmitter.Stats(ctx)
 }
 
 // checkAndSetEventFields updates passed event fields with additional information
@@ -181,11 +398,8 @@ func (r *CheckingEmitter) EmitAuditEvent(ctx context.Context, event apievents.Au
 // This method is a "final stop" for various audit log implementations for
 // updating event fields before it gets persisted in the backend.
 func checkAndSetEventFields(event apievents.AuditEvent, clock clockwork.Clock, uid utils.UID, clusterName string) error {
-	if event.GetType() == "" {
-		return trace.BadParameter("missing mandatory event type field")
-	}
-	if event.GetCode() == "" && event.GetType() != SessionPrintEvent && event.GetType() != DesktopRecordingEvent {
-		return trace.BadParameter("missing mandatory event code field for %v event", event.GetType())
+	if err := checkBasicEventFields(event); err != nil {
+		return trace.Wrap(err)
 	}
 	if event.GetID() == "" && event.GetType() != SessionPrintEvent && event.GetType() != DesktopRecordingEvent {
 		event.SetID(uid.New())
@@ -195,6 +409,16 @@ func checkAndSetEventFields(event apievents.AuditEvent, clock clockwork.Clock, u
 	}
 	if event.GetClusterName() == "" {
 		event.SetClusterName(clusterName)
+	}
+	return nil
+}
+
+func checkBasicEventFields(event apievents.AuditEvent) error {
+	if event.GetType() == "" {
+		return trace.BadParameter("missing mandatory event type field")
+	}
+	if event.GetCode() == "" && event.GetType() != SessionPrintEvent && event.GetType() != DesktopRecordingEvent {
+		return trace.BadParameter("missing mandatory event code field for %v event", event.GetType())
 	}
 	return nil
 }
@@ -233,20 +457,34 @@ func (w *WriterEmitter) EmitAuditEvent(ctx context.Context, event apievents.Audi
 }
 
 // NewLoggingEmitter returns an emitter that logs all events to the console
-// with the info level
-func NewLoggingEmitter() *LoggingEmitter {
-	return &LoggingEmitter{}
+// with the info level. Events are only logged for self-hosted installations,
+// Teleport Cloud treats this as a no-op.
+func NewLoggingEmitter(cloud bool) *LoggingEmitter {
+	return &LoggingEmitter{
+		emit: !modules.GetModules().Features().Cloud && !cloud,
+	}
 }
 
 // LoggingEmitter logs all events with info level
 type LoggingEmitter struct {
+	emit bool
 }
 
 // EmitAuditEvent logs audit event, skips session print events, session
 // disk events and app session request events, because they are very verbose.
-func (*LoggingEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+func (l *LoggingEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	if !l.emit {
+		return nil
+	}
+
 	switch event.GetType() {
-	case ResizeEvent, SessionDiskEvent, SessionPrintEvent, AppSessionRequestEvent, "":
+	case ResizeEvent,
+		SessionDiskEvent,
+		SessionPrintEvent,
+		AppSessionRequestEvent,
+		AppSessionLLMRequestSuccessEvent,
+		AppSessionLLMRequestFailureEvent,
+		"":
 		return nil
 	}
 
@@ -255,14 +493,13 @@ func (*LoggingEmitter) EmitAuditEvent(ctx context.Context, event apievents.Audit
 		return trace.Wrap(err)
 	}
 
-	var fields log.Fields
-	err = utils.FastUnmarshal(data, &fields)
-	if err != nil {
+	var fields map[string]any
+	if err := utils.FastUnmarshal(data, &fields); err != nil {
 		return trace.Wrap(err)
 	}
-	fields[trace.Component] = teleport.Component(teleport.ComponentAuditLog)
+	fields[teleport.ComponentKey] = teleport.ComponentAuditLog
 
-	log.WithFields(fields).Infof(event.GetType())
+	slog.InfoContext(ctx, "emitting audit event", "event_type", event.GetType(), "fields", fields)
 	return nil
 }
 
@@ -281,6 +518,7 @@ type MultiEmitter struct {
 
 // EmitAuditEvent emits audit event to all emitters
 func (m *MultiEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	ctx = context.WithoutCancel(ctx)
 	var errors []error
 	for i := range m.emitters {
 		err := m.emitters[i].EmitAuditEvent(ctx, event)
@@ -297,216 +535,39 @@ type StreamerAndEmitter struct {
 	apievents.Emitter
 }
 
-// CheckingStreamerConfig provides parameters for streamer
-type CheckingStreamerConfig struct {
-	// Inner emits events to the underlying store
-	Inner Streamer
-	// Clock is a clock interface, used in tests
-	Clock clockwork.Clock
-	// UIDGenerator is unique ID generator
-	UIDGenerator utils.UID
-	// ClusterName specifies the name of this teleport cluster.
-	ClusterName string
-}
-
-// NewCheckingStream wraps stream and makes sure event UIDs and timing are in place
-func NewCheckingStream(stream apievents.Stream, clock clockwork.Clock, clusterName string) apievents.Stream {
-	return &CheckingStream{
-		stream:       stream,
-		clock:        clock,
-		uidGenerator: utils.NewRealUID(),
-		clusterName:  clusterName,
-	}
-}
-
-// NewCheckingStreamer returns streamer that checks
-// that all required fields are properly set
-func NewCheckingStreamer(cfg CheckingStreamerConfig) (*CheckingStreamer, error) {
+// NewCallbackEmitter returns an emitter that invokes a callback on every
+// action, is used in tests to inject failures
+func NewCallbackEmitter(cfg CallbackEmitterConfig) (*CallbackEmitter, error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return &CheckingStreamer{
-		CheckingStreamerConfig: cfg,
+	return &CallbackEmitter{
+		CallbackEmitterConfig: cfg,
 	}, nil
 }
 
-// CheckingStreamer ensures that event fields have been set properly
-// and reports statistics for every wrapper
-type CheckingStreamer struct {
-	CheckingStreamerConfig
-}
-
-// CreateAuditStream creates audit event stream
-func (s *CheckingStreamer) CreateAuditStream(ctx context.Context, sid session.ID) (apievents.Stream, error) {
-	stream, err := s.Inner.CreateAuditStream(ctx, sid)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &CheckingStream{
-		clock:        s.CheckingStreamerConfig.Clock,
-		uidGenerator: s.CheckingStreamerConfig.UIDGenerator,
-		clusterName:  s.CheckingStreamerConfig.ClusterName,
-		stream:       stream,
-	}, nil
-}
-
-// ResumeAuditStream resumes audit event stream
-func (s *CheckingStreamer) ResumeAuditStream(ctx context.Context, sid session.ID, uploadID string) (apievents.Stream, error) {
-	stream, err := s.Inner.ResumeAuditStream(ctx, sid, uploadID)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &CheckingStream{
-		clock:        s.CheckingStreamerConfig.Clock,
-		uidGenerator: s.CheckingStreamerConfig.UIDGenerator,
-		clusterName:  s.CheckingStreamerConfig.ClusterName,
-		stream:       stream,
-	}, nil
+// CallbackEmitterConfig provides parameters for emitter
+type CallbackEmitterConfig struct {
+	// OnEmitAuditEvent is called on emit audit event on a stream
+	OnEmitAuditEvent func(ctx context.Context, event apievents.AuditEvent) error
 }
 
 // CheckAndSetDefaults checks and sets default values
-func (w *CheckingStreamerConfig) CheckAndSetDefaults() error {
-	if w.Inner == nil {
-		return trace.BadParameter("checking streamer: missing parameter Inner")
-	}
-	if w.ClusterName == "" {
-		return trace.BadParameter("checking streamer: missing parameter ClusterName")
-	}
-	if w.Clock == nil {
-		w.Clock = clockwork.NewRealClock()
-	}
-	if w.UIDGenerator == nil {
-		w.UIDGenerator = utils.NewRealUID()
+func (c *CallbackEmitterConfig) CheckAndSetDefaults() error {
+	if c.OnEmitAuditEvent == nil {
+		return trace.BadParameter("missing parameter OnEmitAuditEvent")
 	}
 	return nil
 }
 
-// CheckingStream verifies every event
-type CheckingStream struct {
-	stream       apievents.Stream
-	clock        clockwork.Clock
-	uidGenerator utils.UID
-	clusterName  string
+// CallbackEmitter invokes a callback on every action, is used in tests to inject failures
+type CallbackEmitter struct {
+	CallbackEmitterConfig
 }
 
-// Close flushes non-uploaded flight stream data without marking
-// the stream completed and closes the stream instance
-func (s *CheckingStream) Close(ctx context.Context) error {
-	return s.stream.Close(ctx)
-}
-
-// Done returns channel closed when streamer is closed
-// should be used to detect sending errors
-func (s *CheckingStream) Done() <-chan struct{} {
-	return s.stream.Done()
-}
-
-// Status returns channel receiving updates about stream status
-// last event index that was uploaded and upload ID
-func (s *CheckingStream) Status() <-chan apievents.StreamStatus {
-	return s.stream.Status()
-}
-
-// Complete closes the stream and marks it finalized
-func (s *CheckingStream) Complete(ctx context.Context) error {
-	return s.stream.Complete(ctx)
-}
-
-// EmitAuditEvent emits audit event
-func (s *CheckingStream) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
-	if err := checkAndSetEventFields(event, s.clock, s.uidGenerator, s.clusterName); err != nil {
-		log.WithError(err).Errorf("Failed to emit audit event %v(%v).", event.GetType(), event.GetCode())
-		AuditFailedEmit.Inc()
-		return trace.Wrap(err)
-	}
-	if err := s.stream.EmitAuditEvent(ctx, event); err != nil {
-		AuditFailedEmit.Inc()
-		log.WithError(err).Errorf("Failed to emit audit event %v(%v).", event.GetType(), event.GetCode())
-		return trace.Wrap(err)
-	}
-	return nil
-}
-
-// NewTeeStreamer returns a streamer that forwards non print event
-// to emitter in addition to sending them to the stream
-func NewTeeStreamer(streamer Streamer, emitter apievents.Emitter) *TeeStreamer {
-	return &TeeStreamer{
-		Emitter:  emitter,
-		streamer: streamer,
-	}
-}
-
-// CreateAuditStream creates audit event stream
-func (t *TeeStreamer) CreateAuditStream(ctx context.Context, sid session.ID) (apievents.Stream, error) {
-	stream, err := t.streamer.CreateAuditStream(ctx, sid)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &TeeStream{stream: stream, emitter: t.Emitter}, nil
-}
-
-// ResumeAuditStream resumes audit event stream
-func (t *TeeStreamer) ResumeAuditStream(ctx context.Context, sid session.ID, uploadID string) (apievents.Stream, error) {
-	stream, err := t.streamer.ResumeAuditStream(ctx, sid, uploadID)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &TeeStream{stream: stream, emitter: t.Emitter}, nil
-}
-
-// TeeStreamer creates streams that forwards non print events
-// to emitter
-type TeeStreamer struct {
-	apievents.Emitter
-	streamer Streamer
-}
-
-// TeeStream sends non print events to emitter
-// in addition to the stream itself
-type TeeStream struct {
-	emitter apievents.Emitter
-	stream  apievents.Stream
-}
-
-// Done returns channel closed when streamer is closed
-// should be used to detect sending errors
-func (t *TeeStream) Done() <-chan struct{} {
-	return t.stream.Done()
-}
-
-// Status returns channel receiving updates about stream status
-// last event index that was uploaded and upload ID
-func (t *TeeStream) Status() <-chan apievents.StreamStatus {
-	return t.stream.Status()
-}
-
-// Close flushes non-uploaded flight stream data without marking
-// the stream completed and closes the stream instance
-func (t *TeeStream) Close(ctx context.Context) error {
-	return t.stream.Close(ctx)
-}
-
-// Complete closes the stream and marks it finalized
-func (t *TeeStream) Complete(ctx context.Context) error {
-	return t.stream.Complete(ctx)
-}
-
-// EmitAuditEvent emits audit events and forwards session control events
-// to the audit log
-func (t *TeeStream) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
-	var errors []error
-	if err := t.stream.EmitAuditEvent(ctx, event); err != nil {
-		errors = append(errors, err)
-	}
-	// Forward session events except the ones that pollute global logs
-	switch event.GetType() {
-	case ResizeEvent, SessionDiskEvent, SessionPrintEvent, AppSessionRequestEvent, DesktopRecordingEvent, "":
-		return trace.NewAggregate(errors...)
-	}
-	if err := t.emitter.EmitAuditEvent(ctx, event); err != nil {
-		errors = append(errors, err)
-	}
-	return trace.NewAggregate(errors...)
+func (c *CallbackEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	ctx = context.WithoutCancel(ctx)
+	return c.OnEmitAuditEvent(ctx, event)
 }
 
 // NewCallbackStreamer returns streamer that invokes callback on every
@@ -528,8 +589,8 @@ type CallbackStreamerConfig struct {
 	OnCreateAuditStream func(ctx context.Context, sid session.ID, inner Streamer) (apievents.Stream, error)
 	// OnResumeAuditStream is called on resuming audit stream
 	OnResumeAuditStream func(ctx context.Context, sid session.ID, uploadID string, inner Streamer) (apievents.Stream, error)
-	// OnEmitAuditEvent is called on emit audit event on a stream
-	OnEmitAuditEvent func(ctx context.Context, sid session.ID, event apievents.AuditEvent) error
+	// OnRecordEvent is called on emit audit event on a stream
+	OnRecordEvent func(ctx context.Context, sid session.ID, event apievents.PreparedSessionEvent) error
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -613,14 +674,14 @@ func (s *CallbackStream) Complete(ctx context.Context) error {
 	return s.stream.Complete(ctx)
 }
 
-// EmitAuditEvent emits audit event
-func (s *CallbackStream) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
-	if s.streamer.OnEmitAuditEvent != nil {
-		if err := s.streamer.OnEmitAuditEvent(ctx, s.sessionID, event); err != nil {
+// RecordEvent records a session event
+func (s *CallbackStream) RecordEvent(ctx context.Context, event apievents.PreparedSessionEvent) error {
+	if s.streamer.OnRecordEvent != nil {
+		if err := s.streamer.OnRecordEvent(ctx, s.sessionID, event); err != nil {
 			return trace.Wrap(err)
 		}
 	}
-	return s.stream.EmitAuditEvent(ctx, event)
+	return s.stream.RecordEvent(ctx, event)
 }
 
 // NewReportingStreamer reports upload events
@@ -684,7 +745,7 @@ func (s *ReportingStream) Complete(ctx context.Context) error {
 		Error:     err,
 	}:
 	default:
-		log.Warningf("Skip send event on a blocked channel.")
+		slog.WarnContext(ctx, "Skip send event on a blocked channel.")
 	}
 	return trace.Wrap(err)
 }

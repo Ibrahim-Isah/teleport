@@ -1,27 +1,32 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
+	"context"
+	"log/slog"
+
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/sql/armsql"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/cloud/azure"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
@@ -31,11 +36,10 @@ func newAzureSQLServerFetcher(config azureFetcherConfig) (common.Fetcher, error)
 }
 
 // azureSQLServerFetcher implements azureFetcherPlugin for Azure SQL Servers.
-type azureSQLServerFetcher struct {
-}
+type azureSQLServerFetcher struct{}
 
-func (f *azureSQLServerFetcher) GetListClient(cfg *azureFetcherConfig, subID string) (azure.SQLServerClient, error) {
-	client, err := cfg.AzureClients.GetAzureSQLServerClient(subID)
+func (f *azureSQLServerFetcher) GetListClient(ctx context.Context, cfg *azureFetcherConfig, subID string) (azure.SQLServerClient, error) {
+	client, err := cfg.AzureClients.GetSQLServerClient(ctx, subID)
 	return client, trace.Wrap(err)
 }
 
@@ -43,10 +47,13 @@ func (f *azureSQLServerFetcher) GetServerLocation(server *armsql.Server) string 
 	return azure.StringVal(server.Location)
 }
 
-func (f *azureSQLServerFetcher) NewDatabaseFromServer(server *armsql.Server, log logrus.FieldLogger) types.Database {
-	database, err := services.NewDatabaseFromAzureSQLServer(server)
+func (f *azureSQLServerFetcher) NewDatabaseFromServer(ctx context.Context, server *armsql.Server, logger *slog.Logger) types.Database {
+	database, err := common.NewDatabaseFromAzureSQLServer(server)
 	if err != nil {
-		log.Warnf("Could not convert Azure SQL server %q to database resource: %v.", azure.StringVal(server.Name), err)
+		logger.WarnContext(ctx, "Could not convert Azure SQL server to database resource",
+			"server", azure.StringVal(server.Name),
+			"error", err,
+		)
 		return nil
 	}
 

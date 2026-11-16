@@ -1,25 +1,24 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { DiscoverEventResource } from 'teleport/services/userEvent';
-
-import { DatabaseEngine, DatabaseLocation } from '../Database/resources';
+import { Resource } from 'gen-proto-ts/teleport/userpreferences/v1/onboard_pb';
 
 import type { JoinRole } from 'teleport/services/joinToken';
-import type { Database } from '../Database/resources';
 
 export enum ResourceKind {
   Application,
@@ -27,6 +26,10 @@ export enum ResourceKind {
   Desktop,
   Kubernetes,
   Server,
+  SamlApplication,
+  Discovery,
+  ConnectMyComputer,
+  MCP,
 }
 
 export function resourceKindToJoinRole(kind: ResourceKind): JoinRole {
@@ -41,71 +44,30 @@ export function resourceKindToJoinRole(kind: ResourceKind): JoinRole {
       return 'Kube';
     case ResourceKind.Server:
       return 'Node';
+    case ResourceKind.Discovery:
+      return 'Discovery';
+    case ResourceKind.ConnectMyComputer:
+      return 'Node';
   }
 }
 
-export function resourceKindToEventResource(
-  kind: ResourceKind,
-  resourceState: any
-): DiscoverEventResource {
+export function resourceKindToPreferredResource(kind: ResourceKind): Resource {
   switch (kind) {
-    case ResourceKind.Database:
-      const { engine, location } = resourceState as Database;
-      if (location === DatabaseLocation.AWS) {
-        if (engine === DatabaseEngine.PostgreSQL) {
-          return DiscoverEventResource.DatabasePostgresRds;
-        }
-        if (engine === DatabaseEngine.MySQL) {
-          return DiscoverEventResource.DatabaseMysqlRds;
-        }
-        if (engine === DatabaseEngine.SQLServer) {
-          return DiscoverEventResource.DatabaseSqlServerRds;
-        }
-        if (engine === DatabaseEngine.RedShift) {
-          return DiscoverEventResource.DatabasePostgresRedshift;
-        }
-      }
-
-      if (location === DatabaseLocation.SelfHosted) {
-        if (engine === DatabaseEngine.PostgreSQL) {
-          return DiscoverEventResource.DatabasePostgresSelfHosted;
-        }
-        if (engine === DatabaseEngine.MySQL) {
-          return DiscoverEventResource.DatabaseMysqlSelfHosted;
-        }
-        if (engine === DatabaseEngine.Mongo) {
-          return DiscoverEventResource.DatabaseMongodbSelfHosted;
-        }
-        if (engine === DatabaseEngine.SQLServer) {
-          return DiscoverEventResource.DatabaseSqlServerSelfHosted;
-        }
-        if (engine === DatabaseEngine.Redis) {
-          return DiscoverEventResource.DatabaseRedisSelfHosted;
-        }
-      }
-
-      if (location === DatabaseLocation.GCP) {
-        if (engine === DatabaseEngine.PostgreSQL) {
-          return DiscoverEventResource.DatabasePostgresGcp;
-        }
-        if (engine === DatabaseEngine.MySQL) {
-          return DiscoverEventResource.DatabaseMysqlGcp;
-        }
-        if (engine === DatabaseEngine.SQLServer) {
-          return DiscoverEventResource.DatabaseMysqlGcp;
-        }
-      }
-      console.error(`resource database event not defined for ${resourceState}`);
-      return null;
-    case ResourceKind.Desktop:
-      return DiscoverEventResource.WindowsDesktop;
-    case ResourceKind.Kubernetes:
-      return DiscoverEventResource.Kubernetes;
-    case ResourceKind.Server:
-      return DiscoverEventResource.Server;
     case ResourceKind.Application:
-      return DiscoverEventResource.ApplicationHttp;
-    default:
-      console.error(`resource event not defined for ${resourceState}`);
+      return Resource.WEB_APPLICATIONS;
+    case ResourceKind.Database:
+      return Resource.DATABASES;
+    case ResourceKind.Desktop:
+      return Resource.WINDOWS_DESKTOPS;
+    case ResourceKind.Kubernetes:
+      return Resource.KUBERNETES;
+    case ResourceKind.Server:
+      return Resource.SERVER_SSH;
+    case ResourceKind.Discovery:
+      return Resource.UNSPECIFIED;
+    case ResourceKind.ConnectMyComputer:
+      return Resource.SERVER_SSH;
+    case ResourceKind.MCP:
+      return Resource.WEB_APPLICATIONS;
   }
 }

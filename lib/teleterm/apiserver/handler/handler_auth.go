@@ -1,16 +1,20 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package handler
 
@@ -19,37 +23,49 @@ import (
 
 	"github.com/gravitational/trace"
 
+	"github.com/gravitational/teleport"
 	api "github.com/gravitational/teleport/gen/proto/go/teleport/lib/teleterm/v1"
+	"github.com/gravitational/teleport/lib/client"
+	"github.com/gravitational/teleport/lib/teleterm/api/uri"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 // Login logs in a user to a cluster
 func (s *Handler) Login(ctx context.Context, req *api.LoginRequest) (*api.EmptyResponse, error) {
-	cluster, err := s.DaemonService.ResolveCluster(req.ClusterUri)
+	cluster, _, err := s.DaemonService.ResolveCluster(req.GetClusterUri())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	if req.Params == nil {
+	if !cluster.URI.IsRoot() {
+		return nil, trace.BadParameter("cluster URI must be a root URI")
+	}
+
+	if !req.HasParams() {
 		return nil, trace.BadParameter("missing login parameters")
 	}
 
-	switch params := req.Params.(type) {
-	case *api.LoginRequest_Local:
-		if err := cluster.LocalLogin(ctx, params.Local.User, params.Local.Password, params.Local.Token); err != nil {
+	switch req.WhichParams() {
+	case api.LoginRequest_Local_case:
+		if err := cluster.LocalLogin(ctx, req.GetLocal().GetUser(), req.GetLocal().GetPassword(), req.GetLocal().GetToken()); err != nil {
 			return nil, trace.Wrap(err)
 		}
-
-		return &api.EmptyResponse{}, nil
-	case *api.LoginRequest_Sso:
-		if err := cluster.SSOLogin(ctx, params.Sso.ProviderType, params.Sso.ProviderName); err != nil {
+	case api.LoginRequest_Sso_case:
+		if err := cluster.SSOLogin(ctx, req.GetSso().GetProviderType(), req.GetSso().GetProviderName()); err != nil {
 			return nil, trace.Wrap(err)
 		}
-
-		return &api.EmptyResponse{}, nil
 	default:
 		return nil, trace.BadParameter("unsupported login parameters")
 	}
 
+	// Clear the cache after login, not before.
+	// During a re-login, another thread might try to retrieve a client from the cache.
+	// Because the cache is empty, it could initialize a new client using the previous certificate.
+	if err = s.DaemonService.ClearStaleCachedClientsForRoot(cluster.URI); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return &api.EmptyResponse{}, nil
 }
 
 // LoginPasswordless logs in a user to a cluster passwordlessly.
@@ -65,22 +81,42 @@ func (s *Handler) LoginPasswordless(stream api.TerminalService_LoginPasswordless
 		return trace.BadParameter("cluster URI is required")
 	}
 
-	cluster, err := s.DaemonService.ResolveCluster(initReq.GetClusterUri())
+	cluster, clusterClient, err := s.DaemonService.ResolveCluster(initReq.GetClusterUri())
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
+	if !cluster.URI.IsRoot() {
+		return trace.BadParameter("cluster URI must be a root URI")
+	}
+
+	// The passwordless login flow in the Electron app assumes that the default CLI prompt is used and
+	// works around that. Thus we have to remove the teleterm-specific MFAPromptConstructor added by
+	// daemon.Service.ResolveClusterURI.
+	clusterClient.MFAPromptConstructor = nil
 
 	// Start the prompt flow.
 	if err := cluster.PasswordlessLogin(stream.Context(), stream); err != nil {
 		return trace.Wrap(err)
 	}
 
-	return nil
+	// Clear the cache after login, not before.
+	// During a re-login, another thread might try to retrieve a client from the cache.
+	// Because the cache is empty, it could initialize a new client using the previous certificate.
+	err = s.DaemonService.ClearStaleCachedClientsForRoot(cluster.URI)
+	return trace.Wrap(err)
 }
 
-// Logout logs a user out from a cluster
+// Logout logs the user out of the cluster and cleans up associated resources.
+// Optionally removes the profile.
+// This operation is idempotent and can be safely invoked multiple times.
 func (s *Handler) Logout(ctx context.Context, req *api.LogoutRequest) (*api.EmptyResponse, error) {
-	if err := s.DaemonService.ClusterLogout(ctx, req.ClusterUri); err != nil {
+	clusterURI, err := uri.Parse(req.GetClusterUri())
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err = s.DaemonService.ClusterLogout(ctx, clusterURI, req.GetRemoveProfile()); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -89,32 +125,82 @@ func (s *Handler) Logout(ctx context.Context, req *api.LogoutRequest) (*api.Empt
 
 // GetAuthSettings returns cluster auth preferences
 func (s *Handler) GetAuthSettings(ctx context.Context, req *api.GetAuthSettingsRequest) (*api.AuthSettings, error) {
-	cluster, err := s.DaemonService.ResolveCluster(req.ClusterUri)
+	cluster, _, err := s.DaemonService.ResolveCluster(req.GetClusterUri())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	preferences, err := cluster.SyncAuthPreference(ctx)
+	preferences, pr, err := cluster.SyncAuthPreference(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	result := &api.AuthSettings{
-		PreferredMfa:       string(preferences.PreferredLocalMFA),
-		SecondFactor:       string(preferences.SecondFactor),
+	result := api.AuthSettings_builder{
 		LocalAuthEnabled:   preferences.LocalAuthEnabled,
 		AuthType:           preferences.AuthType,
 		AllowPasswordless:  preferences.AllowPasswordless,
 		LocalConnectorName: preferences.LocalConnectorName,
-	}
+		MessageOfTheDay:    preferences.MOTD,
+	}.Build()
 
 	for _, provider := range preferences.Providers {
-		result.AuthProviders = append(result.AuthProviders, &api.AuthProvider{
+		result.SetAuthProviders(append(result.GetAuthProviders(), api.AuthProvider_builder{
 			Type:        provider.Type,
 			Name:        provider.Name,
 			DisplayName: provider.DisplayName,
-		})
+		}.Build()))
+	}
+
+	versions := client.Versions{
+		MinClient: pr.MinClientVersion,
+		Client:    teleport.Version,
+		Server:    pr.ServerVersion,
+	}
+
+	clientVersionStatus, err := client.GetClientVersionStatus(versions)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	result.SetClientVersionStatus(libclientVersionStatusToAPIVersionStatus(clientVersionStatus))
+	result.SetVersions(api.Versions_builder{
+		MinClient: versions.MinClient,
+		Client:    versions.Client,
+		Server:    versions.Server,
+	}.Build())
+
+	if minClientWithoutPreRelease, err := utils.VersionWithoutPreRelease(versions.MinClient); err != nil {
+		log.DebugContext(ctx, "Could not strip pre-release suffix", "error", err)
+	} else {
+		result.GetVersions().SetMinClient(minClientWithoutPreRelease)
 	}
 
 	return result, nil
+}
+
+// StartHeadlessWatcher starts a headless watcher.
+// If the watcher is already running, it is restarted.
+func (s *Handler) StartHeadlessWatcher(_ context.Context, req *api.StartHeadlessWatcherRequest) (*api.StartHeadlessWatcherResponse, error) {
+	// Don't wait for the headless watcher to initialize
+	err := s.DaemonService.StartHeadlessWatcher(req.GetRootClusterUri(), false /* waitInit */)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return &api.StartHeadlessWatcherResponse{}, nil
+}
+
+func libclientVersionStatusToAPIVersionStatus(vs client.ClientVersionStatus) api.ClientVersionStatus {
+	switch vs {
+	case client.ClientVersionOK:
+		return api.ClientVersionStatus_CLIENT_VERSION_STATUS_OK
+
+	case client.ClientVersionTooOld:
+		return api.ClientVersionStatus_CLIENT_VERSION_STATUS_TOO_OLD
+
+	case client.ClientVersionTooNew:
+		return api.ClientVersionStatus_CLIENT_VERSION_STATUS_TOO_NEW
+	}
+
+	return api.ClientVersionStatus_CLIENT_VERSION_STATUS_COMPAT_UNSPECIFIED
 }

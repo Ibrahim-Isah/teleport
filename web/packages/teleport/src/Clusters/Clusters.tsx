@@ -1,23 +1,25 @@
-/*
-Copyright 2020 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { useEffect, useState } from 'react';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React, { useEffect, useState } from 'react';
 import { Box, Indicator } from 'design';
 import { Danger } from 'design/Alert';
-
 import useAttempt from 'shared/hooks/useAttemptNext';
 
 import {
@@ -25,14 +27,28 @@ import {
   FeatureHeader,
   FeatureHeaderTitle,
 } from 'teleport/components/Layout';
-import useTeleport from 'teleport/useTeleport';
-
+import { Route, Switch } from 'teleport/components/Router';
+import cfg from 'teleport/config';
 import { useFeatures } from 'teleport/FeaturesContext';
+import useTeleport from 'teleport/useTeleport';
 
 import ClusterList from './ClusterList';
 import { buildACL } from './utils';
 
 export function Clusters() {
+  return (
+    <Switch>
+      <Route
+        key="cluster-list"
+        exact
+        path={cfg.routes.clusters}
+        element={<ClusterListPage />}
+      />
+    </Switch>
+  );
+}
+
+export function ClusterListPage() {
   const ctx = useTeleport();
 
   const [clusters, setClusters] = useState([]);
@@ -65,13 +81,9 @@ export function Clusters() {
         <ClusterList
           clusters={clusters}
           menuFlags={{
-            showNodes: enabledFeatures.nodes,
+            showResources: enabledFeatures.resources,
             showAudit: enabledFeatures.audit,
             showRecordings: enabledFeatures.recordings,
-            showApps: enabledFeatures.apps,
-            showDatabases: enabledFeatures.databases,
-            showKubes: enabledFeatures.kubes,
-            showDesktops: enabledFeatures.desktops,
           }}
         />
       )}

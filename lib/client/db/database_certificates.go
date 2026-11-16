@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
@@ -24,29 +26,39 @@ import (
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/client/proto"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/client/identityfile"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/tlsca"
 )
+
+type CertificateSigner interface {
+	GetClusterName(ctx context.Context) (types.ClusterName, error)
+	GetCertAuthority(ctx context.Context, id types.CertAuthID, loadKeys bool) (types.CertAuthority, error)
+	GenerateDatabaseCert(context.Context, *proto.DatabaseCertRequest) (*proto.DatabaseCertResponse, error)
+	Ping(context.Context) (proto.PingResponse, error)
+}
 
 // GenerateDatabaseCertificatesRequest contains the required fields used to generate database certificates
 // Those certificates will be used by databases to set up mTLS authentication against Teleport
 type GenerateDatabaseCertificatesRequest struct {
-	ClusterAPI         auth.ClientI
+	ClusterAPI         CertificateSigner
 	Principals         []string
 	OutputFormat       identityfile.Format
 	OutputCanOverwrite bool
 	OutputLocation     string
 	IdentityFileWriter identityfile.ConfigWriter
 	TTL                time.Duration
-	Key                *client.Key
-	// JKSKeyStore is used to generate JKS keystore used for cassandra format.
-	JKSPassword string
+	KeyRing            *client.KeyRing
+	// Password is used to generate JKS keystore used for cassandra format or Oracle wallet.
+	Password string
 }
 
-// GenerateDatabaseCertificates to be used by databases to set up mTLS authentication
-func GenerateDatabaseCertificates(ctx context.Context, req GenerateDatabaseCertificatesRequest) ([]string, error) {
+// GenerateDatabaseServerCertificates to be used by databases to set up mTLS authentication
+func GenerateDatabaseServerCertificates(ctx context.Context, req GenerateDatabaseCertificatesRequest) ([]string, error) {
 
 	if len(req.Principals) == 0 ||
 		(len(req.Principals) == 1 && req.Principals[0] == "" && req.OutputFormat != identityfile.FormatSnowflake) {
@@ -63,6 +75,11 @@ func GenerateDatabaseCertificates(ctx context.Context, req GenerateDatabaseCerti
 
 	subject := pkix.Name{CommonName: req.Principals[0]}
 
+	clusterNameType, err := req.ClusterAPI.GetClusterName(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	clusterName := clusterNameType.GetClusterName()
 	if req.OutputFormat == identityfile.FormatMongo {
 		// Include Organization attribute in MongoDB certificates as well.
 		//
@@ -75,23 +92,24 @@ func GenerateDatabaseCertificates(ctx context.Context, req GenerateDatabaseCerti
 		// MongoDB cluster members so set it to the Teleport cluster name
 		// to avoid hardcoding anything.
 
-		clusterNameType, err := req.ClusterAPI.GetClusterName()
+		subject.Organization = []string{clusterName}
+	}
+
+	if req.KeyRing == nil {
+		key, err := cryptosuites.GenerateKey(ctx,
+			cryptosuites.GetCurrentSuiteFromPing(req.ClusterAPI),
+			cryptosuites.DatabaseServer)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-
-		subject.Organization = []string{clusterNameType.GetClusterName()}
-	}
-
-	if req.Key == nil {
-		key, err := client.GenerateRSAKey()
+		privateKey, err := keys.NewPrivateKey(key)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-		req.Key = key
+		req.KeyRing = client.NewKeyRing(privateKey, privateKey)
 	}
 
-	csr, err := tlsca.GenerateCertificateRequestPEM(subject, req.Key.PrivateKey)
+	csr, err := tlsca.GenerateCertificateRequestPEM(subject, req.KeyRing.TLSPrivateKey)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -112,18 +130,38 @@ func GenerateDatabaseCertificates(ctx context.Context, req GenerateDatabaseCerti
 		return nil, trace.Wrap(err)
 	}
 
-	req.Key.TLSCert = resp.Cert
-	req.Key.TrustedCerts = []auth.TrustedCerts{{
-		ClusterName:     req.Key.ClusterName,
+	// For CockroachDB we provide node.crt, node.key, ca.crt, and ca-client.crt,
+	// and the user must use their own CA to issue client.node.crt,
+	// client.node.key, and add their own CA's cert to ca-client.crt.
+	// The response CA certs are for Teleport DB Client CA, so fetch the
+	// Teleport Database CA certs as well.
+	var additionalCACerts [][]byte
+	if req.OutputFormat == identityfile.FormatCockroach {
+		dbServerCA, err := req.ClusterAPI.GetCertAuthority(ctx, types.CertAuthID{
+			Type:       types.DatabaseCA,
+			DomainName: clusterName,
+		}, false)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		for _, keyPair := range dbServerCA.GetTrustedTLSKeyPairs() {
+			additionalCACerts = append(additionalCACerts, keyPair.Cert)
+		}
+	}
+
+	req.KeyRing.TLSCert = resp.Cert
+	req.KeyRing.TrustedCerts = []authclient.TrustedCerts{{
+		ClusterName:     req.KeyRing.ClusterName,
 		TLSCertificates: resp.CACerts,
 	}}
 	filesWritten, err := identityfile.Write(ctx, identityfile.WriteConfig{
 		OutputPath:           req.OutputLocation,
-		Key:                  req.Key,
+		KeyRing:              req.KeyRing,
 		Format:               req.OutputFormat,
 		OverwriteDestination: req.OutputCanOverwrite,
 		Writer:               req.IdentityFileWriter,
-		JKSPassword:          req.JKSPassword,
+		Password:             req.Password,
+		AdditionalCACerts:    additionalCACerts,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)

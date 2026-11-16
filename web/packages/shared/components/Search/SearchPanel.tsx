@@ -1,46 +1,51 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useState, useEffect } from 'react';
+import { useEffect, useState, type JSX } from 'react';
 import styled from 'styled-components';
-import { Text, Flex } from 'design';
-import { StyledPanel } from 'design/DataTable';
-import InputSearch from 'design/DataTable/InputSearch';
-import { AgentFilter } from 'teleport/services/agents';
-import Toggle from 'teleport/components/Toggle';
-import Tooltip from 'teleport/components/ServersideSearchPanel/Tooltip';
 
-import { PredicateDoc } from './PredicateDoc';
+import { Flex } from 'design';
+import InputSearch from 'design/DataTable/InputSearch';
+import { PageIndicatorText } from 'design/DataTable/Pager/PageIndicatorText';
+import { FlexProps } from 'design/Flex/Flex';
+import { AdvancedSearchToggle } from 'shared/components/AdvancedSearchToggle';
+
+// eslint-disable-next-line no-restricted-imports -- FIXME
+import { ResourceFilter } from 'teleport/services/agents';
 
 export function SearchPanel({
   updateQuery,
   updateSearch,
   pageIndicators,
   filter,
-  showSearchBar,
   disableSearch,
+  hideAdvancedSearch,
   extraChildren,
+  mb = 3,
 }: {
-  updateQuery(s: string): void;
-  updateSearch(s: string): void;
-  pageIndicators: { from: number; to: number; total: number };
-  filter: AgentFilter;
-  showSearchBar: boolean;
-  disableSearch: boolean;
+  updateQuery?: (s: string) => void;
+  updateSearch: (s: string) => void;
+  pageIndicators?: { from: number; to: number; total: number };
+  filter: ResourceFilter;
+  disableSearch?: boolean;
+  hideAdvancedSearch?: boolean;
   extraChildren?: JSX.Element;
+  mb?: FlexProps['mb'];
 }) {
   const [query, setQuery] = useState(filter.search || filter.query || '');
   const [isAdvancedSearch, setIsAdvancedSearch] = useState(!!filter.query);
@@ -54,97 +59,67 @@ export function SearchPanel({
     setIsAdvancedSearch(!isAdvancedSearch);
   }
 
-  function handleOnSubmit(e) {
-    e.preventDefault(); // prevent form default
+  function updateQueryForRefetching(newQuery: string) {
+    setQuery(newQuery);
 
     if (isAdvancedSearch) {
-      updateQuery(query);
+      updateQuery?.(newQuery);
       return;
     }
 
-    updateSearch(query);
+    updateSearch?.(newQuery);
   }
 
   return (
-    <StyledPanel
-      onSubmit={handleOnSubmit}
-      borderTopLeftRadius={3}
-      borderTopRightRadius={3}
+    <Flex
+      justifyContent="space-between"
+      alignItems="center"
+      width="100%"
+      mb={mb}
     >
-      <Flex justifyContent="space-between" alignItems="center" width="100%">
-        <Flex as="form" style={{ width: '70%' }} alignItems="center">
-          <StyledFlex
-            mr={3}
-            alignItems="center"
-            width="100%"
-            className={disableSearch ? 'disabled' : ''}
+      <Flex style={{ width: '100%' }} alignItems="center">
+        <StyledFlex
+          mr={3}
+          alignItems="center"
+          width="100%"
+          className={disableSearch ? 'disabled' : ''}
+        >
+          <InputSearch
+            searchValue={query}
+            setSearchValue={updateQueryForRefetching}
           >
-            {showSearchBar && (
-              <InputSearch searchValue={query} setSearchValue={setQuery}>
-                <ToggleWrapper>
-                  <Toggle isToggled={isAdvancedSearch} onToggle={onToggle} />
-                  <Text typography="paragraph2">Advanced</Text>
-                </ToggleWrapper>
-              </InputSearch>
+            {!hideAdvancedSearch && (
+              <AdvancedSearchToggle
+                isToggled={isAdvancedSearch}
+                onToggle={onToggle}
+                px={3}
+              />
             )}
-          </StyledFlex>
-          {showSearchBar && (
-            <Tooltip>
-              <PredicateDoc />
-            </Tooltip>
-          )}
-        </Flex>
-        <Flex alignItems="center">
+          </InputSearch>
+        </StyledFlex>
+      </Flex>
+      <Flex alignItems="center">
+        {pageIndicators && (
           <PageIndicatorText
             from={pageIndicators.from}
             to={pageIndicators.to}
             count={pageIndicators.total}
           />
-          {extraChildren && extraChildren}
-        </Flex>
+        )}
+        {extraChildren}
       </Flex>
-    </StyledPanel>
+    </Flex>
   );
 }
-
-const ToggleWrapper = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: space-around;
-  padding-right: 16px;
-  padding-left: 16px;
-  width: 120px;
-`;
 
 const StyledFlex = styled(Flex)`
   // The timing functions of transitions have been chosen so that the element loses opacity slowly
   // when entering the disabled state but gains it quickly when going out of the disabled state.
   transition: opacity 150ms ease-out;
+
   &.disabled {
     pointer-events: none;
     opacity: 0.7;
     transition: opacity 150ms ease-in;
   }
 `;
-
-export function PageIndicatorText({
-  from,
-  to,
-  count,
-}: {
-  from: number;
-  to: number;
-  count: number;
-}) {
-  return (
-    <Text
-      typography="body2"
-      color="primary.contrastText"
-      style={{ textTransform: 'uppercase' }}
-      mr={1}
-    >
-      Showing <strong>{from}</strong> - <strong>{to}</strong> of{' '}
-      <strong>{count}</strong>
-    </Text>
-  );
-}

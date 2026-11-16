@@ -1,24 +1,27 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package azure
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -28,10 +31,9 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v2"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v6"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/rbac/v1"
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,6 +42,8 @@ import (
 	authztypes "k8s.io/client-go/kubernetes/typed/authorization/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/gravitational/teleport/lib/fixtures"
 )
 
 // AKSAuthMethod defines the authentication method for AKS cluster.
@@ -191,7 +195,10 @@ func (c *aksClient) ListAll(ctx context.Context) ([]*AKSCluster, error) {
 		for _, s := range page.Value {
 			cluster, err := AKSClusterFromManagedCluster(s)
 			if err != nil {
-				logrus.WithError(err).Debugf("Failed to convert discovered AKS cluster %q to Teleport internal representation.", StringVal(s.Name))
+				slog.DebugContext(ctx, "Failed to convert discovered AKS cluster to Teleport internal representation",
+					"cluster", StringVal(s.Name),
+					"error", err,
+				)
 				continue
 			}
 			servers = append(servers, cluster)
@@ -213,7 +220,10 @@ func (c *aksClient) ListWithinGroup(ctx context.Context, group string) ([]*AKSCl
 		for _, s := range page.Value {
 			cluster, err := AKSClusterFromManagedCluster(s)
 			if err != nil {
-				logrus.WithError(err).Debugf("Failed to convert discovered AKS cluster %q to Teleport internal representation.", StringVal(s.Name))
+				slog.DebugContext(ctx, "Failed to convert discovered AKS cluster to Teleport internal representation",
+					"cluster", StringVal(s.Name),
+					"error", err,
+				)
 				continue
 			}
 			servers = append(servers, cluster)
@@ -261,7 +271,6 @@ func (c *aksClient) ClusterCredentials(ctx context.Context, cfg ClusterCredentia
 	default:
 		return nil, time.Time{}, trace.BadParameter("unsupported AKS authentication mode %v", clusterDetails.Properties.AccessConfig)
 	}
-
 }
 
 // getAzureRBACCredentials generates a config to access the cluster.
@@ -279,7 +288,7 @@ func (c *aksClient) getAzureRBACCredentials(ctx context.Context, cluster Cluster
 	}
 
 	if err := c.checkAccessPermissions(ctx, cfg, cluster); err != nil {
-		return nil, time.Time{}, trace.WrapWithMessage(err, `Azure RBAC rules have not been configured for the agent. 
+		return nil, time.Time{}, trace.WrapWithMessage(err, `Azure RBAC rules have not been configured for the agent.
 		Please check that you have configured them correctly.`)
 	}
 
@@ -300,7 +309,6 @@ func (c *aksClient) getUserCredentials(ctx context.Context, cfg ClusterCredentia
 
 	result, err := c.getRestConfigFromKubeconfigs(res.Kubeconfigs)
 	return result, trace.Wrap(err)
-
 }
 
 // getAzureADCredentials gets the client configuration and checks if Kubernetes RBAC is configured.
@@ -334,8 +342,8 @@ func (c *aksClient) getAzureADCredentials(ctx context.Context, cluster ClusterCr
 
 	// calls the ListClusterAdminCrdentials endpoint to return the admin static credentials.
 	adminCfg, err := c.getAdminCredentials(ctx, cluster.ResourceGroup, cluster.ResourceName)
-	switch {
-	case err == nil:
+	switch err {
+	case nil:
 		// given the admin credentials, the agent will try to create the ClusterRole and
 		// ClusterRoleBinding objects in the AKS cluster.
 		if adminCredentialsErr = c.grantAccessWithAdminCredentials(ctx, adminCfg, groupID); adminCredentialsErr == nil {
@@ -348,7 +356,7 @@ func (c *aksClient) getAzureADCredentials(ctx context.Context, cluster ClusterCr
 		adminCredentialsErr = trace.WrapWithMessage(adminCredentialsErr, `Tried to grant access to %s/%s using aks.ListClusterAdminCredentials`, cluster.ResourceGroup, cluster.ResourceName)
 		// if the creation failed, then the agent will try to run a command to create them.
 		fallthrough
-	case err != nil:
+	default:
 		if runCMDErr = c.grantAccessWithCommand(ctx, cluster.ResourceGroup, cluster.ResourceName, cluster.TenantID, groupID); runCMDErr != nil {
 			return nil, time.Time{}, trace.Wrap(err)
 		}
@@ -360,7 +368,6 @@ func (c *aksClient) getAzureADCredentials(ctx context.Context, cluster ClusterCr
 		return nil, time.Time{}, trace.WrapWithMessage(trace.NewAggregate(adminCredentialsErr, runCMDErr), `Cannot grant access to %s/%s AKS cluster`, cluster.ResourceGroup, cluster.ResourceName)
 	}
 
-	return nil, time.Time{}, trace.NotImplemented("code shouldn't reach")
 }
 
 // getAdminCredentials returns the cluster admin credentials by calling ListClusterAdminCredentials method.
@@ -378,7 +385,6 @@ func (c *aksClient) getAdminCredentials(ctx context.Context, group, name string)
 	}
 	result, err = checkIfAuthMethodIsUnSupported(result)
 	return result, trace.Wrap(err)
-
 }
 
 // getRestConfigFromKubeconfigs parses the first kubeConfig returned by ListClusterAdminCredentials and
@@ -433,17 +439,35 @@ func (c *aksClient) genAzureToken(ctx context.Context, tentantID string) (string
 		return "", time.Time{}, trace.Wrap(ConvertResponseError(err))
 	}
 
-	cliAccessToken, err := cred.GetToken(ctx, policy.TokenRequestOptions{
+	cliAccessToken, origErr := cred.GetToken(ctx, policy.TokenRequestOptions{
 		// azureManagedClusterScope is a fixed scope that identifies azure AKS managed clusters.
 		Scopes: []string{azureManagedClusterScope},
 	},
 	)
-	if err != nil {
-		return "", time.Time{}, trace.Wrap(ConvertResponseError(err))
+	if origErr == nil {
+		return cliAccessToken.Token, cliAccessToken.ExpiresOn, nil
 	}
 
+	// Some azure credentials like Workload Identity - but not all - require the
+	// scope to be suffixed with /.default.
+	// Since the AZ identity returns a chained credentials provider
+	// that tries to get the token from any of the configured providers but doesn't
+	// expose which provider was used, we retry the token generation with the
+	// the expected scope.
+	// In the case of this attempt doesn't return any valid credential, we return
+	// the original error.
+	cliAccessToken, err = cred.GetToken(
+		ctx,
+		policy.TokenRequestOptions{
+			// azureManagedClusterScope is a fixed scope that identifies azure AKS managed clusters.
+			Scopes: []string{azureManagedClusterScope + "/.default"},
+		},
+	)
+	if err != nil {
+		// use the original error since it's clear.
+		return "", time.Time{}, trace.Wrap(ConvertResponseError(origErr))
+	}
 	return cliAccessToken.Token, cliAccessToken.ExpiresOn, nil
-
 }
 
 // grantAccessWithAdminCredentials tries to create the ClusterRole and ClusterRoleBinding into the AKS cluster
@@ -460,14 +484,13 @@ func (c *aksClient) grantAccessWithAdminCredentials(ctx context.Context, adminCf
 
 	err = c.upsertClusterRoleBindingWithAdminCredentials(ctx, client, groupID)
 	return trace.Wrap(err)
-
 }
 
 // upsertClusterRoleWithAdminCredentials tries to upsert the ClusterRole using admin credentials.
 func (c *aksClient) upsertClusterRoleWithAdminCredentials(ctx context.Context, client *kubernetes.Clientset) error {
 	clusterRole := &v1.ClusterRole{}
 
-	if err := yaml.Unmarshal([]byte(clusterRoleTemplate), clusterRole); err != nil {
+	if err := yaml.Unmarshal([]byte(fixtures.KubeClusterRoleTemplate), clusterRole); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -493,7 +516,7 @@ func (c *aksClient) upsertClusterRoleWithAdminCredentials(ctx context.Context, c
 func (c *aksClient) upsertClusterRoleBindingWithAdminCredentials(ctx context.Context, client *kubernetes.Clientset, groupID string) error {
 	clusterRoleBinding := &v1.ClusterRoleBinding{}
 
-	if err := yaml.Unmarshal([]byte(clusterRoleBindingTemplate), clusterRoleBinding); err != nil {
+	if err := yaml.Unmarshal([]byte(fixtures.KubeClusterRoleBindingTemplate), clusterRoleBinding); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -538,7 +561,7 @@ func (c *aksClient) grantAccessWithCommand(ctx context.Context, resourceGroupNam
 	return trace.Wrap(ConvertResponseError(err))
 }
 
-// extractGroupFromAzure extracts the first group id in the Azure Bearer Token.
+// extractGroupFromAzure extracts the first group ID from the Azure Bearer Token.
 func extractGroupFromAzure(token string) (string, error) {
 	p := jwt.NewParser()
 	claims := &azureGroupClaims{}
@@ -548,7 +571,11 @@ func extractGroupFromAzure(token string) (string, error) {
 	if err != nil {
 		return "", trace.Wrap(err)
 	}
-	// ParseUnverified already validates that len(claims.Groups)>0
+
+	if len(claims.Groups) == 0 {
+		return "", trace.BadParameter("no groups found in Azure token")
+	}
+
 	return claims.Groups[0], nil
 }
 
@@ -644,50 +671,6 @@ func isAKSClusterRunning(properties *armcontainerservice.ManagedClusterPropertie
 	return false
 }
 
-const (
-	clusterRoleTemplate = `
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: teleport
-rules:
-- apiGroups:
-  - ""
-  resources:
-  - users
-  - groups
-  - serviceaccounts
-  verbs:
-  - impersonate
-- apiGroups:
-  - ""
-  resources:
-  - pods
-  verbs:
-  - get
-- apiGroups:
-  - "authorization.k8s.io"
-  resources:
-  - selfsubjectaccessreviews
-  - selfsubjectrulesreviews
-  verbs:
-  - create
-`
-	clusterRoleBindingTemplate = `
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: teleport
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: teleport
-subjects:
-- kind: Group
-  name: group_name
-  apiGroup: rbac.authorization.k8s.io`
-)
-
 // kubectlApplyString generates a kubectl apply command to create the ClusterRole
 // and ClusterRoleBinding.
 // cat <<EOF | kubectl apply -f -
@@ -746,5 +729,5 @@ func kubectlApplyString(group string) string {
 %s
 ---
 %s
-EOF`, clusterRoleTemplate, strings.ReplaceAll(clusterRoleBindingTemplate, "group_name", group))
+EOF`, fixtures.KubeClusterRoleTemplate, strings.ReplaceAll(fixtures.KubeClusterRoleBindingTemplate, "group_name", group))
 }

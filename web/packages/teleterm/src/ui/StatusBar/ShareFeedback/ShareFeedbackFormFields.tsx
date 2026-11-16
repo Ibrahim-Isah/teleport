@@ -1,40 +1,37 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import { Text, Toggle } from 'design';
 import FieldInput from 'shared/components/FieldInput';
-import { requiredField } from 'shared/components/Validation/rules';
 import { FieldTextArea } from 'shared/components/FieldTextArea';
-import { Text } from 'design';
-import Toggle from 'teleport/components/Toggle';
+import { requiredField } from 'shared/components/Validation/rules';
 
 import { ShareFeedbackFormValues } from './types';
-
-interface ShareFeedbackFormProps {
-  disabled: boolean;
-  formValues: ShareFeedbackFormValues;
-
-  setFormValues(values: ShareFeedbackFormValues): void;
-}
 
 export function ShareFeedbackFormFields({
   formValues,
   setFormValues,
   disabled,
-}: ShareFeedbackFormProps) {
+}: {
+  disabled: boolean;
+  formValues: ShareFeedbackFormValues;
+  setFormValues(values: ShareFeedbackFormValues): void;
+}) {
   function updateFormField<T extends keyof ShareFeedbackFormValues>(
     field: T,
     value: ShareFeedbackFormValues[T]
@@ -52,6 +49,7 @@ export function ShareFeedbackFormFields({
         readonly={disabled}
         css={`
           input {
+            background: inherit;
             font-size: 14px;
           }
         `}
@@ -60,10 +58,11 @@ export function ShareFeedbackFormFields({
         onChange={e => updateFormField('email', e.target.value)}
       />
       <FieldInput
-        label="Company name (optional)"
+        label="Company Name (optional)"
         readonly={disabled}
         css={`
           input {
+            background: inherit;
             font-size: 14px;
           }
         `}
@@ -72,11 +71,8 @@ export function ShareFeedbackFormFields({
       />
       <FieldTextArea
         label="Suggestions"
-        textAreaCss={`
-          font-size: 14px;
-        `}
         rule={requiredField('Suggestions are required')}
-        readOnly={disabled}
+        disabled={disabled}
         value={formValues.feedback}
         onChange={e => updateFormField('feedback', e.target.value)}
         placeholder="Type your suggestions here"
@@ -88,7 +84,7 @@ export function ShareFeedbackFormFields({
           updateFormField('newsletterEnabled', !formValues.newsletterEnabled);
         }}
       >
-        <Text ml={2} color="text.primary">
+        <Text ml={2} color="text.main">
           Sign me up for the newsletter
         </Text>
       </Toggle>
@@ -104,7 +100,7 @@ export function ShareFeedbackFormFields({
       >
         <Text
           ml={2}
-          color="text.primary"
+          color="text.main"
           css={`
             line-height: 18px;
           `}

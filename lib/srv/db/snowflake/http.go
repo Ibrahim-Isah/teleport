@@ -1,20 +1,20 @@
 /*
-
- Copyright 2022 Gravitational, Inc.
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package snowflake
 
@@ -29,6 +29,7 @@ import (
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 func writeResponse(resp *http.Response, newResp []byte) (*bytes.Buffer, error) {
@@ -69,29 +70,29 @@ func copyRequest(ctx context.Context, req *http.Request, body io.Reader) (*http.
 func readRequestBody(req *http.Request) ([]byte, error) {
 	defer req.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(req.Body, teleport.MaxHTTPRequestSize))
+	body, err := utils.ReadAtMost(req.Body, teleport.MaxHTTPRequestSize)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return maybeReadGzip(&req.Header, body)
+	return maybeReadGzip(&req.Header, body, teleport.MaxHTTPRequestSize)
 }
 
 func readResponseBody(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, teleport.MaxHTTPRequestSize))
+	body, err := utils.ReadAtMost(resp.Body, teleport.MaxHTTPResponseSize)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return maybeReadGzip(&resp.Header, body)
+	return maybeReadGzip(&resp.Header, body, teleport.MaxHTTPResponseSize)
 }
 
 // maybeReadGzip checks if the body is gzip encoded and returns decoded version.
 // To determine gzip encoding the beginning of body message is being checked
 // instead of HTTP header and the second one was less reliable during testing.
-func maybeReadGzip(headers *http.Header, body []byte) ([]byte, error) {
+func maybeReadGzip(headers *http.Header, body []byte, limit int64) ([]byte, error) {
 	gzipMagic := []byte{0x1f, 0x8b, 0x08}
 
 	// Check if the body is gzip encoded. Alternative here could check
@@ -107,7 +108,7 @@ func maybeReadGzip(headers *http.Header, body []byte) ([]byte, error) {
 	}
 	defer bodyGZ.Close()
 
-	body, err = io.ReadAll(bodyGZ)
+	body, err = utils.ReadAtMost(bodyGZ, limit)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}

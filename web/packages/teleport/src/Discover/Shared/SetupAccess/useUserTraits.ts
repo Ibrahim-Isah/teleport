@@ -1,32 +1,43 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
+
 import useAttempt from 'shared/hooks/useAttemptNext';
 
-import { arrayStrDiff } from 'teleport/lib/util';
-import useTeleport from 'teleport/useTeleport';
 import { Option } from 'teleport/Discover/Shared/SelectCreatable';
-import { useDiscover } from 'teleport/Discover/useDiscover';
+import {
+  useDiscover,
+  type AppMeta,
+  type DbMeta,
+  type KubeMeta,
+  type NodeMeta,
+} from 'teleport/Discover/useDiscover';
+import { arrayStrDiff } from 'teleport/lib/util';
+import { splitAwsIamArn } from 'teleport/services/integrations/aws';
+import {
+  ExcludeUserField,
+  type User,
+  type UserTraits,
+} from 'teleport/services/user';
+import useTeleport from 'teleport/useTeleport';
 
 import { ResourceKind } from '../ResourceKind';
-
-import type { DbMeta, KubeMeta, NodeMeta } from 'teleport/Discover/useDiscover';
-import type { User, UserTraits } from 'teleport/services/user';
-import type { AgentStepProps } from '../../types';
 
 // useUserTraits handles:
 //  - retrieving the latest user (for the dynamic traits) from the backend
@@ -34,9 +45,16 @@ import type { AgentStepProps } from '../../types';
 //  - updating user in the backend with the latest dynamic traits
 //  - updating the dynamic traits for our in-memory resource meta object
 //  - provides utility function that makes data objects (type Option) for react-select component
-export function useUserTraits(props: AgentStepProps) {
+export function useUserTraits() {
   const ctx = useTeleport();
-  const { emitErrorEvent } = useDiscover();
+  const {
+    emitErrorEvent,
+    agentMeta,
+    resourceSpec,
+    updateAgentMeta,
+    nextStep: next,
+    prevStep,
+  } = useDiscover();
 
   const [user, setUser] = useState<User>();
   const { attempt, run, setAttempt, handleError } = useAttempt('processing');
@@ -44,47 +62,68 @@ export function useUserTraits(props: AgentStepProps) {
   const isSsoUser = ctx.storeUser.state.authType === 'sso';
   const canEditUser = ctx.storeUser.getUserAccess().edit;
   const dynamicTraits = initUserTraits(user);
+  const wantAutoDiscover = !!agentMeta.autoDiscovery;
 
   // Filter out static traits from the resource that we
   // queried in a prior step where we discovered the newly connected resource.
   // The resource itself contains traits that define both
   // dynamic (user-defined) and static (role-defined) traits.
-  let meta = props.agentMeta;
   let staticTraits = initUserTraits();
-  switch (props.selectedResourceKind) {
+  switch (resourceSpec.kind) {
     case ResourceKind.Kubernetes:
-      const kube = (meta as KubeMeta).kube;
-      staticTraits.kubeUsers = arrayStrDiff(
-        kube.users,
-        dynamicTraits.kubeUsers
-      );
-      staticTraits.kubeGroups = arrayStrDiff(
-        kube.groups,
-        dynamicTraits.kubeGroups
-      );
+      if (!wantAutoDiscover) {
+        const kube = (agentMeta as KubeMeta).kube;
+        staticTraits.kubeUsers = arrayStrDiff(
+          kube.users,
+          dynamicTraits.kubeUsers
+        );
+        staticTraits.kubeGroups = arrayStrDiff(
+          kube.groups,
+          dynamicTraits.kubeGroups
+        );
+      }
       break;
 
     case ResourceKind.Server:
-      const node = (meta as NodeMeta).node;
-      staticTraits.logins = arrayStrDiff(node.sshLogins, dynamicTraits.logins);
+      if (!wantAutoDiscover) {
+        const node = (agentMeta as NodeMeta).node;
+        staticTraits.logins = arrayStrDiff(
+          node.sshLogins,
+          dynamicTraits.logins
+        );
+      }
       break;
 
     case ResourceKind.Database:
-      const db = (meta as DbMeta).db;
-      staticTraits.databaseUsers = arrayStrDiff(
-        db.users,
-        dynamicTraits.databaseUsers
-      );
-      staticTraits.databaseNames = arrayStrDiff(
-        db.names,
-        dynamicTraits.databaseNames
-      );
+      if (!wantAutoDiscover) {
+        const db = (agentMeta as DbMeta).db;
+        staticTraits.databaseUsers = arrayStrDiff(
+          db.users,
+          dynamicTraits.databaseUsers
+        );
+        staticTraits.databaseNames = arrayStrDiff(
+          db.names,
+          dynamicTraits.databaseNames
+        );
+      }
       break;
 
-    default:
+    // Note: specific to AWS CLI access
+    case ResourceKind.Application:
+      if (resourceSpec.appMeta?.awsConsole) {
+        const { awsRoles } = (agentMeta as AppMeta).app;
+        staticTraits.awsRoleArns = arrayStrDiff(
+          awsRoles.map(r => r.arn),
+          dynamicTraits.awsRoleArns
+        );
+        break;
+      }
       throw new Error(
-        `useUserTraits.ts:statiTraits: resource kind ${props.selectedResourceKind} is not handled`
+        `resource kind is application, but there is no handler defined`
       );
+
+    default:
+      throw new Error(`resource kind ${resourceSpec.kind} is not handled`);
   }
 
   useEffect(() => {
@@ -105,27 +144,33 @@ export function useUserTraits(props: AgentStepProps) {
 
   // onProceed deduplicates and removes static traits from the list of traits
   // before updating user in the backend.
-  function onProceed(traitOpts: Partial<Record<Trait, Option[]>>) {
-    switch (props.selectedResourceKind) {
+  function onProceed(
+    traitOpts: Partial<Record<Trait, Option[]>>,
+    numStepsToIncrement?: number
+  ) {
+    switch (resourceSpec.kind) {
       case ResourceKind.Kubernetes:
-        const newDynamicKubeUsers = new Set<string>();
+        let newDynamicKubeUsers = new Set<string>();
         traitOpts.kubeUsers.forEach(o => {
           if (!staticTraits.kubeUsers.includes(o.value)) {
             newDynamicKubeUsers.add(o.value);
           }
         });
 
-        const newDynamicKubeGroups = new Set<string>();
+        let newDynamicKubeGroups = new Set<string>();
         traitOpts.kubeGroups.forEach(o => {
           if (!staticTraits.kubeGroups.includes(o.value)) {
             newDynamicKubeGroups.add(o.value);
           }
         });
 
-        nextStep({
-          kubeUsers: [...newDynamicKubeUsers],
-          kubeGroups: [...newDynamicKubeGroups],
-        });
+        nextStep(
+          {
+            kubeUsers: [...newDynamicKubeUsers],
+            kubeGroups: [...newDynamicKubeGroups],
+          },
+          numStepsToIncrement
+        );
         break;
 
       case ResourceKind.Server:
@@ -136,34 +181,55 @@ export function useUserTraits(props: AgentStepProps) {
           }
         });
 
-        nextStep({ logins: [...newDynamicLogins] });
+        nextStep({ logins: [...newDynamicLogins] }, numStepsToIncrement);
         break;
 
       case ResourceKind.Database:
-        const newDynamicDbUsers = new Set<string>();
+        let newDynamicDbUsers = new Set<string>();
         traitOpts.databaseUsers.forEach(o => {
           if (!staticTraits.databaseUsers.includes(o.value)) {
             newDynamicDbUsers.add(o.value);
           }
         });
 
-        const newDynamicDbNames = new Set<string>();
+        let newDynamicDbNames = new Set<string>();
         traitOpts.databaseNames.forEach(o => {
           if (!staticTraits.databaseNames.includes(o.value)) {
             newDynamicDbNames.add(o.value);
           }
         });
 
-        nextStep({
-          databaseUsers: [...newDynamicDbUsers],
-          databaseNames: [...newDynamicDbNames],
-        });
+        nextStep(
+          {
+            databaseUsers: [...newDynamicDbUsers],
+            databaseNames: [...newDynamicDbNames],
+          },
+          numStepsToIncrement
+        );
         break;
 
-      default:
+      case ResourceKind.Application:
+        if (resourceSpec.appMeta?.awsConsole) {
+          let newDynamicArns = new Set<string>();
+          traitOpts.awsRoleArns.forEach(o => {
+            if (!staticTraits.awsRoleArns.includes(o.value)) {
+              newDynamicArns.add(o.value);
+            }
+          });
+
+          nextStep(
+            {
+              awsRoleArns: [...newDynamicArns],
+            },
+            numStepsToIncrement
+          );
+          break;
+        }
         throw new Error(
-          `useUserTrait.ts:onProceed: resource kind ${props.selectedResourceKind} is not handled`
+          `resource kind is application, but there is no handler defined`
         );
+      default:
+        throw new Error(`resource kind ${resourceSpec.kind} is not handled`);
     }
   }
 
@@ -172,11 +238,11 @@ export function useUserTraits(props: AgentStepProps) {
   function updateResourceMetaDynamicTraits(
     newDynamicTraits: Partial<UserTraits>
   ) {
-    let meta = props.agentMeta;
-    switch (props.selectedResourceKind) {
+    let meta = agentMeta;
+    switch (resourceSpec.kind) {
       case ResourceKind.Kubernetes:
         const kube = (meta as KubeMeta).kube;
-        props.updateAgentMeta({
+        updateAgentMeta({
           ...meta,
           kube: {
             ...kube,
@@ -191,7 +257,7 @@ export function useUserTraits(props: AgentStepProps) {
 
       case ResourceKind.Server:
         const node = (meta as NodeMeta).node;
-        props.updateAgentMeta({
+        updateAgentMeta({
           ...meta,
           node: {
             ...node,
@@ -202,7 +268,7 @@ export function useUserTraits(props: AgentStepProps) {
 
       case ResourceKind.Database:
         const db = (meta as DbMeta).db;
-        props.updateAgentMeta({
+        updateAgentMeta({
           ...meta,
           db: {
             ...db,
@@ -218,16 +284,46 @@ export function useUserTraits(props: AgentStepProps) {
         });
         break;
 
-      default:
+      case ResourceKind.Application:
+        if (resourceSpec.appMeta?.awsConsole) {
+          const app = (meta as AppMeta).app;
+          const arns = [
+            ...staticTraits.awsRoleArns,
+            ...newDynamicTraits.awsRoleArns,
+          ];
+          const awsRoles = arns.map(arn => {
+            const { arnResourceName, awsAccountId } = splitAwsIamArn(arn);
+            return {
+              name: arnResourceName,
+              arn,
+              display: arnResourceName,
+              accountId: awsAccountId,
+            };
+          });
+          updateAgentMeta({
+            ...meta,
+            app: {
+              ...app,
+              awsRoles,
+            },
+          });
+          break;
+        }
         throw new Error(
-          `useUserTraits.ts:updateResourceMetaDynamicTraits: resource kind ${props.selectedResourceKind} is not handled`
+          `resource kind is application, but there is no handler defined`
         );
+
+      default:
+        throw new Error(`resource kind ${resourceSpec.kind} is not handled`);
     }
   }
 
-  async function nextStep(newDynamicTraits: Partial<UserTraits>) {
+  async function nextStep(
+    newDynamicTraits: Partial<UserTraits>,
+    numStepsToSkip?: number
+  ) {
     if (isSsoUser || !canEditUser) {
-      props.nextStep();
+      next(numStepsToSkip);
       return;
     }
 
@@ -237,23 +333,26 @@ export function useUserTraits(props: AgentStepProps) {
     try {
       await ctx.userService
         .updateUser({
-          ...user,
-          traits: {
-            ...user.traits,
-            ...newDynamicTraits,
+          user: {
+            ...user,
+            traits: {
+              ...user.traits,
+              ...newDynamicTraits,
+            },
           },
+          excludeUserField: ExcludeUserField.AllTraits,
         })
         .catch((error: Error) => {
           emitErrorEvent(`error updating user traits: ${error.message}`);
           throw error;
         });
 
-      await ctx.userService.applyUserTraits().catch((error: Error) => {
+      await ctx.userService.reloadUser().catch((error: Error) => {
         emitErrorEvent(`error applying new user traits: ${error.message}`);
         throw error;
       });
 
-      props.nextStep();
+      next(numStepsToSkip);
     } catch (err) {
       handleError(err);
     }
@@ -271,9 +370,24 @@ export function useUserTraits(props: AgentStepProps) {
     return initSelectedOptionsHelper({ trait, staticTraits, dynamicTraits });
   }
 
+  // Only allow kind database's to be able to go back from
+  // this step. The prev screen for databases's atm are either
+  // IamPolicy or MutualTls, which is mostly an informational
+  // step.
+  // For server and kubernetes, the prev screen is the download
+  // script which wouldn't make sense to go back to.
+  let onPrev;
+  if (
+    resourceSpec.kind === ResourceKind.Database &&
+    (agentMeta as DbMeta).serviceDeploy?.method !== 'auto'
+  ) {
+    onPrev = prevStep;
+  }
+
   return {
     attempt,
     onProceed,
+    onPrev,
     fetchUserTraits,
     isSsoUser,
     canEditUser,
@@ -282,7 +396,8 @@ export function useUserTraits(props: AgentStepProps) {
     getSelectableOptions,
     dynamicTraits,
     staticTraits,
-    resourceState: props.resourceState,
+    resourceSpec,
+    agentMeta,
   };
 }
 
@@ -306,6 +421,7 @@ export function initSelectedOptionsHelper({
   trait: Trait;
   staticTraits?: UserTraits;
   dynamicTraits?: UserTraits;
+  wantAutoDiscover?: boolean;
 }): Option[] {
   let fixedOptions = [];
   if (staticTraits) {

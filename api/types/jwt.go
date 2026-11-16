@@ -40,15 +40,18 @@ type GenerateAppTokenRequest struct {
 
 	// URI is the URI of the recipient application.
 	URI string
+
+	// AuthorityType configures which Teleport authority issues the JWT token.
+	AuthorityType CertAuthType
+
+	// Scope is the scope that this app token is valid for.
+	Scope string
 }
 
 // Check validates the request.
 func (p *GenerateAppTokenRequest) Check() error {
 	if p.Username == "" {
 		return trace.BadParameter("username missing")
-	}
-	if len(p.Roles) == 0 {
-		return trace.BadParameter("roles missing")
 	}
 	if p.Expires.IsZero() {
 		return trace.BadParameter("expires missing")

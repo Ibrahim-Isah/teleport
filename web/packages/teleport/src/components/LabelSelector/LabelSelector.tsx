@@ -1,25 +1,26 @@
-/*
-Copyright 2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import styled from 'styled-components';
 
-import { Box, Flex, Pill, Popover, Link, Text } from 'design';
+import { Box, Flex, Link, Pill, Popover, Text } from 'design';
 import { Info, Warning } from 'design/Icon';
-
 import { useClickOutside } from 'shared/hooks/useClickOutside';
 import { useEscape } from 'shared/hooks/useEscape';
 
@@ -32,9 +33,9 @@ function LabelSelector({ onChange }: LabelSelectorProps) {
   const [validLabel, setValidLabel] = useState(false);
   const [showTooltip, setShowTooltip] = useState(false);
 
-  const infoIconRef = useRef<HTMLDivElement>();
-  const addLabelInputRef = useRef<HTMLInputElement>();
-  const addLabelContainerRef = useRef<HTMLDivElement>();
+  const infoIconRef = useRef<HTMLDivElement>(null);
+  const addLabelInputRef = useRef<HTMLInputElement>(null);
+  const addLabelContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setValidLabel(VALID_LABEL.test(newLabel));
@@ -80,11 +81,11 @@ function LabelSelector({ onChange }: LabelSelectorProps) {
                   fontSize: '16px',
                   paddingTop: '5px',
                 }}
+                size="medium"
                 onClick={() => setShowTooltip(!showTooltip)}
               />
             </div>
             <Popover
-              id="simple-popper"
               open={showTooltip}
               anchorOrigin={{
                 vertical: 'bottom',
@@ -97,16 +98,7 @@ function LabelSelector({ onChange }: LabelSelectorProps) {
               anchorEl={infoIconRef.current}
               onClose={() => setShowTooltip(false)}
             >
-              <Box
-                bg="#011223"
-                color="white"
-                width={362}
-                p={4}
-                style={{
-                  boxShadow: '0px 8px 14px rgba(12, 12, 14, 0.07)',
-                  borderRadius: '8px',
-                }}
-              >
+              <Box bg="levels.elevated" width={362} p={4}>
                 Teleport provides users the ability to add labels (in the form
                 of key:value pairs) to resources. Some valid example labels are
                 “env: prod” and “arch: x86_64”. Labels, used in conjunction with
@@ -115,14 +107,14 @@ function LabelSelector({ onChange }: LabelSelectorProps) {
                 “env: prod”. For more information, check out our documentation
                 on{' '}
                 <Link
-                  href="https://goteleport.com/docs/setup/admin/trustedclusters/"
+                  href="https://goteleport.com/docs/admin-guides/management/admin/trustedclusters/"
                   target="_blank"
                 >
                   RBAC
                 </Link>{' '}
                 and{' '}
                 <Link
-                  href="https://goteleport.com/docs/setup/admin/labels/"
+                  href="https://goteleport.com/docs/admin-guides/management/admin/labels/"
                   target="_blank"
                   rel="noreferrer"
                 >
@@ -134,9 +126,8 @@ function LabelSelector({ onChange }: LabelSelectorProps) {
           </Flex>
           <Text>
             <Link
-              href="https://goteleport.com/docs/setup/admin/labels/"
+              href="https://goteleport.com/docs/admin-guides/management/admin/labels/"
               target="_blank"
-              color="rgb(255, 255, 255)"
             >
               View Documentation
             </Link>
@@ -148,7 +139,7 @@ function LabelSelector({ onChange }: LabelSelectorProps) {
         data-testid="label-container"
       >
         {labels.length === 0 && (
-          <Text color="rgba(255, 255, 255, 0.1)">Click to add new labels.</Text>
+          <Text color="text.muted">Click to add new labels.</Text>
         )}
         {labelList({ labels, onDismiss: handleLabelDismiss })}
       </LabelContainer>
@@ -181,10 +172,10 @@ function LabelSelector({ onChange }: LabelSelectorProps) {
           ) : (
             <CreateLabelError data-testid="create-label-error">
               <WarningIconWrapper>
-                <Warning style={{ padding: '3px' }} />
+                <Warning style={{ padding: '1px' }} size="medium" />
               </WarningIconWrapper>
               <WarningText>
-                <Text style={{ color: '#D83C31', fontWeight: 700 }}>
+                <Text color="error.main" style={{ fontWeight: 700 }}>
                   Invalid label format
                 </Text>
                 <Text>Follow `key:pair` format to add a new label</Text>
@@ -204,8 +195,8 @@ const Heading = styled.div`
 
 const LabelContainer = styled.div`
   border-radius: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow: 0px 8px 10px rgba(12, 12, 14, 0.07);
+  border: 1px solid ${props => props.theme.colors.spotBackground[1]};
+  box-shadow: ${props => props.theme.boxShadow[2]};
   cursor: pointer;
   display: flex;
   flex-wrap: wrap;
@@ -216,17 +207,15 @@ const LabelContainer = styled.div`
 `;
 
 const AddLabelContainer = styled.div`
-  background: #182250;
   border-radius: 4px;
   height: 100px;
   padding: 1rem;
 `;
 
 const AddLabelInput = styled.input`
-  background: #182250;
   border-radius: 52px;
-  border: 1.5px solid #512fc9;
-  color: white;
+  border: 1.5px solid ${({ theme }) => theme.colors.brand};
+  color: ${({ theme }) => theme.colors.text.main};
   height: 40px;
   padding: 0 12px;
   width: calc(100% - 2rem);
@@ -235,7 +224,7 @@ const AddLabelInput = styled.input`
 const CreateLabel = styled.button`
   background: none;
   border: none;
-  color: white;
+  color: ${({ theme }) => theme.colors.text.main};
   cursor: pointer;
   font-size: 1rem;
   margin-left: 16px;
@@ -248,7 +237,7 @@ const CreateLabelError = styled.div`
 `;
 
 const WarningIconWrapper = styled.div`
-  background: rgba(255, 255, 255, 0.05);
+  background: ${props => props.theme.colors.spotBackground[0]};
   border-radius: 54px;
   display: flex;
   height: 20px;

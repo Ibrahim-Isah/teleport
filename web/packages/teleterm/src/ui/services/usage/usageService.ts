@@ -1,41 +1,59 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { ClusterOrResourceUri, ClusterUri, routing } from 'teleterm/ui/uri';
-import {
-  Cluster,
-  ReportUsageEventRequest,
-  TshClient,
-} from 'teleterm/services/tshd/types';
+import { Timestamp } from 'gen-proto-ts/google/protobuf/timestamp_pb';
+import { SubmitConnectEventRequest } from 'gen-proto-ts/prehog/v1alpha/connect_pb';
+import { Cluster } from 'gen-proto-ts/teleport/lib/teleterm/v1/cluster_pb';
+import { getErrorMessage } from 'shared/utils/error';
+
+import Logger from 'teleterm/logger';
 import { RuntimeSettings } from 'teleterm/mainProcess/types';
 import { ConfigService } from 'teleterm/services/config';
-import Logger from 'teleterm/logger';
+import { TshdClient } from 'teleterm/services/tshd';
 import { staticConfig } from 'teleterm/staticConfig';
 import { NotificationsService } from 'teleterm/ui/services/notifications';
+import { DocumentOrigin } from 'teleterm/ui/services/workspacesService';
+import { ClusterOrResourceUri, ClusterUri, routing } from 'teleterm/ui/uri';
 
 type PrehogEventReq = Omit<
-  ReportUsageEventRequest['prehogReq'],
+  SubmitConnectEventRequest,
   'distinctId' | 'timestamp'
 >;
+
+/**
+ * Origin denotes which part of Connect UI was used to access a resource.
+ *
+ * 'vnet' is a special case this signals that a resource was opened through means other than Connect
+ * UI itself. Either the user copied the address from Connect or they deduced the name from seeing
+ * other VNet addresses, or perhaps the address is saved in some other app or source code.
+ */
+type Origin = DocumentOrigin | 'vnet';
+/**
+ * AccessThrough describes whether a resource was accessed by speaking to the proxy service
+ * directly, through a local proxy or through VNet.
+ */
+type AccessThrough = 'proxy_service' | 'local_proxy' | 'vnet';
 
 export class UsageService {
   private logger = new Logger('UsageService');
 
   constructor(
-    private tshClient: TshClient,
+    private tshClient: TshdClient,
     private configService: ConfigService,
     private notificationsService: NotificationsService,
     // `findCluster` function - it is a workaround that allows to use `UsageEventService` in `ClustersService`.
@@ -46,6 +64,11 @@ export class UsageService {
     private runtimeSettings: RuntimeSettings
   ) {}
 
+  /**
+   * Should be called only after a successful cluster sync.
+   * Otherwise, details of the root cluster (`authClusterId` and `name`)
+   * will be empty and this event won't be captured.
+   */
   captureUserLogin(uri: ClusterOrResourceUri, connectorType: string): void {
     const clusterProperties = this.getClusterProperties(uri);
     if (!clusterProperties) {
@@ -56,22 +79,43 @@ export class UsageService {
     }
     const { arch, platform, osVersion, appVersion } = this.runtimeSettings;
     this.reportEvent(clusterProperties.authClusterId, {
-      clusterLogin: {
-        clusterName: clusterProperties.clusterName,
-        userName: clusterProperties.userName,
-        connectorType,
-        arch,
-        os: platform,
-        osVersion,
-        appVersion,
+      event: {
+        oneofKind: 'clusterLogin',
+        clusterLogin: {
+          clusterName: clusterProperties.clusterName,
+          userName: clusterProperties.userName,
+          connectorType,
+          arch,
+          os: platform,
+          osVersion,
+          appVersion,
+        },
       },
     });
   }
 
-  captureProtocolUse(
-    uri: ClusterOrResourceUri,
-    protocol: 'ssh' | 'kube' | 'db'
-  ): void {
+  captureProtocolUse({
+    uri,
+    protocol,
+    origin,
+    accessThrough,
+  }: {
+    /**
+     * uri is used to find details of the root cluster. As such, it can be URI of any resource
+     * belonging to a root cluster or one of its leaves.
+     */
+    uri: ClusterOrResourceUri;
+    protocol: 'ssh' | 'kube' | 'db' | 'app' | 'desktop';
+    /**
+     * origin denotes which part of Connect UI was used to access a resource.
+     */
+    origin: Origin;
+    /**
+     * accessThrough describes whether a resource was accessed by speaking to the proxy service
+     * directly, through a local proxy or through VNet.
+     */
+    accessThrough: AccessThrough;
+  }): void {
     const clusterProperties = this.getClusterProperties(uri);
     if (!clusterProperties) {
       this.logger.warn(
@@ -80,10 +124,15 @@ export class UsageService {
       return;
     }
     this.reportEvent(clusterProperties.authClusterId, {
-      protocolUse: {
-        clusterName: clusterProperties.clusterName,
-        userName: clusterProperties.userName,
-        protocol,
+      event: {
+        oneofKind: 'protocolUse',
+        protocolUse: {
+          clusterName: clusterProperties.clusterName,
+          userName: clusterProperties.userName,
+          protocol,
+          origin,
+          accessThrough,
+        },
       },
     });
   }
@@ -100,10 +149,13 @@ export class UsageService {
       return;
     }
     this.reportEvent(clusterProperties.authClusterId, {
-      accessRequestCreate: {
-        clusterName: clusterProperties.clusterName,
-        userName: clusterProperties.userName,
-        kind,
+      event: {
+        oneofKind: 'accessRequestCreate',
+        accessRequestCreate: {
+          clusterName: clusterProperties.clusterName,
+          userName: clusterProperties.userName,
+          kind,
+        },
       },
     });
   }
@@ -117,9 +169,12 @@ export class UsageService {
       return;
     }
     this.reportEvent(clusterProperties.authClusterId, {
-      accessRequestReview: {
-        clusterName: clusterProperties.clusterName,
-        userName: clusterProperties.userName,
+      event: {
+        oneofKind: 'accessRequestReview',
+        accessRequestReview: {
+          clusterName: clusterProperties.clusterName,
+          userName: clusterProperties.userName,
+        },
       },
     });
   }
@@ -133,9 +188,12 @@ export class UsageService {
       return;
     }
     this.reportEvent(clusterProperties.authClusterId, {
-      accessRequestAssumeRole: {
-        clusterName: clusterProperties.clusterName,
-        userName: clusterProperties.userName,
+      event: {
+        oneofKind: 'accessRequestAssumeRole',
+        accessRequestAssumeRole: {
+          clusterName: clusterProperties.clusterName,
+          userName: clusterProperties.userName,
+        },
       },
     });
   }
@@ -152,18 +210,69 @@ export class UsageService {
       return;
     }
     this.reportEvent(clusterProperties.authClusterId, {
-      fileTransferRun: {
-        clusterName: clusterProperties.clusterName,
-        userName: clusterProperties.userName,
-        isUpload,
+      event: {
+        oneofKind: 'fileTransferRun',
+        fileTransferRun: {
+          clusterName: clusterProperties.clusterName,
+          userName: clusterProperties.userName,
+          isUpload,
+        },
       },
     });
   }
 
   captureUserJobRoleUpdate(jobRole: string): void {
     this.reportNonAnonymizedEvent({
-      userJobRoleUpdate: {
-        jobRole,
+      event: {
+        oneofKind: 'userJobRoleUpdate',
+        userJobRoleUpdate: {
+          jobRole,
+        },
+      },
+    });
+  }
+
+  captureConnectMyComputerSetup(
+    uri: ClusterOrResourceUri,
+    properties: { success: true } | { success: false; failedStep: string }
+  ): void {
+    const clusterProperties = this.getClusterProperties(uri);
+    if (!clusterProperties) {
+      this.logger.warn(
+        `Missing cluster data for ${uri}, skipping connectMyComputerSetup event`
+      );
+      return;
+    }
+    this.reportEvent(clusterProperties.authClusterId, {
+      event: {
+        oneofKind: 'connectMyComputerSetup',
+        connectMyComputerSetup: {
+          clusterName: clusterProperties.clusterName,
+          userName: clusterProperties.userName,
+          success: properties.success,
+          failedStep:
+            (properties.success === false && properties.failedStep) ||
+            undefined,
+        },
+      },
+    });
+  }
+
+  captureConnectMyComputerAgentStart(uri: ClusterOrResourceUri): void {
+    const clusterProperties = this.getClusterProperties(uri);
+    if (!clusterProperties) {
+      this.logger.warn(
+        `Missing cluster data for ${uri}, skipping connectMyComputerAgentStart event`
+      );
+      return;
+    }
+    this.reportEvent(clusterProperties.authClusterId, {
+      event: {
+        oneofKind: 'connectMyComputerAgentStart',
+        connectMyComputerAgentStart: {
+          clusterName: clusterProperties.clusterName,
+          userName: clusterProperties.userName,
+        },
       },
     });
   }
@@ -189,23 +298,30 @@ export class UsageService {
         authClusterId,
         prehogReq: {
           distinctId: this.runtimeSettings.installationId,
-          timestamp: new Date(),
+          timestamp: Timestamp.now(),
           ...prehogEventReq,
         },
       });
     } catch (e) {
       this.notificationsService.notifyWarning({
         title: 'Failed to report usage event',
-        description: e.message,
+        description: getErrorMessage(e),
       });
-      this.logger.warn(`Failed to report usage event`, e.message);
+      this.logger.warn('Failed to report usage event', e);
     }
   }
 
   private getClusterProperties(uri: ClusterOrResourceUri) {
     const rootClusterUri = routing.ensureRootClusterUri(uri);
     const cluster = this.findCluster(rootClusterUri);
-    if (!(cluster && cluster.loggedInUser && cluster.authClusterId)) {
+    if (
+      !(
+        cluster &&
+        cluster.loggedInUser &&
+        cluster.authClusterId &&
+        cluster.name
+      )
+    ) {
       return;
     }
 

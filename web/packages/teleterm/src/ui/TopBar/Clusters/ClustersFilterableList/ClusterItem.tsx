@@ -1,51 +1,56 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
-import { Flex, Label, Text } from 'design';
-import { CircleCheck } from 'design/Icon';
-
+import { useEffect, useRef } from 'react';
 import styled from 'styled-components';
 
-import { ListItem } from 'teleterm/ui/components/ListItem';
-import { useKeyboardArrowsNavigation } from 'teleterm/ui/components/KeyboardArrowsNavigation';
+import { Flex, Text } from 'design';
+import { Status } from 'design/Status';
+
 import { Cluster } from 'teleterm/services/tshd/types';
+import { useKeyboardArrowsNavigation } from 'teleterm/ui/components/KeyboardArrowsNavigation';
+import { ListItem } from 'teleterm/ui/components/ListItem';
 
 interface ClusterItemProps {
   index: number;
   item: Cluster;
   isSelected: boolean;
-
   onSelect(): void;
 }
 
 export function ClusterItem(props: ClusterItemProps) {
-  const { isActive } = useKeyboardArrowsNavigation({
+  const { isActive, scrollIntoViewIfActive } = useKeyboardArrowsNavigation({
     index: props.index,
     onRun: props.onSelect,
   });
+  const ref = useRef<HTMLLIElement>(null);
 
-  const LabelVersion = props.isSelected ? InvertedLabel : Label;
   const clusterName = props.item.name;
+
+  useEffect(() => {
+    scrollIntoViewIfActive(ref.current);
+  }, [scrollIntoViewIfActive]);
 
   return (
     <StyledListItem
+      ref={ref}
       onClick={props.onSelect}
       isActive={isActive}
-      isSelected={props.isSelected}
       isLeaf={props.item.leaf}
     >
       <Flex
@@ -55,52 +60,31 @@ export function ClusterItem(props: ClusterItemProps) {
         width="100%"
         minWidth="0"
       >
-        <Text typography="body1" title={clusterName}>
+        <Text typography="body2" title={clusterName}>
           {clusterName}
         </Text>
-        {!props.item.leaf ? (
-          <LabelVersion ml={1} kind="primary">
-            root
-          </LabelVersion>
-        ) : null}
-        {props.isSelected ? <CircleCheck fontSize={12} /> : null}
+        <Flex>
+          {!props.item.leaf && (
+            <Status ml={1} kind="primary" variant="filled" icon={false}>
+              root
+            </Status>
+          )}
+          {props.isSelected && (
+            <Status ml={1} kind="success" variant="filled" icon={false}>
+              active
+            </Status>
+          )}
+        </Flex>
       </Flex>
     </StyledListItem>
   );
 }
 
-const StyledListItem = styled(ListItem)`
+const StyledListItem = styled(ListItem)<{ isLeaf?: boolean }>`
   padding-left: ${props => (props.isLeaf ? '32px' : null)};
-  background: ${getBackgroundColor};
 
   &:hover,
   &:focus {
-    background: ${getHoverBackgroundColor};
+    background: ${props => props.theme.colors.spotBackground[0]};
   }
 `;
-
-const InvertedLabel = styled(Label)`
-  color: ${props => props.theme.colors.secondary.main};
-  background-color: ${props => props.theme.colors.secondary.contrastText};
-`;
-
-function getBackgroundColor(props) {
-  if (props.isSelected) {
-    if (props.isActive) {
-      return props.theme.colors.secondary.light;
-    }
-    return props.theme.colors.secondary.main;
-  }
-  if (props.isActive) {
-    return props.theme.colors.secondary.lighter;
-  }
-}
-
-function getHoverBackgroundColor(props) {
-  if (props.isSelected) {
-    return props.theme.colors.secondary.light;
-  }
-  if (props.isActive) {
-    return props.theme.colors.secondary.lighter;
-  }
-}

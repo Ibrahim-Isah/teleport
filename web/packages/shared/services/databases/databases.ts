@@ -1,27 +1,54 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-export type DbType = 'redshift' | 'rds' | 'gcp' | 'self-hosted';
+export type DbType =
+  | 'self-hosted'
+  | 'rds'
+  | 'rdsproxy'
+  | 'redshift'
+  | 'redshift-serverless'
+  | 'gcp'
+  | 'azure'
+  | 'elasticache'
+  | 'elasticache-serverless'
+  | 'memorydb'
+  | 'keyspace'
+  | 'cassandra'
+  | 'dynamodb'
+  | 'opensearch'
+  | 'spanner';
 
 export type DbProtocol =
   | 'postgres'
   | 'mysql'
   | 'mongodb'
+  | 'oracle'
+  | 'redis'
+  | 'cockroachdb'
   | 'sqlserver'
-  | 'redis';
+  | 'snowflake'
+  | 'cassandra'
+  | 'elasticsearch'
+  | 'opensearch'
+  | 'dynamodb'
+  | 'clickhouse'
+  | 'clickhouse-http'
+  | 'spanner';
 
 const formatProtocol = (input: DbProtocol) => {
   switch (input) {
@@ -35,6 +62,16 @@ const formatProtocol = (input: DbProtocol) => {
       return 'SQL Server';
     case 'redis':
       return 'Redis';
+    case 'oracle':
+      return 'Oracle';
+    case 'cockroachdb':
+      return 'CockroachDB';
+    case 'cassandra':
+      return 'Cassandra';
+    case 'elasticsearch':
+      return 'Elasticsearch';
+    case 'spanner':
+      return 'Spanner';
     default:
       return input;
   }
@@ -43,12 +80,41 @@ const formatProtocol = (input: DbProtocol) => {
 export const formatDatabaseInfo = (type: DbType, protocol: DbProtocol) => {
   const output = { type, protocol, title: '' };
 
+  switch (protocol) {
+    case 'snowflake':
+      output.title = 'Snowflake';
+      return output;
+  }
   switch (type) {
     case 'rds':
-      output.title = `RDS ${formatProtocol(protocol)}`;
+      output.title = `Amazon RDS ${formatProtocol(protocol)}`;
+      return output;
+    case 'rdsproxy':
+      output.title = `Amazon RDS Proxy ${formatProtocol(protocol)}`;
       return output;
     case 'redshift':
-      output.title = 'Redshift';
+      output.title = 'Amazon Redshift';
+      return output;
+    case 'redshift-serverless':
+      output.title = 'Amazon Redshift Serverless';
+      return output;
+    case 'elasticache':
+      output.title = 'Amazon ElastiCache';
+      return output;
+    case 'elasticache-serverless':
+      output.title = 'Amazon ElastiCache Serverless';
+      return output;
+    case 'memorydb':
+      output.title = 'Amazon MemoryDB';
+      return output;
+    case 'keyspace':
+      output.title = 'Amazon Keyspaces';
+      return output;
+    case 'dynamodb':
+      output.title = 'Amazon DynamoDB';
+      return output;
+    case 'opensearch':
+      output.title = 'Amazon OpenSearch';
       return output;
     case 'self-hosted':
       output.title = `Self-hosted ${formatProtocol(protocol)}`;
@@ -56,10 +122,43 @@ export const formatDatabaseInfo = (type: DbType, protocol: DbProtocol) => {
     case 'gcp':
       output.title = `Cloud SQL ${formatProtocol(protocol)}`;
       return output;
+    case 'azure':
+      output.title = `Azure ${formatProtocol(protocol)}`;
+      return output;
+    case 'spanner':
+      output.title = 'Cloud Spanner';
+      return output;
     default:
       output.title = `${type} ${formatProtocol(protocol)}`;
       return output;
   }
 };
 
-export type DatabaseInfo = ReturnType<typeof formatDatabaseInfo>;
+export type DbNameRequirement = 'unsupported' | 'optional' | 'required';
+
+const dbNameRequirementsByProtocol: Record<DbProtocol, DbNameRequirement> = {
+  mongodb: 'required',
+  oracle: 'required',
+  postgres: 'required',
+  spanner: 'required',
+  sqlserver: 'required',
+
+  cassandra: 'unsupported',
+  clickhouse: 'unsupported',
+  'clickhouse-http': 'unsupported',
+  dynamodb: 'unsupported',
+  elasticsearch: 'unsupported',
+  opensearch: 'unsupported',
+  redis: 'unsupported',
+
+  cockroachdb: 'optional',
+  mysql: 'optional',
+  snowflake: 'optional',
+};
+
+export const getDbNameRequirement = (
+  protocol: DbProtocol
+): DbNameRequirement => {
+  // default to 'optional'
+  return dbNameRequirementsByProtocol[protocol] ?? 'optional';
+};

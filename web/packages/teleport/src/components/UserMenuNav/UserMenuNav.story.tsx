@@ -1,22 +1,28 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
 import { MemoryRouter } from 'react-router';
-import * as Icons from 'design/Icon';
+
+import { getOSSFeatures } from 'teleport/features';
+import { FeaturesContextProvider } from 'teleport/FeaturesContext';
+import { makeUserContext } from 'teleport/services/user';
+import TeleportContext from 'teleport/teleportContext';
+import TeleportContextProvider from 'teleport/TeleportContextProvider';
 
 import { UserMenuNav } from './UserMenuNav';
 
@@ -24,27 +30,67 @@ export default {
   title: 'Teleport/UserMenuNav',
 };
 
-export function Loaded() {
+export function UsernameOnly() {
+  return renderUserMenuNav({
+    userName: 'george',
+    displayPrimary: '',
+    displaySecondary: '',
+  });
+}
+
+export function DisplayName() {
+  return renderUserMenuNav({
+    userName: '123456',
+    displayPrimary: 'Jane Garcia',
+    displaySecondary: 'jane@example.com',
+  });
+}
+
+export function SecondaryOnly() {
+  return renderUserMenuNav({
+    userName: 'casey',
+    displayPrimary: '',
+    displaySecondary: 'casey@example.com',
+  });
+}
+
+export function LongName() {
+  return renderUserMenuNav({
+    userName: 'long-canonical-username-used-for-display-testing@example.com',
+    displayPrimary:
+      'Josephine Alexandra Montgomery-Smith With A Very Long Display Name',
+    displaySecondary: '',
+  });
+}
+
+function renderUserMenuNav({
+  userName,
+  displayPrimary,
+  displaySecondary,
+}: {
+  userName: string;
+  displayPrimary: string;
+  displaySecondary: string;
+}) {
+  const ctx = new TeleportContext();
+
+  ctx.storeUser.state = makeUserContext({
+    userName,
+    displayPrimary,
+    displaySecondary,
+    cluster: {
+      name: 'test-cluster',
+      lastConnected: Date.now(),
+    },
+  });
+
   return (
     <MemoryRouter>
-      <UserMenuNav {...props} />
+      <TeleportContextProvider ctx={ctx}>
+        <FeaturesContextProvider value={getOSSFeatures()}>
+          <UserMenuNav />
+        </FeaturesContextProvider>
+      </TeleportContextProvider>
     </MemoryRouter>
   );
 }
-
-const props = {
-  navItems: [
-    {
-      title: 'Nav Item 1',
-      Icon: Icons.Apple,
-      getLink: () => 'test',
-    },
-    {
-      title: 'Nav Item 2',
-      Icon: Icons.Cloud,
-      getLink: () => 'test2',
-    },
-  ],
-  username: 'george',
-  logout: () => null,
-};

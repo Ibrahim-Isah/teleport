@@ -1,22 +1,25 @@
 /**
- * Copyright 2020 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import api from 'teleport/services/api';
 
 import AuditService from './audit';
+import { EventQuery } from './types';
 
 test('fetch events', async () => {
   const audit = new AuditService();
@@ -43,7 +46,7 @@ test('fetch events', async () => {
       id: '5ec6-4c2c-8567-36bcb',
       code: 'T6000I',
       user: '90678c66-ffcc-4f02.im-a-cluster-name',
-      time: '2021-05-25T07:34:22.204Z',
+      time: new Date('2021-05-25T07:34:22.204Z'),
       raw: {
         cluster_name: 'im-a-cluster-name',
         code: 'T6000I',
@@ -64,7 +67,7 @@ test('fetch events', async () => {
       id: 'user.login:2021-05-25T14:37:27.848Z',
       code: 'T1000I',
       user: 'root',
-      time: '2021-05-25T14:37:27.848Z',
+      time: new Date('2021-05-25T14:37:27.848Z'),
       raw: {
         cluster_name: 'im-a-cluster-name',
         code: 'T1000I',
@@ -86,9 +89,10 @@ test('fetch events', async () => {
   expect(response.events[0].message).toBe('Unknown');
 });
 
-const params = {
+const params: EventQuery = {
   from: new Date(0),
   to: new Date(0),
+  order: 'DESC',
 };
 
 const normalJson = {

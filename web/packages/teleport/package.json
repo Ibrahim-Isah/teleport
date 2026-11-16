@@ -2,12 +2,13 @@
   "name": "@gravitational/teleport",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
   "scripts": {
-    "start": "g-start --config $(pwd)/webpack.dev.config.js",
-    "build": "g-build --config webpack.prod.config.js --progress --bail",
-    "test": "npx jest",
-    "tdd": "jest . --watch"
+    "start": "pnpm build-wasm && vite",
+    "build": "pnpm build-wasm && vite build",
+    "build-wasm": "pnpm --filter=@gravitational/shared build-wasm",
+    "event-reference": "pnpm event-reference:build && pnpm event-reference:gen",
+    "event-reference:build": "vite --config ../build/vite/gen-event-reference-config.mts build",
+    "event-reference:gen": "node ./src/services/audit/gen-event-reference/dist/gen-event-reference.js ../../../docs/pages/reference/audit-events.mdx"
   },
   "author": "Gravitational, Inc.",
   "license": "Apache-2.0",
@@ -17,16 +18,37 @@
     "directory": "packages/teleport"
   },
   "dependencies": {
-    "@gravitational/design": "1.0.0",
-    "@gravitational/shared": "1.0.0",
-    "xterm": "^5.0.0",
-    "xterm-addon-fit": "^0.7.0",
-    "xterm-addon-web-links": "^0.8.0"
+    "@gravitational/design": "workspace:*",
+    "@gravitational/shared": "workspace:*",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/context-zone": "^2.10.0",
+    "@opentelemetry/core": "^2.10.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.221.0",
+    "@opentelemetry/instrumentation": "^0.221.0",
+    "@opentelemetry/instrumentation-document-load": "^0.66.0",
+    "@opentelemetry/instrumentation-fetch": "^0.221.0",
+    "@opentelemetry/instrumentation-user-interaction": "^0.65.0",
+    "@opentelemetry/instrumentation-xml-http-request": "^0.221.0",
+    "@opentelemetry/propagator-b3": "^2.10.0",
+    "@opentelemetry/resources": "^2.10.0",
+    "@opentelemetry/sdk-trace-base": "^2.10.0",
+    "@opentelemetry/sdk-trace-web": "^2.10.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-image": "^0.9.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/addon-webgl": "^0.19.0",
+    "@xterm/xterm": "^6.0.0",
+    "create-react-class": "^15.6.3",
+    "events": "3.3.0"
   },
   "devDependencies": {
-    "@gravitational/build": "^1.0.0",
-    "@types/wicg-file-system-access": "^2020.9.5",
-    "jest-canvas-mock": "^2.3.1",
-    "ts-loader": "^9.3.1"
+    "@gravitational/build": "workspace:*",
+    "@gravitational/teleport": "workspace:*",
+    "ace-builds": "1.44.0",
+    "babel-plugin-transform-import-meta": "2.3.3",
+    "babel-plugin-transform-vite-meta-env": "^1.0.3",
+    "babel-plugin-transform-vite-meta-hot": "^1.0.0",
+    "jest-websocket-mock": "^2.5.0"
   }
 }

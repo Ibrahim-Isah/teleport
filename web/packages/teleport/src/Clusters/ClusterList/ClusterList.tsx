@@ -1,29 +1,31 @@
-/*
-Copyright 2019-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import React from 'react';
-import { NavLink } from 'react-router-dom';
+import { NavLink } from 'react-router';
 import styled from 'styled-components';
 
-import { MenuButton, MenuItem } from 'shared/components/MenuAction';
 import Table, { Cell } from 'design/DataTable';
-import { Primary } from 'design/Label';
+import { Status } from 'design/Status';
+import { MenuButton, MenuItem } from 'shared/components/MenuAction';
 
-import { Cluster } from 'teleport/services/clusters';
 import cfg from 'teleport/config';
+import { Cluster } from 'teleport/services/clusters';
 
 export default function ClustersList(props: Props) {
   const { clusters = [], pageSize = 50, menuFlags } = props;
@@ -52,6 +54,9 @@ export default function ClustersList(props: Props) {
         clusters.find(c => c.clusterId === cfg.proxyCluster)
       }
       pagination={{ pageSize }}
+      row={{
+        getKey: cluster => cluster.clusterId,
+      }}
     />
   );
 }
@@ -59,29 +64,27 @@ export default function ClustersList(props: Props) {
 function renderRootLabelCell({ clusterId }: Cluster) {
   const isRoot = cfg.proxyCluster === clusterId;
   return (
-    <Cell style={{ width: '40px' }}>{isRoot && <Primary>ROOT</Primary>}</Cell>
+    <Cell style={{ width: '40px' }}>
+      {isRoot ? (
+        <Status kind="primary" variant="filled" icon={false}>
+          ROOT
+        </Status>
+      ) : (
+        <Status kind="neutral" variant="filled-subtle" icon={false}>
+          LEAF
+        </Status>
+      )}
+    </Cell>
   );
 }
 
 function renderActionCell({ clusterId }: Cluster, flags: MenuFlags) {
   const $items = [] as React.ReactNode[];
 
-  if (flags.showNodes) {
-    $items.push(renderMenuItem('Servers', cfg.getNodesRoute(clusterId)));
-  }
-  if (flags.showApps) {
-    $items.push(renderMenuItem('Applications', cfg.getAppsRoute(clusterId)));
-  }
-  if (flags.showKubes) {
+  if (flags.showResources) {
     $items.push(
-      renderMenuItem('Kubernetes', cfg.getKubernetesRoute(clusterId))
+      renderMenuItem('Resources', cfg.getUnifiedResourcesRoute(clusterId))
     );
-  }
-  if (flags.showDatabases) {
-    $items.push(renderMenuItem('Databases', cfg.getDatabasesRoute(clusterId)));
-  }
-  if (flags.showDesktops) {
-    $items.push(renderMenuItem('Desktops', cfg.getDesktopsRoute(clusterId)));
   }
   if (flags.showAudit) {
     $items.push(renderMenuItem('Audit Log', cfg.getAuditRoute(clusterId)));
@@ -93,13 +96,13 @@ function renderActionCell({ clusterId }: Cluster, flags: MenuFlags) {
   }
 
   return (
-    <Cell align="right">{$items && <MenuButton children={$items} />}</Cell>
+    <Cell align="right">{$items && <MenuButton>{$items}</MenuButton>}</Cell>
   );
 }
 
 function renderMenuItem(name: string, url: string) {
   return (
-    <MenuItem as={NavLink} to={url} key={name}>
+    <MenuItem as={NavLink} color="text.main" to={url} key={name}>
       {name}
     </MenuItem>
   );
@@ -112,13 +115,9 @@ type Props = {
 };
 
 type MenuFlags = {
-  showNodes: boolean;
+  showResources: boolean;
   showAudit: boolean;
   showRecordings: boolean;
-  showApps: boolean;
-  showDatabases: boolean;
-  showKubes: boolean;
-  showDesktops: boolean;
 };
 
 const StyledTable = styled(Table)`

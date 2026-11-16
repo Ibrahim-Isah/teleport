@@ -1,34 +1,37 @@
 /**
- * Copyright 2021 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useState, useRef, useEffect, useMemo } from 'react';
-import styled from 'styled-components';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { components } from 'react-select';
-import { Flex, Text, ButtonBorder, ButtonIcon, Box } from 'design';
-import { Close, Add } from 'design/Icon';
+import styled from 'styled-components';
+
+import { Box, ButtonBorder, ButtonIcon, Flex, Text } from 'design';
+import { makeLabelTag } from 'design/formatters';
+import { Add, Cross } from 'design/Icon';
 import Select, {
-  Option as BaseOption,
   ActionMeta,
+  Option as BaseOption,
 } from 'shared/components/Select';
 
-import { makeLabelTag } from 'teleport/components/formatters';
 import { Filter } from 'teleport/types';
 
-import usePages from './usePages';
 import Pager from './Pager';
+import usePages from './usePages';
 
 export default function SelectFilters({
   applyFilters,
@@ -80,7 +83,7 @@ export default function SelectFilters({
     applyFilters(selectedOptions.map(o => o.filter));
   }
 
-  function handleKeyDown(e: KeyboardEvent) {
+  function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === 'Escape') {
       setShowSelector(false);
     }
@@ -137,7 +140,7 @@ export default function SelectFilters({
           mr={3}
           mb={2}
         >
-          <Add fontSize={4} mr={1} color="rgba(255,255,255,0.24)" />
+          <Add size="small" mr={1} />
           Add Filters
         </AddButton>
         {showSelector && (
@@ -250,15 +253,15 @@ function Label({
   return (
     <StyledLabel onClick={() => onClick(name)}>
       <span title={name}>{name}</span>
-      <ButtonIcon size={0} ml="1" bg="primary.light">
-        <Close />
+      <ButtonIcon size={0} ml="1" bg="levels.surface">
+        <Cross size="small" />
       </ButtonIcon>
     </StyledLabel>
   );
 }
 
 const ActionButton = styled(ButtonBorder)`
-  lineheight: normal;
+  line-height: normal;
   color: #4b4b4b;
   background-color: #fff;
   border: 1px solid #4b4b4b;
@@ -281,14 +284,14 @@ const ActionButton = styled(ButtonBorder)`
 
 const AddButton = styled(ButtonBorder)`
   line-height: normal;
-  background-color: ${props => props.theme.colors.primary.dark};
+  background-color: ${props => props.theme.colors.levels.sunken};
   font-weight: normal;
   border: 1px solid rgba(255, 255, 255, 0.24);
   color: #fff;
 
   &:hover,
   &:focus {
-    background: ${props => props.theme.colors.primary.lighter};
+    background: ${props => props.theme.colors.levels.elevated};
   }
 `;
 
@@ -347,14 +350,14 @@ const StyledLabel = styled.div`
   padding: 0;
   border: 1px solid rgba(255, 255, 255, 0.24);
   border-radius: 4px;
-  color: ${({ theme }) => theme.colors.text.primary};
-  background-color: ${props => props.theme.colors.primary.dark};
+  color: ${({ theme }) => theme.colors.text.main};
+  background-color: ${props => props.theme.colors.levels.sunken};
   font-weight: regular;
   font-size: 12px;
 
   &:hover,
   &:focus {
-    background: ${props => props.theme.colors.primary.lighter};
+    background: ${props => props.theme.colors.levels.elevated};
   }
 
   > span {
@@ -365,7 +368,7 @@ const StyledLabel = styled.div`
   }
 
   button {
-    color: ${({ theme }) => theme.colors.text.primary};
+    color: ${({ theme }) => theme.colors.text.main};
     border-radius: 0;
     font-size: 14px;
     min-width: 10px;

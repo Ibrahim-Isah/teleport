@@ -1,30 +1,32 @@
 /*
-Copyright 2015-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package service
 
 import (
 	"context"
 	"net"
+	"slices"
 	"strings"
 
 	"github.com/gravitational/trace"
-	"golang.org/x/exp/slices"
 
-	"github.com/gravitational/teleport/lib/reversetunnel"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/web/app"
 )
@@ -32,10 +34,8 @@ import (
 type hostPolicyCheckerConfig struct {
 	// publicAddrs is a list of pubic addresses to support acme for
 	publicAddrs []utils.NetAddr
-	// clt is used to get the list of registered applications
-	clt app.Getter
-	// tun is a reverse tunnel
-	tun reversetunnel.Tunnel
+	// clusterGetter is used to retrieve connected Teleport clusters.
+	clusterGetter reversetunnelclient.ClusterGetter
 	// clusterName is a name of this cluster
 	clusterName string
 }
@@ -58,7 +58,9 @@ func (h *hostPolicyChecker) checkHost(ctx context.Context, host string) error {
 		return nil
 	}
 
-	_, _, err := app.ResolveFQDN(ctx, h.cfg.clt, h.cfg.tun, h.dnsNames, host)
+	// Note: canAccess is nil here. For cert provisioning we only need to
+	// know that some app with the specified FQDN exists.
+	_, _, err := app.ResolveFQDN(ctx, h.cfg.clusterGetter, h.cfg.clusterName, h.dnsNames, host, nil /* canAccess */)
 	if err == nil {
 		return nil
 	}
@@ -85,12 +87,8 @@ func newHostPolicyChecker(cfg hostPolicyCheckerConfig) (*hostPolicyChecker, erro
 }
 
 func (h *hostPolicyCheckerConfig) CheckAndSetDefaults() ([]string, error) {
-	if h.clt == nil {
-		return nil, trace.BadParameter("missing parameter clt")
-	}
-
-	if h.tun == nil {
-		return nil, trace.BadParameter("missing parameter tun")
+	if h.clusterGetter == nil {
+		return nil, trace.BadParameter("missing parameter clusterGetter")
 	}
 
 	dnsNames := make([]string, 0, len(h.publicAddrs))

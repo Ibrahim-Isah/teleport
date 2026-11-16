@@ -1,35 +1,35 @@
 /*
-
- Copyright 2022 Gravitational, Inc.
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package redis
 
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
-	"net"
 	"strings"
 	"sync"
 
-	"github.com/go-redis/redis/v9"
 	"github.com/gravitational/trace"
+	"github.com/redis/go-redis/v9"
 
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/db/common"
 	"github.com/gravitational/teleport/lib/srv/db/common/role"
@@ -91,6 +91,8 @@ const (
 const (
 	// aclWhoami is a subcommand of "acl" that requires special handling.
 	aclWhoami = "whoami"
+	// protocolV2 defines the RESP protocol v2 that Teleport uses.
+	protocolV2 = 2
 )
 
 // clusterClient is a wrapper around redis.ClusterClient
@@ -100,30 +102,26 @@ type clusterClient struct {
 
 // newClient creates a new Redis client based on given ConnectionMode. If connection mode is not supported
 // an error is returned.
-func newClient(ctx context.Context, connectionOptions *connection.Options, tlsConfig *tls.Config, onConnect onClientConnectFunc) (redis.UniversalClient, error) {
-	connectionAddr := net.JoinHostPort(connectionOptions.Address, connectionOptions.Port)
+func newClient(ctx context.Context, connectionOptions *connection.Options, tlsConfig *tls.Config, credentialsProvider fetchCredentialsFunc) (redis.UniversalClient, error) {
+	connectionAddr := getHostPort(connectionOptions)
 	// TODO(jakub): Investigate Redis Sentinel.
 	switch connectionOptions.Mode {
 	case connection.Standalone:
 		return redis.NewClient(&redis.Options{
-			Addr:      connectionAddr,
-			TLSConfig: tlsConfig,
-			OnConnect: onConnect,
-
-			// Auth should be done by the `OnConnect` callback here. So disable
-			// "automatic" auth by the client.
-			DisableAuthOnConnect: true,
+			Addr:                       connectionAddr,
+			TLSConfig:                  tlsConfig,
+			CredentialsProviderContext: credentialsProvider,
+			Protocol:                   protocolV2,
+			DisableIndentity:           true,
 		}), nil
 	case connection.Cluster:
 		client := &clusterClient{
 			ClusterClient: *redis.NewClusterClient(&redis.ClusterOptions{
-				Addrs:     []string{connectionAddr},
-				TLSConfig: tlsConfig,
-				OnConnect: onConnect,
-				NewClient: func(opt *redis.Options) *redis.Client {
-					opt.DisableAuthOnConnect = true
-					return redis.NewClient(opt)
-				},
+				Addrs:                      []string{connectionAddr},
+				TLSConfig:                  tlsConfig,
+				CredentialsProviderContext: credentialsProvider,
+				Protocol:                   protocolV2,
+				DisableIndentity:           true,
 			}),
 		}
 		// Load cluster information.
@@ -136,62 +134,115 @@ func newClient(ctx context.Context, connectionOptions *connection.Options, tlsCo
 	}
 }
 
-// onClientConnectFunc is a callback function that performs setups after Redis
-// client makes a new connection.
-type onClientConnectFunc func(context.Context, *redis.Conn) error
+// fetchCredentialsFunc fetches credentials for a new connection.
+type fetchCredentialsFunc func(ctx context.Context) (username, password string, err error)
 
-// authWithPasswordOnConnect returns an onClientConnectFunc that sends "auth"
+// authWithPasswordOnConnect returns an fetchCredentialsFunc that sends "auth"
 // with provided username and password.
-func authWithPasswordOnConnect(username, password string) onClientConnectFunc {
-	return func(ctx context.Context, conn *redis.Conn) error {
-		return authConnection(ctx, conn, username, password)
+func authWithPasswordOnConnect(username, password string) fetchCredentialsFunc {
+	return func(ctx context.Context) (string, string, error) {
+		return username, password, nil
 	}
 }
 
-// fetchUserPasswordOnConnect returns an onClientConnectFunc that fetches user
-// password on the fly then uses it for "auth".
-func fetchUserPasswordOnConnect(sessionCtx *common.Session, users common.Users, audit common.Audit) onClientConnectFunc {
+// fetchCredentialsOnConnect returns an fetchCredentialsFunc that does an
+// authorization check, calls a provided credential fetcher callback func,
+// then logs an AUTH query to the audit log once and and uses the credentials to
+// auth a new connection.
+func fetchCredentialsOnConnect(closeCtx context.Context, sessionCtx *common.Session, audit common.Audit, fetchCreds fetchCredentialsFunc) fetchCredentialsFunc {
+	// audit log one time, to avoid excessive audit logs from reconnects.
 	var auditOnce sync.Once
-	return func(ctx context.Context, conn *redis.Conn) error {
+	return func(ctx context.Context) (string, string, error) {
 		err := sessionCtx.Checker.CheckAccess(sessionCtx.Database,
 			services.AccessState{MFAVerified: true},
-			role.DatabaseRoleMatchers(
-				sessionCtx.Database,
-				sessionCtx.DatabaseUser,
-				sessionCtx.DatabaseName,
-			)...)
+			role.GetDatabaseRoleMatchers(role.RoleMatchersConfig{
+				Database:     sessionCtx.Database,
+				DatabaseUser: sessionCtx.DatabaseUser,
+				DatabaseName: sessionCtx.DatabaseName,
+			})...)
 		if err != nil {
-			return trace.Wrap(err)
+			return "", "", trace.Wrap(err)
 		}
+		username, password, err := fetchCreds(ctx)
+		if err != nil {
+			return "", "", trace.Wrap(err)
+		}
+		auditOnce.Do(func() {
+			var query string
+			if username == "" {
+				query = "AUTH ******"
+			} else {
+				query = fmt.Sprintf("AUTH %s ******", username)
+			}
+			audit.OnQuery(closeCtx, sessionCtx, common.Query{Query: query})
+		})
+		return username, password, nil
+	}
+}
 
+// managedUserCredFetchFunc fetches user password on the fly.
+func managedUserCredFetchFunc(sessionCtx *common.Session, users common.Users) fetchCredentialsFunc {
+	return func(ctx context.Context) (string, string, error) {
 		username := sessionCtx.DatabaseUser
 		password, err := users.GetPassword(ctx, sessionCtx.Database, username)
 		if err != nil {
-			return trace.AccessDenied("failed to get password for %v: %v.", username, err)
+			return "", "", trace.AccessDenied("failed to get password for %v: %v.",
+				username, err)
 		}
-
-		auditOnce.Do(func() {
-			audit.OnQuery(ctx, sessionCtx, common.Query{Query: fmt.Sprintf("AUTH %s ******", username)})
-		})
-		return authConnection(ctx, conn, username, password)
+		return username, password, nil
 	}
 }
 
-// authConnection is a helper function that sends "auth" command to provided
-// Redis connection with provided username and password.
-func authConnection(ctx context.Context, conn *redis.Conn, username, password string) error {
-	// Copied from redis.baseClient.initConn.
-	_, err := conn.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-		if password != "" {
-			if username != "" {
-				pipe.AuthACL(ctx, username, password)
-			} else {
-				pipe.Auth(ctx, password)
-			}
+// azureAccessKeyFetchFunc Azure access key for the "default" user.
+func azureAccessKeyFetchFunc(sessionCtx *common.Session, auth common.Auth) fetchCredentialsFunc {
+	return func(ctx context.Context) (string, string, error) {
+		// Retrieve the auth token for Azure Cache for Redis. Use default user.
+		password, err := auth.GetAzureCacheForRedisToken(ctx, sessionCtx.Database)
+		if err != nil {
+			return "", "", trace.AccessDenied("failed to get Azure access key: %v", err)
 		}
-		return nil
-	})
-	return trace.Wrap(err)
+		// Azure doesn't support ACL yet, so username is left blank.
+		return "", password, nil
+	}
+}
+
+// elasticacheIAMTokenFetchFunc fetches an AWS ElastiCache IAM auth token.
+func elasticacheIAMTokenFetchFunc(sessionCtx *common.Session, auth common.Auth) fetchCredentialsFunc {
+	return func(ctx context.Context) (string, string, error) {
+		// Retrieve the auth token for AWS IAM ElastiCache.
+		password, err := auth.GetElastiCacheRedisToken(ctx, sessionCtx.Database, sessionCtx.DatabaseUser)
+		if err != nil {
+			return "", "", trace.AccessDenied(
+				"failed to get AWS ElastiCache IAM auth token for %v: %v",
+				sessionCtx.DatabaseUser, err)
+		}
+		return sessionCtx.DatabaseUser, password, nil
+	}
+}
+
+// memorydbIAMTokenFetchFunc fetches an AWS MemoryDB IAM auth token.
+func memorydbIAMTokenFetchFunc(sessionCtx *common.Session, auth common.Auth) fetchCredentialsFunc {
+	return func(ctx context.Context) (string, string, error) {
+		password, err := auth.GetMemoryDBToken(ctx, sessionCtx.Database, sessionCtx.DatabaseUser)
+		if err != nil {
+			return "", "", trace.AccessDenied(
+				"failed to get AWS MemoryDB IAM auth token for %v: %v",
+				sessionCtx.DatabaseUser, err)
+		}
+		return sessionCtx.DatabaseUser, password, nil
+	}
+}
+
+func awsIAMTokenFetchFunc(sessionCtx *common.Session, auth common.Auth) (fetchCredentialsFunc, error) {
+	switch sessionCtx.Database.GetType() {
+	case types.DatabaseTypeElastiCache, types.DatabaseTypeElastiCacheServerless:
+		return elasticacheIAMTokenFetchFunc(sessionCtx, auth), nil
+	case types.DatabaseTypeMemoryDB:
+		return memorydbIAMTokenFetchFunc(sessionCtx, auth), nil
+	default:
+		// If this happens it means something wrong with our implementation.
+		return nil, trace.BadParameter("database type %q not supported for AWS IAM Auth", sessionCtx.Database.GetType())
+	}
 }
 
 // Process add supports for additional cluster commands. Our Redis implementation passes most commands to
@@ -267,7 +318,7 @@ func (c *clusterClient) Process(ctx context.Context, inCmd redis.Cmder) error {
 			return trace.BadParameter("wrong number of arguments for 'mget' command")
 		}
 
-		var resultsKeys []interface{}
+		var resultsKeys []any
 
 		keys := cmd.Args()[1:]
 		for _, key := range keys {
@@ -277,7 +328,7 @@ func (c *clusterClient) Process(ctx context.Context, inCmd redis.Cmder) error {
 			}
 
 			result := c.Get(ctx, k)
-			if result.Err() == redis.Nil {
+			if errors.Is(result.Err(), redis.Nil) {
 				resultsKeys = append(resultsKeys, redis.Nil)
 				continue
 			}

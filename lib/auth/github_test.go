@@ -1,20 +1,22 @@
 /*
-Copyright 2017 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-package auth
+package auth_test
 
 import (
 	"bytes"
@@ -35,26 +37,37 @@ import (
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth/keystore"
+	"github.com/gravitational/teleport/api/types/accesslist"
+	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/api/types/header"
+	"github.com/gravitational/teleport/entitlements"
+	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/auth/authtest"
 	authority "github.com/gravitational/teleport/lib/auth/testauthority"
+	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/memory"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/events/eventstest"
 	"github.com/gravitational/teleport/lib/loginrule"
 	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/modules/modulestest"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
 
 type githubContext struct {
-	a           *Server
-	mockEmitter *eventstest.MockEmitter
+	a           *auth.Server
+	mockEmitter *eventstest.MockRecorderEmitter
 	b           backend.Backend
-	c           clockwork.FakeClock
+	c           *clockwork.FakeClock
 }
 
-func setupGithubContext(ctx context.Context, t *testing.T) *githubContext {
+// TODO(nixpig): Refactor to avoid using global modules.
+// See: https://github.com/gravitational/teleport/pull/63829#discussion_r3646729631
+func setupGithubContext(t *testing.T) *githubContext {
 	var tt githubContext
 	t.Cleanup(func() { tt.Close() })
 
@@ -62,7 +75,7 @@ func setupGithubContext(ctx context.Context, t *testing.T) *githubContext {
 
 	var err error
 	tt.b, err = memory.New(memory.Config{
-		Context: context.Background(),
+		Context: t.Context(),
 		Clock:   tt.c,
 	})
 	require.NoError(t, err)
@@ -71,23 +84,27 @@ func setupGithubContext(ctx context.Context, t *testing.T) *githubContext {
 		ClusterName: "me.localhost",
 	})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, tt.b.Close())
+	})
 
-	authConfig := &InitConfig{
-		ClusterName:            clusterName,
-		Backend:                tt.b,
-		Authority:              authority.New(),
-		SkipPeriodicOperations: true,
-		KeyStoreConfig: keystore.Config{
-			Software: keystore.SoftwareConfig{
-				RSAKeyPairSource: authority.New().GenerateKeyPair,
-			},
-		},
-	}
-	tt.a, err = NewServer(authConfig)
+	keygen, err := authority.NewKeygen(modules.BuildOSS, tt.c.Now)
 	require.NoError(t, err)
 
-	tt.mockEmitter = &eventstest.MockEmitter{}
-	tt.a.emitter = tt.mockEmitter
+	authConfig := &auth.InitConfig{
+		ClusterName:            clusterName,
+		Backend:                tt.b,
+		VersionStorage:         authtest.NewFakeTeleportVersion(),
+		Authority:              keygen,
+		SkipPeriodicOperations: true,
+		HostUUID:               uuid.NewString(),
+		Modules:                modulestest.OSSModules(),
+	}
+	tt.a, err = auth.NewServer(authConfig)
+	require.NoError(t, err)
+
+	tt.mockEmitter = &eventstest.MockRecorderEmitter{}
+	tt.a.SetEmitter(tt.mockEmitter)
 
 	return &tt
 }
@@ -99,45 +116,47 @@ func (tt *githubContext) Close() error {
 }
 
 func TestPopulateClaims(t *testing.T) {
+	t.Parallel()
 	client := &testGithubAPIClient{}
 	user, err := client.getUser()
 	require.NoError(t, err)
 	teams, err := client.getTeams()
 	require.NoError(t, err)
 
-	claims, err := populateGithubClaims(user, teams)
+	claims, err := auth.PopulateGithubClaims(user, teams)
 	require.NoError(t, err)
 	require.Empty(t, cmp.Diff(claims, &types.GithubClaims{
 		Username: "octocat",
+		UserID:   "1234567",
 		OrganizationToTeams: map[string][]string{
 			"org1": {"team1", "team2"},
 			"org2": {"team1"},
 		},
 		Teams: []string{"team1", "team2", "team1"},
 	}))
-
 }
 
 func TestCreateGithubUser(t *testing.T) {
-	ctx := context.Background()
-	tt := setupGithubContext(ctx, t)
+	t.Parallel()
+	ctx := t.Context()
+	tt := setupGithubContext(t)
 
 	// Dry-run creation of Github user.
-	user, err := tt.a.createGithubUser(context.Background(), &CreateUserParams{
+	user, err := tt.a.CreateGithubUser(ctx, &auth.CreateUserParams{
 		ConnectorName: "github",
 		Username:      "foo@example.com",
 		Roles:         []string{"admin"},
 		SessionTTL:    1 * time.Minute,
 	}, true)
 	require.NoError(t, err)
-	require.Equal(t, user.GetName(), "foo@example.com")
+	require.Equal(t, "foo@example.com", user.GetName())
 
 	// Dry-run must not create a user.
-	_, err = tt.a.GetUser("foo@example.com", false)
+	_, err = tt.a.GetUser(ctx, "foo@example.com", false)
 	require.Error(t, err)
 
 	// Create GitHub user with 1 minute expiry.
-	_, err = tt.a.createGithubUser(context.Background(), &CreateUserParams{
+	_, err = tt.a.CreateGithubUser(ctx, &auth.CreateUserParams{
 		ConnectorName: "github",
 		Username:      "foo",
 		Roles:         []string{"admin"},
@@ -146,46 +165,49 @@ func TestCreateGithubUser(t *testing.T) {
 	require.NoError(t, err)
 
 	// Within that 1 minute period the user should still exist.
-	_, err = tt.a.GetUser("foo", false)
+	_, err = tt.a.GetUser(ctx, "foo", false)
 	require.NoError(t, err)
 
 	// Advance time 2 minutes, the user should be gone.
 	tt.c.Advance(2 * time.Minute)
-	_, err = tt.a.GetUser("foo", false)
+	_, err = tt.a.GetUser(ctx, "foo", false)
 	require.Error(t, err)
 }
 
 type testGithubAPIClient struct{}
 
-func (c *testGithubAPIClient) getUser() (*userResponse, error) {
-	return &userResponse{Login: "octocat"}, nil
+func (c *testGithubAPIClient) getUser() (*auth.GithubUserResponse, error) {
+	return &auth.GithubUserResponse{Login: "octocat", ID: 1234567}, nil
 }
 
-func (c *testGithubAPIClient) getTeams() ([]teamResponse, error) {
-	return []teamResponse{
+func (c *testGithubAPIClient) getTeams() ([]auth.GithubTeamResponse, error) {
+	return []auth.GithubTeamResponse{
 		{
 			Name: "team1",
 			Slug: "team1",
-			Org:  orgResponse{Login: "org1"},
+			Org:  auth.GithubOrgResponse{Login: "org1"},
 		},
 		{
 			Name: "team2",
 			Slug: "team2",
-			Org:  orgResponse{Login: "org1"},
+			Org:  auth.GithubOrgResponse{Login: "org1"},
 		},
 		{
 			Name: "team1",
 			Slug: "team1",
-			Org:  orgResponse{Login: "org2"},
+			Org:  auth.GithubOrgResponse{Login: "org2"},
 		},
 	}, nil
 }
 
 func TestValidateGithubAuthCallbackEventsEmitted(t *testing.T) {
-	ctx := context.Background()
-	tt := setupGithubContext(ctx, t)
+	t.Parallel()
+	clientAddr := &net.TCPAddr{IP: net.IPv4(10, 255, 0, 0)}
+	ctx := authz.ContextWithClientSrcAddr(context.Background(), clientAddr)
+	tt := setupGithubContext(t)
+	logger := logtest.NewLogger()
 
-	auth := &GithubAuthResponse{
+	resp := &authclient.GithubAuthResponse{
 		Username: "test-name",
 	}
 
@@ -201,8 +223,8 @@ func TestValidateGithubAuthCallbackEventsEmitted(t *testing.T) {
 		return nil
 	}
 
-	ssoDiagContextFixture := func(testFlow bool) *SSODiagContext {
-		diagCtx := NewSSODiagContext(types.KindGithub, SSODiagServiceFunc(createSSODiagnosticInfoStub))
+	ssoDiagContextFixture := func(testFlow bool) *auth.SSODiagContext {
+		diagCtx := auth.NewSSODiagContext(types.KindGithub, auth.SSODiagServiceFunc(createSSODiagnosticInfoStub))
 		diagCtx.RequestID = uuid.New().String()
 		diagCtx.Info.TestFlow = testFlow
 		return diagCtx
@@ -211,54 +233,66 @@ func TestValidateGithubAuthCallbackEventsEmitted(t *testing.T) {
 
 	// Test success event, non-test-flow.
 	diagCtx := ssoDiagContextFixture(false /* testFlow */)
-	m.mockValidateGithubAuthCallback = func(ctx context.Context, diagCtx *SSODiagContext, q url.Values) (*GithubAuthResponse, error) {
+	m.mockValidateGithubAuthCallback = func(ctx context.Context, diagCtx *auth.SSODiagContext, q url.Values) (*authclient.GithubAuthResponse, error) {
 		diagCtx.Info.GithubClaims = claims
-		return auth, nil
+		diagCtx.Info.AppliedLoginRules = []string{"login-rule"}
+		return resp, nil
 	}
-	_, _ = validateGithubAuthCallbackHelper(context.Background(), m, diagCtx, nil, tt.a.emitter)
-	require.Equal(t, tt.mockEmitter.LastEvent().GetType(), events.UserLoginEvent)
-	require.Equal(t, tt.mockEmitter.LastEvent().GetCode(), events.UserSSOLoginCode)
-	require.Equal(t, ssoDiagInfoCalls, 0)
+	_, _ = auth.ValidateGithubAuthCallbackHelper(ctx, m, diagCtx, nil, tt.a.GetEmitter(), logger)
+	require.Equal(t, events.UserLoginEvent, tt.mockEmitter.LastEvent().GetType())
+	require.Equal(t, events.UserSSOLoginCode, tt.mockEmitter.LastEvent().GetCode())
+	loginEvt := tt.mockEmitter.LastEvent().(*apievents.UserLogin)
+	require.Equal(t, []string{"login-rule"}, loginEvt.AppliedLoginRules)
+	require.Equal(t, clientAddr.String(), loginEvt.ConnectionMetadata.RemoteAddr)
+	require.Equal(t, 0, ssoDiagInfoCalls)
 	tt.mockEmitter.Reset()
 
 	// Test failure event, non-test-flow.
 	diagCtx = ssoDiagContextFixture(false /* testFlow */)
-	m.mockValidateGithubAuthCallback = func(ctx context.Context, diagCtx *SSODiagContext, q url.Values) (*GithubAuthResponse, error) {
+	m.mockValidateGithubAuthCallback = func(ctx context.Context, diagCtx *auth.SSODiagContext, q url.Values) (*authclient.GithubAuthResponse, error) {
 		diagCtx.Info.GithubClaims = claims
-		return auth, trace.BadParameter("")
+		return resp, trace.BadParameter("")
 	}
-	_, _ = validateGithubAuthCallbackHelper(context.Background(), m, diagCtx, nil, tt.a.emitter)
-	require.Equal(t, tt.mockEmitter.LastEvent().GetCode(), events.UserSSOLoginFailureCode)
-	require.Equal(t, ssoDiagInfoCalls, 0)
+	_, _ = auth.ValidateGithubAuthCallbackHelper(ctx, m, diagCtx, nil, tt.a.GetEmitter(), logger)
+	require.Equal(t, events.UserLoginEvent, tt.mockEmitter.LastEvent().GetType())
+	require.Equal(t, events.UserSSOLoginFailureCode, tt.mockEmitter.LastEvent().GetCode())
+	loginEvt = tt.mockEmitter.LastEvent().(*apievents.UserLogin)
+	require.Equal(t, clientAddr.String(), loginEvt.ConnectionMetadata.RemoteAddr)
+	require.Equal(t, 0, ssoDiagInfoCalls)
 
 	// Test success event, test-flow.
 	diagCtx = ssoDiagContextFixture(true /* testFlow */)
-	m.mockValidateGithubAuthCallback = func(ctx context.Context, diagCtx *SSODiagContext, q url.Values) (*GithubAuthResponse, error) {
+	m.mockValidateGithubAuthCallback = func(ctx context.Context, diagCtx *auth.SSODiagContext, q url.Values) (*authclient.GithubAuthResponse, error) {
 		diagCtx.Info.GithubClaims = claims
-		return auth, nil
+		return resp, nil
 	}
-	_, _ = validateGithubAuthCallbackHelper(context.Background(), m, diagCtx, nil, tt.a.emitter)
-	require.Equal(t, tt.mockEmitter.LastEvent().GetType(), events.UserLoginEvent)
-	require.Equal(t, tt.mockEmitter.LastEvent().GetCode(), events.UserSSOTestFlowLoginCode)
-	require.Equal(t, ssoDiagInfoCalls, 1)
+	_, _ = auth.ValidateGithubAuthCallbackHelper(ctx, m, diagCtx, nil, tt.a.GetEmitter(), logger)
+	require.Equal(t, events.UserLoginEvent, tt.mockEmitter.LastEvent().GetType())
+	require.Equal(t, events.UserSSOTestFlowLoginCode, tt.mockEmitter.LastEvent().GetCode())
+	loginEvt = tt.mockEmitter.LastEvent().(*apievents.UserLogin)
+	require.Equal(t, clientAddr.String(), loginEvt.ConnectionMetadata.RemoteAddr)
+	require.Equal(t, 1, ssoDiagInfoCalls)
 	tt.mockEmitter.Reset()
 
 	// Test failure event, test-flow.
 	diagCtx = ssoDiagContextFixture(true /* testFlow */)
-	m.mockValidateGithubAuthCallback = func(ctx context.Context, diagCtx *SSODiagContext, q url.Values) (*GithubAuthResponse, error) {
+	m.mockValidateGithubAuthCallback = func(ctx context.Context, diagCtx *auth.SSODiagContext, q url.Values) (*authclient.GithubAuthResponse, error) {
 		diagCtx.Info.GithubClaims = claims
-		return auth, trace.BadParameter("")
+		return resp, trace.BadParameter("")
 	}
-	_, _ = validateGithubAuthCallbackHelper(context.Background(), m, diagCtx, nil, tt.a.emitter)
-	require.Equal(t, tt.mockEmitter.LastEvent().GetCode(), events.UserSSOTestFlowLoginFailureCode)
-	require.Equal(t, ssoDiagInfoCalls, 2)
+	_, _ = auth.ValidateGithubAuthCallbackHelper(ctx, m, diagCtx, nil, tt.a.GetEmitter(), logger)
+	require.Equal(t, events.UserLoginEvent, tt.mockEmitter.LastEvent().GetType())
+	require.Equal(t, events.UserSSOTestFlowLoginFailureCode, tt.mockEmitter.LastEvent().GetCode())
+	loginEvt = tt.mockEmitter.LastEvent().(*apievents.UserLogin)
+	require.Equal(t, clientAddr.String(), loginEvt.ConnectionMetadata.RemoteAddr)
+	require.Equal(t, 2, ssoDiagInfoCalls)
 }
 
 type mockedGithubManager struct {
-	mockValidateGithubAuthCallback func(ctx context.Context, diagCtx *SSODiagContext, q url.Values) (*GithubAuthResponse, error)
+	mockValidateGithubAuthCallback func(ctx context.Context, diagCtx *auth.SSODiagContext, q url.Values) (*authclient.GithubAuthResponse, error)
 }
 
-func (m *mockedGithubManager) validateGithubAuthCallback(ctx context.Context, diagCtx *SSODiagContext, q url.Values) (*GithubAuthResponse, error) {
+func (m *mockedGithubManager) ValidateGithubAuthRedirect(ctx context.Context, diagCtx *auth.SSODiagContext, q url.Values) (*authclient.GithubAuthResponse, error) {
 	if m.mockValidateGithubAuthCallback != nil {
 		return m.mockValidateGithubAuthCallback(ctx, diagCtx, q)
 	}
@@ -267,8 +301,9 @@ func (m *mockedGithubManager) validateGithubAuthCallback(ctx context.Context, di
 }
 
 func TestCalculateGithubUserNoTeams(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
-	a := &Server{}
+	a := &auth.Server{}
 	connector, err := types.NewGithubConnector("github", types.GithubConnectorSpecV3{
 		TeamsToRoles: []types.TeamRolesMapping{
 			{
@@ -280,7 +315,9 @@ func TestCalculateGithubUserNoTeams(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = a.calculateGithubUser(ctx, connector, &types.GithubClaims{
+	diagCtx := &auth.SSODiagContext{}
+
+	params, err := a.CalculateGithubUser(ctx, diagCtx, connector, &types.GithubClaims{
 		Username: "octocat",
 		OrganizationToTeams: map[string][]string{
 			"org1": {"team1", "team2"},
@@ -288,12 +325,14 @@ func TestCalculateGithubUserNoTeams(t *testing.T) {
 		},
 		Teams: []string{"team1", "team2", "team1"},
 	}, &types.GithubAuthRequest{})
-	require.ErrorIs(t, err, ErrGithubNoTeams)
+	require.NoError(t, err)
+	require.Empty(t, params.Roles)
 }
 
 // Test that calculateGithubUser calls the login rule evaluator, evaluated
 // traits end up in the user params, and traits are evaluated exactly once.
 func TestCalculateGithubUserWithLoginRules(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	// Create a test role so that FetchRoles can succeed.
@@ -309,7 +348,7 @@ func TestCalculateGithubUserWithLoginRules(t *testing.T) {
 			},
 		},
 	}
-	a := &Server{
+	a := &auth.Server{
 		Cache: &mockRoleCache{
 			roles: roles,
 		},
@@ -325,6 +364,7 @@ func TestCalculateGithubUserWithLoginRules(t *testing.T) {
 	}
 	mockEvaluator := &mockLoginRuleEvaluator{
 		outputTraits: evaluatedTraits,
+		ruleNames:    []string{"mock"},
 	}
 	a.SetLoginRuleEvaluator(mockEvaluator)
 
@@ -340,7 +380,9 @@ func TestCalculateGithubUserWithLoginRules(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	userParams, err := a.calculateGithubUser(ctx, connector, &types.GithubClaims{
+	diagCtx := &auth.SSODiagContext{}
+
+	userParams, err := a.CalculateGithubUser(ctx, diagCtx, connector, &types.GithubClaims{
 		Username: "octocat",
 		OrganizationToTeams: map[string][]string{
 			"org1": {"team1"},
@@ -349,7 +391,7 @@ func TestCalculateGithubUserWithLoginRules(t *testing.T) {
 	}, &types.GithubAuthRequest{})
 	require.NoError(t, err)
 
-	require.Equal(t, &CreateUserParams{
+	require.Equal(t, &auth.CreateUserParams{
 		ConnectorName: "github",
 		Username:      "octocat",
 		KubeGroups:    evaluatedTraits[constants.TraitKubeGroups],
@@ -359,11 +401,12 @@ func TestCalculateGithubUserWithLoginRules(t *testing.T) {
 		SessionTTL:    defaults.MaxCertDuration,
 	}, userParams, "user params does not match expected")
 	require.Equal(t, 1, mockEvaluator.evaluatedCount, "login rules were not evaluated exactly once")
+	require.Equal(t, mockEvaluator.ruleNames, diagCtx.Info.AppliedLoginRules)
 }
 
 type mockRoleCache struct {
 	roles map[string]types.Role
-	Cache
+	authclient.Cache
 }
 
 func (m *mockRoleCache) GetRole(_ context.Context, name string) (types.Role, error) {
@@ -373,12 +416,14 @@ func (m *mockRoleCache) GetRole(_ context.Context, name string) (types.Role, err
 type mockLoginRuleEvaluator struct {
 	outputTraits   map[string][]string
 	evaluatedCount int
+	ruleNames      []string
 }
 
 func (m *mockLoginRuleEvaluator) Evaluate(context.Context, *loginrule.EvaluationInput) (*loginrule.EvaluationOutput, error) {
 	m.evaluatedCount++
 	return &loginrule.EvaluationOutput{
-		Traits: m.outputTraits,
+		Traits:       m.outputTraits,
+		AppliedRules: m.ruleNames,
 	}, nil
 }
 
@@ -429,7 +474,7 @@ func TestCheckGithubOrgSSOSupport(t *testing.T) {
 	tests := []struct {
 		testName             string
 		connector            types.GithubConnector
-		isEnterprise         bool
+		buildType            string
 		requestShouldSucceed bool
 		httpStatusCode       int
 		reuseCache           bool
@@ -438,7 +483,7 @@ func TestCheckGithubOrgSSOSupport(t *testing.T) {
 		{
 			testName:             "OSS HTTP connection failure",
 			connector:            ssoOrg,
-			isEnterprise:         false,
+			buildType:            modules.BuildOSS,
 			requestShouldSucceed: false,
 			reuseCache:           false,
 			errFunc:              trace.IsConnectionProblem,
@@ -446,7 +491,7 @@ func TestCheckGithubOrgSSOSupport(t *testing.T) {
 		{
 			testName:             "Enterprise skips HTTP check",
 			connector:            ssoOrg,
-			isEnterprise:         true,
+			buildType:            modules.BuildEnterprise,
 			requestShouldSucceed: false,
 			reuseCache:           false,
 			errFunc:              nil,
@@ -454,7 +499,7 @@ func TestCheckGithubOrgSSOSupport(t *testing.T) {
 		{
 			testName:             "OSS has SSO",
 			connector:            ssoOrg,
-			isEnterprise:         false,
+			buildType:            modules.BuildOSS,
 			requestShouldSucceed: true,
 			httpStatusCode:       http.StatusOK,
 			reuseCache:           false,
@@ -463,7 +508,7 @@ func TestCheckGithubOrgSSOSupport(t *testing.T) {
 		{
 			testName:             "OSS has SSO with cache",
 			connector:            ssoOrg,
-			isEnterprise:         false,
+			buildType:            modules.BuildOSS,
 			requestShouldSucceed: false,
 			reuseCache:           true,
 			errFunc:              trace.IsAccessDenied,
@@ -471,7 +516,7 @@ func TestCheckGithubOrgSSOSupport(t *testing.T) {
 		{
 			testName:             "OSS doesn't have SSO",
 			connector:            noSSOOrg,
-			isEnterprise:         false,
+			buildType:            modules.BuildOSS,
 			requestShouldSucceed: true,
 			httpStatusCode:       404,
 			reuseCache:           true,
@@ -480,7 +525,7 @@ func TestCheckGithubOrgSSOSupport(t *testing.T) {
 		{
 			testName:             "OSS doesn't have SSO with cache",
 			connector:            noSSOOrg,
-			isEnterprise:         false,
+			buildType:            modules.BuildOSS,
 			requestShouldSucceed: false,
 			reuseCache:           true,
 			errFunc:              nil,
@@ -488,19 +533,13 @@ func TestCheckGithubOrgSSOSupport(t *testing.T) {
 	}
 
 	var orgCache *utils.FnCache
-	ctx := context.Background()
+	ctx := t.Context()
 
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
 			client := mockHTTPRequester{
 				succeed:    tt.requestShouldSucceed,
 				statusCode: tt.httpStatusCode,
-			}
-
-			if tt.isEnterprise {
-				modules.SetTestModules(t, &modules.TestModules{
-					TestBuildType: modules.BuildEnterprise,
-				})
 			}
 
 			if !tt.reuseCache {
@@ -510,13 +549,403 @@ func TestCheckGithubOrgSSOSupport(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			err := checkGithubOrgSSOSupport(ctx, tt.connector, nil, orgCache, client)
+			err := auth.CheckGithubOrgSSOSupport(ctx, tt.connector, nil, tt.buildType, orgCache, client)
 			if tt.errFunc == nil {
 				require.NoError(t, err)
 			} else {
 				require.Error(t, err)
 				require.True(t, tt.errFunc(err))
 			}
+		})
+	}
+}
+
+func TestGithubURLFormat(t *testing.T) {
+	t.Parallel()
+	tts := []struct {
+		host   string
+		path   string
+		expect string
+	}{
+		{
+			host:   "example.com",
+			path:   "foo/bar",
+			expect: "https://example.com/foo/bar",
+		},
+		{
+			host:   "example.com",
+			path:   "/foo/bar?spam=eggs",
+			expect: "https://example.com/foo/bar?spam=eggs",
+		},
+		{
+			host:   "example.com",
+			path:   "/foo/bar",
+			expect: "https://example.com/foo/bar",
+		},
+	}
+
+	for _, tt := range tts {
+		require.Equal(t, tt.expect, auth.FormatGithubURL(tt.host, tt.path))
+	}
+}
+
+func TestBuildAPIEndpoint(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "no path",
+			input:    "https://github.com",
+			expected: "github.com",
+		},
+		{
+			name:     "with path",
+			input:    "https://mykewlapiendpoint/apage",
+			expected: "mykewlapiendpoint/apage",
+		},
+		{
+			name:     "with path and double slashes",
+			input:    "https://mykewlapiendpoint//apage//",
+			expected: "mykewlapiendpoint/apage/",
+		},
+		{
+			name:     "with path and query",
+			input:    "https://mykewlapiendpoint/apage?legit=nope",
+			expected: "mykewlapiendpoint/apage",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := auth.BuildAPIEndpoint(tt.input)
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func TestGithubUserRoleMappingCombinations(t *testing.T) {
+	modulestest.SetTestModules(t, modulestest.Modules{
+		TestBuildType: modules.BuildEnterprise,
+		TestFeatures: modules.Features{
+			Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+				entitlements.Identity: {Enabled: true},
+			},
+		},
+	})
+
+	ctx := t.Context()
+	tt := setupGithubContext(t)
+
+	accessRole, err := types.NewRole("access", types.RoleSpecV6{})
+	require.NoError(t, err)
+
+	_, err = tt.a.CreateRole(ctx, accessRole)
+	require.NoError(t, err)
+
+	connector, err := types.NewGithubConnector("github", types.GithubConnectorSpecV3{
+		TeamsToRoles: []types.TeamRolesMapping{{
+			Organization: "org1",
+			Team:         "teamx",
+			Roles:        []string{"access"},
+		}},
+	})
+	require.NoError(t, err)
+
+	tests := []struct {
+		testName  string
+		claims    *types.GithubClaims
+		setup     func(t *testing.T, username string)
+		assertion func(t *testing.T, userState services.UserState, err error)
+	}{
+		{
+			testName: "SSO role mapping and access list role mapping",
+			claims: &types.GithubClaims{
+				Username:            "testuser1",
+				OrganizationToTeams: map[string][]string{"org1": {"teamx"}},
+				Teams:               []string{"teamx"},
+			},
+			setup: func(t *testing.T, username string) {
+				acl, err := accesslist.NewAccessList(
+					header.Metadata{Name: "test-acl-user1"},
+					accesslist.Spec{
+						Title:              "title",
+						Owners:             []accesslist.Owner{{Name: "owner"}},
+						Audit:              accesslist.Audit{NextAuditDate: time.Now().Add(24 * time.Hour)},
+						MembershipRequires: accesslist.Requires{},
+						OwnershipRequires:  accesslist.Requires{},
+						Grants:             accesslist.Grants{Roles: []string{"access"}},
+					},
+				)
+				require.NoError(t, err)
+
+				member, err := accesslist.NewAccessListMember(
+					header.Metadata{Name: username},
+					accesslist.AccessListMemberSpec{
+						AccessList: acl.GetName(),
+						Name:       username,
+						Joined:     time.Now(),
+						Expires:    time.Now().Add(24 * time.Hour),
+						Reason:     "test",
+						AddedBy:    "admin",
+					},
+				)
+				require.NoError(t, err)
+
+				_, _, err = tt.a.UpsertAccessListWithMembers(ctx, acl, []*accesslist.AccessListMember{member})
+				require.NoError(t, err)
+
+				t.Cleanup(func() {
+					tt.a.DeleteAccessList(ctx, acl.GetName())
+				})
+			},
+			assertion: func(t *testing.T, userState services.UserState, err error) {
+				require.NoError(t, err)
+				require.Contains(t, userState.GetRoles(), "access")
+			},
+		},
+		{
+			testName: "SSO role mapping and no access list role mapping",
+			claims: &types.GithubClaims{
+				Username:            "testuser2",
+				OrganizationToTeams: map[string][]string{"org1": {"teamx"}},
+				Teams:               []string{"teamx"},
+			},
+			assertion: func(t *testing.T, userState services.UserState, err error) {
+				require.NoError(t, err)
+				require.Contains(t, userState.GetRoles(), "access")
+			},
+		},
+		{
+			testName: "no SSO role mapping and access list role mapping",
+			claims: &types.GithubClaims{
+				Username:            "testuser3",
+				OrganizationToTeams: map[string][]string{"org1": {"other-team"}},
+				Teams:               []string{"other-team"},
+			},
+			setup: func(t *testing.T, username string) {
+				acl, err := accesslist.NewAccessList(
+					header.Metadata{Name: "test-acl-user3"},
+					accesslist.Spec{
+						Title:  "title",
+						Owners: []accesslist.Owner{{Name: "owner"}},
+						Audit: accesslist.Audit{
+							NextAuditDate: time.Now().Add(365 * 24 * time.Hour),
+						},
+						MembershipRequires: accesslist.Requires{},
+						OwnershipRequires:  accesslist.Requires{},
+						Grants:             accesslist.Grants{Roles: []string{"access"}},
+					},
+				)
+				require.NoError(t, err)
+				member, err := accesslist.NewAccessListMember(
+					header.Metadata{Name: username},
+					accesslist.AccessListMemberSpec{
+						AccessList: acl.GetName(),
+						Name:       username,
+						Joined:     time.Now(),
+						Expires:    time.Now().Add(24 * time.Hour),
+						Reason:     "test",
+						AddedBy:    "admin",
+					},
+				)
+				require.NoError(t, err)
+
+				_, _, err = tt.a.UpsertAccessListWithMembers(ctx, acl, []*accesslist.AccessListMember{member})
+				require.NoError(t, err)
+
+				t.Cleanup(func() {
+					tt.a.DeleteAccessList(ctx, acl.GetName())
+				})
+			},
+			assertion: func(t *testing.T, userState services.UserState, err error) {
+				require.NoError(t, err)
+				require.Contains(t, userState.GetRoles(), "access")
+			},
+		},
+		{
+			testName: "no SSO role mapping and no access list role mapping",
+			claims: &types.GithubClaims{
+				Username:            "testuser4",
+				OrganizationToTeams: map[string][]string{"org1": {"other-team"}},
+				Teams:               []string{"other-team"},
+			},
+			assertion: func(t *testing.T, userState services.UserState, err error) {
+				require.NoError(t, err)
+				require.Empty(t, userState.GetRoles())
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.testName, func(t *testing.T) {
+			diagCtx := &auth.SSODiagContext{}
+
+			params, err := tt.a.CalculateGithubUser(
+				ctx,
+				diagCtx,
+				connector,
+				test.claims,
+				&types.GithubAuthRequest{},
+			)
+			require.NoError(t, err)
+
+			user, err := tt.a.CreateGithubUser(ctx, params, false)
+			require.NoError(t, err)
+
+			if test.setup != nil {
+				test.setup(t, user.GetName())
+			}
+
+			require.NoError(t, tt.a.CallLoginHooks(ctx, user))
+
+			userState, err := tt.a.GetUserOrLoginState(ctx, user.GetName())
+
+			test.assertion(t, userState, err)
+		})
+	}
+}
+
+func TestGithubCallbackRoleValidation(t *testing.T) {
+	modulestest.SetTestModules(t, modulestest.Modules{
+		TestBuildType: modules.BuildEnterprise,
+		TestFeatures: modules.Features{
+			Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+				entitlements.Identity: {Enabled: true},
+			},
+		},
+	})
+
+	srv := newTestTLSServer(t)
+	ctx := t.Context()
+
+	connector, err := types.NewGithubConnector("github", types.GithubConnectorSpecV3{
+		ClientID:     "test-client-id",
+		ClientSecret: "test-client-secret",
+		RedirectURL:  "https://example.com/v1/webapi/github/callback",
+		Display:      "Sign in with GitHub",
+		TeamsToRoles: []types.TeamRolesMapping{
+			{
+				Organization: "org1",
+				Team:         "teamx",
+				Roles:        []string{"access"},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	a := srv.Auth()
+	a.GithubUserAndTeamsOverride = func() (*auth.GithubUserResponse, []auth.GithubTeamResponse, error) {
+		return &auth.GithubUserResponse{
+				Login: "testuser1",
+			}, []auth.GithubTeamResponse{{
+				Name: "other-team",
+				Slug: "other-team",
+				Org:  auth.GithubOrgResponse{Login: "org1"},
+			}}, nil
+	}
+
+	_, err = auth.UpsertGithubConnector(ctx, a, connector)
+	require.NoError(t, err)
+
+	_, err = authtest.CreateRole(ctx, a, "access", types.RoleSpecV6{
+		Options: types.RoleOptions{
+			// MaxSessionTTL less than default MinCertDuration to ensure session
+			// duration in constrained.
+			MaxSessionTTL: types.Duration(defaults.MinCertDuration / 2),
+		},
+	})
+	require.NoError(t, err)
+
+	proxyClient, err := srv.NewClient(authtest.TestBuiltin(types.RoleProxy))
+	require.NoError(t, err)
+
+	tests := []struct {
+		testName         string
+		createWebSession bool
+		setup            func(t *testing.T)
+		assertion        func(t *testing.T, resp *authclient.GithubAuthResponse, userState services.UserState, err error)
+	}{
+		{
+			testName: "user with no roles",
+			assertion: func(t *testing.T, resp *authclient.GithubAuthResponse, userState services.UserState, err error) {
+				require.Nil(t, resp)
+				require.Empty(t, userState.GetRoles())
+				require.ErrorIs(t, err, auth.ErrGithubNoRoles)
+			},
+		},
+		{
+			testName:         "user with roles from ACL",
+			createWebSession: true,
+			setup: func(t *testing.T) {
+				acl, err := accesslist.NewAccessList(
+					header.Metadata{Name: "test-acl-user1"},
+					accesslist.Spec{
+						Title:              "title",
+						Owners:             []accesslist.Owner{{Name: "owner"}},
+						Audit:              accesslist.Audit{NextAuditDate: time.Now().Add(24 * time.Hour)},
+						MembershipRequires: accesslist.Requires{},
+						OwnershipRequires:  accesslist.Requires{},
+						Grants:             accesslist.Grants{Roles: []string{"access"}},
+					},
+				)
+				require.NoError(t, err)
+
+				member, err := accesslist.NewAccessListMember(
+					header.Metadata{Name: "testuser1"},
+					accesslist.AccessListMemberSpec{
+						AccessList: acl.GetName(),
+						Name:       "testuser1",
+						Joined:     time.Now(),
+						Expires:    time.Now().Add(24 * time.Hour),
+						Reason:     "test",
+						AddedBy:    "admin",
+					},
+				)
+				require.NoError(t, err)
+
+				_, _, err = a.UpsertAccessListWithMembers(ctx, acl, []*accesslist.AccessListMember{member})
+				require.NoError(t, err)
+
+				t.Cleanup(func() {
+					a.DeleteAccessList(ctx, acl.GetName())
+				})
+			},
+			assertion: func(t *testing.T, resp *authclient.GithubAuthResponse, userState services.UserState, err error) {
+				require.NotNil(t, resp)
+				require.NoError(t, err)
+				require.Contains(t, userState.GetRoles(), "access")
+				require.WithinDuration(t, time.Now().Add(defaults.MinCertDuration/2), resp.Session.GetExpiryTime(), time.Second*5)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.testName, func(t *testing.T) {
+			req, err := proxyClient.CreateGithubAuthRequest(ctx, types.GithubAuthRequest{
+				ConnectorID:      connector.GetName(),
+				Type:             constants.Github,
+				CertTTL:          defaults.MinCertDuration,
+				CreateWebSession: tt.createWebSession,
+			})
+			require.NoError(t, err)
+
+			if tt.setup != nil {
+				tt.setup(t)
+			}
+
+			resp, err := proxyClient.ValidateGithubAuthCallback(ctx, url.Values{
+				"code":  []string{"test-code"},
+				"state": []string{req.StateToken},
+			})
+
+			userState, userErr := a.GetUserOrLoginState(ctx, "testuser1")
+			require.NoError(t, userErr)
+
+			tt.assertion(t, resp, userState, err)
 		})
 	}
 }

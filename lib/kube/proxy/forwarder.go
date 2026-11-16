@@ -1,126 +1,133 @@
 /*
-Copyright 2018-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
 import (
-	"bytes"
+	"cmp"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
-	mathrand "math/rand"
+	"log/slog"
+	"maps"
 	"net"
 	"net/http"
-	"path/filepath"
-	"regexp"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
-	"github.com/gravitational/oxy/forward"
-	fwdutils "github.com/gravitational/oxy/utils"
+	gwebsocket "github.com/gorilla/websocket"
 	"github.com/gravitational/trace"
-	"github.com/gravitational/ttlmap"
 	"github.com/jonboulle/clockwork"
 	"github.com/julienschmidt/httprouter"
-	"github.com/sirupsen/logrus"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/exp/slices"
-	"golang.org/x/net/http2"
-	corev1 "k8s.io/api/core/v1"
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	oteltrace "go.opentelemetry.io/otel/trace"
+	"golang.org/x/net/http/httpguts"
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/httpstream"
-	"k8s.io/apiserver/pkg/util/wsstream"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/transport/spdy"
+	kwebsocket "k8s.io/client-go/transport/websocket"
 	kubeexec "k8s.io/client-go/util/exec"
+	"k8s.io/streaming/pkg/httpstream"
+	httpstreamspdy "k8s.io/streaming/pkg/httpstream/spdy"
+	"k8s.io/streaming/pkg/httpstream/wsstream"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/constants"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
+	scopesv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/scopes/v1"
 	"github.com/gravitational/teleport/api/observability/tracing"
+	tracehttp "github.com/gravitational/teleport/api/observability/tracing/http"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	apiutils "github.com/gravitational/teleport/api/utils"
-	"github.com/gravitational/teleport/api/utils/keys"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/auth/native"
+	"github.com/gravitational/teleport/entitlements"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/auth/moderation"
+	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
-	"github.com/gravitational/teleport/lib/events/filesessions"
 	"github.com/gravitational/teleport/lib/httplib"
+	"github.com/gravitational/teleport/lib/httplib/reverseproxy"
+	"github.com/gravitational/teleport/lib/kube/internal"
 	"github.com/gravitational/teleport/lib/kube/proxy/responsewriters"
 	"github.com/gravitational/teleport/lib/kube/proxy/streamproto"
-	kubeutils "github.com/gravitational/teleport/lib/kube/utils"
-	"github.com/gravitational/teleport/lib/reversetunnel"
+	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/multiplexer"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
+	"github.com/gravitational/teleport/lib/scopes"
+	"github.com/gravitational/teleport/lib/scopes/pinning"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv"
 	"github.com/gravitational/teleport/lib/sshca"
-	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
+	"github.com/gravitational/teleport/lib/utils/set"
 )
 
 // KubeServiceType specifies a Teleport service type which can forward Kubernetes requests
-type KubeServiceType int
+type KubeServiceType = string
 
 const (
 	// KubeService is a Teleport kubernetes_service. A KubeService always forwards
 	// requests directly to a Kubernetes endpoint.
-	KubeService KubeServiceType = iota
+	KubeService = "kube_service"
 	// ProxyService is a Teleport proxy_service with kube_listen_addr/
 	// kube_public_addr enabled. A ProxyService always forwards requests to a
 	// Teleport KubeService or LegacyProxyService.
-	ProxyService
+	ProxyService = "kube_proxy"
 	// LegacyProxyService is a Teleport proxy_service with the kubernetes section
 	// enabled. A LegacyProxyService can forward requests directly to a Kubernetes
 	// endpoint, or to another Teleport LegacyProxyService or KubeService.
-	LegacyProxyService
+	LegacyProxyService = "legacy_proxy"
 )
 
 // ForwarderConfig specifies configuration for proxy forwarder
 type ForwarderConfig struct {
 	// ReverseTunnelSrv is the teleport reverse tunnel server
-	ReverseTunnelSrv reversetunnel.Server
+	ReverseTunnelSrv reversetunnelclient.Server
 	// ClusterName is a local cluster name
 	ClusterName string
 	// Keygen points to a key generator implementation
 	Keygen sshca.Authority
-	// Authz authenticates user
-	Authz auth.Authorizer
+	// ScopedAuthz authenticates user
+	ScopedAuthz authz.ScopedAuthorizer
 	// AuthClient is a auth server client.
-	AuthClient auth.ClientI
+	AuthClient authclient.ClientI
 	// CachingAuthClient is a caching auth server client for read-only access.
-	CachingAuthClient auth.ReadKubernetesAccessPoint
-	// StreamEmitter is used to create audit streams
-	// and emit audit events
-	StreamEmitter events.StreamEmitter
+	CachingAuthClient authclient.ReadKubernetesAccessPoint
+	// Emitter is used to emit audit events
+	Emitter apievents.Emitter
 	// DataDir is a data dir to store logs
 	DataDir string
 	// Namespace is a namespace of the proxy server (not a K8s namespace)
@@ -151,11 +158,52 @@ type ForwarderConfig struct {
 	LockWatcher *services.LockWatcher
 	// CheckImpersonationPermissions is an optional override of the default
 	// impersonation permissions check, for use in testing
-	CheckImpersonationPermissions ImpersonationPermissionsChecker
+	CheckImpersonationPermissions servicecfg.ImpersonationPermissionsChecker
 	// PublicAddr is the address that can be used to reach the kube cluster
 	PublicAddr string
+	// PROXYSigner is used to sign PROXY headers for securely propagating client IP address
+	PROXYSigner multiplexer.PROXYHeaderSigner
 	// log is the logger function
-	log logrus.FieldLogger
+	log *slog.Logger
+	// TracerProvider is used to create tracers capable
+	// of starting spans.
+	TracerProvider oteltrace.TracerProvider
+	// Tracer is used to start spans.
+	tracer oteltrace.Tracer
+	// GetConnTLSCertificate returns the TLS client certificate to use when
+	// connecting to the upstream Teleport proxy or Kubernetes service when
+	// forwarding requests using the forward identity (i.e. proxy impersonating
+	// a user) method. Paired with GetConnTLSRoots and ConnTLSCipherSuites to
+	// generate the correct [*tls.Config] on demand.
+	GetConnTLSCertificate utils.GetCertificateFunc
+	// GetConnTLSRoots returns the [*x509.CertPool] used to validate TLS
+	// connections to the upstream Teleport proxy or Kubernetes service.
+	GetConnTLSRoots utils.GetRootsFunc
+	// ConnTLSCipherSuites optionally contains a list of TLS ciphersuites to use
+	// when connecting to the upstream Teleport Proxy or Kubernetes service.
+	ConnTLSCipherSuites []uint16
+	// ClusterFeaturesGetter is a function that returns the Teleport cluster licensed features.
+	// It is used to determine if the cluster is licensed for Kubernetes usage.
+	ClusterFeatures ClusterFeaturesGetter
+	// Scope is the scope the forwarder is pinned to if a full scope pin is not present.
+	Scope string
+	// ScopePin is the scope and scoped role assignments the forwarder is pinned to.
+	ScopePin *scopesv1.Pin
+}
+
+// ClusterFeaturesGetter is a function that returns the Teleport cluster licensed features.
+type ClusterFeaturesGetter func() proto.Features
+
+func (f ClusterFeaturesGetter) GetEntitlement(e entitlements.EntitlementKind) modules.EntitlementInfo {
+	al, ok := f().Entitlements[string(e)]
+	if !ok {
+		return modules.EntitlementInfo{}
+	}
+
+	return modules.EntitlementInfo{
+		Enabled: al.Enabled,
+		Limit:   al.Limit,
+	}
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -166,11 +214,14 @@ func (f *ForwarderConfig) CheckAndSetDefaults() error {
 	if f.CachingAuthClient == nil {
 		return trace.BadParameter("missing parameter CachingAuthClient")
 	}
-	if f.Authz == nil {
-		return trace.BadParameter("missing parameter Authz")
+	if f.ScopedAuthz == nil {
+		return trace.BadParameter("missing parameter ScopedAuthz")
 	}
-	if f.StreamEmitter == nil {
-		return trace.BadParameter("missing parameter StreamEmitter")
+	if f.LockWatcher == nil {
+		return trace.BadParameter("missing parameter LockWatcher")
+	}
+	if f.Emitter == nil {
+		return trace.BadParameter("missing parameter Emitter")
 	}
 	if f.ClusterName == "" {
 		return trace.BadParameter("missing parameter ClusterName")
@@ -183,6 +234,12 @@ func (f *ForwarderConfig) CheckAndSetDefaults() error {
 	}
 	if f.HostID == "" {
 		return trace.BadParameter("missing parameter ServerID")
+	}
+	if f.ClusterFeatures == nil {
+		return trace.BadParameter("missing parameter ClusterFeatures")
+	}
+	if f.KubeServiceType != KubeService && f.PROXYSigner == nil {
+		return trace.BadParameter("missing parameter PROXYSigner")
 	}
 	if f.Namespace == "" {
 		f.Namespace = apidefaults.Namespace
@@ -204,10 +261,21 @@ func (f *ForwarderConfig) CheckAndSetDefaults() error {
 		f.CheckImpersonationPermissions = checkImpersonationPermissions
 	}
 
+	if f.TracerProvider == nil {
+		f.TracerProvider = tracing.DefaultProvider()
+	}
+
+	f.tracer = f.TracerProvider.Tracer("kube")
+
 	switch f.KubeServiceType {
 	case KubeService:
-	case ProxyService:
-	case LegacyProxyService:
+	case ProxyService, LegacyProxyService:
+		if f.GetConnTLSCertificate == nil {
+			return trace.BadParameter("missing parameter GetConnTLSCertificate")
+		}
+		if f.GetConnTLSRoots == nil {
+			return trace.BadParameter("missing parameter GetConnTLSRoots")
+		}
 	default:
 		return trace.BadParameter("unknown value for KubeServiceType")
 	}
@@ -218,10 +286,32 @@ func (f *ForwarderConfig) CheckAndSetDefaults() error {
 		f.KubeClusterName = f.ClusterName
 	}
 	if f.log == nil {
-		f.log = logrus.New()
+		f.log = slog.Default()
+	}
+
+	if f.ScopePin != nil {
+		if err := pinning.WeakValidate(f.ScopePin); err != nil {
+			return trace.Wrap(err)
+		}
+	}
+	if f.Scope != "" {
+		if err := scopes.WeakValidate(f.Scope); err != nil {
+			return trace.Wrap(err)
+		}
+	}
+	if f.ScopePin.GetScope() != "" && f.Scope != "" {
+		return trace.BadParameter("either a scope pin or a bare scope must be set for a scoped kube forwarder, not both")
 	}
 	return nil
 }
+
+// GetScope returns the scope the forwarder is pinned to whether it's a bare scope or a scope pin.
+func (f *ForwarderConfig) GetScope() string {
+	return cmp.Or(f.ScopePin.GetScope(), f.Scope)
+}
+
+// transportCacheTTL is the TTL for the transport cache.
+const transportCacheTTL = 5 * time.Hour
 
 // NewForwarder returns new instance of Kubernetes request
 // forwarding proxy.
@@ -230,32 +320,38 @@ func NewForwarder(cfg ForwarderConfig) (*Forwarder, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	clientCredentials, err := ttlmap.New(defaults.ClientCacheSize)
+	// TODO (tigrato): remove this once we have a better way to handle
+	// deleting expired entried clusters and kube_servers entries.
+	// In the meantime, we need to make sure that the cache is cleaned
+	// from time to time.
+	transportClients, err := utils.NewFnCache(utils.FnCacheConfig{
+		TTL:   transportCacheTTL,
+		Clock: cfg.Clock,
+	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	closeCtx, close := context.WithCancel(cfg.Context)
-
 	fwd := &Forwarder{
-		log:               cfg.log,
-		router:            *httprouter.New(),
-		cfg:               cfg,
-		clientCredentials: clientCredentials,
-		activeRequests:    make(map[string]context.Context),
-		ctx:               closeCtx,
-		close:             close,
-		sessions:          make(map[uuid.UUID]*session),
-		upgrader: websocket.Upgrader{
+		log:            cfg.log,
+		cfg:            cfg,
+		activeRequests: make(map[string]context.Context),
+		ctx:            closeCtx,
+		close:          close,
+		sessions:       make(map[uuid.UUID]*session),
+		upgrader: gwebsocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
 		},
-		clusterDetails: make(map[string]*kubeDetails),
+		clusterDetails:  make(map[string]*kubeDetails),
+		cachedTransport: transportClients,
 	}
 
-	fwd.router.UseRawPath = true
+	router := httprouter.New()
+	router.UseRawPath = true
 
-	fwd.router.GET("/version", fwd.withAuth(
+	router.GET("/version", fwd.withAuth(
 		func(ctx *authContext, w http.ResponseWriter, r *http.Request, _ httprouter.Params) (any, error) {
 			// Forward version requests to the cluster.
 			return fwd.catchAll(ctx, w, r)
@@ -263,38 +359,39 @@ func NewForwarder(cfg ForwarderConfig) (*Forwarder, error) {
 		withCustomErrFormatter(fwd.writeResponseErrorToBody),
 	))
 
-	fwd.router.POST("/api/:ver/namespaces/:podNamespace/pods/:podName/exec", fwd.withAuth(fwd.exec))
-	fwd.router.GET("/api/:ver/namespaces/:podNamespace/pods/:podName/exec", fwd.withAuth(fwd.exec))
+	router.POST("/api/:ver/namespaces/:podNamespace/pods/:podName/exec", fwd.withAuth(fwd.exec))
+	router.GET("/api/:ver/namespaces/:podNamespace/pods/:podName/exec", fwd.withAuth(fwd.exec))
 
-	fwd.router.POST("/api/:ver/namespaces/:podNamespace/pods/:podName/attach", fwd.withAuth(fwd.exec))
-	fwd.router.GET("/api/:ver/namespaces/:podNamespace/pods/:podName/attach", fwd.withAuth(fwd.exec))
+	router.POST("/api/:ver/namespaces/:podNamespace/pods/:podName/attach", fwd.withAuth(fwd.exec))
+	router.GET("/api/:ver/namespaces/:podNamespace/pods/:podName/attach", fwd.withAuth(fwd.exec))
 
-	fwd.router.POST("/api/:ver/namespaces/:podNamespace/pods/:podName/portforward", fwd.withAuth(fwd.portForward))
-	fwd.router.GET("/api/:ver/namespaces/:podNamespace/pods/:podName/portforward", fwd.withAuth(fwd.portForward))
+	router.POST("/api/:ver/namespaces/:podNamespace/pods/:podName/portforward", fwd.withAuth(fwd.portForward))
+	router.GET("/api/:ver/namespaces/:podNamespace/pods/:podName/portforward", fwd.withAuth(fwd.portForward))
 
-	fwd.router.GET("/api/:ver/pods", fwd.withAuth(fwd.listPods))
-	fwd.router.GET("/api/:ver/namespaces/:podNamespace/pods", fwd.withAuth(fwd.listPods))
-	fwd.router.DELETE("/api/:ver/namespaces/:podNamespace/pods", fwd.withAuth(fwd.deletePodsCollection))
-	fwd.router.POST("/api/:ver/namespaces/:podNamespace/pods", fwd.withAuth(
-		func(ctx *authContext, w http.ResponseWriter, r *http.Request, _ httprouter.Params) (any, error) {
-			// Forward pod creation to default handler.
-			return fwd.catchAll(ctx, w, r)
-		},
-	))
+	router.POST("/apis/authorization.k8s.io/:ver/selfsubjectaccessreviews", fwd.withAuth(fwd.selfSubjectAccessReviews))
 
-	fwd.router.GET("/api/:ver/teleport/join/:session", fwd.withAuthPassthrough(fwd.join))
+	router.PATCH("/api/:ver/namespaces/:podNamespace/pods/:podName/ephemeralcontainers", fwd.withAuth(fwd.ephemeralContainers))
+	router.PUT("/api/:ver/namespaces/:podNamespace/pods/:podName/ephemeralcontainers", fwd.withAuth(fwd.ephemeralContainers))
 
-	fwd.router.NotFound = fwd.withAuthStd(fwd.catchAll)
+	router.GET("/api/:ver/teleport/join/:session", fwd.withAuthPassthrough(fwd.join))
+
+	for _, method := range allHTTPMethods() {
+		router.Handle(method, "/v1/teleport/:base64Cluster/:base64KubeCluster/*path", fwd.singleCertHandler())
+	}
+
+	router.NotFound = fwd.withAuthStd(fwd.catchAll)
+
+	fwd.router = instrumentHTTPHandler(fwd.cfg.KubeServiceType, router)
 
 	if cfg.ClusterOverride != "" {
-		fwd.log.Debugf("Cluster override is set, forwarder will send all requests to remote cluster %v.", cfg.ClusterOverride)
+		fwd.log.DebugContext(closeCtx, "Cluster override is set, forwarder will send all requests to remote cluster", "cluster_override", cfg.ClusterOverride)
 	}
 	if len(cfg.KubeClusterName) > 0 || len(cfg.KubeconfigPath) > 0 || cfg.KubeServiceType != KubeService {
-		fwd.clusterDetails, err = getKubeDetails(cfg.Context, fwd.log, cfg.ClusterName, cfg.KubeClusterName, cfg.KubeconfigPath, cfg.KubeServiceType, cfg.CheckImpersonationPermissions)
-		if err != nil {
+		if err := fwd.getKubeDetails(cfg.Context); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
+
 	return fwd, nil
 }
 
@@ -303,15 +400,9 @@ func NewForwarder(cfg ForwarderConfig) (*Forwarder, error) {
 // however some requests like exec sessions it intercepts and records.
 type Forwarder struct {
 	mu     sync.Mutex
-	log    logrus.FieldLogger
-	router httprouter.Router
+	log    *slog.Logger
+	router http.Handler
 	cfg    ForwarderConfig
-	// clientCredentials is an expiring cache of ephemeral client credentials.
-	// Forwarder requests credentials with client identity, when forwarding to
-	// another teleport process (but not when forwarding to k8s API).
-	//
-	// TODO(klizhentas): flush certs on teleport CA rotation?
-	clientCredentials *ttlmap.TTLMap
 	// activeRequests is a map used to serialize active CSR requests to the auth server
 	activeRequests map[string]context.Context
 	// close is a close function
@@ -325,8 +416,32 @@ type Forwarder struct {
 	// sessions tracks in-flight sessions
 	sessions map[uuid.UUID]*session
 	// upgrades connections to websockets
-	upgrader websocket.Upgrader
+	upgrader gwebsocket.Upgrader
+	// getKubernetesServersForKubeCluster is a function that returns a list of
+	// kubernetes servers for a given kube cluster but uses different methods
+	// depending on the service type.
+	// For example, if the service type is KubeService, it will use the
+	// local kubernetes clusters. If the service type is Proxy, it will
+	// use the heartbeat clusters.
+	getKubernetesServersForKubeCluster getKubeServersByNameFunc
+
+	// cachedTransport is a cache of cachedTransportEntry objects used to
+	// connect to Teleport services.
+	// TODO(tigrato): Implement a cache eviction policy using watchers.
+	cachedTransport *utils.FnCache
 }
+
+// cachedTransportEntry is a cached transport entry used to connect to
+// Teleport services. It contains a cached http.RoundTripper and a cached
+// tls.Config.
+type cachedTransportEntry struct {
+	transport http.RoundTripper
+	tlsConfig *tls.Config
+}
+
+// getKubeServersByNameFunc is a function that returns a list of
+// kubernetes servers for a given kube cluster.
+type getKubeServersByNameFunc = func(ctx context.Context, name string) ([]types.KubeServer, error)
 
 // Close signals close to all outstanding or background operations
 // to complete
@@ -342,7 +457,10 @@ func (f *Forwarder) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 // authContext is a context of authenticated user,
 // contains information about user, target cluster and authenticated groups
 type authContext struct {
-	auth.Context
+	*authz.ScopedContext
+	// checker will be set once we know which access checker has been used to grant access
+	checker           *services.ScopedAccessChecker
+	accessState       services.AccessState
 	kubeGroups        map[string]struct{}
 	kubeUsers         map[string]struct{}
 	kubeClusterLabels map[string]string
@@ -351,6 +469,9 @@ type authContext struct {
 	recordingConfig   types.SessionRecordingConfig
 	// clientIdleTimeout sets information on client idle timeout
 	clientIdleTimeout time.Duration
+	// clientIdleTimeoutMessage is the message to be displayed to the user
+	// when the client idle timeout is reached
+	clientIdleTimeoutMessage string
 	// disconnectExpiredCert if set, controls the time when the connection
 	// should be disconnected because the client cert expires
 	disconnectExpiredCert time.Time
@@ -361,15 +482,25 @@ type authContext struct {
 	// kubeCluster is the Kubernetes cluster the request is targeted to.
 	// It's only available after authorization layer.
 	kubeCluster types.KubeCluster
-	// kubeResource is the kubernetes resource the request is targeted at.
-	// Can be nil, if the resource is not a pod or the request is not targeted
-	// at a specific pod.
-	// If non empty, kubeResource.Kind is populated with type "pod",
-	// kubeResource.Namespace is the resource namespace and kubeResource.Name
-	// is the resource name.
-	kubeResource *types.KubernetesResource
-	// httpMethod is the request HTTP Method.
-	httpMethod string
+
+	// metaResource holds the resource data:
+	// - the requested resource
+	// - the looked up resource definition, including the flag to know if it is namespaced
+	// - the verb used to access the resource
+	metaResource metaResource
+
+	// kubeServers are the registered agents for the kubernetes cluster the request
+	// is targeted to. After a scoped authorization, this list will be reduced to the
+	// spcific kube server used to authorize the request.
+	kubeServers []types.KubeServer
+
+	// isLocalKubernetesCluster is true if the target cluster is served by this teleport service.
+	// It is false if the target cluster is served by another teleport service or a different
+	// Teleport cluster.
+	isLocalKubernetesCluster bool
+
+	// LockingMode determines the kubernetes' behavior when locks are stale
+	LockingMode constants.LockingMode
 }
 
 func (c authContext) String() string {
@@ -382,11 +513,21 @@ func (c *authContext) key() string {
 	return fmt.Sprintf("%v:%v:%v:%v:%v:%v:%v", c.teleportCluster.name, c.User.GetName(), c.kubeUsers, c.kubeGroups, c.kubeClusterName, c.certExpires.Unix(), c.Identity.GetIdentity().ActiveRequests)
 }
 
-func (c *authContext) eventClusterMeta() apievents.KubernetesClusterMetadata {
+func (c *authContext) eventClusterMeta(req *http.Request) apievents.KubernetesClusterMetadata {
+	var kubeUsers, kubeGroups []string
+
+	if impersonateUser, impersonateGroups, err := computeAndValidateImpersonatedPrincipals(c.kubeUsers, c.kubeGroups, c.User.GetName(), req.Header); err == nil {
+		kubeUsers = []string{impersonateUser}
+		kubeGroups = impersonateGroups
+	} else {
+		kubeUsers = slices.Collect(maps.Keys(c.kubeUsers))
+		kubeGroups = slices.Collect(maps.Keys(c.kubeGroups))
+	}
+
 	return apievents.KubernetesClusterMetadata{
 		KubernetesCluster: c.kubeClusterName,
-		KubernetesUsers:   utils.StringsSliceFromSet(c.kubeUsers),
-		KubernetesGroups:  utils.StringsSliceFromSet(c.kubeGroups),
+		KubernetesUsers:   kubeUsers,
+		KubernetesGroups:  kubeGroups,
 		KubernetesLabels:  c.kubeClusterLabels,
 	}
 }
@@ -405,21 +546,22 @@ func (c *authContext) eventUserMetaWithLogin(login string) apievents.UserMetadat
 	return meta
 }
 
-type dialFunc func(ctx context.Context, network string, endpoint kubeClusterEndpoint) (net.Conn, error)
+// getAccessChecker returns the [*services.ScopedAccessChecker] that granted access to the kube cluster
+// refrenced by the authContext. Once it's set it should not be changed and all subsequent calls
+// to an access checker should use the cached checker.
+func (c *authContext) getAccessChecker() (*services.ScopedAccessChecker, error) {
+	if c.checker != nil {
+		return c.checker, nil
+	}
+	return nil, trace.AccessDenied("no access checker found for kube forwarder auth context")
+}
 
 // teleportClusterClient is a client for either a k8s endpoint in local cluster or a
 // proxy endpoint in a remote cluster.
 type teleportClusterClient struct {
-	remoteAddr     utils.NetAddr
-	name           string
-	dial           dialFunc
-	isRemote       bool
-	isRemoteClosed func() bool
-}
-
-// dialEndpoint dials a connection to a kube cluster using the given kube cluster endpoint
-func (c *teleportClusterClient) dialEndpoint(ctx context.Context, network string, endpoint kubeClusterEndpoint) (net.Conn, error) {
-	return c.dial(ctx, network, endpoint)
+	remoteAddr utils.NetAddr
+	name       string
+	isRemote   bool
 }
 
 // handlerWithAuthFunc is http handler with passed auth context
@@ -428,75 +570,61 @@ type handlerWithAuthFunc func(ctx *authContext, w http.ResponseWriter, r *http.R
 // handlerWithAuthFuncStd is http handler with passed auth context
 type handlerWithAuthFuncStd func(ctx *authContext, w http.ResponseWriter, r *http.Request) (any, error)
 
+// accessDeniedMsg is a message returned to the client when access is denied.
+const accessDeniedMsg = "[00] access denied"
+
 // authenticate function authenticates request
 func (f *Forwarder) authenticate(req *http.Request) (*authContext, error) {
-	const accessDeniedMsg = "[00] access denied"
+	// If the cluster is not licensed for Kubernetes, return an error to the client.
+	if !f.cfg.ClusterFeatures.GetEntitlement(entitlements.K8s).Enabled {
+		// If the cluster is not licensed for Kubernetes, return an error to the client.
+		return nil, trace.AccessDenied("Teleport cluster is not licensed for Kubernetes")
+	}
+	ctx, span := f.cfg.tracer.Start(
+		req.Context(),
+		"kube.Forwarder/authenticate",
+		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+		oteltrace.WithAttributes(
+			semconv.RPCServiceKey.String(f.cfg.KubeServiceType),
+			semconv.RPCSystemKey.String("kube"),
+		),
+	)
+	defer span.End()
 
 	var isRemoteUser bool
-	userTypeI := req.Context().Value(auth.ContextUser)
-	switch userTypeI.(type) {
-	case auth.LocalUser:
-
-	case auth.RemoteUser:
-		isRemoteUser = true
-	case auth.BuiltinRole:
-		f.log.Warningf("Denying proxy access to unauthenticated user of type %T - this can sometimes be caused by inadvertently using an HTTP load balancer instead of a TCP load balancer on the Kubernetes port.", userTypeI)
-		return nil, trace.AccessDenied(accessDeniedMsg)
-	default:
-		f.log.Warningf("Denying proxy access to unsupported user type: %T.", userTypeI)
-		return nil, trace.AccessDenied(accessDeniedMsg)
-	}
-
-	userContext, err := f.cfg.Authz.Authorize(req.Context())
+	userTypeI, err := authz.UserFromContext(ctx)
 	if err != nil {
-		switch {
-		// propagate connection problem error so we can differentiate
-		// between connection failed and access denied
-		case trace.IsConnectionProblem(err):
-			return nil, trace.ConnectionProblem(err, "[07] failed to connect to the database")
-		case trace.IsAccessDenied(err):
-			// don't print stack trace, just log the warning
-			f.log.Warn(err)
-		case keys.IsPrivateKeyPolicyError(err):
-			// private key policy errors should be returned to the client
-			// unaltered so that they know to reauthenticate with a valid key.
-			return nil, trace.Unwrap(err)
-		default:
-			f.log.Warn(trace.DebugReport(err))
-		}
-		return nil, trace.AccessDenied(accessDeniedMsg)
+		f.log.WarnContext(ctx, "error getting user from context", "error", err)
+		return nil, trace.AccessDenied("%s", accessDeniedMsg)
 	}
-	peers := req.TLS.PeerCertificates
-	if len(peers) > 1 {
-		// when turning intermediaries on, don't forget to verify
-		// https://github.com/kubernetes/kubernetes/pull/34524/files#diff-2b283dde198c92424df5355f39544aa4R59
-		return nil, trace.AccessDenied("access denied: intermediaries are not supported")
+	switch userTypeI.(type) {
+	case authz.LocalUser:
+
+	case authz.RemoteUser:
+		isRemoteUser = true
+	case authz.BuiltinRole:
+		f.log.WarnContext(ctx, "Denying proxy access to unauthenticated user - this can sometimes be caused by inadvertently using an HTTP load balancer instead of a TCP load balancer on the Kubernetes port",
+			"user_type", logutils.TypeAttr(userTypeI),
+		)
+		return nil, trace.AccessDenied("%s", accessDeniedMsg)
+	default:
+		f.log.WarnContext(ctx, "Denying proxy access to unsupported user type", "user_type", logutils.TypeAttr(userTypeI))
+		return nil, trace.AccessDenied("%s", accessDeniedMsg)
 	}
-	if len(peers) == 0 {
-		return nil, trace.AccessDenied("access denied: only mutual TLS authentication is supported")
-	}
-	clientCert := peers[0]
-	clientIdentity, err := tlsca.FromSubject(clientCert.Subject, clientCert.NotAfter)
+
+	scopedCtx, err := f.cfg.ScopedAuthz.AuthorizeScoped(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	// kubeResource is the Kubernetes Resource the request is targeted at.
-	// Currently only supports Pods and it includes the pod name and namespace.
-	kubeResource := getPodResourceFromRequest(req.RequestURI)
-	authContext, err := f.setupContext(*userContext, req, isRemoteUser, clientIdentity, kubeResource)
+
+	authContext, err := f.setupContext(ctx, scopedCtx, req, isRemoteUser)
 	if err != nil {
-		f.log.WithError(err).Warn("Unable to setup context.")
+		f.log.WarnContext(ctx, "Unable to setup context", "error", err)
 		if trace.IsAccessDenied(err) {
-			if kubeResource != nil {
-				return nil, trace.AccessDenied(
-					kubeResourceDeniedAccessMsg(
-						clientIdentity.Username,
-						req.Method,
-						kubeResource,
-					),
-				)
+			if errors.Is(err, errAmbiguousCluster) {
+				return nil, trace.Wrap(err)
 			}
-			return nil, trace.AccessDenied(accessDeniedMsg)
+			return nil, trace.AccessDenied("%s", accessDeniedMsg)
 		}
 		return nil, trace.Wrap(err)
 	}
@@ -505,11 +633,23 @@ func (f *Forwarder) authenticate(req *http.Request) (*authContext, error) {
 
 func (f *Forwarder) withAuthStd(handler handlerWithAuthFuncStd) http.HandlerFunc {
 	return httplib.MakeStdHandlerWithErrorWriter(func(w http.ResponseWriter, req *http.Request) (any, error) {
+		ctx, span := f.cfg.tracer.Start(
+			req.Context(),
+			"kube.Forwarder/withAuthStd",
+			oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+			oteltrace.WithAttributes(
+				semconv.RPCServiceKey.String(f.cfg.KubeServiceType),
+				semconv.RPCSystemKey.String("kube"),
+			),
+		)
+		req = req.WithContext(ctx)
+		defer span.End()
+
 		authContext, err := f.authenticate(req)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-		if err := f.authorize(req.Context(), authContext); err != nil {
+		if err := f.authorize(ctx, authContext); err != nil {
 			return nil, trace.Wrap(err)
 		}
 
@@ -519,13 +659,19 @@ func (f *Forwarder) withAuthStd(handler handlerWithAuthFuncStd) http.HandlerFunc
 
 // acquireConnectionLockWithIdentity acquires a connection lock under a given identity.
 func (f *Forwarder) acquireConnectionLockWithIdentity(ctx context.Context, identity *authContext) error {
-	user := identity.Identity.GetIdentity().Username
-	roles, err := getRolesByName(f, identity.Identity.GetIdentity().Groups)
-	if err != nil {
-		return trace.Wrap(err)
+	unscopedContext, isUnscoped := identity.UnscopedContext()
+	if !isUnscoped {
+		// TODO(espadolini) TODO(eriktate): scoped identities don't currently
+		// support max_kubernetes_connections, this should be updated when they
+		// do
+		return nil
 	}
-
-	if err := f.acquireConnectionLock(ctx, user, roles); err != nil {
+	maxConnections := unscopedContext.Checker.MaxKubernetesConnections()
+	if maxConnections == 0 {
+		return nil
+	}
+	user := unscopedContext.Identity.GetIdentity().Username
+	if err := f.acquireConnectionLock(ctx, user, maxConnections); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -556,14 +702,25 @@ func (f *Forwarder) withAuth(handler handlerWithAuthFunc, opts ...authOption) ht
 		opt(&authOpts)
 	}
 	return httplib.MakeHandlerWithErrorWriter(func(w http.ResponseWriter, req *http.Request, p httprouter.Params) (any, error) {
+		ctx, span := f.cfg.tracer.Start(
+			req.Context(),
+			"kube.Forwarder/withAuth",
+			oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+			oteltrace.WithAttributes(
+				semconv.RPCServiceKey.String(f.cfg.KubeServiceType),
+				semconv.RPCSystemKey.String("kube"),
+			),
+		)
+		req = req.WithContext(ctx)
+		defer span.End()
 		authContext, err := f.authenticate(req)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-		if err := f.authorize(req.Context(), authContext); err != nil {
+		if err := f.authorize(ctx, authContext); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		err = f.acquireConnectionLockWithIdentity(req.Context(), authContext)
+		err = f.acquireConnectionLockWithIdentity(ctx, authContext)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -575,11 +732,21 @@ func (f *Forwarder) withAuth(handler handlerWithAuthFunc, opts ...authOption) ht
 // doesn't have RBAC access to the Kubernetes cluster.
 func (f *Forwarder) withAuthPassthrough(handler handlerWithAuthFunc) httprouter.Handle {
 	return httplib.MakeHandlerWithErrorWriter(func(w http.ResponseWriter, req *http.Request, p httprouter.Params) (any, error) {
+		ctx, span := f.cfg.tracer.Start(
+			req.Context(),
+			"kube.Forwarder/withAuthPassthrough",
+			oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+			oteltrace.WithAttributes(
+				semconv.RPCServiceKey.String(f.cfg.KubeServiceType),
+				semconv.RPCSystemKey.String("kube"),
+			),
+		)
+		req = req.WithContext(ctx)
+		defer span.End()
+
 		authContext, err := f.authenticate(req)
 		if err != nil {
-			if !trace.IsAccessDenied(err) && !trace.IsNotFound(err) {
-				return nil, trace.Wrap(err)
-			}
+			return nil, trace.Wrap(err)
 		}
 		err = f.acquireConnectionLockWithIdentity(req.Context(), authContext)
 		if err != nil {
@@ -600,20 +767,57 @@ func (f *Forwarder) writeResponseErrorToBody(rw http.ResponseWriter, respErr err
 	http.Error(rw, respErr.Error(), http.StatusInternalServerError)
 }
 
-// formatStatusResponseError formats the error response into a kube Status object.
+// formatForwardResponseError handles errors returned from requests to the Kubernetes API.
+// Any errors produced as a result of a GOAWAY request are forwarded to users as [http.StatusTooManyRequests]
+// with a Retry-After header set to inform clients that they should retry the request. All
+// other errors are formatted as a [metav1.Status] and written to the [http.ResponseWriter].
 func (f *Forwarder) formatStatusResponseError(rw http.ResponseWriter, respErr error) {
+	// This detects failed requests that were terminated by the server due to GOAWAY. There
+	// is no direct way to detect these errors. No exported constants or error types exist from the
+	// standard library, so we have to match on the error message. The two error strings come from:
+	//   - golang.org/x/net/http2 when its internal retry path cannot replay the body:
+	//     https://github.com/golang/net/blob/5ac9daca088ab4f378d7df849f6c7d28bea86071/http2/transport.go#L694
+	//   - net/http (errCannotRewind) when, after the http2 conn pool is drained, the http1 retry
+	//     path tries to rewind the body and fails because Request.GetBody is unset:
+	//     https://github.com/golang/go/blob/go1.26.2/src/net/http/transport.go#L759
+	// When a failed request is found, we return a response that indicates  to clients that they
+	// should retry the request themselves.
+	errString := respErr.Error()
+	isHTTP2RetryErr := strings.Contains(errString, `http2: Transport: cannot retry err`) &&
+		strings.HasSuffix(errString, `after Request.Body was written; define Request.GetBody to avoid this error`)
+	isHTTP1RewindErr := strings.Contains(errString, `net/http: cannot rewind body after connection loss`)
+	if isHTTP2RetryErr || isHTTP1RewindErr {
+
+		data, err := runtime.Encode(globalKubeCodecs.LegacyCodec(), &kubeerrors.NewTooManyRequests("Connection closed by upstream Kubernetes server", 1).ErrStatus)
+		if err != nil {
+			f.log.WarnContext(f.ctx, "Failed encoding error into kube Status object", "error", err)
+			trace.WriteError(rw, respErr)
+			return
+		}
+
+		rw.Header().Set("Retry-After", "1")
+		rw.Header().Set(responsewriters.ContentTypeHeader, "application/json")
+		rw.WriteHeader(http.StatusTooManyRequests)
+
+		if _, err := rw.Write(data); err != nil && !utils.IsOKNetworkError(err) {
+			f.log.WarnContext(f.ctx, "Failed writing kube error response body", "error", err)
+		}
+		return
+	}
+
+	code, reason := kubeStatusCodeAndReason(respErr)
 	status := &metav1.Status{
 		Status: metav1.StatusFailure,
 		// Don't trace.Unwrap the error, in case it was wrapped with a
 		// user-friendly message. The underlying root error is likely too
 		// low-level to be useful.
 		Message: respErr.Error(),
-		Code:    int32(trace.ErrorToCode(respErr)),
-		Reason:  errorToKubeStatusReason(respErr),
+		Code:    int32(code),
+		Reason:  reason,
 	}
-	data, err := runtime.Encode(kubeCodecs.LegacyCodec(), status)
+	data, err := runtime.Encode(globalKubeCodecs.LegacyCodec(), status)
 	if err != nil {
-		f.log.Warningf("Failed encoding error into kube Status object: %v", err)
+		f.log.WarnContext(f.ctx, "Failed encoding error into kube Status object", "error", err)
 		trace.WriteError(rw, respErr)
 		return
 	}
@@ -622,20 +826,44 @@ func (f *Forwarder) formatStatusResponseError(rw http.ResponseWriter, respErr er
 	// it correctly. If response code and status.Code drift, kubectl prints
 	// `Error from server (InternalError): an error on the server ("unknown")
 	// has prevented the request from succeeding`` instead of the correct reason.
-	rw.WriteHeader(trace.ErrorToCode(respErr))
-	if _, err := rw.Write(data); err != nil {
-		f.log.Warningf("Failed writing kube error response body: %v", err)
+	rw.WriteHeader(code)
+	if _, err := rw.Write(data); err != nil && !utils.IsOKNetworkError(err) {
+		f.log.WarnContext(f.ctx, "Failed writing kube error response body", "error", err)
 	}
 }
 
-func (f *Forwarder) setupContext(authCtx auth.Context, req *http.Request, isRemoteUser bool, clientIdentity *tlsca.Identity, kubeResource *types.KubernetesResource) (*authContext, error) {
-	roles := authCtx.Checker
+// kubeStatusCodeAndReason returns HTTP status code and Kubernetes status reason to use when surfacing error to user.
+// Without this, trace.ErrorToCode falls back to 500 and rewrites the original 403 into an InternalError.
+func kubeStatusCodeAndReason(respErr error) (int, metav1.StatusReason) {
+	var statusErr *kubeerrors.StatusError
+	if errors.As(respErr, &statusErr) && statusErr.ErrStatus.Code != 0 {
+		return int(statusErr.ErrStatus.Code), statusErr.ErrStatus.Reason
+	}
+	code := trace.ErrorToCode(respErr)
+	reason := errorToKubeStatusReason(respErr, code)
+	return code, reason
+}
 
-	// adjust session ttl to the smaller of two values: the session
-	// ttl requested in tsh or the session ttl for the role.
-	sessionTTL := roles.AdjustSessionTTL(time.Hour)
+var errAmbiguousCluster = &trace.AccessDeniedError{Message: "could not disambiguate between two or more scoped kube clusters with the same name, please login with credentials for a narrower scope"}
 
-	identity := authCtx.Identity.GetIdentity()
+func (f *Forwarder) setupContext(
+	ctx context.Context,
+	scopedCtx *authz.ScopedContext,
+	req *http.Request,
+	isRemoteUser bool,
+) (*authContext, error) {
+	ctx, span := f.cfg.tracer.Start(
+		ctx,
+		"kube.Forwarder/setupContext",
+		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+		oteltrace.WithAttributes(
+			semconv.RPCServiceKey.String(f.cfg.KubeServiceType),
+			semconv.RPCSystemKey.String("kube"),
+		),
+	)
+	defer span.End()
+
+	identity := scopedCtx.Identity.GetIdentity()
 	teleportClusterName := identity.RouteToCluster
 	if teleportClusterName == "" {
 		teleportClusterName = f.cfg.ClusterName
@@ -647,103 +875,45 @@ func (f *Forwarder) setupContext(authCtx auth.Context, req *http.Request, isRemo
 		return nil, trace.AccessDenied("access denied: remote user can not access remote cluster")
 	}
 
-	kubeCluster := identity.KubernetesCluster
-	if !isRemoteCluster {
-		kc, err := kubeutils.CheckOrSetKubeCluster(req.Context(), f.cfg.CachingAuthClient, identity.KubernetesCluster, teleportClusterName)
-		if err != nil {
-			if !trace.IsNotFound(err) {
-				return nil, trace.Wrap(err)
-			}
-			// Fallback for old clusters and old user certs. Assume that the
-			// user is trying to access the default cluster name.
-			kubeCluster = teleportClusterName
-		} else {
-			kubeCluster = kc
-		}
-	}
-
 	var (
-		kubeUsers, kubeGroups []string
-		kubeLabels            map[string]string
+		kubeServers  []types.KubeServer
+		kubeResource metaResource
+		err          error
 	)
+
+	kubeCluster := identity.KubernetesCluster
+	unscopedCtx, isUnscoped := scopedCtx.UnscopedContext()
+	// aliasing to isScoped because it's a bit easier to reason about
+	isScoped := !isUnscoped
+
 	// Only check k8s principals for local clusters.
 	//
 	// For remote clusters, everything will be remapped to new roles on the
 	// leaf and checked there.
 	if !isRemoteCluster {
-		// check signing TTL and return a list of allowed logins for local cluster based on Kubernetes service labels.
-		kubeAccessDetails, err := f.getKubeAccessDetails(roles, kubeCluster, sessionTTL, kubeResource)
-		if err != nil && !trace.IsNotFound(err) {
-			return nil, trace.Wrap(err)
-			// roles.CheckKubeGroupsAndUsers returns trace.NotFound if the user does
-			// does not have at least one configured kubernetes_users or kubernetes_groups.
-		} else if trace.IsNotFound(err) {
-			const errMsg = "Your user's Teleport role does not allow Kubernetes access." +
-				" Please ask cluster administrator to ensure your role has appropriate kubernetes_groups and kubernetes_users set."
-			return nil, trace.NotFound(errMsg)
+		kubeServers, err = f.getKubernetesServersForKubeCluster(ctx, kubeCluster)
+		if err != nil || len(kubeServers) == 0 {
+			return nil, trace.NotFound("Kubernetes cluster %q not found", kubeCluster)
 		}
 
-		kubeUsers = kubeAccessDetails.kubeUsers
-		kubeGroups = kubeAccessDetails.kubeGroups
-		kubeLabels = kubeAccessDetails.clusterLabels
+		if !isScoped {
+			// If the calling identity is not scoped but there are multiple kube servers present in different scopes
+			// (e.g. when running in Proxy mode) we won't be able to disambiguate between them. In that case, we
+			// should return an error suggesting that the user logs in with scoped credentials
+			if err := checkAmbiguousClusters(kubeServers); err != nil {
+				return nil, trace.Wrap(err)
+			}
+
+		}
 	}
-
-	// fillDefaultKubePrincipalDetails fills the default details in order to keep
-	// the correct behavior when forwarding the request to the Kubernetes API.
-	kubeUsers, kubeGroups = fillDefaultKubePrincipalDetails(kubeUsers, kubeGroups, authCtx.User.GetName())
-
-	// Get a dialer for either a k8s endpoint in current cluster or a tunneled
-	// endpoint for a leaf teleport cluster.
-	var dialFn dialFunc
-	var isRemoteClosed func() bool
-	if isRemoteCluster {
-		// Tunnel is nil for a teleport process with "kubernetes_service" but
-		// not "proxy_service".
-		if f.cfg.ReverseTunnelSrv == nil {
-			return nil, trace.BadParameter("this Teleport process can not dial Kubernetes endpoints in remote Teleport clusters; only proxy_service supports this, make sure a Teleport proxy is first in the request path")
-		}
-
-		targetCluster, err := f.cfg.ReverseTunnelSrv.GetSite(teleportClusterName)
+	isLocalKubernetesCluster := f.isLocalKubeCluster(isRemoteCluster, kubeCluster)
+	if isLocalKubernetesCluster {
+		kubeResource, err = f.parseResourceFromRequest(req, kubeCluster)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-
-		dialFn = func(ctx context.Context, network string, endpoint kubeClusterEndpoint) (net.Conn, error) {
-			return targetCluster.DialTCP(reversetunnel.DialParams{
-				From:     &utils.NetAddr{AddrNetwork: "tcp", Addr: req.RemoteAddr},
-				To:       &utils.NetAddr{AddrNetwork: "tcp", Addr: endpoint.addr},
-				ConnType: types.KubeTunnel,
-				ServerID: endpoint.serverID,
-				ProxyIDs: endpoint.proxyIDs,
-			})
-		}
-		isRemoteClosed = targetCluster.IsClosed
-	} else if f.cfg.ReverseTunnelSrv != nil {
-		// Not a remote cluster and we have a reverse tunnel server.
-		// Use the local reversetunnel.Site which knows how to dial by serverID
-		// (for "kubernetes_service" connected over a tunnel) and falls back to
-		// direct dial if needed.
-		localCluster, err := f.cfg.ReverseTunnelSrv.GetSite(f.cfg.ClusterName)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-
-		dialFn = func(ctx context.Context, network string, endpoint kubeClusterEndpoint) (net.Conn, error) {
-			return localCluster.DialTCP(reversetunnel.DialParams{
-				From:     &utils.NetAddr{AddrNetwork: "tcp", Addr: req.RemoteAddr},
-				To:       &utils.NetAddr{AddrNetwork: "tcp", Addr: endpoint.addr},
-				ConnType: types.KubeTunnel,
-				ServerID: endpoint.serverID,
-				ProxyIDs: endpoint.proxyIDs,
-			})
-		}
-		isRemoteClosed = localCluster.IsClosed
 	} else {
-		// Don't have a reverse tunnel server, so we can only dial directly.
-		dialFn = func(ctx context.Context, network string, endpoint kubeClusterEndpoint) (net.Conn, error) {
-			return new(net.Dialer).DialContext(ctx, network, endpoint.addr)
-		}
-		isRemoteClosed = func() bool { return false }
+		kubeResource.verb = kubeResource.requestedResource.getVerb(req)
 	}
 
 	netConfig, err := f.cfg.CachingAuthClient.GetClusterNetworkingConfig(f.ctx)
@@ -755,41 +925,110 @@ func (f *Forwarder) setupContext(authCtx auth.Context, req *http.Request, isRemo
 		return nil, trace.Wrap(err)
 	}
 
-	authPref, err := f.cfg.CachingAuthClient.GetAuthPreference(req.Context())
+	authPref, err := f.cfg.CachingAuthClient.GetAuthPreference(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
+	// These are the defaults for scoped identities. They will be adjusted
+	// in the authorize function once we know which role is being used to
+	// grant access.
+	sessionTTL := time.Hour
+	clientIdleTimeout := netConfig.GetClientIdleTimeout()
+	if !isScoped {
+		sessionTTL = unscopedCtx.Checker.AdjustSessionTTL(sessionTTL)
+		clientIdleTimeout = unscopedCtx.Checker.AdjustClientIdleTimeout(clientIdleTimeout)
+	}
 	return &authContext{
-		clientIdleTimeout:     roles.AdjustClientIdleTimeout(netConfig.GetClientIdleTimeout()),
-		sessionTTL:            sessionTTL,
-		Context:               authCtx,
-		kubeGroups:            utils.StringsSet(kubeGroups),
-		kubeUsers:             utils.StringsSet(kubeUsers),
-		kubeClusterLabels:     kubeLabels,
-		recordingConfig:       recordingConfig,
-		kubeClusterName:       kubeCluster,
-		kubeResource:          kubeResource,
-		certExpires:           clientIdentity.Expires,
-		disconnectExpiredCert: srv.GetDisconnectExpiredCertFromIdentity(roles, authPref, clientIdentity),
+		ScopedContext:            scopedCtx,
+		clientIdleTimeout:        clientIdleTimeout,
+		clientIdleTimeoutMessage: netConfig.GetClientIdleTimeoutMessage(),
+		sessionTTL:               sessionTTL,
+		recordingConfig:          recordingConfig,
+		kubeClusterName:          kubeCluster,
+		certExpires:              identity.Expires,
+		disconnectExpiredCert:    scopedCtx.GetDisconnectCertExpiry(authPref),
 		teleportCluster: teleportClusterClient{
-			name:           teleportClusterName,
-			remoteAddr:     utils.NetAddr{AddrNetwork: "tcp", Addr: req.RemoteAddr},
-			dial:           dialFn,
-			isRemote:       isRemoteCluster,
-			isRemoteClosed: isRemoteClosed,
+			name:       teleportClusterName,
+			remoteAddr: utils.NetAddr{AddrNetwork: "tcp", Addr: req.RemoteAddr},
+			isRemote:   isRemoteCluster,
 		},
-		httpMethod: req.Method,
+		kubeServers:              kubeServers,
+		metaResource:             kubeResource,
+		isLocalKubernetesCluster: isLocalKubernetesCluster,
 	}, nil
+}
+
+// checkAmbiguousClusters accepts a list of kube servers that have already been filtered for a given cluster name
+// and determines if there is any ambiguity about which scope we should route to.
+func checkAmbiguousClusters(kubeServers []types.KubeServer) error {
+	var foundScope string
+	for i, ks := range kubeServers {
+		switch {
+		case i == 0:
+			foundScope = ks.GetScope()
+		case ks.GetScope() != foundScope:
+			return trace.Wrap(errAmbiguousCluster)
+		}
+	}
+	return nil
+}
+
+func (f *Forwarder) parseResourceFromRequest(req *http.Request, kubeClusterName string) (metaResource, error) {
+	switch f.cfg.KubeServiceType {
+	case LegacyProxyService:
+		if details, err := f.findKubeDetailsByClusterName(kubeClusterName); err == nil {
+			out, err := getResourceFromRequest(req, details)
+			return out, trace.Wrap(err)
+		}
+		// When the cluster is not being served by the local service, the LegacyProxy
+		// is working as a normal proxy and will forward the request to the remote
+		// service. When this happens, proxy won't enforce any Kubernetes RBAC rules
+		// and will forward the request as is to the remote service. The remote
+		// service will enforce RBAC rules and will return an error if the user is
+		// not authorized.
+		fallthrough
+	case ProxyService:
+		// When the service is acting as a proxy (ProxyService or LegacyProxyService
+		// if the local cluster wasn't found), the proxy will forward the request
+		// to the remote service without enforcing any RBAC rules - we send the
+		// details = nil to indicate that we don't want to extract the kube resource
+		// from the request.
+		out, err := getResourceFromRequest(req, nil /*details*/)
+		return out, trace.Wrap(err)
+	case KubeService:
+		details, err := f.findKubeDetailsByClusterName(kubeClusterName)
+		if err != nil {
+			return metaResource{}, trace.Wrap(err)
+		}
+		out, err := getResourceFromRequest(req, details)
+		return out, trace.Wrap(err)
+
+	default:
+		return metaResource{}, trace.BadParameter("unsupported kube service type: %q", f.cfg.KubeServiceType)
+	}
 }
 
 // emitAuditEvent emits the audit event for a `kube.request` event if the session
 // requires audit events.
-func (f *Forwarder) emitAuditEvent(ctx *authContext, req *http.Request, sess *clusterSession, status int) {
-	if sess.noAuditEvents {
+func (f *Forwarder) emitAuditEvent(req *http.Request, sess *clusterSession, status int) {
+	_, span := f.cfg.tracer.Start(
+		req.Context(),
+		"kube.Forwarder/emitAuditEvent",
+		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+		oteltrace.WithAttributes(
+			semconv.RPCServiceKey.String(f.cfg.KubeServiceType),
+			semconv.RPCSystemKey.String("kube"),
+		),
+	)
+	defer span.End()
+
+	// If the session is not local, don't emit the event.
+	if !sess.isLocalKubernetesCluster {
 		return
 	}
-	r := parseResourcePath(req.URL.Path)
+
+	r := sess.metaResource.requestedResource
 	if r.skipEvent {
 		return
 	}
@@ -799,25 +1038,25 @@ func (f *Forwarder) emitAuditEvent(ctx *authContext, req *http.Request, sess *cl
 			Type: events.KubeRequestEvent,
 			Code: events.KubeRequestCode,
 		},
-		UserMetadata: ctx.eventUserMeta(),
+		UserMetadata: sess.eventUserMeta(),
 		ConnectionMetadata: apievents.ConnectionMetadata{
 			RemoteAddr: req.RemoteAddr,
 			LocalAddr:  sess.kubeAddress,
 			Protocol:   events.EventProtocolKube,
 		},
-		ServerMetadata: apievents.ServerMetadata{
-			ServerID:        f.cfg.HostID,
-			ServerNamespace: f.cfg.Namespace,
-		},
+		ServerMetadata:            sess.getServerMetadata(),
 		RequestPath:               req.URL.Path,
 		Verb:                      req.Method,
 		ResponseCode:              int32(status),
-		KubernetesClusterMetadata: ctx.eventClusterMeta(),
+		KubernetesClusterMetadata: sess.eventClusterMeta(req),
+		SessionMetadata: apievents.SessionMetadata{
+			WithMFA: sess.Identity.GetIdentity().MFAVerified,
+		},
 	}
 
 	r.populateEvent(event)
-	if err := f.cfg.AuthClient.EmitAuditEvent(f.ctx, event); err != nil {
-		f.log.WithError(err).Warn("Failed to emit event.")
+	if err := f.cfg.Emitter.EmitAuditEvent(f.ctx, event); err != nil {
+		f.log.WarnContext(f.ctx, "Failed to emit event", "error", err)
 	}
 }
 
@@ -848,156 +1087,280 @@ type kubeAccessDetails struct {
 	kubeGroups []string
 	// kube cluster labels
 	clusterLabels map[string]string
+	// kubeCluster is the local kube cluster we're granting access to
+	kubeCluster types.KubeCluster
+	// checker is the scoped access checker that permitted access to this
+	// kubeAccessDetails
+	checker *services.ScopedAccessChecker
 }
 
-// getKubeAccessDetails returns the allowed kube groups/users names and the cluster labels for a local kube cluster.
-func (f *Forwarder) getKubeAccessDetails(
-	roles services.AccessChecker,
-	kubeClusterName string,
-	sessionTTL time.Duration,
-	kubeResource *types.KubernetesResource,
-) (kubeAccessDetails, error) {
-	kubeServers, err := f.cfg.CachingAuthClient.GetKubernetesServers(f.ctx)
-	if err != nil {
-		return kubeAccessDetails{}, trace.Wrap(err)
-	}
+var errNoMatchingCluster = &trace.AccessDeniedError{Message: "no matching kube cluster found"}
+var errImplicitDeny = &trace.AccessDeniedError{Message: "no roles grant access"}
 
+// getKubeAccessDetails returns the allowed kube groups/users names and the cluster labels for a local kube cluster.
+// It also returns the [*services.ScopedAccessChecker] that granted access to the returned details.
+func (f *Forwarder) getKubeAccessDetails(
+	ctx context.Context,
+	actx *authContext,
+	matchers ...services.RoleMatcher,
+) (kubeAccessDetails, error) {
+	// track explicit denies so we can decide how to return once all available kube servers have been visited
+	var explicitDenies []error
+	// track the reason for an implicit deny so we can handle each case appropriately
+	var implicitDenyOrNotFound error = errNoMatchingCluster
+
+	// We don't want to append directly to matchers and don't want to clone matchers on every iteration when we
+	// append the label matcher. Instead we allocate a copy of the matchers with an extra slot reserved for adding the
+	// label prior to calling GetGroupsAndUsers. If matchers is empty, this will result in a slice of length 1 which
+	// will have its 0th element set to the label matcher.
+	matchersWithLabelMatcher := make([]services.RoleMatcher, len(matchers)+1)
+	copy(matchersWithLabelMatcher, matchers)
+
+	var checker *services.ScopedAccessChecker
 	// Find requested kubernetes cluster name and get allowed kube users/groups names.
-	for _, s := range kubeServers {
+	for _, s := range actx.kubeServers {
 		c := s.GetCluster()
-		if c.GetName() != kubeClusterName {
+		if c.GetName() != actx.kubeClusterName {
+			continue
+		}
+		// Once we find at least one cluster that matches by name, we should no longer return errNoMatchingCluster.
+		if errors.Is(implicitDenyOrNotFound, errNoMatchingCluster) {
+			implicitDenyOrNotFound = errImplicitDeny
+		}
+		if err := actx.CheckerContext.Decision(ctx, c.GetScope(), func(check *services.ScopedAccessChecker) error {
+			if err := check.Kube().CheckAccessToCluster(c, actx.accessState, matchers...); err != nil {
+				return err
+			}
+			checker = check
+			return nil
+		}); err != nil {
+			if services.IsAccessExplicitlyDenied(err) {
+				explicitDenies = append(explicitDenies, err)
+			}
 			continue
 		}
 
-		// Get list of allowed kube user/groups based on kubernetes service labels.
-		labels := types.CombineLabels(c.GetStaticLabels(), types.LabelsToV2(c.GetDynamicLabels()))
-
-		matchers := make([]services.RoleMatcher, 0, 2)
 		// Creates a matcher that matches the cluster labels against `kubernetes_labels`
-		// defined for each user's role.
-		matchers = append(matchers,
-			services.NewKubernetesClusterLabelMatcher(labels),
+		// defined for each user's role. If a role has no `kubernetes_labels` defined, this matcher will
+		// treat it as a wildcard deny. We don't want this when checking access to the cluster, but we do
+		// when fetching groups and users so we only include it after getCheckerForCluster.
+		labels := types.CombineLabels(nil, c.GetStaticLabels(), types.LabelsToV2(c.GetDynamicLabels()))
+		labelMatcher := services.NewKubernetesClusterLabelMatcher(
+			types.CombineLabels(nil, c.GetStaticLabels(), types.LabelsToV2(c.GetDynamicLabels())),
+			checker.AccessInfo().Username,
+			actx.CheckerContext.Traits(),
 		)
+		matchersWithLabelMatcher[len(matchersWithLabelMatcher)-1] = labelMatcher
 
-		// If the kubeResource is available, append an extra matcher that validates
-		// if the kubernetes resource is allowed by the user roles that satisfy the
-		// target cluster labels.
-		// Each role defines `kubernetes_resources` and when kubeResource is available,
-		// KubernetesResourceMatcher will match roles that statisfy the resources at the
-		// same time that ClusterLabelMatcher matches the role's "kubernetes_labels".
-		// The call to roles.CheckKubeGroupsAndUsers when both matchers are provided
-		// results in the intersection of roles that match the "kubernetes_labels" and
-		// roles that allow access to the desired "kubernetes_resource".
-		// If from the intersection results an empty set, the request is denied.
-		if kubeResource != nil {
-			matchers = append(
-				matchers,
-				services.NewKubernetesResourceMatcher(*kubeResource),
-			)
-		}
-		// roles.CheckKubeGroupsAndUsers returns the accumulated kubernetes_groups
-		// and kubernetes_users that satisfy te provided matchers.
-		// When a KubernetesResourceMatcher, it will gather the Kubernetes principals
-		// whose role satisfy the the desired Kubernetes Resource.
-		// The users/groups will be forwarded to Kubernetes Cluster as Impersonation
-		// headers.
-		groups, users, err := roles.CheckKubeGroupsAndUsers(sessionTTL, false /* overrideTTL */, matchers...)
+		// GetGroupsAndUsers returns the accumulated kubernetes groups and users that satisfy the provided matchers.
+		// For unscoped identities, this will return the groups and users attached to any role that matches the
+		// target kubernetes cluster. If a KubernetesResourceMatcher is included in the list of matchers, it will
+		// only return the groups and users attached to roles that also satisfy the desired kubernetes resource.
+		// For scoped identities, the groups and users will be sourced from the scoped role providing access to the
+		// resource without matching on any specific kubernetes resources. The users/groups will be forwarded to the
+		// kubernetes cluster as impersonation headers.
+		const overrideTTL = false
+		groups, users, err := checker.Kube().GetGroupsAndUsers(checker.AdjustSessionTTL(actx.sessionTTL), overrideTTL, matchersWithLabelMatcher...)
 		if err != nil {
-			return kubeAccessDetails{}, trace.Wrap(err)
+			if services.IsAccessExplicitlyDenied(err) {
+				explicitDenies = append(explicitDenies, err)
+			}
+			if trace.IsNotFound(err) {
+				implicitDenyOrNotFound = err
+			}
+			continue
 		}
+
 		return kubeAccessDetails{
 			kubeGroups:    groups,
 			kubeUsers:     users,
 			clusterLabels: labels,
+			kubeCluster:   c,
+			checker:       checker,
 		}, nil
 
 	}
-	// kubeClusterName not found. Empty list of allowed kube users/groups is returned.
-	return kubeAccessDetails{
-		kubeGroups:    []string{},
-		kubeUsers:     []string{},
-		clusterLabels: map[string]string{},
-	}, nil
-}
 
-// podNameRegex is the Pods endpoint API url.
-var podNameRegex = regexp.MustCompile(`/api/v1/namespaces/([^/]+)/pods/([^/]+)`)
+	// Any explicit denials mean the cluster was found, no checkers granted access,
+	// and at least one explicitly denied access.
+	if len(explicitDenies) > 0 {
+		return kubeAccessDetails{}, trace.NewAggregate(explicitDenies...)
+	}
 
-// getPodResourceFromRequest returns a KubernetesResource if the user tried to access
-// a specific Pod endpoint. Otherwise, returns nil.
-// TODO(tigrato): extend it to support other resources.
-func getPodResourceFromRequest(requestURI string) *types.KubernetesResource {
-	matches := podNameRegex.FindStringSubmatch(requestURI)
-	if matches == nil {
-		return nil
-	}
-	return &types.KubernetesResource{
-		Kind:      types.KindKubePod,
-		Namespace: matches[1],
-		Name:      matches[2],
-	}
+	// If there are no explicit denials, we're left with three remaining cases:
+	// 1. There was no cluster found matching actx.kubeClusterName (no matching cluster)
+	// 2. There were no access checkers granting access to the cluster (implicit deny)
+	// 3. An access checker that would have granted access returned no groups/users (not found)
+	// The correct error for each case should already be assigned to implicitDenyOrNotFound
+	return kubeAccessDetails{}, trace.Wrap(implicitDenyOrNotFound)
 }
 
 func (f *Forwarder) authorize(ctx context.Context, actx *authContext) error {
+	ctx, span := f.cfg.tracer.Start(
+		ctx,
+		"kube.Forwarder/authorize",
+		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+		oteltrace.WithAttributes(
+			semconv.RPCServiceKey.String(f.cfg.KubeServiceType),
+			semconv.RPCSystemKey.String("kube"),
+		),
+	)
+	defer span.End()
+
+	unscopedCtx, isUnscoped := actx.UnscopedContext()
+	// aliasing to isScoped because it's a bit easier to reason about
+	isScoped := !isUnscoped
+
 	if actx.teleportCluster.isRemote {
+		if isScoped {
+			return trace.Wrap(services.ErrScopedIdentity, "authorizing with remote cluster")
+		}
 		// Authorization for a remote kube cluster will happen on the remote
 		// end (by their proxy), after that cluster has remapped used roles.
-		f.log.WithField("auth_context", actx.String()).Debug("Skipping authorization for a remote kubernetes cluster name")
+		f.log.DebugContext(ctx, "Skipping authorization for a remote kubernetes cluster name",
+			"auth_context", logutils.StringerAttr(actx),
+		)
 		return nil
 	}
 	if actx.kubeClusterName == "" {
+		if isScoped {
+			return trace.Wrap(services.ErrScopedIdentity, "authorizing with remote cluster")
+		}
 		// This should only happen for remote clusters (filtered above), but
 		// check and report anyway.
-		f.log.WithField("auth_context", actx.String()).Debug("Skipping authorization due to unknown kubernetes cluster name")
+		f.log.DebugContext(ctx, "Skipping authorization due to unknown kubernetes cluster name",
+			"auth_context", logutils.StringerAttr(actx),
+		)
 		return nil
 	}
-	servers, err := f.cfg.CachingAuthClient.GetKubernetesServers(ctx)
+
+	// A kind unknown to the cluster's discovery can't be matched against the
+	// role's kubernetes_resources rules, so reject it rather than forward it unenforced.
+	// It's reported as NotFound because the kind isn't served by the cluster,
+	// the same result a client would get talking to the API server.
+	if actx.metaResource.unsupportedResource {
+		return trace.NotFound(
+			"Kubernetes resource kind %q in API group %q is not known to cluster %q",
+			actx.metaResource.requestedResource.resourceKind,
+			actx.metaResource.requestedResource.apiGroup,
+			actx.kubeClusterName,
+		)
+	}
+
+	identity := actx.Identity.GetIdentity()
+	var err error
+	actx.accessState, err = actx.CheckerContext.AccessStateFromTLSIdentity(ctx, &identity, f.cfg.CachingAuthClient)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
+	notFoundMessage := fmt.Sprintf("kubernetes cluster %q not found", actx.kubeClusterName)
+	var roleMatchers services.RoleMatchers
+	if !actx.metaResource.isList {
+		if rbacResource := actx.metaResource.rbacResource(); rbacResource != nil {
+			notFoundMessage = f.kubeResourceDeniedAccessMsg(
+				actx.User.GetName(),
+				actx.metaResource.verb,
+				actx.metaResource.requestedResource,
+			)
+			// If the kubeResource is available, append an extra matcher that validates
+			// if the kubernetes resource is allowed by the user roles that satisfy the
+			// target cluster labels.
+			// Each role defines `kubernetes_resources` and when kubeResource is available,
+			// KubernetesResourceMatcher will match roles that statisfy the resources at the
+			// same time that ClusterLabelMatcher matches the role's "kubernetes_labels".
+			// The call to roles.CheckKubeGroupsAndUsers when both matchers are provided
+			// results in the intersection of roles that match the "kubernetes_labels" and
+			// roles that allow access to the desired "kubernetes_resource".
+			// If from the intersection results an empty set, the request is denied.
+			//
+			// requiredRBACResources returns one tuple per (resource, verb) the request needs.
+			// Most requests need exactly one, adding an ephemeral container needs both exec and the mutation verb.
+			isClusterWideResource := actx.metaResource.isClusterWideResource()
+			required := actx.metaResource.requiredRBACResources()
+			roleMatchers = make(services.RoleMatchers, 0, len(required))
+			for i := range required {
+				roleMatchers = append(roleMatchers,
+					services.NewKubernetesResourceMatcher(required[i], isClusterWideResource))
+			}
+		}
+	}
+	// check access to cluster, check signing TTL, and return a list of allowed logins for local cluster based on
+	// Kubernetes service labels.
+	kubeAccessDetails, err := f.getKubeAccessDetails(
+		ctx,
+		actx,
+		roleMatchers...,
+	)
+	if errors.Is(err, services.ErrTrustedDeviceRequired) {
+		return trace.Wrap(err)
+	}
+
+	// roles.CheckKubeGroupsAndUsers returns trace.NotFound if the user does
+	// does not have at least one configured kubernetes_users or kubernetes_groups.
+	if trace.IsNotFound(err) {
+		const errMsg = "Your user's Teleport role does not allow Kubernetes access." +
+			" Please ask cluster administrator to ensure your role has appropriate kubernetes_groups and kubernetes_users set."
+		return trace.NotFound("%s", errMsg)
+	}
+
+	if err != nil {
+		if actx.metaResource.resourceDefinition != nil {
+			return trace.AccessDenied("%s", notFoundMessage)
+		}
+		if !errors.Is(err, errNoMatchingCluster) {
+			return trace.AccessDenied("%s", accessDeniedMsg)
+		}
+	}
+
+	// fillDefaultKubePrincipalDetails fills the default details in order to keep
+	// the correct behavior when forwarding the request to the Kubernetes API.
+	kubeUsers, kubeGroups := fillDefaultKubePrincipalDetails(kubeAccessDetails.kubeUsers, kubeAccessDetails.kubeGroups, actx.User.GetName())
+	actx.kubeUsers = set.New(kubeUsers...)
+	actx.kubeGroups = set.New(kubeGroups...)
+	actx.kubeCluster = kubeAccessDetails.kubeCluster
+	actx.kubeClusterLabels = kubeAccessDetails.clusterLabels
+	// cache the access checker for later decisions
+	actx.checker = kubeAccessDetails.checker
+	if actx.checker == nil && !isScoped {
+		// Checker could be nil if the request was implicitly denied, but this is a valid state for
+		// unscoped identities. We fall back to the unscoped context's checker in this case.
+		actx.checker = services.NewScopedAccessCheckerFromUnscoped(unscopedCtx.Checker)
+	}
+	actx.sessionTTL = actx.checker.AdjustSessionTTL(actx.sessionTTL)
+	actx.clientIdleTimeout, err = actx.checker.Kube().AdjustClientIdleTimeout(actx.clientIdleTimeout)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
 	authPref, err := f.cfg.CachingAuthClient.GetAuthPreference(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	state := actx.GetAccessState(authPref)
+	if actx.checker.Kube().AdjustDisconnectExpiredCert(authPref.GetDisconnectExpiredCert()) {
+		actx.disconnectExpiredCert = actx.ScopedContext.GetDisconnectCertExpiryTime()
+	} else {
+		actx.disconnectExpiredCert = time.Time{}
+	}
 
-	notFoundMessage := fmt.Sprintf("kubernetes cluster %q not found", actx.kubeClusterName)
-	var roleMatchers services.RoleMatchers
-	if actx.kubeResource != nil {
-		notFoundMessage = kubeResourceDeniedAccessMsg(
-			actx.User.GetName(),
-			actx.httpMethod,
-			actx.kubeResource,
-		)
-		roleMatchers = services.RoleMatchers{
-			// Append a matcher that validates if the Kubernetes resource is allowed
-			// by the roles that satisfy the Kubernetes Cluster.
-			services.NewKubernetesResourceMatcher(*actx.kubeResource),
+	// For scoped roles, check for the locking mode here so that we can verify whether users can connect or not when not
+	// when the lock is stale.
+	if isScoped {
+		actx.LockingMode = actx.checker.Kube().LockingMode(authPref.GetLockingMode())
+		// TODO(williamo/scopes): Potentially delete this in favor of checking locks in lib/authz/scoped.go
+		if err := f.cfg.LockWatcher.CheckLockInForce(actx.LockingMode, actx.LockTargets()...); err != nil {
+			return trace.Wrap(err)
 		}
 	}
 
-	// Check authz against the first match.
-	//
-	// We assume that users won't register two identically-named clusters with
-	// mis-matched labels. If they do, expect weirdness.
-	for _, s := range servers {
-		ks := s.GetCluster()
-		if ks.GetName() != actx.kubeClusterName {
-			continue
-		}
-
-		switch err := actx.Checker.CheckAccess(ks, state, roleMatchers...); {
-		case errors.Is(err, services.ErrTrustedDeviceRequired):
-			return trace.Wrap(err)
-		case err != nil:
-			return trace.AccessDenied(notFoundMessage)
-		}
-
-		// If the user has active Access requests we need to validate that they allow
-		// the kubeResource.
-		// This is required because CheckAccess does not validate the subresource type.
-		if actx.kubeResource != nil && len(actx.Checker.GetAllowedResourceIDs()) > 0 {
+	// If the user has active Access requests we need to validate that they allow
+	// the kubeResource.
+	// This is required because CheckAccess does not validate the subresource type.
+	// TODO(eriktate/scopes): scoped identities don't support access requests, so we skip
+	// these checks for now.
+	if !isScoped && !actx.metaResource.isList {
+		if rbacResource := actx.metaResource.rbacResource(); rbacResource != nil && len(unscopedCtx.Checker.GetAllowedResourceAccessIDs()) > 0 {
 			// GetKubeResources returns the allowed and denied Kubernetes resources
 			// for the user. Since we have active access requests, the allowed
 			// resources will be the list of pods that the user requested access to if he
@@ -1005,73 +1368,64 @@ func (f *Forwarder) authorize(ctx context.Context, actx *authContext) error {
 			// allow if the user requested access a kubernetes cluster. If the user
 			// did not request access to any Kubernetes resource type, the allowed
 			// list will be empty.
-			allowed, denied := actx.Checker.GetKubeResources(ks)
-			if err := matchKubernetesResource(*actx.kubeResource, allowed, denied); err != nil {
-				return trace.AccessDenied(notFoundMessage)
+			allowed, denied := unscopedCtx.Checker.GetKubeResources(actx.kubeCluster)
+			if result, err := matchKubernetesResource(*rbacResource, actx.metaResource.isClusterWideResource(), allowed, denied); err != nil || !result {
+				return trace.AccessDenied("%s", notFoundMessage)
 			}
 		}
-		// store a copy of the Kubernetes Cluster.
-		actx.kubeCluster = ks
+	}
+
+	// if we were granted access to any kube users or groups, we can safely proceed
+	if len(actx.kubeUsers) > 0 || len(actx.kubeGroups) > 0 {
 		return nil
 	}
+
+	// If we were not granted access to any kube users or groups, we need to check if we should bypass auth for a
+	// proxy-based kube cluster. We should only skip authZ for unscoped identities connecting to proxy-based kube
+	// clusters.
 	if actx.kubeClusterName == f.cfg.ClusterName {
-		f.log.WithField("auth_context", actx.String()).Debug("Skipping authorization for proxy-based kubernetes cluster,")
+		if isScoped {
+			return trace.Wrap(services.ErrScopedIdentity, "scoped identities do not support kube clusters exposed directly from the Teleport Proxy Service, only clusters exposed by the Teleport Kubernetes Service are supported")
+		}
+		f.log.DebugContext(ctx, "Skipping authorization for proxy-based kubernetes cluster",
+			"auth_context", logutils.StringerAttr(actx),
+		)
 		return nil
 	}
-	return trace.AccessDenied(notFoundMessage)
+
+	return trace.AccessDenied("%s", notFoundMessage)
 }
 
 // matchKubernetesResource checks if the Kubernetes Resource does not match any
 // entry from the deny list and matches at least one entry from the allowed list.
-func matchKubernetesResource(resource types.KubernetesResource, allowed, denied []types.KubernetesResource) error {
+func matchKubernetesResource(resource types.KubernetesResource, isClusterWideResource bool, allowed, denied []types.KubernetesResource) (bool, error) {
 	// utils.KubeResourceMatchesRegex checks if the resource.Kind is strictly equal
 	// to each entry and validates if the Name and Namespace fields matches the
 	// regex allowed by each entry.
-	result, err := utils.KubeResourceMatchesRegex(resource, denied)
+	result, err := utils.KubeResourceMatchesRegex(resource, isClusterWideResource, denied, types.Deny)
 	if err != nil {
-		return trace.Wrap(err)
+		return false, trace.Wrap(err)
 	} else if result {
-		return trace.AccessDenied("access to %s %q denied", resource.Kind, resource.ClusterResource())
+		return false, nil
 	}
 
-	result, err = utils.KubeResourceMatchesRegex(resource, allowed)
+	result, err = utils.KubeResourceMatchesRegex(resource, isClusterWideResource, allowed, types.Allow)
 	if err != nil {
-		return trace.Wrap(err)
-	} else if !result {
-		return trace.AccessDenied("access to %s %q denied", resource.Kind, resource.ClusterResource())
+		return false, trace.Wrap(err)
 	}
-	return nil
-}
-
-// newStreamer returns sync or async streamer based on the configuration
-// of the server and the session, sync streamer sends the events
-// directly to the auth server and blocks if the events can not be received,
-// async streamer buffers the events to disk and uploads the events later
-func (f *Forwarder) newStreamer(ctx *authContext) (events.Streamer, error) {
-	if services.IsRecordSync(ctx.recordingConfig.GetMode()) {
-		f.log.Debug("Using sync streamer for session.")
-		return f.cfg.AuthClient, nil
-	}
-	f.log.Debug("Using async streamer for session.")
-	dir := filepath.Join(
-		f.cfg.DataDir, teleport.LogsDir, teleport.ComponentUpload,
-		events.StreamingSessionsDir, apidefaults.Namespace,
-	)
-	fileStreamer, err := filesessions.NewStreamer(dir)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	// TeeStreamer sends non-print and non disk events
-	// to the audit log in async mode, while buffering all
-	// events on disk for further upload at the end of the session
-	return events.NewTeeStreamer(fileStreamer, f.cfg.StreamEmitter), nil
+	return result, nil
 }
 
 // join joins an existing session over a websocket connection
 func (f *Forwarder) join(ctx *authContext, w http.ResponseWriter, req *http.Request, p httprouter.Params) (resp any, err error) {
-	f.log.Debugf("Join %v.", req.URL.String())
+	// Increment the request counter and the in-flight gauge.
+	joinSessionsRequestCounter.WithLabelValues(f.cfg.KubeServiceType).Inc()
+	joinSessionsInFlightGauge.WithLabelValues(f.cfg.KubeServiceType).Inc()
+	defer joinSessionsInFlightGauge.WithLabelValues(f.cfg.KubeServiceType).Dec()
 
-	sess, err := f.newClusterSession(*ctx)
+	f.log.DebugContext(req.Context(), "Joining session", "join_url", logutils.StringerAttr(req.URL))
+
+	sess, err := f.newClusterSession(req.Context(), *ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1081,11 +1435,11 @@ func (f *Forwarder) join(ctx *authContext, w http.ResponseWriter, req *http.Requ
 	// the resources as soon as we know the session is no longer active.
 	defer sess.close()
 
-	if err := f.setupForwardingHeaders(sess, req); err != nil {
+	if err := f.setupForwardingHeaders(sess, req, false /* withImpersonationHeaders */); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	if !f.isLocalKubeCluster(sess) {
+	if !sess.isLocalKubernetesCluster {
 		return f.remoteJoin(ctx, w, req, p, sess)
 	}
 
@@ -1104,40 +1458,51 @@ func (f *Forwarder) join(ctx *authContext, w http.ResponseWriter, req *http.Requ
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
+	var stream *streamproto.SessionStream
+	// Close the stream when we exit to ensure no goroutines are leaked and
+	// to ensure the client gets a close message in case of an error.
+	defer func() {
+		if stream != nil {
+			stream.Close()
+		}
+	}()
 	if err := func() error {
-		stream, err := streamproto.NewSessionStream(ws, streamproto.ServerHandshake{MFARequired: session.PresenceEnabled})
+		stream, err = streamproto.NewSessionStream(ws, streamproto.ServerHandshake{MFARequired: session.PresenceEnabled})
 		if err != nil {
 			return trace.Wrap(err)
 		}
 
-		client := &websocketClientStreams{stream}
+		client := &websocketClientStreams{uuid.New(), stream}
 		party := newParty(*ctx, stream.Mode, client)
 
-		err = session.join(party)
+		err = session.join(req.Context(), party, true /* emitSessionJoinEvent */)
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		closeC := make(chan struct{})
-		go func() {
-			defer close(closeC)
-			select {
-			case <-stream.Done():
-				party.InformClose()
-			case <-party.closeC:
-				return
+
+		defer func() {
+			// Detach cancellation so leave's moderation rebalance still runs after the websocket closes.
+			leaveCtx := context.WithoutCancel(req.Context())
+			if _, err := session.leave(leaveCtx, party.ID); err != nil {
+				f.log.DebugContext(leaveCtx, "Participant was unable to leave session",
+					"participant_id", party.ID,
+					"session_id", session.id,
+					"error", err,
+				)
 			}
 		}()
-		<-party.closeC
-		if _, err := session.leave(party.ID); err != nil {
-			f.log.WithError(err).Debugf("Participant %q was unable to leave session %s", party.ID, session.id)
+
+		select {
+		case <-stream.Done():
+			party.InformClose(trace.BadParameter("websocket connection closed"))
+			return nil
+		case err := <-party.closeC:
+			return trace.Wrap(err)
 		}
-		<-closeC
-		return nil
 	}(); err != nil {
-		writeErr := ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, err.Error()), time.Now().Add(time.Second*10))
+		writeErr := ws.WriteControl(gwebsocket.CloseMessage, gwebsocket.FormatCloseMessage(gwebsocket.CloseInternalServerErr, err.Error()), time.Now().Add(time.Second*10))
 		if writeErr != nil {
-			f.log.WithError(writeErr).Warn("Failed to send early-exit websocket close message.")
+			f.log.WarnContext(req.Context(), "Failed to send early-exit websocket close message", "error", writeErr)
 		}
 	}
 
@@ -1172,9 +1537,25 @@ func (f *Forwarder) deleteSession(id uuid.UUID) {
 
 // remoteJoin forwards a join request to a remote cluster.
 func (f *Forwarder) remoteJoin(ctx *authContext, w http.ResponseWriter, req *http.Request, p httprouter.Params, sess *clusterSession) (resp any, err error) {
-	dialer := &websocket.Dialer{
-		TLSClientConfig: sess.tlsConfig,
-		NetDialContext:  sess.DialWithContext,
+	hostID, err := f.getSessionHostID(req.Context(), ctx, p)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	netDialer := sess.DialWithContext(withTargetHostID(hostID))
+	tlsConfig, impersonationHeaders, err := f.getTLSConfig(sess)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	dialer := &gwebsocket.Dialer{
+		TLSClientConfig: tlsConfig,
+		NetDialContext:  netDialer,
+	}
+
+	headers := http.Header{}
+	if impersonationHeaders {
+		if headers, err = internal.IdentityForwardingHeaders(req.Context(), headers); err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 
 	url := "wss://" + req.URL.Host
@@ -1183,8 +1564,12 @@ func (f *Forwarder) remoteJoin(ctx *authContext, w http.ResponseWriter, req *htt
 	}
 	url = url + req.URL.Path
 
-	wsTarget, respTarget, err := dialer.Dial(url, nil)
+	wsTarget, respTarget, err := dialer.DialContext(req.Context(), url, headers)
 	if err != nil {
+		if respTarget == nil {
+			return nil, trace.Wrap(err)
+		}
+		defer respTarget.Body.Close()
 		msg, err := io.ReadAll(respTarget.Body)
 		if err != nil {
 			return nil, trace.Wrap(err)
@@ -1194,7 +1579,6 @@ func (f *Forwarder) remoteJoin(ctx *authContext, w http.ResponseWriter, req *htt
 		if err := json.Unmarshal(msg, &obj); err != nil {
 			return nil, trace.Wrap(err)
 		}
-
 		return obj, trace.Wrap(err)
 	}
 	defer wsTarget.Close()
@@ -1206,74 +1590,105 @@ func (f *Forwarder) remoteJoin(ctx *authContext, w http.ResponseWriter, req *htt
 	}
 	defer wsSource.Close()
 
-	err = wsProxy(wsSource, wsTarget)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+	wsProxy(req.Context(), f.log, wsSource, wsTarget)
 
 	return nil, nil
 }
 
+// getSessionHostID returns the host ID that controls the session being joined.
+// If the session is remote, returns an empty string, otherwise returns the host ID
+// from the session tracker.
+func (f *Forwarder) getSessionHostID(ctx context.Context, authCtx *authContext, p httprouter.Params) (string, error) {
+	if authCtx.teleportCluster.isRemote {
+		return "", nil
+	}
+	session := p.ByName("session")
+	if session == "" {
+		return "", trace.BadParameter("missing session ID")
+	}
+	sess, err := f.cfg.AuthClient.GetSessionTracker(ctx, session)
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+	return sess.GetHostID(), nil
+}
+
 // wsProxy proxies a websocket connection between two clusters transparently to allow for
 // remote joins.
-func wsProxy(wsSource *websocket.Conn, wsTarget *websocket.Conn) error {
-	closeM := make(chan struct{})
-	errS := make(chan error)
-	errT := make(chan error)
+func wsProxy(ctx context.Context, log *slog.Logger, wsSource *gwebsocket.Conn, wsTarget *gwebsocket.Conn) {
+	errS := make(chan error, 1)
+	errT := make(chan error, 1)
+	wg := &sync.WaitGroup{}
 
-	go func() {
+	forwardConn := func(dst, src *gwebsocket.Conn, errc chan<- error) {
+		defer dst.Close()
+		defer src.Close()
 		for {
-			ty, data, err := wsSource.ReadMessage()
+			msgType, msg, err := src.ReadMessage()
 			if err != nil {
-				wsSource.Close()
-				errS <- trace.Wrap(err)
-				return
+				m := gwebsocket.FormatCloseMessage(gwebsocket.CloseNormalClosure, err.Error())
+				var e *gwebsocket.CloseError
+				if errors.As(err, &e) {
+					if e.Code != gwebsocket.CloseNoStatusReceived {
+						m = gwebsocket.FormatCloseMessage(e.Code, e.Text)
+					}
+				}
+				errc <- err
+				dst.WriteMessage(gwebsocket.CloseMessage, m)
+				break
 			}
 
-			wsTarget.WriteMessage(ty, data)
-
-			if ty == websocket.CloseMessage {
-				closeM <- struct{}{}
-				return
+			err = dst.WriteMessage(msgType, msg)
+			if err != nil {
+				errc <- err
+				break
 			}
 		}
+	}
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		forwardConn(wsSource, wsTarget, errS)
 	}()
-
 	go func() {
-		for {
-			ty, data, err := wsTarget.ReadMessage()
-			if err != nil {
-				wsTarget.Close()
-				errT <- trace.Wrap(err)
-				return
-			}
-
-			wsSource.WriteMessage(ty, data)
-
-			if ty == websocket.CloseMessage {
-				closeM <- struct{}{}
-				return
-			}
-		}
+		defer wg.Done()
+		forwardConn(wsTarget, wsSource, errT)
 	}()
 
 	var err error
+	var from, to string
 	select {
 	case err = <-errS:
-		wsTarget.WriteMessage(websocket.CloseMessage, []byte{})
+		from = "client"
+		to = "upstream"
 	case err = <-errT:
-		wsSource.WriteMessage(websocket.CloseMessage, []byte{})
-	case <-closeM:
+		from = "upstream"
+		to = "client"
 	}
 
-	return trace.Wrap(err)
+	var websocketErr *gwebsocket.CloseError
+	if errors.As(err, &websocketErr) && websocketErr.Code == gwebsocket.CloseAbnormalClosure {
+		log.DebugContext(ctx, "websocket proxying failed", "src", from, "target", to, "error", err)
+	}
+	wg.Wait()
 }
 
 // acquireConnectionLock acquires a semaphore used to limit connections to the Kubernetes agent.
 // The semaphore is releasted when the request is returned/connection is closed.
 // Returns an error if a semaphore could not be acquired.
-func (f *Forwarder) acquireConnectionLock(ctx context.Context, user string, roles services.RoleSet) error {
-	maxConnections := roles.MaxKubernetesConnections()
+func (f *Forwarder) acquireConnectionLock(ctx context.Context, user string, maxConnections int64) error {
+	ctx, span := f.cfg.tracer.Start(
+		ctx,
+		"kube.Forwarder/acquireConnectionLock",
+		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+		oteltrace.WithAttributes(
+			semconv.RPCServiceKey.String(f.cfg.KubeServiceType),
+			semconv.RPCSystemKey.String("kube"),
+		),
+	)
+	defer span.End()
+
 	if maxConnections == 0 {
 		return nil
 	}
@@ -1303,44 +1718,22 @@ func (f *Forwarder) acquireConnectionLock(ctx context.Context, user string, role
 }
 
 // execNonInteractive handles all exec sessions without a TTY.
-func (f *Forwarder) execNonInteractive(ctx *authContext, w http.ResponseWriter, req *http.Request, p httprouter.Params, request remoteCommandRequest, proxy *remoteCommandProxy, sess *clusterSession) (resp any, err error) {
-	defer proxy.Close()
-
-	roles, err := getRolesByName(f, ctx.Context.Identity.GetIdentity().Groups)
+func (f *Forwarder) execNonInteractive(ctx *authContext, req *http.Request, _ httprouter.Params, request remoteCommandRequest, proxy *remoteCommandProxy, sess *clusterSession) error {
+	canStart, err := f.canStartSessionAlone(ctx)
 	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	var policySets []*types.SessionTrackerPolicySet
-	for _, role := range roles {
-		policySet := role.GetSessionPolicySet()
-		policySets = append(policySets, &policySet)
-	}
-
-	authorizer := auth.NewSessionAccessEvaluator(policySets, types.KubernetesSessionKind, ctx.User.GetName())
-	canStart, _, err := authorizer.FulfilledFor(nil)
-	if err != nil {
-		return nil, trace.Wrap(err)
+		return trace.Wrap(err)
 	}
 	if !canStart {
-		return nil, trace.AccessDenied("insufficient permissions to launch non-interactive session")
+		return trace.AccessDenied("insufficient permissions to launch non-interactive session")
 	}
 
-	eventPodMeta := request.eventPodMeta(request.context, sess.creds)
+	eventPodMeta := request.eventPodMeta(request.context, sess.kubeAPICreds)
 
 	sessionStart := f.cfg.Clock.Now().UTC()
 
-	serverMetadata := apievents.ServerMetadata{
-		ServerID:        f.cfg.HostID,
-		ServerNamespace: f.cfg.Namespace,
-		ServerHostname:  sess.teleportCluster.name,
-		ServerAddr:      sess.kubeAddress,
-	}
+	serverMetadata := sess.getServerMetadata()
 
-	sessionMetadata := apievents.SessionMetadata{
-		SessionID: uuid.NewString(),
-		WithMFA:   ctx.Identity.GetIdentity().MFAVerified,
-	}
+	sessionMetadata := ctx.Identity.GetIdentity().GetSessionMetadata(uuid.NewString())
 
 	connectionMetdata := apievents.ConnectionMetadata{
 		RemoteAddr: req.RemoteAddr,
@@ -1358,15 +1751,16 @@ func (f *Forwarder) execNonInteractive(ctx *authContext, w http.ResponseWriter, 
 		SessionMetadata:           sessionMetadata,
 		UserMetadata:              ctx.eventUserMeta(),
 		ConnectionMetadata:        connectionMetdata,
-		KubernetesClusterMetadata: ctx.eventClusterMeta(),
+		KubernetesClusterMetadata: ctx.eventClusterMeta(req),
 		KubernetesPodMetadata:     eventPodMeta,
 
 		InitialCommand:   request.cmd,
 		SessionRecording: ctx.recordingConfig.GetMode(),
 	}
 
-	if err := f.cfg.StreamEmitter.EmitAuditEvent(f.ctx, sessionStartEvent); err != nil {
-		f.log.WithError(err).Warn("Failed to emit event.")
+	if err := f.cfg.Emitter.EmitAuditEvent(f.ctx, sessionStartEvent); err != nil {
+		f.log.WarnContext(f.ctx, "Failed to emit event", "error", err)
+		return trace.Wrap(err)
 	}
 
 	execEvent := &apievents.Exec{
@@ -1381,13 +1775,13 @@ func (f *Forwarder) execNonInteractive(ctx *authContext, w http.ResponseWriter, 
 		CommandMetadata: apievents.CommandMetadata{
 			Command: strings.Join(request.cmd, " "),
 		},
-		KubernetesClusterMetadata: ctx.eventClusterMeta(),
+		KubernetesClusterMetadata: ctx.eventClusterMeta(req),
 		KubernetesPodMetadata:     eventPodMeta,
 	}
 
 	defer func() {
-		if err := f.cfg.StreamEmitter.EmitAuditEvent(f.ctx, execEvent); err != nil {
-			f.log.WithError(err).Warn("Failed to emit exec event.")
+		if err := f.cfg.Emitter.EmitAuditEvent(f.ctx, execEvent); err != nil {
+			f.log.WarnContext(f.ctx, "Failed to emit exec event", "error", err)
 		}
 
 		sessionEndEvent := &apievents.SessionEnd{
@@ -1403,42 +1797,61 @@ func (f *Forwarder) execNonInteractive(ctx *authContext, w http.ResponseWriter, 
 			Interactive:               false,
 			StartTime:                 sessionStart,
 			EndTime:                   f.cfg.Clock.Now().UTC(),
-			KubernetesClusterMetadata: ctx.eventClusterMeta(),
+			KubernetesClusterMetadata: ctx.eventClusterMeta(req),
 			KubernetesPodMetadata:     eventPodMeta,
 			InitialCommand:            request.cmd,
 			SessionRecording:          ctx.recordingConfig.GetMode(),
 		}
 
-		if err := f.cfg.StreamEmitter.EmitAuditEvent(f.ctx, sessionEndEvent); err != nil {
-			f.log.WithError(err).Warn("Failed to emit session end event.")
+		if err := f.cfg.Emitter.EmitAuditEvent(f.ctx, sessionEndEvent); err != nil {
+			f.log.WarnContext(f.ctx, "Failed to emit session end event", "error", err)
 		}
 	}()
 
-	executor, err := f.getExecutor(*ctx, sess, req)
+	executor, executorCleanup, err := f.getExecutor(sess, req)
 	if err != nil {
 		execEvent.Code = events.ExecFailureCode
 		execEvent.Error, execEvent.ExitCode = exitCode(err)
 
-		f.log.WithError(err).Warning("Failed creating executor.")
-		return nil, trace.Wrap(err)
+		f.log.WarnContext(f.ctx, "Failed creating executor", "error", err)
+		return trace.Wrap(err)
 	}
+	defer executorCleanup()
 
 	streamOptions := proxy.options()
-	if err = executor.StreamWithContext(req.Context(), streamOptions); err != nil {
+	err = executor.StreamWithContext(req.Context(), streamOptions)
+	if err != nil {
 		execEvent.Code = events.ExecFailureCode
 		execEvent.Error, execEvent.ExitCode = exitCode(err)
 
-		f.log.WithError(err).Warning("Executor failed while streaming.")
-		if err := proxy.sendStatus(err); err != nil {
-			f.log.WithError(err).Warning("Failed to send status. Exec command was aborted by client.")
-		}
-		// do not return the error otherwise the fwd.withAuth interceptor will try to write it into a hijacked connection
-		return nil, nil
+		f.log.WarnContext(f.ctx, "Executor failed while streaming", "error", err)
+		return trace.Wrap(err)
 	}
 
 	execEvent.Code = events.ExecCode
 
-	return nil, nil
+	return nil
+}
+
+// canStartSessionAlone returns true if the user associated with authCtx
+// is allowed to start a session without moderation.
+func (f *Forwarder) canStartSessionAlone(authCtx *authContext) (bool, error) {
+	unscopedCtx, isUnscoped := authCtx.UnscopedContext()
+	// TODO(eriktate/scopes): scoped access does not currently support session moderation, so we always allow
+	// scoped identities to start a session alone. An unscoped identity connecting to a scoped kube agent should
+	// still expect moderated session policy to be enforced. We should revisit this once scoped moderated sessions are
+	// addressed more wholistically.
+	if !isUnscoped {
+		return true, nil
+	}
+	policySets := unscopedCtx.Checker.SessionPolicySets()
+	authorizer := moderation.NewSessionAccessEvaluator(policySets, types.KubernetesSessionKind, authCtx.User.GetName())
+	canStart, _, err := authorizer.FulfilledFor(nil)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+
+	return canStart, nil
 }
 
 func exitCode(err error) (errMsg, code string) {
@@ -1452,6 +1865,9 @@ func exitCode(err error) (errMsg, code string) {
 			return
 		}
 		errMsg = kubeStatusErr.ErrStatus.Message
+		if errMsg == "" {
+			errMsg = string(kubeStatusErr.ErrStatus.Reason)
+		}
 		code = strconv.Itoa(int(kubeStatusErr.ErrStatus.Code))
 	} else if errors.As(err, &kubeExecErr) {
 		if kubeExecErr.Err != nil {
@@ -1467,19 +1883,36 @@ func exitCode(err error) (errMsg, code string) {
 
 // exec forwards all exec requests to the target server, captures
 // all output from the session
-func (f *Forwarder) exec(ctx *authContext, w http.ResponseWriter, req *http.Request, p httprouter.Params) (resp any, err error) {
-	f.log.Debugf("Exec %v.", req.URL.String())
+func (f *Forwarder) exec(authCtx *authContext, w http.ResponseWriter, req *http.Request, p httprouter.Params) (resp any, err error) {
+	// Increment the request counter and the in-flight gauge.
+	execSessionsRequestCounter.WithLabelValues(f.cfg.KubeServiceType).Inc()
+	execSessionsInFlightGauge.WithLabelValues(f.cfg.KubeServiceType).Inc()
+	defer execSessionsInFlightGauge.WithLabelValues(f.cfg.KubeServiceType).Dec()
+
+	ctx, span := f.cfg.tracer.Start(
+		req.Context(),
+		"kube.Forwarder/exec",
+		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+		oteltrace.WithAttributes(
+			semconv.RPCServiceKey.String(f.cfg.KubeServiceType),
+			semconv.RPCMethodKey.String("Exec"),
+			semconv.RPCSystemKey.String("kube"),
+		),
+	)
+	defer span.End()
+
+	f.log.DebugContext(ctx, "Starting exec", "exec_url", logutils.StringerAttr(req.URL))
 	defer func() {
 		if err != nil {
-			f.log.WithError(err).Debug("Exec request failed")
+			f.log.DebugContext(ctx, "Exec request failed", "error", err)
 		}
 	}()
 
-	sess, err := f.newClusterSession(*ctx)
+	sess, err := f.newClusterSession(ctx, *authCtx)
 	if err != nil {
 		// This error goes to kubernetes client and is not visible in the logs
 		// of the teleport server if not logged here.
-		f.log.Errorf("Failed to create cluster session: %v.", err)
+		f.log.ErrorContext(ctx, "Failed to create cluster session", "error", err)
 		return nil, trace.Wrap(err)
 	}
 	// sess.Close cancels the connection monitor context to release it sooner.
@@ -1505,83 +1938,103 @@ func (f *Forwarder) exec(ctx *authContext, w http.ResponseWriter, req *http.Requ
 		tty:                utils.AsBool(q.Get("tty")),
 		httpRequest:        req,
 		httpResponseWriter: w,
-		context:            req.Context(),
+		context:            ctx,
 		pingPeriod:         f.cfg.ConnPingPeriod,
+		idleTimeout:        sess.clientIdleTimeout,
 		onResize:           func(remotecommand.TerminalSize) {},
 	}
 
-	if err := f.setupForwardingHeaders(sess, req); err != nil {
+	if err := f.setupForwardingHeaders(sess, req, true /* withImpersonationHeaders */); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	proxy, err := createRemoteCommandProxy(request)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+	return upgradeRequestToRemoteCommandProxy(request,
+		func(proxy *remoteCommandProxy) error {
+			sess.sendErrStatus = proxy.writeStatus
 
-	if sess.noAuditEvents {
-		// We're forwarding this to another kubernetes_service instance, let it handle multiplexing.
-		return f.remoteExec(ctx, w, req, p, sess, request, proxy)
-	}
+			if !sess.isLocalKubernetesCluster {
+				// We're forwarding this to another kubernetes_service instance or Teleport proxy, let it handle session recording.
+				return f.remoteExec(req, sess, proxy)
+			}
 
-	if !request.tty {
-		resp, err = f.execNonInteractive(ctx, w, req, p, request, proxy, sess)
-		return
-	}
+			if !request.tty {
+				return f.execNonInteractive(authCtx, req, p, request, proxy, sess)
+			}
 
-	client := newKubeProxyClientStreams(proxy)
-	party := newParty(*ctx, types.SessionPeerMode, client)
-	session, err := newSession(*ctx, f, req, p, party, sess)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+			client := newKubeProxyClientStreams(proxy)
+			party := newParty(*authCtx, types.SessionPeerMode, client)
+			session, err := newSession(*authCtx, f, req, p, party, sess)
+			if err != nil {
+				return trace.Wrap(err)
+			}
 
-	f.setSession(session.id, session)
-	err = session.join(party)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+			f.setSession(session.id, session)
+			if err = session.join(ctx, party, true /* emitSessionJoinEvent */); err != nil {
+				return trace.Wrap(err)
+			}
 
-	<-party.closeC
+			err = <-party.closeC
 
-	if _, err := session.leave(party.ID); err != nil {
-		f.log.WithError(err).Debugf("Participant %q was unable to leave session %s", party.ID, session.id)
-	}
+			// Detach cancellation so leave's moderation rebalance still runs after the client disconnects.
+			leaveCtx := context.WithoutCancel(ctx)
+			if _, errLeave := session.leave(leaveCtx, party.ID); errLeave != nil {
+				f.log.DebugContext(leaveCtx, "Participant was unable to leave session",
+					"participant_id", party.ID,
+					"session_id", session.id,
+					"error", errLeave,
+				)
+			}
 
-	return nil, nil
+			return trace.Wrap(err)
+		},
+	)
 }
 
 // remoteExec forwards an exec request to a remote cluster.
-func (f *Forwarder) remoteExec(ctx *authContext, w http.ResponseWriter, req *http.Request, p httprouter.Params, sess *clusterSession, request remoteCommandRequest, proxy *remoteCommandProxy) (resp any, err error) {
-	defer proxy.Close()
-
-	executor, err := f.getExecutor(*ctx, sess, req)
+func (f *Forwarder) remoteExec(req *http.Request, sess *clusterSession, proxy *remoteCommandProxy) error {
+	executor, executorCleanup, err := f.getExecutor(sess, req)
 	if err != nil {
-		f.log.WithError(err).Warning("Failed creating executor.")
-		return nil, trace.Wrap(err)
+		f.log.WarnContext(req.Context(), "Failed creating executor", "error", err)
+		return trace.Wrap(err)
 	}
+	defer executorCleanup()
 	streamOptions := proxy.options()
-	if err = executor.StreamWithContext(req.Context(), streamOptions); err != nil {
-		f.log.WithError(err).Warning("Executor failed while streaming.")
-		// send the status back to the client when forwarding mode is enabled
-		if err := proxy.sendStatus(err); err != nil {
-			f.log.WithError(err).Warning("Failed to send status. Exec command was aborted by client.")
-		}
-		// do not return the error otherwise the fwd.withAuth interceptor will try to write it into a hijacked connection
-		return nil, nil
+	err = executor.StreamWithContext(req.Context(), streamOptions)
+	if err != nil {
+		f.log.WarnContext(req.Context(), "Executor failed while streaming", "error", err)
 	}
 
-	return nil, nil
+	return trace.Wrap(err)
 }
 
 // portForward starts port forwarding to the remote cluster
-func (f *Forwarder) portForward(ctx *authContext, w http.ResponseWriter, req *http.Request, p httprouter.Params) (any, error) {
-	f.log.Debugf("Port forward: %v. req headers: %v.", req.URL.String(), req.Header)
-	sess, err := f.newClusterSession(*ctx)
+func (f *Forwarder) portForward(authCtx *authContext, w http.ResponseWriter, req *http.Request, p httprouter.Params) (any, error) {
+	// Increment the request counter and the in-flight gauge.
+	portforwardRequestCounter.WithLabelValues(f.cfg.KubeServiceType).Inc()
+	portforwardSessionsInFlightGauge.WithLabelValues(f.cfg.KubeServiceType).Inc()
+	defer portforwardSessionsInFlightGauge.WithLabelValues(f.cfg.KubeServiceType).Dec()
+
+	ctx, span := f.cfg.tracer.Start(
+		req.Context(),
+		"kube.Forwarder/portForward",
+		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+		oteltrace.WithAttributes(
+			semconv.RPCServiceKey.String(f.cfg.KubeServiceType),
+			semconv.RPCMethodKey.String("portForward"),
+			semconv.RPCSystemKey.String("kube"),
+		),
+	)
+	defer span.End()
+
+	f.log.DebugContext(ctx, "Handling port forward request",
+		"request_url", logutils.StringerAttr(req.URL),
+		"request_headers", req.Header,
+	)
+	sess, err := f.newClusterSession(ctx, *authCtx)
 	if err != nil {
 		// This error goes to kubernetes client and is not visible in the logs
 		// of the teleport server if not logged here.
-		f.log.Errorf("Failed to create cluster session: %v.", err)
+		f.log.ErrorContext(ctx, "Failed to create cluster session", "error", err)
 		return nil, trace.Wrap(err)
 	}
 	// sess.Close cancels the connection monitor context to release it sooner.
@@ -1595,26 +2048,40 @@ func (f *Forwarder) portForward(ctx *authContext, w http.ResponseWriter, req *ht
 		return nil, trace.Wrap(err)
 	}
 
-	if err := f.setupForwardingHeaders(sess, req); err != nil {
-		f.log.Debugf("DENIED Port forward: %v.", req.URL.String())
+	if err := f.setupForwardingHeaders(sess, req, true /* withImpersonationHeaders */); err != nil {
+		f.log.DebugContext(ctx, "DENIED Port forward", "request_url", logutils.StringerAttr(req.URL))
 		return nil, trace.Wrap(err)
 	}
 
-	dialer, err := f.getDialer(*ctx, sess, req)
+	dialer, dialerCleanup, err := f.getPortForwardDialer(sess, req)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+	defer dialerCleanup()
 
+	auditSent := map[string]bool{} // Set of `addr`. Can be multiple ports on single call. Using bool to simplify the check.
+	var auditSentMu sync.Mutex
 	onPortForward := func(addr string, success bool) {
-		if sess.noAuditEvents {
+		if !sess.isLocalKubernetesCluster {
 			return
 		}
+
+		auditSentMu.Lock()
+		isAuditSent := auditSent[addr]
+		if !isAuditSent {
+			auditSent[addr] = true
+		}
+		auditSentMu.Unlock()
+		if isAuditSent {
+			return
+		}
+
 		portForward := &apievents.PortForward{
 			Metadata: apievents.Metadata{
 				Type: events.PortForwardEvent,
 				Code: events.PortForwardCode,
 			},
-			UserMetadata: ctx.eventUserMeta(),
+			UserMetadata: authCtx.eventUserMeta(),
 			ConnectionMetadata: apievents.ConnectionMetadata{
 				LocalAddr:  sess.kubeAddress,
 				RemoteAddr: req.RemoteAddr,
@@ -1624,33 +2091,64 @@ func (f *Forwarder) portForward(ctx *authContext, w http.ResponseWriter, req *ht
 			Status: apievents.Status{
 				Success: success,
 			},
+			KubernetesClusterMetadata: sess.eventClusterMeta(req),
+			KubernetesPodMetadata: apievents.KubernetesPodMetadata{
+				KubernetesPodNamespace: p.ByName("podNamespace"),
+				KubernetesPodName:      p.ByName("podName"),
+			},
 		}
 		if !success {
 			portForward.Code = events.PortForwardFailureCode
 		}
-		if err := f.cfg.StreamEmitter.EmitAuditEvent(f.ctx, portForward); err != nil {
-			f.log.WithError(err).Warn("Failed to emit event.")
+		if err := f.cfg.Emitter.EmitAuditEvent(f.ctx, portForward); err != nil {
+			f.log.WarnContext(ctx, "Failed to emit event", "error", err)
 		}
 	}
+	defer func() {
+		for addr := range auditSent {
+			portForward := &apievents.PortForward{
+				Metadata: apievents.Metadata{
+					Type: events.PortForwardEvent,
+					Code: events.PortForwardStopCode,
+				},
+				UserMetadata: authCtx.eventUserMeta(),
+				ConnectionMetadata: apievents.ConnectionMetadata{
+					LocalAddr:  sess.kubeAddress,
+					RemoteAddr: req.RemoteAddr,
+					Protocol:   events.EventProtocolKube,
+				},
+				Addr:                      addr,
+				KubernetesClusterMetadata: sess.eventClusterMeta(req),
+				KubernetesPodMetadata: apievents.KubernetesPodMetadata{
+					KubernetesPodNamespace: p.ByName("podNamespace"),
+					KubernetesPodName:      p.ByName("podName"),
+				},
+			}
+			if err := f.cfg.Emitter.EmitAuditEvent(f.ctx, portForward); err != nil {
+				f.log.WarnContext(ctx, "Failed to emit event", "error", err)
+			}
+		}
+	}()
 
 	q := req.URL.Query()
 	request := portForwardRequest{
 		podNamespace:       p.ByName("podNamespace"),
 		podName:            p.ByName("podName"),
 		ports:              q["ports"],
-		context:            req.Context(),
+		context:            ctx,
 		httpRequest:        req,
 		httpResponseWriter: w,
 		onPortForward:      onPortForward,
 		targetDialer:       dialer,
 		pingPeriod:         f.cfg.ConnPingPeriod,
+		idleTimeout:        sess.clientIdleTimeout,
 	}
-	f.log.Debugf("Starting %v.", request)
+	f.log.DebugContext(ctx, "Starting port forwarding", "request", request)
 	err = runPortForwarding(request)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	f.log.Debugf("Done %v.", request)
+	f.log.DebugContext(ctx, "Completed port forwarding", "request", request)
 	return nil, nil
 }
 
@@ -1659,10 +2157,14 @@ func (f *Forwarder) portForward(ctx *authContext, w http.ResponseWriter, req *ht
 // Go client uses SPDY while other clients still require WebSockets.
 // This function will run until the end of the execution of the request.
 func runPortForwarding(req portForwardRequest) error {
-	if wsstream.IsWebSocketRequest(req.httpRequest) {
+	switch {
+	case wsstream.IsWebSocketRequestWithTunnelingProtocol(req.httpRequest):
+		return trace.Wrap(runPortForwardingTunneledHTTPStreams(req))
+	case wsstream.IsWebSocketRequest(req.httpRequest):
 		return trace.Wrap(runPortForwardingWebSocket(req))
+	default:
+		return trace.Wrap(runPortForwardingHTTPStreams(req))
 	}
-	return trace.Wrap(runPortForwardingHTTPStreams(req))
 }
 
 const (
@@ -1677,11 +2179,12 @@ const (
 	ImpersonationRequestDeniedMessage = "impersonation request has been denied"
 )
 
-func (f *Forwarder) setupForwardingHeaders(sess *clusterSession, req *http.Request) error {
-	if err := setupImpersonationHeaders(f.log, sess.authContext, req.Header); err != nil {
-		return trace.Wrap(err)
+func (f *Forwarder) setupForwardingHeaders(sess *clusterSession, req *http.Request, withImpersonationHeaders bool) error {
+	if withImpersonationHeaders {
+		if err := setupImpersonationHeaders(sess, req.Header); err != nil {
+			return trace.Wrap(err)
+		}
 	}
-
 	// Setup scheme, override target URL to the destination address
 	req.URL.Scheme = "https"
 	req.RequestURI = req.URL.Path + "?" + req.URL.RawQuery
@@ -1689,8 +2192,8 @@ func (f *Forwarder) setupForwardingHeaders(sess *clusterSession, req *http.Reque
 	// We only have a direct host to provide when using local creds.
 	// Otherwise, use kube-teleport-proxy-alpn.teleport.cluster.local to pass TLS handshake and leverage TLS Routing.
 	req.URL.Host = fmt.Sprintf("%s%s", constants.KubeTeleportProxyALPNPrefix, constants.APIDomain)
-	if sess.creds != nil {
-		req.URL.Host = sess.creds.getTargetAddr()
+	if sess.kubeAPICreds != nil {
+		req.URL.Host = sess.kubeAPICreds.getTargetAddr()
 	}
 
 	// add origin headers so the service consuming the request on the other site
@@ -1704,16 +2207,21 @@ func (f *Forwarder) setupForwardingHeaders(sess *clusterSession, req *http.Reque
 }
 
 // setupImpersonationHeaders sets up Impersonate-User and Impersonate-Group headers
-func setupImpersonationHeaders(log logrus.FieldLogger, ctx authContext, headers http.Header) error {
-	if ctx.teleportCluster.isRemote {
+func setupImpersonationHeaders(sess *clusterSession, headers http.Header) error {
+	// If the request is remote or this instance is a proxy,
+	// do not set up impersonation headers.
+	if sess.teleportCluster.isRemote || sess.kubeAPICreds == nil {
 		return nil
 	}
 
-	impersonateUser, impersonateGroups, err := computeImpersonatedPrincipals(log, ctx.kubeUsers, ctx.kubeGroups, headers)
+	impersonateUser, impersonateGroups, err := computeAndValidateImpersonatedPrincipals(sess.kubeUsers, sess.kubeGroups, sess.User.GetName(), headers)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+	return replaceImpersonationHeaders(headers, impersonateUser, impersonateGroups)
+}
 
+func replaceImpersonationHeaders(headers http.Header, impersonateUser string, impersonateGroups []string) error {
 	headers.Set(ImpersonateUserHeader, impersonateUser)
 
 	// Make sure to overwrite the exiting headers, instead of appending to
@@ -1741,11 +2249,15 @@ func copyImpersonationHeaders(dst, src http.Header) {
 	}
 }
 
-// computeImpersonatedPrincipals computes the intersection between the information
+// computeAndValidateImpersonatedPrincipals computes the intersection between the information
 // received in the `Impersonate-User` and `Impersonate-Groups` headers and the
 // allowed values. If the user didn't specify any user and groups to impersonate,
 // Teleport will use every group the user is allowed to impersonate.
-func computeImpersonatedPrincipals(log logrus.FieldLogger, kubeUsers, kubeGroups map[string]struct{}, headers http.Header) (string, []string, error) {
+// This function also validates the impersonateUser and impersonateGroups against
+// HTTP header field value requirements to prevent header injection attacks.
+func computeAndValidateImpersonatedPrincipals(kubeUsers, kubeGroups map[string]struct{}, username string, headers http.Header) (string, []string, error) {
+	_, hasUserWildcard := kubeUsers[types.Wildcard]
+
 	var impersonateUser string
 	var impersonateGroups []string
 	for header, values := range headers {
@@ -1770,7 +2282,7 @@ func computeImpersonatedPrincipals(log logrus.FieldLogger, kubeUsers, kubeGroups
 			}
 			impersonateUser = values[0]
 
-			if _, ok := kubeUsers[impersonateUser]; !ok {
+			if _, ok := kubeUsers[impersonateUser]; !ok && !hasUserWildcard {
 				return "", nil, trace.AccessDenied("%v, user header %q is not allowed in roles", ImpersonationRequestDeniedMessage, impersonateUser)
 			}
 		case ImpersonateGroupHeader:
@@ -1804,20 +2316,24 @@ func computeImpersonatedPrincipals(log logrus.FieldLogger, kubeUsers, kubeGroups
 	// link the user identity with the IAM role, for example `IAM#{{external.email}}`
 	//
 	if impersonateUser == "" {
-		switch len(kubeUsers) {
-		// this is currently not possible as kube users have at least one
-		// user (user name), but in case if someone breaks it, catch here
-		case 0:
-			return "", nil, trace.AccessDenied("assumed at least one user to be present")
-		// if there is deterministic choice, make it to improve user experience
-		case 1:
-			for user := range kubeUsers {
-				impersonateUser = user
-				break
+		if hasUserWildcard {
+			impersonateUser = username
+		} else {
+			switch len(kubeUsers) {
+			// this is currently not possible as kube users have at least one
+			// user (user name), but in case if someone breaks it, catch here
+			case 0:
+				return "", nil, trace.AccessDenied("assumed at least one user to be present")
+			// if there is deterministic choice, make it to improve user experience
+			case 1:
+				for user := range kubeUsers {
+					impersonateUser = user
+					break
+				}
+			default:
+				return "", nil, trace.AccessDenied(
+					"please select a user to impersonate, refusing to select a user due to several kubernetes_users set up for this user")
 			}
-		default:
-			return "", nil, trace.AccessDenied(
-				"please select a user to impersonate, refusing to select a user due to several kubernetes_users set up for this user")
 		}
 	}
 
@@ -1826,17 +2342,41 @@ func computeImpersonatedPrincipals(log logrus.FieldLogger, kubeUsers, kubeGroups
 			impersonateGroups = append(impersonateGroups, group)
 		}
 	}
+	// Validate impersonateUser and impersonateGroups against HTTP header field value
+	// requirements to prevent header injection attacks.
+	// requirements in http://www.w3.org/Protocols/rfc2616/rfc2616-sec4.html#sec4.2
+	if !httpguts.ValidHeaderFieldValue(impersonateUser) {
+		return "", nil, trace.BadParameter("invalid impersonated user header value: %q", impersonateUser)
+	}
+	for _, group := range impersonateGroups {
+		if !httpguts.ValidHeaderFieldValue(group) {
+			return "", nil, trace.BadParameter("invalid impersonated group header value: %q", group)
+		}
+	}
 
 	return impersonateUser, impersonateGroups, nil
 }
 
 // catchAll forwards all HTTP requests to the target k8s API server
-func (f *Forwarder) catchAll(ctx *authContext, w http.ResponseWriter, req *http.Request) (any, error) {
-	sess, err := f.newClusterSession(*ctx)
+func (f *Forwarder) catchAll(authCtx *authContext, w http.ResponseWriter, req *http.Request) (any, error) {
+	ctx, span := f.cfg.tracer.Start(
+		req.Context(),
+		"kube.Forwarder/catchAll",
+		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+		oteltrace.WithAttributes(
+			semconv.RPCServiceKey.String(f.cfg.KubeServiceType),
+			semconv.RPCMethodKey.String("catchAll"),
+			semconv.RPCSystemKey.String("kube"),
+		),
+	)
+	req = req.WithContext(ctx)
+	defer span.End()
+
+	sess, err := f.newClusterSession(ctx, *authCtx)
 	if err != nil {
 		// This error goes to kubernetes client and is not visible in the logs
 		// of the teleport server if not logged here.
-		f.log.Errorf("Failed to create cluster session: %v.", err)
+		f.log.ErrorContext(ctx, "Failed to create cluster session", "error", err)
 		return nil, trace.Wrap(err)
 	}
 	// sess.Close cancels the connection monitor context to release it sooner.
@@ -1851,285 +2391,509 @@ func (f *Forwarder) catchAll(ctx *authContext, w http.ResponseWriter, req *http.
 		return nil, trace.Wrap(err)
 	}
 
-	if err := f.setupForwardingHeaders(sess, req); err != nil {
+	if err := f.setupForwardingHeaders(sess, req, true /* withImpersonationHeaders */); err != nil {
 		// This error goes to kubernetes client and is not visible in the logs
 		// of the teleport server if not logged here.
-		f.log.Errorf("Failed to set up forwarding headers: %v.", err)
+		f.log.ErrorContext(ctx, "Failed to set up forwarding headers", "error", err)
 		return nil, trace.Wrap(err)
 	}
-	rw := httplib.NewResponseStatusRecorder(w)
-	sess.forwarder.ServeHTTP(rw, req)
 
-	f.emitAuditEvent(ctx, req, sess, rw.Status())
+	isLocalKubeCluster := sess.isLocalKubernetesCluster
+	isListRequest := authCtx.metaResource.verb == types.KubeVerbList
+	// Watch requests can be send to a single resource or to a collection of resources.
+	// isWatchingCollectionRequest is true when the request is a watch request and
+	// the resource is a collection of resources, e.g. /api/v1/pods?watch=true.
+	// authCtx.kubeResource is only set when the request targets a single resource.
+	isWatchingCollectionRequest := authCtx.metaResource.verb == types.KubeVerbWatch && authCtx.metaResource.isList
 
-	return nil, nil
+	switch {
+	case isListRequest || isWatchingCollectionRequest:
+		return f.listResources(sess, w, req)
+	case authCtx.metaResource.verb == types.KubeVerbDeleteCollection && isLocalKubeCluster:
+		return f.deleteResourcesCollection(sess, w, req)
+	default:
+		rw := httplib.NewResponseStatusRecorder(w)
+		sess.forwarder.ServeHTTP(rw, req)
+
+		f.emitAuditEvent(req, sess, rw.Status())
+
+		return nil, nil
+	}
 }
 
-func (f *Forwarder) getExecutor(ctx authContext, sess *clusterSession, req *http.Request) (remotecommand.Executor, error) {
-	upgradeRoundTripper := NewSpdyRoundTripperWithDialer(roundTripperConfig{
-		ctx:             req.Context(),
-		authCtx:         ctx,
-		dial:            sess.DialWithContext,
-		tlsConfig:       sess.tlsConfig,
-		pingPeriod:      f.cfg.ConnPingPeriod,
-		originalHeaders: req.Header,
+// getWebsocketRestConfig builds a [*rest.Config] configuration to be
+// used when upgrading requests via websocket.
+func (f *Forwarder) getWebsocketRestConfig(sess *clusterSession, req *http.Request) (_ *rest.Config, cleanup func(), _ error) {
+	tlsConfig, useImpersonation, err := f.getTLSConfig(sess)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	upgradeRoundTripper := NewWebsocketRoundTripperWithDialer(roundTripperConfig{
+		ctx:                   req.Context(),
+		log:                   f.log,
+		sess:                  sess,
+		dialWithContext:       sess.DialWithContext(),
+		tlsConfig:             tlsConfig,
+		originalHeaders:       req.Header,
+		useIdentityForwarding: useImpersonation,
+		proxier:               sess.getProxier(),
 	})
 	rt := http.RoundTripper(upgradeRoundTripper)
-	if sess.creds != nil {
+	if sess.kubeAPICreds != nil {
 		var err error
-		rt, err = sess.creds.wrapTransport(rt)
+		rt, err = sess.kubeAPICreds.wrapTransport(rt)
 		if err != nil {
-			return nil, trace.Wrap(err)
+			upgradeRoundTripper.Cleanup()
+			return nil, nil, trace.Wrap(err)
 		}
 	}
-	return remotecommand.NewSPDYExecutorForTransports(rt, upgradeRoundTripper, req.Method, req.URL)
+	rt = tracehttp.NewTransport(rt)
+
+	cfg := &rest.Config{
+		// WrapTransport will replace default roundTripper created for the WebsocketExecutor
+		// and on successfully established connection we will set upgrader's websocket connection.
+		WrapTransport: func(baseRt http.RoundTripper) http.RoundTripper {
+			if wrt, ok := baseRt.(*kwebsocket.RoundTripper); ok {
+				upgradeRoundTripper.onConnected = func(wsConn *gwebsocket.Conn) {
+					wrt.Conn = wsConn
+				}
+			}
+
+			return rt
+		},
+	}
+	return cfg, upgradeRoundTripper.Cleanup, nil
 }
 
-func (f *Forwarder) getDialer(ctx authContext, sess *clusterSession, req *http.Request) (httpstream.Dialer, error) {
+func (f *Forwarder) getWebsocketExecutor(sess *clusterSession, req *http.Request) (_ remotecommand.Executor, cleanup func(), _ error) {
+	f.log.DebugContext(req.Context(), "Creating websocket remote executor for request",
+		"request_method", req.Method,
+		"request_uri", req.RequestURI,
+	)
+	cfg, wsCleanup, err := f.getWebsocketRestConfig(sess, req)
+	if err != nil {
+		return nil, nil, trace.Wrap(err, "unable to create websocket executor")
+	}
+	executor, err := remotecommand.NewWebSocketExecutor(cfg, req.Method, req.URL.String())
+	if err != nil {
+		wsCleanup()
+		return nil, nil, trace.Wrap(err, "unable to create websocket executor")
+	}
+	return executor, wsCleanup, nil
+}
+
+func isRelevantWebsocketError(err error) bool {
+	return err != nil && !strings.Contains(err.Error(), "next reader: EOF")
+}
+
+func (f *Forwarder) getExecutor(sess *clusterSession, req *http.Request) (_ remotecommand.Executor, cleanup func(), _ error) {
+	wsExec, wsCleanup, err := f.getWebsocketExecutor(sess, req)
+	if err != nil {
+		return nil, nil, trace.Wrap(err, "unable to create websocket executor")
+	}
+	spdyExec, spdyCleanup, err := f.getSPDYExecutor(sess, req)
+	if err != nil {
+		wsCleanup()
+		return nil, nil, trace.Wrap(err, "unable to create spdy executor")
+	}
+	executor, err := remotecommand.NewFallbackExecutor(
+		wsExec,
+		spdyExec,
+		func(err error) bool {
+			// If the error is a known upgrade failure, we can retry with the other protocol.
+			return httpstream.IsUpgradeFailure(err) ||
+				httpstream.IsHTTPSProxyError(err) ||
+				kubeerrors.IsForbidden(err) ||
+				isTeleportUpgradeFailure(err)
+		})
+	if err != nil {
+		wsCleanup()
+		spdyCleanup()
+		return nil, nil, trace.Wrap(err, "unable to create fallback executor")
+	}
+	return executor, func() { wsCleanup(); spdyCleanup() }, nil
+}
+
+func (f *Forwarder) getSPDYExecutor(sess *clusterSession, req *http.Request) (_ remotecommand.Executor, cleanup func(), _ error) {
+	f.log.DebugContext(req.Context(), "Creating SPDY remote executor for request",
+		"request_method", req.Method,
+		"request_uri", req.RequestURI,
+	)
+
+	tlsConfig, useImpersonation, err := f.getTLSConfig(sess)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
 	upgradeRoundTripper := NewSpdyRoundTripperWithDialer(roundTripperConfig{
-		ctx:             req.Context(),
-		authCtx:         ctx,
-		dial:            sess.DialWithContext,
-		tlsConfig:       sess.tlsConfig,
-		pingPeriod:      f.cfg.ConnPingPeriod,
-		originalHeaders: req.Header,
+		ctx:                   req.Context(),
+		sess:                  sess,
+		dialWithContext:       sess.DialWithContext(),
+		tlsConfig:             tlsConfig,
+		pingPeriod:            f.cfg.ConnPingPeriod,
+		originalHeaders:       req.Header,
+		useIdentityForwarding: useImpersonation,
+		proxier:               sess.getProxier(),
 	})
 	rt := http.RoundTripper(upgradeRoundTripper)
-	if sess.creds != nil {
+	if sess.kubeAPICreds != nil {
 		var err error
-		rt, err = sess.creds.wrapTransport(rt)
+		rt, err = sess.kubeAPICreds.wrapTransport(rt)
 		if err != nil {
-			return nil, trace.Wrap(err)
+			upgradeRoundTripper.Cleanup()
+			return nil, nil, trace.Wrap(err)
+		}
+	}
+	rt = tracehttp.NewTransport(rt)
+
+	executor, err := remotecommand.NewSPDYExecutorForTransports(
+		rt,
+		spdy.NewUpgraderForStreaming(upgradeRoundTripper),
+		req.Method,
+		req.URL,
+	)
+	if err != nil {
+		upgradeRoundTripper.Cleanup()
+		return nil, nil, trace.Wrap(err)
+	}
+
+	return executor, upgradeRoundTripper.Cleanup, nil
+}
+
+func (f *Forwarder) getPortForwardDialer(sess *clusterSession, req *http.Request) (_ httpstream.Dialer, cleanup func(), _ error) {
+	wsDialer, wsCleanup, err := f.getWebsocketDialer(sess, req)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	spdyDialer, spdyCleanup, err := f.getSPDYDialer(sess, req)
+	if err != nil {
+		wsCleanup()
+		return nil, nil, trace.Wrap(err)
+	}
+
+	return portforward.NewFallbackDialerForStreaming(wsDialer, spdyDialer, func(err error) bool {
+		// If the error is a known upgrade failure, we can retry with the other protocol.
+		return httpstream.IsUpgradeFailure(err) ||
+			httpstream.IsHTTPSProxyError(err) ||
+			kubeerrors.IsForbidden(err) ||
+			isTeleportUpgradeFailure(err)
+	}), func() { wsCleanup(); spdyCleanup() }, nil
+}
+
+// getSPDYDialer returns a dialer that can be used to upgrade the connection
+// to SPDY protocol.
+// SPDY is a deprecated protocol, but it is still used by kubectl to manage data streams.
+// The dialer uses an HTTP1.1 connection to upgrade to SPDY.
+func (f *Forwarder) getSPDYDialer(sess *clusterSession, req *http.Request) (_ httpstream.Dialer, cleanup func(), _ error) {
+	tlsConfig, useImpersonation, err := f.getTLSConfig(sess)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	req = createSPDYRequest(req, PortForwardProtocolV1Name)
+	upgradeRoundTripper := NewSpdyRoundTripperWithDialer(roundTripperConfig{
+		ctx:                   req.Context(),
+		sess:                  sess,
+		dialWithContext:       sess.DialWithContext(),
+		tlsConfig:             tlsConfig,
+		pingPeriod:            f.cfg.ConnPingPeriod,
+		originalHeaders:       req.Header,
+		useIdentityForwarding: useImpersonation,
+		proxier:               sess.getProxier(),
+	})
+	rt := http.RoundTripper(upgradeRoundTripper)
+	if sess.kubeAPICreds != nil {
+		var err error
+		rt, err = sess.kubeAPICreds.wrapTransport(rt)
+		if err != nil {
+			upgradeRoundTripper.Cleanup()
+			return nil, nil, trace.Wrap(err)
 		}
 	}
 	client := &http.Client{
-		Transport: otelhttp.NewTransport(rt, otelhttp.WithSpanNameFormatter(tracing.HTTPTransportFormatter)),
+		Transport: tracehttp.NewTransport(rt),
 	}
 
-	return spdy.NewDialer(upgradeRoundTripper, client, req.Method, req.URL), nil
+	return spdy.NewDialerForStreaming(spdy.NewUpgraderForStreaming(upgradeRoundTripper), client, req.Method, req.URL),
+		upgradeRoundTripper.Cleanup,
+		nil
+}
+
+func (f *Forwarder) getWebsocketDialer(sess *clusterSession, req *http.Request) (_ httpstream.Dialer, cleanup func(), _ error) {
+	cfg, wsCleanup, err := f.getWebsocketRestConfig(sess, req)
+	if err != nil {
+		return nil, nil, trace.Wrap(err, "unable to retrieve *rest.Config for websocket")
+	}
+	dialer, err := portforward.NewSPDYOverWebsocketDialerForStreaming(req.URL, cfg)
+	return dialer, wsCleanup, trace.Wrap(err)
+}
+
+// createSPDYRequest modifies the passed request to remove
+// WebSockets headers and add SPDY upgrade information, including
+// spdy protocols acceptable to the client.
+func createSPDYRequest(req *http.Request, spdyProtocols ...string) *http.Request {
+	clone := req.Clone(req.Context())
+	// Clean up the websocket headers from the http request.
+	clone.Header.Del(wsstream.WebSocketProtocolHeader)
+	clone.Header.Del("Sec-Websocket-Key")
+	clone.Header.Del("Sec-Websocket-Version")
+	clone.Header.Del(httpstream.HeaderUpgrade)
+	// Update the http request for an upstream SPDY upgrade.
+	clone.Method = "POST"
+	clone.Body = nil // Remove the request body which is unused.
+	clone.Header.Set(httpstream.HeaderUpgrade, httpstreamspdy.HeaderSpdy31)
+	clone.Header.Del(httpstream.HeaderProtocolVersion)
+	for i := range spdyProtocols {
+		clone.Header.Add(httpstream.HeaderProtocolVersion, spdyProtocols[i])
+	}
+	return clone
 }
 
 // clusterSession contains authenticated user session to the target cluster:
 // x509 short lived credentials, forwarding proxies and other data
 type clusterSession struct {
 	authContext
-	parent    *Forwarder
-	creds     kubeCreds
-	tlsConfig *tls.Config
-	forwarder *forward.Forwarder
-	// noAuditEvents is true if this teleport service should leave audit event
-	// logging to another service.
-	noAuditEvents        bool
-	kubeClusterEndpoints []kubeClusterEndpoint
+	parent *Forwarder
+	// kubeAPICreds are the credentials used to authenticate to the Kubernetes API server.
+	// It is non-nil if the kubernetes cluster is served by this teleport service,
+	// nil otherwise.
+	kubeAPICreds kubeCreds
+	forwarder    *reverseproxy.Forwarder
+	// targetAddr is the address of the target cluster.
+	targetAddr string
 	// kubeAddress is the address of this session's active connection (if there is one)
 	kubeAddress string
 	// upgradeToHTTP2 indicates whether the transport should be configured to use HTTP2.
 	// A HTTP2 configured transport does not work with connections that are going to be
 	// upgraded to SPDY, like in the cases of exec, port forward...
 	upgradeToHTTP2 bool
-	// monitorCancel is the conn monitor monitorCancel function.
-	monitorCancel context.CancelFunc
+	// requestContext is the context of the original request.
+	requestContext context.Context
+	// codecFactory is the codec factory used to create the serializer
+	// for unmarshalling the payload.
+	codecFactory *serializer.CodecFactory
+	// rbacSupportedResources is the list of resources that support RBAC for the
+	// current cluster.
+	rbacSupportedResources rbacSupportedResources
+	// sessionCtx is used with one or more connection contexts.
+	sessionCtx context.Context
+	// sessionCancel cancels the session context and related connection contexts.
+	sessionCancel context.CancelCauseFunc
+	// sendErrStatus is a function that sends an error status to the client.
+	sendErrStatus func(status *kubeerrors.StatusError) error
 }
 
-// close cancels the connection monitor context if available.
+// close cancels the session context and related connection contexts.
 func (s *clusterSession) close() {
-	if s.monitorCancel != nil {
-		s.monitorCancel()
-	}
+	s.sessionCancel(io.EOF)
 }
 
-// kubeClusterEndpoint can be used to connect to a kube cluster
-type kubeClusterEndpoint struct {
-	// addr is a direct network address.
-	addr string
-	// serverID is the server:cluster ID of the endpoint,
-	// which is used to find its corresponding reverse tunnel.
-	serverID string
-	// proxyIDs is the list of proxy ids that the cluster is
-	// connected to.
-	proxyIDs []string
-}
-
-func (s *clusterSession) monitorConn(conn net.Conn, err error) (net.Conn, error) {
+func (s *clusterSession) monitorConn(conn net.Conn, err error, hostID string) (net.Conn, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	ctx, cancel := context.WithCancel(s.parent.ctx)
-	s.monitorCancel = cancel
+	// Create a connection context from the session context.
+	// This separates session lifecycle from the connection attempt lifecycle.
+	// There may be multiple connection attempts within a session using FallbackExecutor/FallbackDialer.
+	// The approach avoids a potential race condition for s.sessionCancel.
+	connCtx, connCancel := context.WithCancelCause(s.sessionCtx)
+
 	tc, err := srv.NewTrackingReadConn(srv.TrackingReadConnConfig{
 		Conn:    conn,
 		Clock:   s.parent.cfg.Clock,
-		Context: ctx,
-		Cancel:  cancel,
+		Context: connCtx,
+		Cancel:  connCancel,
 	})
 	if err != nil {
-		cancel()
+		connCancel(err)
 		return nil, trace.Wrap(err)
 	}
-
+	lockTargets := s.LockTargets()
+	// when the target is not a kubernetes_service instance, we don't need to lock it.
+	// the target could be a remote cluster or a local Kubernetes API server. In both cases,
+	// hostID is empty.
+	if hostID != "" {
+		lockTargets = append(lockTargets, types.LockTarget{
+			ServerID: hostID,
+		})
+	}
 	err = srv.StartMonitor(srv.MonitorConfig{
 		LockWatcher:           s.parent.cfg.LockWatcher,
-		LockTargets:           s.LockTargets(),
+		LockTargets:           lockTargets,
 		DisconnectExpiredCert: s.disconnectExpiredCert,
 		ClientIdleTimeout:     s.clientIdleTimeout,
+		IdleTimeoutMessage:    s.clientIdleTimeoutMessage,
 		Clock:                 s.parent.cfg.Clock,
 		Tracker:               tc,
 		Conn:                  tc,
-		Context:               ctx,
+		Context:               connCtx,
 		TeleportUser:          s.User.GetName(),
+		UserOriginClusterName: s.Identity.GetIdentity().OriginClusterName,
 		ServerID:              s.parent.cfg.HostID,
-		Entry:                 s.parent.log,
+		Logger:                s.parent.log,
 		Emitter:               s.parent.cfg.AuthClient,
+		EmitterContext:        s.parent.ctx,
+		MessageWriter:         formatForwardResponseError(s.sendErrStatus),
+		LockingMode:           s.LockingMode,
 	})
 	if err != nil {
-		tc.Close()
-		cancel()
+		tc.CloseWithCause(err)
 		return nil, trace.Wrap(err)
 	}
 	return tc, nil
 }
 
+func (s *clusterSession) getServerMetadata() apievents.ServerMetadata {
+	return apievents.ServerMetadata{
+		ServerID:        s.parent.cfg.HostID,
+		ServerNamespace: s.parent.cfg.Namespace,
+		ServerHostname:  s.teleportCluster.name,
+		ServerAddr:      s.kubeAddress,
+		ServerLabels:    maps.Clone(s.kubeClusterLabels),
+		ServerVersion:   teleport.Version,
+	}
+}
+
 func (s *clusterSession) Dial(network, addr string) (net.Conn, error) {
-	return s.monitorConn(s.dial(context.Background(), network))
+	var hostID string
+	conn, err := s.dial(s.requestContext, network, addr, withHostIDCollection(&hostID))
+	return s.monitorConn(conn, err, hostID)
 }
 
-func (s *clusterSession) DialWithContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	return s.monitorConn(s.dial(ctx, network))
+func (s *clusterSession) DialWithContext(opts ...contextDialerOption) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var hostID string
+		conn, err := s.dial(ctx, network, addr, append(opts, withHostIDCollection(&hostID))...)
+		return s.monitorConn(conn, err, hostID)
+	}
 }
 
-func (s *clusterSession) dial(ctx context.Context, network string) (net.Conn, error) {
-	if len(s.kubeClusterEndpoints) == 0 {
-		return nil, trace.BadParameter("no kube services to dial")
-	}
+func (s *clusterSession) dial(ctx context.Context, network, addr string, opts ...contextDialerOption) (net.Conn, error) {
+	dialer := s.parent.getContextDialerFunc(s, opts...)
 
-	// Shuffle endpoints to balance load
-	shuffledEndpoints := make([]kubeClusterEndpoint, len(s.kubeClusterEndpoints))
-	copy(shuffledEndpoints, s.kubeClusterEndpoints)
-	mathrand.Shuffle(len(shuffledEndpoints), func(i, j int) {
-		shuffledEndpoints[i], shuffledEndpoints[j] = shuffledEndpoints[j], shuffledEndpoints[i]
-	})
+	conn, err := dialer(ctx, network, addr)
 
-	errs := []error{}
-	for _, endpoint := range shuffledEndpoints {
-		conn, err := s.teleportCluster.dialEndpoint(ctx, network, endpoint)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		s.kubeAddress = endpoint.addr
-		return conn, nil
+	return conn, trace.Wrap(err)
+}
+
+// getProxier returns the proxier function to use for this session.
+// If the target cluster is not served by this teleport service, the proxier
+// must be nil to avoid using it through the reverse tunnel.
+// If the target cluster is served by this teleport service, the proxier
+// must be set to the default proxy function.
+func (s *clusterSession) getProxier() func(req *http.Request) (*url.URL, error) {
+	// When the target cluster is not served by this teleport service, the
+	// proxier must be nil to avoid using it through the reverse tunnel.
+	if s.kubeAPICreds == nil {
+		return nil
 	}
-	return nil, trace.NewAggregate(errs...)
+	return utilnet.NewProxierWithNoProxyCIDR(http.ProxyFromEnvironment)
+}
+
+// getClusterScope returns the scope associated with the cluster that the clusterSession
+// refers to.
+func (s *clusterSession) getClusterScope() string {
+	if s.kubeCluster != nil {
+		return s.kubeCluster.GetScope()
+	}
+	return ""
 }
 
 // TODO(awly): unit test this
-func (f *Forwarder) newClusterSession(ctx authContext) (*clusterSession, error) {
-	if ctx.teleportCluster.isRemote {
-		return f.newClusterSessionRemoteCluster(ctx)
+func (f *Forwarder) newClusterSession(ctx context.Context, authCtx authContext) (*clusterSession, error) {
+	ctx, span := f.cfg.tracer.Start(
+		ctx,
+		"kube.Forwarder/newClusterSession",
+		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+		oteltrace.WithAttributes(
+			semconv.RPCServiceKey.String(f.cfg.KubeServiceType),
+			semconv.RPCMethodKey.String("GlobalRequest"),
+			semconv.RPCSystemKey.String("kube"),
+		),
+	)
+	defer span.End()
+
+	if authCtx.teleportCluster.isRemote {
+		return f.newClusterSessionRemoteCluster(ctx, authCtx)
 	}
-	return f.newClusterSessionSameCluster(ctx)
+	return f.newClusterSessionSameCluster(ctx, authCtx)
 }
 
-func (f *Forwarder) newClusterSessionRemoteCluster(ctx authContext) (*clusterSession, error) {
-	tlsConfig, err := f.getOrRequestClientCreds(ctx)
-	if err != nil {
-		f.log.Warningf("Failed to get certificate for %v: %v.", ctx, err)
-		return nil, trace.AccessDenied("access denied: failed to authenticate with auth server")
-	}
-
-	f.log.Debugf("Forwarding kubernetes session for %v to remote cluster.", ctx)
+func (f *Forwarder) newClusterSessionRemoteCluster(ctx context.Context, authCtx authContext) (*clusterSession, error) {
+	f.log.DebugContext(ctx, "Forwarding kubernetes session to remote cluster", "auth_context", logutils.StringerAttr(authCtx))
+	sessionCtx, sessionCancel := context.WithCancelCause(ctx)
 	return &clusterSession{
 		parent:      f,
-		authContext: ctx,
+		authContext: authCtx,
 		// Proxy uses reverse tunnel dialer to connect to Kubernetes in a leaf cluster
 		// and the targetKubernetes cluster endpoint is determined from the identity
 		// encoded in the TLS certificate. We're setting the dial endpoint to a hardcoded
 		// `kube.teleport.cluster.local` value to indicate this is a Kubernetes proxy request
-		kubeClusterEndpoints: []kubeClusterEndpoint{{addr: reversetunnel.LocalKubernetes}},
-		tlsConfig:            tlsConfig.Clone(),
+		targetAddr:     reversetunnelclient.LocalKubernetes,
+		requestContext: ctx,
+		sessionCtx:     sessionCtx,
+		sessionCancel:  sessionCancel,
 	}, nil
 }
 
-func (f *Forwarder) newClusterSessionSameCluster(ctx authContext) (*clusterSession, error) {
+func (f *Forwarder) newClusterSessionSameCluster(ctx context.Context, authCtx authContext) (*clusterSession, error) {
 	// Try local creds first
-	sess, localErr := f.newClusterSessionLocal(ctx)
-	if localErr == nil {
+	sess, localErr := f.newClusterSessionLocal(ctx, authCtx)
+	switch {
+	case localErr == nil:
 		return sess, nil
-	}
-
-	kubeServers, err := f.cfg.CachingAuthClient.GetKubernetesServers(f.ctx)
-	if err != nil && !trace.IsNotFound(err) {
-		return nil, trace.Wrap(err)
-	}
-
-	if len(kubeServers) == 0 && ctx.kubeClusterName == ctx.teleportCluster.name {
+	case trace.IsConnectionProblem(localErr):
 		return nil, trace.Wrap(localErr)
 	}
 
-	// Validate that the requested kube cluster is registered.
-	var endpoints []kubeClusterEndpoint
-	for _, s := range kubeServers {
-		kubeCluster := s.GetCluster()
-		if kubeCluster.GetName() != ctx.kubeClusterName {
-			continue
-		}
-
-		// TODO(awly): check RBAC
-		endpoints = append(endpoints, kubeClusterEndpoint{
-			serverID: fmt.Sprintf("%s.%s", s.GetHostID(), ctx.teleportCluster.name),
-			addr:     s.GetHostname(),
-			proxyIDs: s.GetProxyIDs(),
-		})
-		continue
-
+	kubeServers := authCtx.kubeServers
+	if len(kubeServers) == 0 && authCtx.kubeClusterName == authCtx.teleportCluster.name {
+		return nil, trace.Wrap(localErr)
 	}
-	if len(endpoints) == 0 {
-		return nil, trace.NotFound("kubernetes cluster %q is not found in teleport cluster %q", ctx.kubeClusterName, ctx.teleportCluster.name)
+
+	if len(kubeServers) == 0 {
+		return nil, trace.NotFound("kubernetes cluster %q not found", authCtx.kubeClusterName)
 	}
-	return f.newClusterSessionDirect(ctx, endpoints)
+
+	return f.newClusterSessionDirect(ctx, authCtx)
 }
 
-func (f *Forwarder) newClusterSessionLocal(ctx authContext) (*clusterSession, error) {
-	if len(f.clusterDetails) == 0 {
-		return nil, trace.NotFound("this Teleport process is not configured for direct Kubernetes access; you likely need to 'tsh login' into a leaf cluster or 'tsh kube login' into a different kubernetes cluster")
+func (f *Forwarder) newClusterSessionLocal(ctx context.Context, authCtx authContext) (*clusterSession, error) {
+	details, err := f.findKubeDetailsByClusterName(authCtx.kubeClusterName)
+	if err != nil {
+		return nil, trace.NotFound("kubernetes cluster %q not found", authCtx.kubeClusterName)
 	}
 
-	details, ok := f.clusterDetails[ctx.kubeClusterName]
-	if !ok {
-		return nil, trace.NotFound("kubernetes cluster %q not found", ctx.kubeClusterName)
+	codecFactory, rbacSupportedResources, err := details.getClusterSupportedResources()
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
-
-	f.log.Debugf("Handling kubernetes session for %v using local credentials.", ctx)
+	sessionCtx, sessionCancel := context.WithCancelCause(ctx)
+	f.log.DebugContext(ctx, "Handling kubernetes session using local credentials", "auth_context", logutils.StringerAttr(authCtx))
 	return &clusterSession{
-		parent:               f,
-		authContext:          ctx,
-		creds:                details.kubeCreds,
-		kubeClusterEndpoints: []kubeClusterEndpoint{{addr: details.getTargetAddr()}},
-		tlsConfig:            details.getTLSConfig().Clone(),
+		parent:                 f,
+		authContext:            authCtx,
+		kubeAPICreds:           details.kubeCreds,
+		targetAddr:             details.getTargetAddr(),
+		requestContext:         ctx,
+		codecFactory:           codecFactory,
+		rbacSupportedResources: rbacSupportedResources,
+		sessionCtx:             sessionCtx,
+		sessionCancel:          sessionCancel,
 	}, nil
 }
 
-func (f *Forwarder) newClusterSessionDirect(ctx authContext, endpoints []kubeClusterEndpoint) (*clusterSession, error) {
-	if len(endpoints) == 0 {
-		return nil, trace.BadParameter("no kube cluster endpoints provided")
-	}
-
-	tlsConfig, err := f.getOrRequestClientCreds(ctx)
-	if err != nil {
-		f.log.Warningf("Failed to get certificate for %v: %v.", ctx, err)
-		return nil, trace.AccessDenied("access denied: failed to authenticate with auth server")
-	}
-
-	f.log.WithField("kube_service.endpoints", endpoints).Debugf("Kubernetes session for %v forwarded to remote kubernetes_service instance.", ctx)
+func (f *Forwarder) newClusterSessionDirect(ctx context.Context, authCtx authContext) (*clusterSession, error) {
+	sessionCtx, sessionCancel := context.WithCancelCause(ctx)
 	return &clusterSession{
-		parent:               f,
-		authContext:          ctx,
-		kubeClusterEndpoints: endpoints,
-		tlsConfig:            tlsConfig.Clone(),
-		// This session talks to a kubernetes_service, which should handle
-		// audit logging. Avoid duplicate logging.
-		noAuditEvents: true,
+		parent:         f,
+		authContext:    authCtx,
+		requestContext: ctx,
+		sessionCtx:     sessionCtx,
+		sessionCancel:  sessionCancel,
 	}, nil
 }
 
@@ -2139,212 +2903,34 @@ func (f *Forwarder) newClusterSessionDirect(ctx authContext, endpoints []kubeClu
 // - for HTTP2 in all other cases.
 // The reason being is that streaming requests are going to be upgraded to SPDY, which is only
 // supported coming from an HTTP1 request.
-func (f *Forwarder) makeSessionForwarder(sess *clusterSession) (*forward.Forwarder, error) {
-	var err error
-	transport := f.newTransport(sess.Dial, sess.tlsConfig)
-
-	if sess.upgradeToHTTP2 {
-		// Upgrade transport to h2 where HTTP_PROXY and HTTPS_PROXY
-		// envs are not take into account purposely.
-		if err := http2.ConfigureTransport(transport); err != nil {
-			return nil, trace.Wrap(err)
-		}
+func (f *Forwarder) makeSessionForwarder(sess *clusterSession) (*reverseproxy.Forwarder, error) {
+	transport, err := f.transportForRequest(sess)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	opts := []reverseproxy.Option{
+		reverseproxy.WithFlushInterval(100 * time.Millisecond),
+		reverseproxy.WithRoundTripper(transport),
+		reverseproxy.WithLogger(f.log),
+		reverseproxy.WithErrorHandler(f.formatForwardResponseError),
+	}
+	if sess.isLocalKubernetesCluster {
+		// If the target cluster is local, i.e. the cluster that is served by this
+		// teleport service, then we set up the forwarder to allow re-writing
+		// the response to the client to include user friendly error messages.
+		// This is done by adding a response modifier to the forwarder.
+		// Right now, the only error that is re-written is the 403 Forbidden error
+		// that is returned when the user tries to access a GKE Autopilot cluster
+		// with system:masters group impersonation.
+		//nolint:bodyclose // the caller closes the response body in httputils.ReverseProxy
+		opts = append(opts, reverseproxy.WithResponseModifier(f.rewriteResponseForbidden(sess)))
 	}
 
-	rt := http.RoundTripper(transport)
-	if sess.creds != nil {
-		rt, err = sess.creds.wrapTransport(rt)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-	}
-
-	forwarder, err := forward.New(
-		forward.FlushInterval(100*time.Millisecond),
-		forward.RoundTripper(rt),
-		forward.WebsocketDial(sess.Dial),
-		forward.Logger(f.log),
-		forward.ErrorHandler(fwdutils.ErrorHandlerFunc(f.formatForwardResponseError)),
+	forwarder, err := reverseproxy.New(
+		opts...,
 	)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
 
-	return forwarder, nil
-}
-
-// DialFunc is a network dialer function that returns a network connection
-type DialFunc func(string, string) (net.Conn, error)
-
-func (f *Forwarder) newTransport(dial DialFunc, tlsConfig *tls.Config) *http.Transport {
-	return &http.Transport{
-		Dial:            dial,
-		TLSClientConfig: tlsConfig,
-		// Increase the size of the connection pool. This substantially improves the
-		// performance of Teleport under load as it reduces the number of TLS
-		// handshakes performed.
-		MaxIdleConns:        defaults.HTTPMaxIdleConns,
-		MaxIdleConnsPerHost: defaults.HTTPMaxIdleConnsPerHost,
-		// IdleConnTimeout defines the maximum amount of time before idle connections
-		// are closed. Leaving this unset will lead to connections open forever and
-		// will cause memory leaks in a long running process.
-		IdleConnTimeout: defaults.HTTPIdleTimeout,
-	}
-}
-
-// getOrCreateRequestContext creates a new certificate request for a given context,
-// if there is no active CSR request in progress, or returns an existing one.
-// if the new context has been created, cancel function is returned as a
-// second argument. Caller should call this function to signal that CSR has been
-// completed or failed.
-func (f *Forwarder) getOrCreateRequestContext(key string) (context.Context, context.CancelFunc) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	ctx, ok := f.activeRequests[key]
-	if ok {
-		return ctx, nil
-	}
-	ctx, cancel := context.WithCancel(f.ctx)
-	f.activeRequests[key] = ctx
-	return ctx, func() {
-		cancel()
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		delete(f.activeRequests, key)
-	}
-}
-
-func (f *Forwarder) getOrRequestClientCreds(ctx authContext) (*tls.Config, error) {
-	c := f.getClientCreds(ctx)
-	if c == nil {
-		return f.serializedRequestClientCreds(ctx)
-	}
-	return c, nil
-}
-
-func (f *Forwarder) getClientCreds(ctx authContext) *tls.Config {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	creds, ok := f.clientCredentials.Get(ctx.key())
-	if !ok {
-		return nil
-	}
-	c := creds.(*tls.Config)
-	if !validClientCreds(f.cfg.Clock, c) {
-		return nil
-	}
-	return c
-}
-
-func (f *Forwarder) saveClientCreds(ctx authContext, c *tls.Config) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.clientCredentials.Set(ctx.key(), c, ctx.sessionTTL)
-}
-
-func validClientCreds(clock clockwork.Clock, c *tls.Config) bool {
-	if len(c.Certificates) == 0 || len(c.Certificates[0].Certificate) == 0 {
-		return false
-	}
-	crt, err := x509.ParseCertificate(c.Certificates[0].Certificate[0])
-	if err != nil {
-		return false
-	}
-	// Make sure that the returned cert will be valid for at least 1 more
-	// minute.
-	return clock.Now().Add(time.Minute).Before(crt.NotAfter)
-}
-
-func (f *Forwarder) serializedRequestClientCreds(authContext authContext) (*tls.Config, error) {
-	ctx, cancel := f.getOrCreateRequestContext(authContext.key())
-	if cancel != nil {
-		f.log.Debugf("Requesting new ephemeral user certificate for %v.", authContext)
-		defer cancel()
-		c, err := f.requestCertificate(authContext)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		return c, f.saveClientCreds(authContext, c)
-	}
-	// cancel == nil means that another request is in progress, so simply wait until
-	// it finishes or fails
-	f.log.Debugf("Another request is in progress for %v, waiting until it gets completed.", authContext)
-	select {
-	case <-ctx.Done():
-		c := f.getClientCreds(authContext)
-		if c == nil {
-			return nil, trace.BadParameter("failed to request ephemeral certificate, try again")
-		}
-		return c, nil
-	case <-f.ctx.Done():
-		return nil, trace.BadParameter("forwarder is closing, aborting the request")
-	}
-}
-
-func (f *Forwarder) requestCertificate(ctx authContext) (*tls.Config, error) {
-	f.log.Debugf("Requesting K8s cert for %v.", ctx)
-	keyPEM, _, err := native.GenerateKeyPair()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	privateKey, err := ssh.ParseRawPrivateKey(keyPEM)
-	if err != nil {
-		return nil, trace.Wrap(err, "failed to parse private key")
-	}
-
-	// Note: ctx.UnmappedIdentity can potentially have temporary roles granted via
-	// workflow API. Always use the Subject() method to preserve the roles from
-	// caller's certificate.
-	//
-	// Also note: we need to send the UnmappedIdentity which could be a remote
-	// user identity. If we used the local mapped identity instead, the
-	// receiver of this certificate will think this is a local user and fail to
-	// find it in the backend.
-	callerIdentity := ctx.UnmappedIdentity.GetIdentity()
-	subject, err := callerIdentity.Subject()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	csr := &x509.CertificateRequest{
-		Subject: subject,
-	}
-	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, csr, privateKey)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
-
-	response, err := f.cfg.AuthClient.ProcessKubeCSR(auth.KubeCSR{
-		Username:    ctx.User.GetName(),
-		ClusterName: ctx.teleportCluster.name,
-		CSR:         csrPEM,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	f.log.Debugf("Received valid K8s cert for %v.", ctx)
-
-	cert, err := tls.X509KeyPair(response.Cert, keyPEM)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	pool := x509.NewCertPool()
-	for _, certAuthority := range response.CertAuthorities {
-		ok := pool.AppendCertsFromPEM(certAuthority)
-		if !ok {
-			return nil, trace.BadParameter("failed to append certificates, check that kubeconfig has correctly encoded certificate authority data")
-		}
-	}
-	tlsConfig := &tls.Config{
-		RootCAs:      pool,
-		Certificates: []tls.Certificate{cert},
-	}
-	//nolint:staticcheck // Keep BuildNameToCertificate to avoid changes in legacy behavior.
-	tlsConfig.BuildNameToCertificate()
-
-	return tlsConfig, nil
+	return forwarder, trace.Wrap(err)
 }
 
 // kubeClusters returns the list of available clusters
@@ -2401,349 +2987,95 @@ func (f *Forwarder) removeKubeDetails(name string) {
 // if it's of Type KubeService.
 // KubeProxy services or remote clusters are automatically forwarded to
 // the final destination.
-func (f *Forwarder) isLocalKubeCluster(sess *clusterSession) bool {
-	return !sess.authContext.teleportCluster.isRemote && f.cfg.KubeServiceType == KubeService
-}
-
-// listPods forwards the pod list request to the target server, captures
-// all output and filters accordingly to user roles resource access rules.
-func (f *Forwarder) listPods(ctx *authContext, w http.ResponseWriter, req *http.Request, p httprouter.Params) (resp any, err error) {
-	sess, err := f.newClusterSession(*ctx)
-	if err != nil {
-		// This error goes to kubernetes client and is not visible in the logs
-		// of the teleport server if not logged here.
-		f.log.Errorf("Failed to create cluster session: %v.", err)
-		return nil, trace.Wrap(err)
-	}
-
-	sess.upgradeToHTTP2 = true
-	sess.forwarder, err = f.makeSessionForwarder(sess)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	if err := f.setupForwardingHeaders(sess, req); err != nil {
-		// This error goes to kubernetes client and is not visible in the logs
-		// of the teleport server if not logged here.
-		f.log.Errorf("Failed to set up forwarding headers: %v.", err)
-		return nil, trace.Wrap(err)
-	}
-	// status holds the returned response code.
-	var status int
-	// Check if the target Kubernetes cluster is not served by the current service.
-	// If it's the case, forward the request to the target Kube Service where the
-	// filtering logic will be applied.
-	if !f.isLocalKubeCluster(sess) {
-		rw := httplib.NewResponseStatusRecorder(w)
-		sess.forwarder.ServeHTTP(rw, req)
-		status = rw.Status()
-	} else {
-		allowedResources, deniedResources := ctx.Checker.GetKubeResources(ctx.kubeCluster)
-		// isWatch identifies if the request is long-lived watch stream based on
-		// HTTP connection.
-		isWatch := req.URL.Query().Get("watch") == "true"
-		if !isWatch {
-			// List pods and return immediately.
-			status, err = f.listPodsList(req, w, sess, allowedResources, deniedResources)
-		} else {
-			// Creates a watch stream to the upstream target and applies filtering
-			// for each new frame that is received to exclude pods the user doesn't
-			// have access to.
-			status, err = f.listPodsWatcher(req, w, sess, allowedResources, deniedResources)
+func (f *Forwarder) isLocalKubeCluster(isRemoteTeleportCluster bool, kubeClusterName string) bool {
+	switch f.cfg.KubeServiceType {
+	case KubeService:
+		// Kubernetes service is always local.
+		return true
+	case LegacyProxyService:
+		// remote clusters are always forwarded to the final destination.
+		if isRemoteTeleportCluster {
+			return false
 		}
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-	}
-
-	f.emitAuditEvent(ctx, req, sess, status)
-
-	return nil, nil
-}
-
-// listPodsList forwards the request into the target cluster and accumulates the
-// response into the memory. Once the request finishes, the memory buffer
-// data is parsed and pods the user does not have access to are excluded from
-// the response. Finally, the filtered response is serialized and sent back to
-// the user with the appropriate headers.
-func (f *Forwarder) listPodsList(req *http.Request, w http.ResponseWriter, sess *clusterSession, allowedResources, deniedResources []types.KubernetesResource) (int, error) {
-	// Creates a memory response writer that collects the response status, headers
-	// and payload into memory.
-	memBuffer := responsewriters.NewMemoryResponseWriter()
-	// Forward the request to the target cluster.
-	sess.forwarder.ServeHTTP(memBuffer, req)
-	// filterBuffer filters the response to exclude pods the user doesn't have access to.
-	// The filtered payload will be written into memBuffer again.
-	if err := filterBuffer(
-		newPodFilterer(allowedResources, deniedResources, f.log),
-		memBuffer,
-	); err != nil {
-		return memBuffer.Status(), trace.Wrap(err)
-	}
-	// Copy the filtered payload into target http.ResponseWriter.
-	err := memBuffer.CopyInto(w)
-
-	// Returns the status and any filter error.
-	return memBuffer.Status(), trace.Wrap(err)
-}
-
-// listPodsWatcher handles a long lived connection to the upstream server where
-// the Kubernetes API returns frames with events.
-// This handler creates a WatcherResponseWriter that spins a new goroutine once
-// the API server writes the status code and headers.
-// The goroutine waits for new events written into the response body and
-// decodes each event. Once decoded, we validate if the Pod name matches
-// any Pod specified in `kubernetes_resources` and if included, the event is
-// forwarded to the user's response writer.
-// If it does not match, the watcher ignores the event and continues waiting
-// for the next event.
-func (f *Forwarder) listPodsWatcher(req *http.Request, w http.ResponseWriter, sess *clusterSession, allowedResources, deniedResources []types.KubernetesResource) (int, error) {
-	negotiator := newClientNegotiator()
-	rw, err := responsewriters.NewWatcherResponseWriter(w, negotiator, newPodFilterer(allowedResources, deniedResources, f.log))
-	if err != nil {
-		return http.StatusInternalServerError, trace.Wrap(err)
-	}
-	// Forwards the request to the target cluster.
-	sess.forwarder.ServeHTTP(rw, req)
-	// Once the request terminates, close the watcher and waits for resources
-	// cleanup.
-	err = rw.Close()
-	return rw.Status(), trace.Wrap(err)
-}
-
-// deletePodsCollection calls listPods method to list the Pods the user
-// has access to and calls their delete method using the allowed kube principals.
-func (f *Forwarder) deletePodsCollection(ctx *authContext, w http.ResponseWriter, req *http.Request, p httprouter.Params) (resp any, err error) {
-	sess, err := f.newClusterSession(*ctx)
-	if err != nil {
-		// This error goes to kubernetes client and is not visible in the logs
-		// of the teleport server if not logged here.
-		f.log.Errorf("Failed to create cluster session: %v.", err)
-		return nil, trace.Wrap(err)
-	}
-
-	sess.upgradeToHTTP2 = true
-	sess.forwarder, err = f.makeSessionForwarder(sess)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	if err := f.setupForwardingHeaders(sess, req); err != nil {
-		// This error goes to kubernetes client and is not visible in the logs
-		// of the teleport server if not logged here.
-		f.log.Errorf("Failed to set up forwarding headers: %v.", err)
-		return nil, trace.Wrap(err)
-	}
-	// status holds the returned response code.
-	var status int
-	// Check if the target Kubernetes cluster is not served by the current service.
-	// If it's the case, forward the request to the target Kube Service where the
-	// filtering logic will be applied.
-	if !f.isLocalKubeCluster(sess) {
-		rw := httplib.NewResponseStatusRecorder(w)
-		sess.forwarder.ServeHTTP(rw, req)
-		status = rw.Status()
-	} else {
-		memoryRW := responsewriters.NewMemoryResponseWriter()
-		listReq := req.Clone(req.Context())
-		// reset body and method since list does not need the body response.
-		listReq.Body = nil
-		listReq.Method = http.MethodGet
-		_, err = f.listPods(ctx, memoryRW, listReq, p)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		// decompress the response body to be able to parse it.
-		if err := decompressInplace(memoryRW); err != nil {
-			return nil, trace.Wrap(err)
-		}
-		status, err = f.handleDeleteCollectionReq(req, &sess.authContext, memoryRW, w)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-	}
-
-	f.emitAuditEvent(ctx, req, sess, status)
-
-	return nil, nil
-}
-
-func (f *Forwarder) handleDeleteCollectionReq(req *http.Request, authCtx *authContext, memWriter *responsewriters.MemoryResponseWriter, w http.ResponseWriter) (int, error) {
-	const internalErrStatus = http.StatusInternalServerError
-	// get content-type value
-	contentType := responsewriters.GetContentHeader(memWriter.Header())
-	encoder, decoder, err := newEncoderAndDecoderForContentType(contentType, newClientNegotiator())
-	if err != nil {
-		return internalErrStatus, trace.Wrap(err)
-	}
-
-	deleteOptions, err := parseDeleteCollectionBody(req.Body, decoder)
-	if err != nil {
-		return internalErrStatus, trace.Wrap(err)
-	}
-	req.Body.Close()
-
-	// decode memory rw body.
-	obj, err := decodeAndSetGVK(decoder, memWriter.Buffer().Bytes())
-	if err != nil {
-		return internalErrStatus, trace.Wrap(err)
-	}
-
-	details, err := f.findKubeDetailsByClusterName(authCtx.kubeClusterName)
-	if err != nil {
-		return internalErrStatus, trace.Wrap(err)
-	}
-	switch o := obj.(type) {
-	case *metav1.Status:
-		// Do nothing.
-	case *corev1.PodList:
-		// At this point, items already include the list of pods the filtered pods the
-		// user has access to.
-		// For each Pod, we compute the kubernetes_groups and kubernetes_labels
-		// that are applicable and we will forward them as the delete request.
-		// If request is a dry-run.
-		// TODO (tigrato):
-		//  - parallelize loop
-		//  -  check if the request should stop at the first fail.
-		items := make([]corev1.Pod, 0, len(o.Items))
-		for _, item := range o.Items {
-			// Compute users and groups from available roles that match the
-			// cluster labels and kubernetes resources.
-			allowedKubeGroups, allowedKubeUsers, err := authCtx.Checker.CheckKubeGroupsAndUsers(
-				authCtx.sessionTTL,
-				false,
-				services.NewKubernetesClusterLabelMatcher(authCtx.kubeClusterLabels),
-				services.NewKubernetesResourceMatcher(
-					types.KubernetesResource{
-						Kind:      types.KindKubePod,
-						Name:      item.Name,
-						Namespace: item.Namespace,
-					},
-				),
-			)
-			// no match was found, we ignore the request.
-			if err != nil {
-				continue
-			}
-			allowedKubeUsers, allowedKubeGroups = fillDefaultKubePrincipalDetails(allowedKubeUsers, allowedKubeGroups, authCtx.User.GetName())
-
-			impersonatedUsers, impersonatedGroups, err := computeImpersonatedPrincipals(
-				f.log, utils.StringsSet(allowedKubeUsers), utils.StringsSet(allowedKubeGroups),
-				req.Header,
-			)
-			if err != nil {
-				continue
-			}
-
-			// create a new kubernetes.Client using the impersonated users and groups
-			// that matched the current pod.
-			client, err := newImpersonatedKubeClient(details.kubeCreds, impersonatedUsers, impersonatedGroups)
-			if err != nil {
-				return internalErrStatus, trace.Wrap(err)
-			}
-			// delete each pod individually.
-			err = client.CoreV1().Pods(item.Namespace).Delete(req.Context(), item.Name, deleteOptions)
-			if err != nil {
-				// TODO(tigrato): check what should we do when delete returns an error.
-				// Should we check if it's permission error?
-				// Check if the Pod has already been deleted by a concurrent request
-				continue
-			}
-			items = append(items, item)
-		}
-		// reset items.
-		o.Items = items
+		// Legacy proxy service is local only if the kube cluster name matches
+		// with clusters served by this agent.
+		_, err := f.findKubeDetailsByClusterName(kubeClusterName)
+		return err == nil
 	default:
-		return internalErrStatus, trace.BadParameter("expected *corev1.PodList, got: %T", obj)
+		return false
 	}
-	// reset the memory buffer.
-	memWriter.Buffer().Reset()
-	// encode the filtered response into the memory buffer.
-	if err := encoder.Encode(obj, memWriter.Buffer()); err != nil {
-		return internalErrStatus, trace.Wrap(err)
-	}
-	// copy the output into the user's ResponseWriter and return.
-	return memWriter.Status(), trace.Wrap(memWriter.CopyInto(w))
-}
-
-// newImpersonatedKubeClient creates a new Kubernetes Client that impersonates
-// a username and the groups.
-func newImpersonatedKubeClient(creds kubeCreds, username string, groups []string) (*kubernetes.Clientset, error) {
-	c := &rest.Config{}
-	// clone cluster's rest config.
-	*c = *creds.getKubeRestConfig()
-	// change the impersonated headers.
-	c.Impersonate = rest.ImpersonationConfig{
-		UserName: username,
-		Groups:   groups,
-	}
-	// TODO(tigrato): reuse the http client.
-	client, err := kubernetes.NewForConfig(c)
-	return client, trace.Wrap(err)
-}
-
-// parseDeleteCollectionBody parses the request body targeted to pod collection
-// endpoints.
-func parseDeleteCollectionBody(r io.Reader, decoder runtime.Decoder) (metav1.DeleteOptions, error) {
-	into := metav1.DeleteOptions{}
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return into, trace.Wrap(err)
-	}
-	if len(data) == 0 {
-		return into, nil
-	}
-	_, _, err = decoder.Decode(data, nil, &into)
-	return into, trace.Wrap(err)
 }
 
 // kubeResourceDeniedAccessMsg creates a Kubernetes API like forbidden response.
 // Logic from:
 // https://github.com/kubernetes/kubernetes/blob/ea0764452222146c47ec826977f49d7001b0ea8c/staging/src/k8s.io/apiserver/pkg/endpoints/handlers/responsewriters/errors.go#L51
-func kubeResourceDeniedAccessMsg(user, method string, kubeResource *types.KubernetesResource) string {
-	resource := pluralize(kubeResource.Kind)
-	// pod api group is ""
-	// Check this code when we introduce new resources.
-	apiGroup := ""
-	// <resource> "<pod_name>" is forbidden: User "<user>" cannot create resource "<resource>" in API group "" in the namespace "<namespace>"
-	return fmt.Sprintf(
-		"%s %q is forbidden: User %q cannot %s resource %q in API group %q in the namespace %q",
-		resource,
-		kubeResource.Name,
-		user,
-		getRequestVerb(method),
-		resource,
-		apiGroup,
-		kubeResource.Namespace,
-	)
-}
+func (f *Forwarder) kubeResourceDeniedAccessMsg(user, verb string, resource apiResource) string {
+	kind := strings.Split(resource.resourceKind, "/")[0]
 
-// pluralize adds an s at the end of the input string.
-func pluralize(s string) string {
-	return s + "s"
-}
+	apiGroup := resource.apiGroup
+	teleportType := resource.resourceKind
 
-// getRequestVerb converts the request method into a Kubernetes Verb.
-func getRequestVerb(method string) string {
-	apiVerb := ""
-	switch method {
-	case http.MethodPost:
-		apiVerb = "create"
-	case http.MethodGet:
-		apiVerb = "get"
-	case http.MethodPut:
-		apiVerb = "update"
-	case http.MethodPatch:
-		apiVerb = "patch"
-	case http.MethodDelete:
-		apiVerb = "delete"
+	switch {
+	case resource.namespace != "" && resource.resourceName != "":
+		// <resource> "<pod_name>" is forbidden: User "<user>" cannot create resource "<resource>" in API group "" in the namespace "<namespace>"
+		return fmt.Sprintf(
+			"%[1]s %[2]q is forbidden: User %[3]q cannot %[4]s resource %[1]q in API group %[5]q in the namespace %[6]q\n"+
+				"Ask your Teleport admin to ensure that your Teleport role includes access to the %[7]s in %[8]q field.\n"+
+				"Check by running: kubectl auth can-i %[4]s %[1]s/%[2]s --namespace %[6]s ",
+			kind,                   // 1
+			resource.resourceName,  // 2
+			user,                   // 3
+			verb,                   // 4
+			apiGroup,               // 5
+			resource.namespace,     // 6
+			teleportType,           // 7
+			kubernetesResourcesKey, // 8
+		)
+	case resource.namespace != "":
+		// <resource> is forbidden: User "<user>" cannot create resource "<resource>" in API group "" in the namespace "<namespace>"
+		return fmt.Sprintf(
+			"%[1]s is forbidden: User %[2]q cannot %[3]s resource %[1]q in API group %[4]q in the namespace %[5]q\n"+
+				"Ask your Teleport admin to ensure that your Teleport role includes access to the %[6]s in %[7]q field.\n"+
+				"Check by running: kubectl auth can-i %[3]s %[1]s --namespace %[5]s ",
+			kind,                   // 1
+			user,                   // 2
+			verb,                   // 3
+			apiGroup,               // 4
+			resource.namespace,     // 5
+			teleportType,           // 6
+			kubernetesResourcesKey, // 7
+		)
+	case resource.resourceName == "":
+		return fmt.Sprintf(
+			"%[1]s is forbidden: User %[2]q cannot %[3]s resource %[1]q in API group %[4]q at the cluster scope\n"+
+				"Ask your Teleport admin to ensure that your Teleport role includes access to the %[5]s in %[6]q field.\n"+
+				"Check by running: kubectl auth can-i %[3]s %[1]s",
+			kind,                   // 1
+			user,                   // 2
+			verb,                   // 3
+			apiGroup,               // 4
+			teleportType,           // 5
+			kubernetesResourcesKey, // 6
+		)
+	default:
+		return fmt.Sprintf(
+			"%[1]s %[2]q is forbidden: User %[3]q cannot %[4]s resource %[1]q in API group %[5]q at the cluster scope\n"+
+				"Ask your Teleport admin to ensure that your Teleport role includes access to the %[6]s in %[7]q field.\n"+
+				"Check by running: kubectl auth can-i %[4]s %[1]s/%[2]s",
+			kind,                   // 1
+			resource.resourceName,  // 2
+			user,                   // 3
+			verb,                   // 4
+			apiGroup,               // 5
+			teleportType,           // 6
+			kubernetesResourcesKey, // 7
+		)
 	}
-	return apiVerb
 }
 
 // errorToKubeStatusReason returns an appropriate StatusReason based on the
 // provided error type.
-func errorToKubeStatusReason(err error) metav1.StatusReason {
+func errorToKubeStatusReason(err error, code int) metav1.StatusReason {
 	switch {
 	case trace.IsAggregate(err):
 		return metav1.StatusReasonTimeout
@@ -2763,30 +3095,49 @@ func errorToKubeStatusReason(err error) metav1.StatusReason {
 		return metav1.StatusReasonTooManyRequests
 	case trace.IsConnectionProblem(err):
 		return metav1.StatusReasonTimeout
+	case code == http.StatusInternalServerError:
+		return metav1.StatusReasonInternalError
 	default:
 		return metav1.StatusReasonUnknown
 	}
 }
 
-// decompressInplace decompresses the response into the same buffer it was
-// written to.
-// If the response is not compressed, it does nothing.
-func decompressInplace(memoryRW *responsewriters.MemoryResponseWriter) error {
-	switch memoryRW.Header().Get(contentEncodingHeader) {
-	case contentEncodingGZIP:
-		_, decompressor, err := getResponseCompressorDecompressor(memoryRW.Header())
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		newBuf := bytes.NewBuffer(nil)
-		_, err = io.Copy(newBuf, memoryRW.Buffer())
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		memoryRW.Buffer().Reset()
-		err = decompressor(memoryRW.Buffer(), newBuf)
-		return trace.Wrap(err)
-	default:
-		return nil
+// formatForwardResponseError formats the error response from the connection
+// monitor to a Kubernetes API error response.
+type formatForwardResponseError func(status *kubeerrors.StatusError) error
+
+func (f formatForwardResponseError) WriteString(s string) (int, error) {
+	if f == nil {
+		return len(s), nil
+	}
+	err := f(
+		&kubeerrors.StatusError{
+			ErrStatus: metav1.Status{
+				Status:  metav1.StatusFailure,
+				Code:    http.StatusInternalServerError,
+				Reason:  metav1.StatusReasonInternalError,
+				Message: s,
+			},
+		},
+	)
+	if err != nil {
+		return 0, trace.Wrap(err)
+	}
+	return len(s), nil
+}
+
+// allHTTPMethods returns a list of all HTTP methods, useful for creating
+// non-root catch-all handlers.
+func allHTTPMethods() []string {
+	return []string{
+		http.MethodConnect,
+		http.MethodDelete,
+		http.MethodGet,
+		http.MethodHead,
+		http.MethodOptions,
+		http.MethodPatch,
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodTrace,
 	}
 }

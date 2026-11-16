@@ -1,43 +1,53 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import React from 'react';
+
 import { Flex, Text } from 'design';
 import TextEditor from 'shared/components/TextEditor';
 
 import {
-  kubeAccessRW,
-  kubeAccessRO,
-  nodeAccessRO,
-  nodeAccessRW,
+  awsAppAccessRO,
+  awsAppAccessRW,
   connDiagRW,
   dbAccessRO,
   dbAccessRW,
+  kubeAccessRO,
+  kubeAccessRW,
+  nodeAccessRO,
+  nodeAccessRW,
 } from '../../yamlTemplates';
 
 export function AccessInfo({ accessKind, traitKind, traitDesc }: Props) {
+  let accessDesc = `${traitKind} ${traitDesc}`;
+  if (traitKind === 'ARN') {
+    accessDesc = `AWS Role ${traitKind}s`;
+  }
   switch (accessKind) {
     case 'ssoUserAndNoTraits':
       return (
         <>
           <Info>
-            You don’t have any {traitKind} {traitDesc} defined.
+            You don’t have any {accessDesc} defined and SSO users are not able
+            to add access.
             <br />
             Please ask your Teleport administrator to update your role and add
-            the required {traitKind} {traitDesc}.
+            the required {accessDesc}.
           </Info>
           <YamlReader traitKind={traitKind} userAccessReadOnly={true} />
         </>
@@ -46,7 +56,7 @@ export function AccessInfo({ accessKind, traitKind, traitDesc }: Props) {
       return (
         <>
           <Info>
-            You don’t have {traitKind} access.
+            You don't have permission to setup {accessDesc}
             <br />
             Please ask your Teleport administrator to update your role:
           </Info>
@@ -57,10 +67,10 @@ export function AccessInfo({ accessKind, traitKind, traitDesc }: Props) {
       return (
         <>
           <Info>
-            You don't have permission to add new {traitKind} {traitDesc}.
+            You don't have permission to add new {accessDesc}.
             <br />
-            If you don't see the {traitKind} {traitDesc} that you require,
-            please ask your Teleport administrator to update your role:
+            If you don't see the {accessDesc} that you require, please ask your
+            Teleport administrator to update your role:
           </Info>
           <YamlReader traitKind={traitKind} />
         </>
@@ -69,10 +79,10 @@ export function AccessInfo({ accessKind, traitKind, traitDesc }: Props) {
       return (
         <>
           <Info>
-            SSO users are not able to add new {traitKind} {traitDesc}.
+            SSO users are not able to add new {accessDesc}.
             <br />
-            If you don't see the {traitKind} {traitDesc} that you require,
-            please ask your Teleport administrator to update your role:
+            If you don't see the {accessDesc} that you require, please ask your
+            Teleport administrator to update your role:
           </Info>
           <YamlReader traitKind={traitKind} userAccessReadOnly={true} />
         </>
@@ -133,17 +143,34 @@ export function YamlReader({
           <ReadOnlyYamlEditor content={connDiagRW} />
         </Flex>
       );
+    case 'ARN':
+      if (userAccessReadOnly) {
+        return (
+          <Flex minHeight="210px" mt={3}>
+            <ReadOnlyYamlEditor content={awsAppAccessRO} />
+          </Flex>
+        );
+      }
+      return (
+        <Flex minHeight="310px" mt={3}>
+          <ReadOnlyYamlEditor content={awsAppAccessRW} />
+        </Flex>
+      );
   }
 }
 
 const Info = ({ children }: { children: React.ReactNode }) => (
-  <Text mt={4} width="100px">
-    {children}
-  </Text>
+  <Text mt={4}>{children}</Text>
 );
 
 const ReadOnlyYamlEditor = ({ content }: { content: string }) => {
-  return <TextEditor readOnly={true} data={[{ content, type: 'yaml' }]} />;
+  return (
+    <TextEditor
+      readOnly={true}
+      data={[{ content, type: 'yaml' }]}
+      bg="levels.deep"
+    />
+  );
 };
 
 type AccessKind =
@@ -152,7 +179,7 @@ type AccessKind =
   | 'ssoUserAndNoTraits'
   | 'ssoUserButHasTraits';
 
-export type TraitKind = 'Kubernetes' | 'OS' | 'ConnDiag' | 'Database';
+export type TraitKind = 'Kubernetes' | 'OS' | 'ConnDiag' | 'Database' | 'ARN';
 
 type Props = {
   accessKind: AccessKind;

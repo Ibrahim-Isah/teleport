@@ -15,34 +15,66 @@
 package ssh
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net"
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.10.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/observability/tracing"
-	"github.com/gravitational/teleport/api/utils/sshutils"
 )
 
 const (
-	// TracingRequest is sent by clients to server to pass along tracing context.
-	TracingRequest = "tracing@goteleport.com"
-
-	// TracingChannel is a SSH channel used to indicate that servers support tracing.
-	TracingChannel = "tracing"
+	// EnvsRequest sets multiple environment variables that will be applied to any
+	// command executed by Shell or Run.
+	// See [EnvsReq] for the corresponding payload.
+	EnvsRequest = "envs@goteleport.com"
 
 	// instrumentationName is the name of this instrumentation package.
 	instrumentationName = "otelssh"
+
+	// sessionMFAAuthTimeout is the maximum amount of time to wait for the SSH authentication exchange to complete in
+	// when in-band MFA might be required. WebAuthn and SSO ceremonies can take longer than the
+	// defaults.DefaultIOTimeout, so this extended timeout prevents premature connection closure during the interactive
+	// handshake.
+	sessionMFAAuthTimeout = 3 * time.Minute
 )
+
+// EnvsReq contains json marshaled key:value pairs sent as the
+// payload for an [EnvsRequest].
+type EnvsReq struct {
+	// EnvsJSON is a json marshaled map[string]string containing
+	// environment variables.
+	EnvsJSON []byte `json:"envs"`
+}
+
+// FileTransferReq contains parameters used to create a file transfer
+// request to be stored in the SSH server
+type FileTransferReq struct {
+	// Download is true if the file transfer requests a download, false if upload
+	Download bool
+	// Location is the location of the file to be downloaded, or directory to upload a file
+	Location string
+	// Filename is the name of the file to be uploaded
+	Filename string
+}
+
+// FileTransferDecisionReq contains parameters used to approve or deny an active
+// file transfer request on the SSH server
+type FileTransferDecisionReq struct {
+	// RequestID is the ID of the file transfer request being responded to
+	RequestID string
+	// Approved is true if approved, false if denied.
+	Approved bool
+}
 
 // ContextFromRequest extracts any tracing data provided via an Envelope
 // in the ssh.Request payload. If the payload contains an Envelope, then
@@ -102,72 +134,92 @@ func Dial(ctx context.Context, network, addr string, config *ssh.ClientConfig, o
 	if err != nil {
 		return nil, err
 	}
-	c, chans, reqs, err := NewClientConn(ctx, conn, addr, config, opts...)
+	c, err := NewClientWithTimeout(ctx, conn, addr, config, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return NewClient(c, chans, reqs), nil
+	return c, nil
 }
 
-// NewClientConn creates a new SSH client connection that is passed tracing context so that spans may be correlated
-// properly over the ssh connection.
-func NewClientConn(ctx context.Context, conn net.Conn, addr string, config *ssh.ClientConfig, opts ...tracing.Option) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+// NewClientConnWithTimeout creates a new SSH client connection that includes tracing context,
+// allowing spans to be properly correlated across the SSH connection.
+//
+// The connection respects the earliest of the following:
+//   - The context's deadline or cancellation
+//   - The timeout specified in the config
+//   - A default timeout of 30 seconds if config doesn't specify a timeout
+//   - When AuthCallback is set, timeout extends to SessionMFAAuthTimeout for interactive MFA.
+//
+// Behavior based on config.Timeout:
+// - If > 0: the timeout is applied in addition to any context deadline.
+// - If >= 0 && config.AuthCallback is non-nil: the timeout is extended to at least SessionMFAAuthTimeout.
+// - If == 0: a default timeout of 30 seconds is used to avoid hanging connections.
+// - If < 0: only the context's deadline or cancellation is used.
+func NewClientConnWithTimeout(ctx context.Context, conn net.Conn, addr string, config *ssh.ClientConfig, opts ...tracing.Option) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
 	tracer := tracing.NewConfig(opts).TracerProvider.Tracer(instrumentationName)
-	ctx, span := tracer.Start(
+	ctx, span := tracer.Start( //nolint:staticcheck,ineffassign // keeping shadowed ctx to avoid accidental missing in the future
 		ctx,
-		"ssh/NewClientConn",
+		"ssh/NewClientConnWithTimeout",
 		oteltrace.WithSpanKind(oteltrace.SpanKindClient),
 		oteltrace.WithAttributes(
 			append(
 				peerAttr(conn.RemoteAddr()),
 				attribute.String("address", addr),
 				semconv.RPCServiceKey.String("ssh"),
-				semconv.RPCMethodKey.String("NewClientConn"),
+				semconv.RPCMethodKey.String("NewClientConnWithTimeout"),
 				semconv.RPCSystemKey.String("ssh"),
 			)...,
 		),
 	)
 	defer span.End()
 
-	hp := &sshutils.HandshakePayload{
-		TracingContext: tracing.PropagationContextFromContext(ctx, opts...),
+	// ssh.ClientConfig.Timeout applies only to TCP dial, not the SSH handshake. Since we pass an already-connected
+	// net.Conn, x/crypto/ssh won't enforce it. We enforce a timeout around NewClientConn instead to prevent hanging
+	// connections when the server is unresponsive or net.Conn doesn't support read deadlines.
+	if config.Timeout >= 0 {
+		timeout := cmp.Or(config.Timeout, defaults.DefaultIOTimeout)
+		if config.AuthCallback != nil {
+			timeout = max(timeout, sessionMFAAuthTimeout)
+		}
+
+		newCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		ctx = newCtx
 	}
 
-	if len(hp.TracingContext) > 0 {
-		payloadJSON, err := json.Marshal(hp)
-		if err == nil {
-			payload := fmt.Sprintf("%s%s\x00", sshutils.ProxyHelloSignature, payloadJSON)
-			if _, err := conn.Write([]byte(payload)); err != nil {
-				log.WithError(err).Warnf("Failed to pass along tracing context to proxy %v", addr)
-			}
-		}
-	}
+	stopFn := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stopFn()
 
 	c, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
 	if err != nil {
-		return nil, nil, nil, trace.Wrap(err)
+		// if the context was canceled or timed out, return that an aggregated error instead
+		// of the original error returned from NewClientConn. The returned error would be something like
+		// "ssh: handshake failed: read tcp {ip}:{port} -> {ip}:{port} use of closed network connection"
+		// which doesn't indicate the real error was a timeout or cancellation.
+		// If the context was not canceled and the function failed, it returns the original error as
+		// ctx.Err() would be nil.
+		return nil, nil, nil, trace.NewAggregate(ctx.Err(), err)
+	}
+
+	if !stopFn() {
+		// we failed to stop the AfterFunc so conn will be closed and
+		// c will soon become invalid no matter what we do, so we
+		// drain it and close it
+		_ = conn.Close()
+		go func() {
+			for newCh := range chans {
+				_ = newCh.Reject(0, "")
+			}
+		}()
+		go ssh.DiscardRequests(reqs)
+		_ = c.Close()
+		return nil, nil, nil, trace.Wrap(ctx.Err())
 	}
 
 	return c, chans, reqs, nil
-}
-
-// NewClientConnWithDeadline establishes new client connection with specified deadline
-func NewClientConnWithDeadline(ctx context.Context, conn net.Conn, addr string, config *ssh.ClientConfig, opts ...tracing.Option) (*Client, error) {
-	if config.Timeout > 0 {
-		if err := conn.SetReadDeadline(time.Now().Add(config.Timeout)); err != nil {
-			return nil, trace.Wrap(err)
-		}
-	}
-	c, chans, reqs, err := NewClientConn(ctx, conn, addr, config, opts...)
-	if err != nil {
-		return nil, err
-	}
-	if config.Timeout > 0 {
-		if err := conn.SetReadDeadline(time.Time{}); err != nil {
-			return nil, trace.Wrap(err)
-		}
-	}
-	return NewClient(c, chans, reqs, opts...), nil
 }
 
 // peerAttr returns attributes about the peer address.
@@ -188,7 +240,7 @@ func peerAttr(addr net.Addr) []attribute.KeyValue {
 }
 
 // Envelope wraps the payload of all ssh messages with
-// tracing context. Any servers that reply to a TracingChannel
+// tracing context. Any servers that support tracing propagation
 // will attempt to parse the Envelope for all received requests and
 // ensure that the original payload is provided to the handlers.
 type Envelope struct {

@@ -1,25 +1,26 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package tlsca
 
 import (
 	"bytes"
 	"crypto"
-	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -32,16 +33,38 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 
-	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
-// ClusterName returns cluster name from organization
-func ClusterName(subject pkix.Name) (string, error) {
-	if len(subject.Organization) == 0 {
-		return "", trace.BadParameter("missing subject organization")
+// ClusterName returns cluster name from a Teleport CA name (Issuer or Subject).
+func ClusterName(name pkix.Name) (string, error) {
+	// Cluster name in custom OID.
+	for _, atv := range name.Names {
+		if atv.Type.Equal(CAClusterNameExtensionOID) {
+			var ok bool
+			clusterName, ok := atv.Value.(string)
+			switch {
+			case !ok:
+				return "", trace.BadParameter("OID %s has value of unexpected type %T", atv.Type, atv.Value)
+			case clusterName == "":
+				return "", trace.BadParameter("OID %s has empty value", atv.Type)
+			default:
+				return clusterName, nil
+			}
+		}
 	}
-	return subject.Organization[0], nil
+
+	// Cluster name in "O=".
+	if len(name.Organization) == 0 {
+		return "", trace.BadParameter("missing cluster name")
+	}
+	clusterName := name.Organization[0]
+	if clusterName == "" {
+		return "", trace.BadParameter("empty organization value")
+	}
+	return clusterName, nil
 }
 
 // GenerateSelfSignedCAWithSigner generates self-signed certificate authority used for internal inter-node communications
@@ -62,8 +85,16 @@ type GenerateCAConfig struct {
 	Entity      pkix.Name
 	DNSNames    []string
 	IPAddresses []net.IP
-	TTL         time.Duration
-	Clock       clockwork.Clock
+
+	// TTL and Clock are used to create the NotBefore and NotAfter timestamps.
+	// TTL is an offset from the NotBefore.
+	// Optional if NotBefore/NotAfter are supplied.
+	TTL   time.Duration
+	Clock clockwork.Clock
+
+	// NotBefore and NotAfter are the certificate timestamps.
+	// Optional. If unset then TTL and Clock are used.
+	NotBefore, NotAfter time.Time
 }
 
 // setDefaults imposes defaults on this configuration
@@ -78,8 +109,15 @@ func (r *GenerateCAConfig) setDefaults() {
 // Returns PEM-encoded private key/certificate payloads upon success
 func GenerateSelfSignedCAWithConfig(config GenerateCAConfig) (certPEM []byte, err error) {
 	config.setDefaults()
-	notBefore := config.Clock.Now()
-	notAfter := notBefore.Add(config.TTL)
+
+	notBefore := config.NotBefore
+	if notBefore.IsZero() {
+		notBefore = config.Clock.Now()
+	}
+	notAfter := config.NotAfter
+	if notAfter.IsZero() {
+		notAfter = notBefore.Add(config.TTL)
+	}
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
@@ -90,15 +128,22 @@ func GenerateSelfSignedCAWithConfig(config GenerateCAConfig) (certPEM []byte, er
 	// signed by the same private key and having the same subject (happens in tests)
 	config.Entity.SerialNumber = serialNumber.String()
 
+	// Note: KeyUsageCRLSign is set only to generate empty CRLs for
+	// desktop and database access on Windows
+	keyUsage := x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign | x509.KeyUsageCRLSign
+	if _, isRSA := config.Signer.Public().(*rsa.PublicKey); isRSA {
+		// The KeyEncipherment bit is necessary for RSA key exchanges
+		// https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.3
+		keyUsage |= x509.KeyUsageKeyEncipherment
+	}
+
 	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Issuer:       config.Entity,
-		Subject:      config.Entity,
-		NotBefore:    notBefore,
-		NotAfter:     notAfter,
-		// Note: KeyUsageCRLSign is set only to generate empty CRLs for Desktop
-		// Access authentication with Windows.
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		SerialNumber:          serialNumber,
+		Issuer:                config.Entity,
+		Subject:               config.Entity,
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              keyUsage,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		DNSNames:              config.DNSNames,
@@ -114,14 +159,20 @@ func GenerateSelfSignedCAWithConfig(config GenerateCAConfig) (certPEM []byte, er
 	return certPEM, nil
 }
 
-// GenerateSelfSignedCA generates self-signed certificate authority used for internal inter-node communications
+// GenerateSelfSignedCA generates self-signed certificate authority used for tests.
+//
+// Prefer tlscatest.GenerateSelfSignedCA, which operates on a higher level of
+// abstraction and always creates a valid-looking CA certificate.
 func GenerateSelfSignedCA(entity pkix.Name, dnsNames []string, ttl time.Duration) ([]byte, []byte, error) {
-	priv, err := rsa.GenerateKey(rand.Reader, constants.RSAKeySize)
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	signer, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
-	certPEM, err := GenerateSelfSignedCAWithSigner(priv, entity, dnsNames, ttl)
+	keyPEM, err := keys.MarshalPrivateKey(signer)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+	certPEM, err := GenerateSelfSignedCAWithSigner(signer, entity, dnsNames, ttl)
 	return keyPEM, certPEM, err
 }
 
@@ -133,7 +184,7 @@ func ParseCertificateRequestPEM(bytes []byte) (*x509.CertificateRequest, error) 
 	}
 	csr, err := x509.ParseCertificateRequest(block.Bytes)
 	if err != nil {
-		return nil, trace.BadParameter(err.Error())
+		return nil, trace.BadParameter("%s", err)
 	}
 	return csr, nil
 }
@@ -165,12 +216,13 @@ func ParseCertificatePEM(bytes []byte) (*x509.Certificate, error) {
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return nil, trace.BadParameter(err.Error())
+		return nil, trace.BadParameter("%s", err)
 	}
 	return cert, nil
 }
 
 // ParseCertificatePEM parses multiple PEM-encoded certificates
+// It returns an error if bytes doesn't contain at least one certificate.
 func ParseCertificatePEMs(bytes []byte) ([]*x509.Certificate, error) {
 	if len(bytes) == 0 {
 		return nil, trace.BadParameter("missing PEM encoded block")
@@ -185,84 +237,24 @@ func ParseCertificatePEMs(bytes []byte) ([]*x509.Certificate, error) {
 	for _, block := range blocks {
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			return nil, trace.BadParameter(err.Error())
+			return nil, trace.BadParameter("%s", err)
 		}
 		certs = append(certs, cert)
 	}
+	if len(certs) == 0 {
+		return nil, trace.BadParameter("no PEM-encoded certificate found")
+	}
 	return certs, nil
-}
-
-// ParsePrivateKeyPEM parses PEM-encoded private key
-func ParsePrivateKeyPEM(bytes []byte) (crypto.Signer, error) {
-	block, _ := pem.Decode(bytes)
-	if block == nil {
-		return nil, trace.BadParameter("expected PEM-encoded block")
-	}
-	return ParsePrivateKeyDER(block.Bytes)
-}
-
-// ParsePrivateKeyDER parses unencrypted DER-encoded private key
-func ParsePrivateKeyDER(der []byte) (crypto.Signer, error) {
-	generalKey, err := x509.ParsePKCS8PrivateKey(der)
-	if err != nil {
-		generalKey, err = x509.ParsePKCS1PrivateKey(der)
-		if err != nil {
-			generalKey, err = x509.ParseECPrivateKey(der)
-			if err != nil {
-				return nil, trace.BadParameter("failed parsing private key")
-			}
-		}
-	}
-
-	switch k := generalKey.(type) {
-	case *rsa.PrivateKey:
-		return k, nil
-	case *ecdsa.PrivateKey:
-		return k, nil
-	}
-
-	return nil, trace.BadParameter("unsupported private key type")
-}
-
-// ParsePublicKeyPEM parses public key PEM
-func ParsePublicKeyPEM(bytes []byte) (interface{}, error) {
-	block, _ := pem.Decode(bytes)
-	if block == nil {
-		return nil, trace.BadParameter("expected PEM-encoded block")
-	}
-	return ParsePublicKeyDER(block.Bytes)
-}
-
-// ParsePublicKeyDER parses unencrypted DER-encoded publice key
-func ParsePublicKeyDER(der []byte) (crypto.PublicKey, error) {
-	generalKey, err := x509.ParsePKIXPublicKey(der)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return generalKey, nil
 }
 
 // MarshalPublicKeyFromPrivateKeyPEM extracts public key from private key
 // and returns PEM marshaled key
 func MarshalPublicKeyFromPrivateKeyPEM(privateKey crypto.PrivateKey) ([]byte, error) {
-	rsaPrivateKey, ok := privateKey.(*rsa.PrivateKey)
-	if !ok {
-		return nil, trace.BadParameter("expected RSA key")
+	// All private keys in the standard library implement crypto.Signer, which gives access to the public key.
+	if signer, ok := privateKey.(crypto.Signer); ok {
+		return keys.MarshalPublicKey(signer.Public())
 	}
-	rsaPublicKey := rsaPrivateKey.Public()
-	derBytes, err := x509.MarshalPKIXPublicKey(rsaPublicKey)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "RSA PUBLIC KEY", Bytes: derBytes}), nil
-}
-
-// MarshalPrivateKeyPEM marshals provided rsa.PrivateKey into PEM format.
-func MarshalPrivateKeyPEM(privateKey *rsa.PrivateKey) []byte {
-	return pem.EncodeToMemory(&pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
-	})
+	return nil, trace.BadParameter("unsupported key type %T", privateKey)
 }
 
 // MarshalCertificatePEM takes a *x509.Certificate and returns the PEM

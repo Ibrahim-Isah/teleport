@@ -1,24 +1,27 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package alpnproxy
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/tls"
 	"net"
@@ -26,7 +29,8 @@ import (
 
 	"github.com/gravitational/trace"
 
-	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 )
@@ -225,7 +229,20 @@ func (r *CertGenListener) generateCertFor(host string) (*tls.Certificate, error)
 		return cert, nil
 	}
 
-	certKey, err := rsa.GenerateKey(rand.Reader, constants.RSAKeySize)
+	// Copy the key algorithm from the CA instead of asking Auth for the current
+	// signature algorithm suite for every new cert.
+	var alg cryptosuites.Algorithm
+	switch r.certAuthority.Signer.Public().(type) {
+	case *rsa.PublicKey:
+		alg = cryptosuites.RSA2048
+	case *ecdsa.PublicKey:
+		alg = cryptosuites.ECDSAP256
+	case ed25519.PublicKey:
+		alg = cryptosuites.Ed25519
+	default:
+		return nil, trace.BadParameter("unsupported public key type for CA signer: %T", r.certAuthority.Signer.Public())
+	}
+	certKey, err := cryptosuites.GenerateKeyWithAlgorithm(alg)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -234,7 +251,7 @@ func (r *CertGenListener) generateCertFor(host string) (*tls.Certificate, error)
 	subject.CommonName = host
 
 	certPem, err := r.certAuthority.GenerateCertificate(tlsca.CertificateRequest{
-		PublicKey: &certKey.PublicKey,
+		PublicKey: certKey.Public(),
 		Subject:   subject,
 		NotAfter:  r.certAuthority.Cert.NotAfter,
 		DNSNames:  []string{host},
@@ -243,7 +260,11 @@ func (r *CertGenListener) generateCertFor(host string) (*tls.Certificate, error)
 		return nil, trace.Wrap(err)
 	}
 
-	cert, err := tls.X509KeyPair(certPem, tlsca.MarshalPrivateKeyPEM(certKey))
+	keyPem, err := keys.MarshalPrivateKey(certKey)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	cert, err := tls.X509KeyPair(certPem, keyPem)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}

@@ -1,33 +1,39 @@
 /*
-Copyright 2015-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/gravitational/trace"
 
 	apidefaults "github.com/gravitational/teleport/api/defaults"
+	linuxdesktopv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/linuxdesktop/v1"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/wrappers"
 	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/scopes"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
@@ -72,6 +78,11 @@ func CompareServers(a, b types.Resource) int {
 			return compareWindowsDesktopServices(winA, winB)
 		}
 	}
+	if linA, ok := a.(types.Resource153UnwrapperT[*linuxdesktopv1.LinuxDesktop]); ok {
+		if linB, ok := b.(types.Resource153UnwrapperT[*linuxdesktopv1.LinuxDesktop]); ok {
+			return CompareLinuxDesktop(linA.UnwrapT(), linB.UnwrapT())
+		}
+	}
 	return Different
 }
 
@@ -91,9 +102,13 @@ func compareServers(a, b types.Server) int {
 	if a.GetNamespace() != b.GetNamespace() {
 		return Different
 	}
-	if a.GetPublicAddr() != b.GetPublicAddr() {
+	if len(a.GetPublicAddrs()) != len(b.GetPublicAddrs()) {
 		return Different
 	}
+	if !slices.Equal(a.GetPublicAddrs(), b.GetPublicAddrs()) {
+		return Different
+	}
+
 	r := a.GetRotation()
 	if !r.Matches(b.GetRotation()) {
 		return Different
@@ -101,24 +116,61 @@ func compareServers(a, b types.Server) int {
 	if a.GetUseTunnel() != b.GetUseTunnel() {
 		return Different
 	}
-	if !utils.StringMapsEqual(a.GetStaticLabels(), b.GetStaticLabels()) {
+
+	if !maps.Equal(a.GetStaticLabels(), b.GetStaticLabels()) {
 		return Different
 	}
-	if !cmp.Equal(a.GetCmdLabels(), b.GetCmdLabels()) {
+
+	if !maps.EqualFunc(a.GetCmdLabels(), b.GetCmdLabels(), func(label types.CommandLabel, label2 types.CommandLabel) bool {
+		return slices.Equal(label.GetCommand(), label2.GetCommand()) &&
+			label.GetPeriod() == label2.GetPeriod() &&
+			label.GetResult() == label2.GetResult()
+	}) {
 		return Different
 	}
+
+	if !maps.Equal(a.GetImmutableLabels(), b.GetImmutableLabels()) {
+		return Different
+	}
+
 	if a.GetTeleportVersion() != b.GetTeleportVersion() {
 		return Different
 	}
-	if !cmp.Equal(a.GetApps(), b.GetApps()) {
+
+	if !slices.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
 		return Different
 	}
-	if !cmp.Equal(a.GetKubernetesClusters(), b.GetKubernetesClusters()) {
+
+	if a.GetRelayGroup() != b.GetRelayGroup() {
 		return Different
 	}
-	if !cmp.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+	if !slices.Equal(a.GetRelayIDs(), b.GetRelayIDs()) {
 		return Different
 	}
+
+	if (a.GetGitHub() == nil && b.GetGitHub() != nil) ||
+		(a.GetGitHub() != nil && b.GetGitHub() == nil) {
+		return Different
+	}
+
+	if a.GetGitHub() != nil && b.GetGitHub() != nil {
+		if a.GetGitHub().Integration != b.GetGitHub().Integration {
+			return Different
+		}
+
+		if a.GetGitHub().Organization != b.GetGitHub().Organization {
+			return Different
+		}
+	}
+
+	if a.GetScope() != b.GetScope() {
+		return Different
+	}
+
+	if !maps.Equal(a.GetAllLabels(), b.GetAllLabels()) {
+		return Different
+	}
+
 	// OnlyTimestampsDifferent check must be after all Different checks.
 	if !a.Expiry().Equal(b.Expiry()) {
 		return OnlyTimestampsDifferent
@@ -143,10 +195,22 @@ func compareApplicationServers(a, b types.AppServer) int {
 	if !r.Matches(b.GetRotation()) {
 		return Different
 	}
-	if !cmp.Equal(a.GetApp(), b.GetApp()) {
+	if !a.GetApp().IsEqual(b.GetApp()) {
 		return Different
 	}
-	if !cmp.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+	if !slices.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+		return Different
+	}
+	if a.GetRelayGroup() != b.GetRelayGroup() {
+		return Different
+	}
+	if !slices.Equal(a.GetRelayIDs(), b.GetRelayIDs()) {
+		return Different
+	}
+	if a.GetScope() != b.GetScope() {
+		return Different
+	}
+	if !maps.Equal(a.GetAllLabels(), b.GetAllLabels()) {
 		return Different
 	}
 	// OnlyTimestampsDifferent check must be after all Different checks.
@@ -166,9 +230,20 @@ func compareDatabaseServices(a, b types.DatabaseService) int {
 	if a.GetNamespace() != b.GetNamespace() {
 		return Different
 	}
-	if !cmp.Equal(a.GetResourceMatchers(), b.GetResourceMatchers()) {
+	if !slices.EqualFunc(a.GetResourceMatchers(), b.GetResourceMatchers(),
+		func(matcher *types.DatabaseResourceMatcher, matcher2 *types.DatabaseResourceMatcher) bool {
+			return matcher.AWS.AssumeRoleARN == matcher2.AWS.AssumeRoleARN &&
+				maps.EqualFunc(matcher.Labels.ToProto().Values, matcher2.Labels.ToProto().Values,
+					func(values wrappers.StringValues, values2 wrappers.StringValues) bool {
+						return slices.Equal(values.Values, values2.Values)
+					})
+		}) {
 		return Different
 	}
+	if !maps.Equal(a.GetAllLabels(), b.GetAllLabels()) {
+		return Different
+	}
+	// OnlyTimestampsDifferent check must be after all Different checks.
 	if !a.Expiry().Equal(b.Expiry()) {
 		return OnlyTimestampsDifferent
 	}
@@ -192,10 +267,22 @@ func compareKubernetesServers(a, b types.KubeServer) int {
 	if !r.Matches(b.GetRotation()) {
 		return Different
 	}
-	if !cmp.Equal(a.GetCluster(), b.GetCluster()) {
+	if !a.GetCluster().IsEqual(b.GetCluster()) {
 		return Different
 	}
-	if !cmp.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+	if !slices.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+		return Different
+	}
+	if a.GetRelayGroup() != b.GetRelayGroup() {
+		return Different
+	}
+	if !slices.Equal(a.GetRelayIDs(), b.GetRelayIDs()) {
+		return Different
+	}
+	if a.GetScope() != b.GetScope() {
+		return Different
+	}
+	if !maps.Equal(a.GetAllLabels(), b.GetAllLabels()) {
 		return Different
 	}
 	// OnlyTimestampsDifferent check must be after all Different checks.
@@ -222,10 +309,22 @@ func compareDatabaseServers(a, b types.DatabaseServer) int {
 	if !r.Matches(b.GetRotation()) {
 		return Different
 	}
-	if !cmp.Equal(a.GetDatabase(), b.GetDatabase()) {
+	if !a.GetDatabase().IsEqual(b.GetDatabase()) {
 		return Different
 	}
-	if !cmp.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+	if !slices.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+		return Different
+	}
+	if a.GetRelayGroup() != b.GetRelayGroup() {
+		return Different
+	}
+	if !slices.Equal(a.GetRelayIDs(), b.GetRelayIDs()) {
+		return Different
+	}
+	if a.GetScope() != b.GetScope() {
+		return Different
+	}
+	if !maps.Equal(a.GetAllLabels(), b.GetAllLabels()) {
 		return Different
 	}
 	// OnlyTimestampsDifferent check must be after all Different checks.
@@ -248,11 +347,49 @@ func compareWindowsDesktopServices(a, b types.WindowsDesktopService) int {
 	if a.GetTeleportVersion() != b.GetTeleportVersion() {
 		return Different
 	}
-	if !cmp.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+	if !slices.Equal(a.GetProxyIDs(), b.GetProxyIDs()) {
+		return Different
+	}
+	if a.GetRelayGroup() != b.GetRelayGroup() {
+		return Different
+	}
+	if !slices.Equal(a.GetRelayIDs(), b.GetRelayIDs()) {
+		return Different
+	}
+	if !maps.Equal(a.GetAllLabels(), b.GetAllLabels()) {
 		return Different
 	}
 	// OnlyTimestampsDifferent check must be after all Different checks.
 	if !a.Expiry().Equal(b.Expiry()) {
+		return OnlyTimestampsDifferent
+	}
+	return Equal
+}
+
+func CompareLinuxDesktop(a, b *linuxdesktopv1.LinuxDesktop) int {
+	if a.GetKind() != b.GetKind() {
+		return Different
+	}
+	if a.GetSubKind() != b.GetSubKind() {
+		return Different
+	}
+	if a.GetMetadata().GetName() != b.GetMetadata().GetName() {
+		return Different
+	}
+	if a.GetSpec().GetAddr() != b.GetSpec().GetAddr() {
+		return Different
+	}
+	if a.GetSpec().GetHostname() != b.GetSpec().GetHostname() {
+		return Different
+	}
+	if !slices.Equal(a.GetSpec().GetProxyIds(), b.GetSpec().GetProxyIds()) {
+		return Different
+	}
+	if !maps.Equal(a.GetMetadata().GetLabels(), b.GetMetadata().GetLabels()) {
+		return Different
+	}
+	// OnlyTimestampsDifferent check must be after all Different checks.
+	if !a.GetMetadata().GetExpires().AsTime().Equal(b.GetMetadata().GetExpires().AsTime()) {
 		return OnlyTimestampsDifferent
 	}
 	return Equal
@@ -344,46 +481,32 @@ func UnmarshalServer(bytes []byte, kind string, opts ...MarshalOption) (types.Se
 		return nil, trace.BadParameter("missing server data")
 	}
 
-	var h types.ResourceHeader
-	if err = utils.FastUnmarshal(bytes, &h); err != nil {
+	var s types.ServerV2
+	if err := utils.FastUnmarshal(bytes, &s); err != nil {
+		return nil, trace.BadParameter("%s", err)
+	}
+	s.Kind = kind
+	if err := s.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
-
-	switch h.Version {
-	case types.V2:
-		var s types.ServerV2
-
-		if err := utils.FastUnmarshal(bytes, &s); err != nil {
-			return nil, trace.BadParameter(err.Error())
-		}
-		s.Kind = kind
-		if err := s.CheckAndSetDefaults(); err != nil {
-			return nil, trace.Wrap(err)
-		}
-		if cfg.ID != 0 {
-			s.SetResourceID(cfg.ID)
-		}
-		if !cfg.Expires.IsZero() {
-			s.SetExpiry(cfg.Expires)
-		}
-		if s.Metadata.Expires != nil {
-			apiutils.UTC(s.Metadata.Expires)
-		}
-		// Force the timestamps to UTC for consistency.
-		// See https://github.com/gogo/protobuf/issues/519 for details on issues this causes for proto.Clone
-		apiutils.UTC(&s.Spec.Rotation.Started)
-		apiutils.UTC(&s.Spec.Rotation.LastRotated)
-		return &s, nil
+	if cfg.Revision != "" {
+		s.SetRevision(cfg.Revision)
 	}
-	return nil, trace.BadParameter("server resource version %q is not supported", h.Version)
+	if !cfg.Expires.IsZero() {
+		s.SetExpiry(cfg.Expires)
+	}
+	if s.Metadata.Expires != nil {
+		apiutils.UTC(s.Metadata.Expires)
+	}
+	// Force the timestamps to UTC for consistency.
+	// See https://github.com/gogo/protobuf/issues/519 for details on issues this causes for proto.Clone
+	apiutils.UTC(&s.Spec.Rotation.Started)
+	apiutils.UTC(&s.Spec.Rotation.LastRotated)
+	return &s, nil
 }
 
 // MarshalServer marshals the Server resource to JSON.
 func MarshalServer(server types.Server, opts ...MarshalOption) ([]byte, error) {
-	if err := server.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	cfg, err := CollectOptions(opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -391,14 +514,11 @@ func MarshalServer(server types.Server, opts ...MarshalOption) ([]byte, error) {
 
 	switch server := server.(type) {
 	case *types.ServerV2:
-		if !cfg.PreserveResourceID {
-			// avoid modifying the original object
-			// to prevent unexpected data races
-			copy := *server
-			copy.SetResourceID(0)
-			server = &copy
+		if err := server.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		return utils.FastMarshal(server)
+
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, server))
 	default:
 		return nil, trace.BadParameter("unrecognized server version %T", server)
 	}
@@ -414,8 +534,8 @@ func UnmarshalServers(bytes []byte) ([]types.Server, error) {
 	}
 
 	out := make([]types.Server, len(servers))
-	for i, v := range servers {
-		out[i] = types.Server(&v)
+	for i := range servers {
+		out[i] = types.Server(&servers[i])
 	}
 	return out, nil
 }
@@ -430,8 +550,24 @@ func MarshalServers(s []types.Server) ([]byte, error) {
 	return bytes, nil
 }
 
+// GetCursorForNode returns the resource cursor identifying a node in the
+// logical resource stream: "<name>" for unscoped nodes and
+// "~scoped/<encoded-scope>/<name>" for scoped nodes.
+func GetCursorForNode(server types.Server) string {
+	return scopes.MakeResourceCursor(server.GetScope(), server.GetName())
+}
+
 // NodeHasMissedKeepAlives checks if node has missed its keep alive
 func NodeHasMissedKeepAlives(s types.Server) bool {
 	serverExpiry := s.Expiry()
 	return serverExpiry.Before(time.Now().Add(apidefaults.ServerAnnounceTTL - (apidefaults.ServerKeepAliveTTL() * 2)))
+}
+
+// EqualFromBool is a helper function that converts a boolean value to an integer
+// value that represents the equality status.
+func EqualFromBool(b bool) int {
+	if !b {
+		return Different
+	}
+	return Equal
 }

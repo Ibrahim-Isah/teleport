@@ -1,42 +1,53 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
 import (
+	"bytes"
 	"context"
-	"fmt"
+	"log/slog"
+	"math/rand/v2"
 	"net"
-	"strconv"
+	"os"
+	"slices"
 	"sync"
 
-	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport"
+	scopesv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/scopes/v1"
 	"github.com/gravitational/teleport/api/observability/tracing"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/defaults"
+	apiutils "github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/api/utils/aws"
+	"github.com/gravitational/teleport/lib/agentless"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/desktop"
 	"github.com/gravitational/teleport/lib/observability/metrics"
-	"github.com/gravitational/teleport/lib/reversetunnel"
-	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/teleagent"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
+	"github.com/gravitational/teleport/lib/scopes"
+	"github.com/gravitational/teleport/lib/scopes/pinning"
+	"github.com/gravitational/teleport/lib/services/readonly"
+	"github.com/gravitational/teleport/lib/sshagent"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
@@ -71,40 +82,43 @@ func init() {
 	metrics.RegisterPrometheusCollectors(proxiedSessions, failedConnectingToNode, connectingToNode)
 }
 
-// proxiedMetricConn wraps [net.Conn] opened by
+// ProxiedMetricConn wraps [net.Conn] opened by
 // the [Router] so that the proxiedSessions counter
 // can be decremented when it is closed.
-type proxiedMetricConn struct {
+type ProxiedMetricConn struct {
 	// once ensures that proxiedSessions is only decremented
 	// a single time per [net.Conn]
 	once sync.Once
 	net.Conn
 }
 
-// newProxiedMetricConn increments proxiedSessions and creates
-// a proxiedMetricConn that defers to the provided [net.Conn].
-func newProxiedMetricConn(conn net.Conn) *proxiedMetricConn {
+// NewProxiedMetricConn increments proxiedSessions and creates
+// a ProxiedMetricConn that defers to the provided [net.Conn].
+func NewProxiedMetricConn(conn net.Conn) *ProxiedMetricConn {
 	proxiedSessions.Inc()
-	return &proxiedMetricConn{Conn: conn}
+	return &ProxiedMetricConn{Conn: conn}
 }
 
-func (c *proxiedMetricConn) Close() error {
+func (c *ProxiedMetricConn) Close() error {
 	c.once.Do(proxiedSessions.Dec)
 	return trace.Wrap(c.Conn.Close())
 }
 
-type serverResolverFn = func(ctx context.Context, host, port string, site site) (types.Server, error)
+type serverResolverFn = func(ctx context.Context, scopePin *scopesv1.Pin, host, port string, cluster cluster) (types.Server, error)
+type windowsDesktopServiceConnectorFn = func(ctx context.Context, config *desktop.ConnectionConfig) (conn net.Conn, version string, err error)
 
-// SiteGetter provides access to connected local or remote sites
-type SiteGetter interface {
-	// GetSite returns the site matching the provided clusterName
-	GetSite(clusterName string) (reversetunnel.RemoteSite, error)
+// ClusterGetter provides access to connected local or remote clusters.
+type ClusterGetter interface {
+	// Cluster returns the cluster matching the provided clusterName
+	Cluster(ctx context.Context, clusterName string) (reversetunnelclient.Cluster, error)
 }
 
-// RemoteClusterGetter provides access to remote cluster resources
-type RemoteClusterGetter interface {
+// LocalAccessPoint provides access to remote cluster resources
+type LocalAccessPoint interface {
 	// GetRemoteCluster returns a remote cluster by name
-	GetRemoteCluster(clusterName string) (types.RemoteCluster, error)
+	GetRemoteCluster(ctx context.Context, clusterName string) (types.RemoteCluster, error)
+	// GetAuthPreference returns the local cluster auth preference.
+	GetAuthPreference(context.Context) (types.AuthPreference, error)
 }
 
 // RouterConfig contains all the dependencies required
@@ -112,34 +126,32 @@ type RemoteClusterGetter interface {
 type RouterConfig struct {
 	// ClusterName indicates which cluster the router is for
 	ClusterName string
-	// Log is the logger to use
-	Log *logrus.Entry
-	// AccessPoint is the proxy cache
-	RemoteClusterGetter RemoteClusterGetter
-	// SiteGetter allows looking up sites
-	SiteGetter SiteGetter
+	// LocalAccessPoint is the proxy cache
+	LocalAccessPoint LocalAccessPoint
+	// ClusterGetter allows looking up clusters
+	ClusterGetter ClusterGetter
 	// TracerProvider allows tracers to be created
 	TracerProvider oteltrace.TracerProvider
+	// Log is an optional logger. A default logger will be created if not set.
+	Logger *slog.Logger
 
 	// serverResolver is used to resolve hosts, used by tests
 	serverResolver serverResolverFn
+	// serverResolver is used to connect to Windows desktop service, used by tests
+	windowsDesktopServiceConnector windowsDesktopServiceConnectorFn
 }
 
 // CheckAndSetDefaults ensures the required items were populated
 func (c *RouterConfig) CheckAndSetDefaults() error {
-	if c.Log == nil {
-		c.Log = logrus.WithField(trace.Component, "Router")
-	}
-
 	if c.ClusterName == "" {
 		return trace.BadParameter("ClusterName must be provided")
 	}
 
-	if c.RemoteClusterGetter == nil {
-		return trace.BadParameter("RemoteClusterGetter must be provided")
+	if c.LocalAccessPoint == nil {
+		return trace.BadParameter("LocalAccessPoint must be provided")
 	}
 
-	if c.SiteGetter == nil {
+	if c.ClusterGetter == nil {
 		return trace.BadParameter("SiteGetter must be provided")
 	}
 
@@ -151,19 +163,28 @@ func (c *RouterConfig) CheckAndSetDefaults() error {
 		c.serverResolver = getServer
 	}
 
+	if c.windowsDesktopServiceConnector == nil {
+		c.windowsDesktopServiceConnector = desktop.ConnectToWindowsService
+	}
+
+	if c.Logger == nil {
+		c.Logger = slog.Default()
+	}
+
 	return nil
 }
 
-// Router is used by the proxy to establish connections to both
-// nodes and other clusters.
+// Router is used by the proxy to establish connections to
+// nodes, desktops, and other clusters.
 type Router struct {
-	clusterName    string
-	log            *logrus.Entry
-	clusterGetter  RemoteClusterGetter
-	localSite      reversetunnel.RemoteSite
-	siteGetter     SiteGetter
-	tracer         oteltrace.Tracer
-	serverResolver serverResolverFn
+	clusterName                    string
+	localAccessPoint               LocalAccessPoint
+	localCluster                   reversetunnelclient.Cluster
+	clusterGetter                  ClusterGetter
+	tracer                         oteltrace.Tracer
+	log                            *slog.Logger
+	serverResolver                 serverResolverFn
+	windowsDesktopServiceConnector windowsDesktopServiceConnectorFn
 }
 
 // NewRouter creates and returns a Router that is populated
@@ -173,275 +194,456 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	localSite, err := cfg.SiteGetter.GetSite(cfg.ClusterName)
+	localCluster, err := cfg.ClusterGetter.Cluster(context.Background(), cfg.ClusterName)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	return &Router{
-		clusterName:    cfg.ClusterName,
-		log:            cfg.Log,
-		clusterGetter:  cfg.RemoteClusterGetter,
-		localSite:      localSite,
-		siteGetter:     cfg.SiteGetter,
-		tracer:         cfg.TracerProvider.Tracer("Router"),
-		serverResolver: cfg.serverResolver,
+		clusterName:                    cfg.ClusterName,
+		localAccessPoint:               cfg.LocalAccessPoint,
+		localCluster:                   localCluster,
+		clusterGetter:                  cfg.ClusterGetter,
+		tracer:                         cfg.TracerProvider.Tracer("Router"),
+		log:                            cfg.Logger,
+		serverResolver:                 cfg.serverResolver,
+		windowsDesktopServiceConnector: cfg.windowsDesktopServiceConnector,
 	}, nil
-
 }
 
 // DialHost dials the node that matches the provided host, port and cluster. If no matching node
 // is found an error is returned. If more than one matching node is found and the cluster networking
-// configuration is not set to route to the most recent an error is returned. Also returns teleport version of the
-// target server if it's a teleport server
-// DELETE IN 14.0: remove returning teleport version, it was needed for compatibility
-func (r *Router) DialHost(ctx context.Context, clientSrcAddr, clientDstAddr net.Addr, host, port, clusterName string, accessChecker services.AccessChecker, agentGetter teleagent.Getter) (_ net.Conn, teleportVersion string, err error) {
+// configuration is not set to route to the most recent an error is returned.
+func (r *Router) DialHost(ctx context.Context, scopePin *scopesv1.Pin, clientSrcAddr, clientDstAddr net.Addr, host, port, clusterName string, clusterAccessChecker func(types.RemoteCluster) error, agentGetter sshagent.ClientGetter, signer agentless.SignerCreator) (_ net.Conn, err error) {
 	ctx, span := r.tracer.Start(
 		ctx,
 		"router/DialHost",
 		oteltrace.WithAttributes(
 			attribute.String("host", host),
 			attribute.String("port", port),
-			attribute.String("site", clusterName),
+			attribute.String("cluster", clusterName),
 		),
 	)
+	connectingToNode.Inc()
 	defer func() {
 		if err != nil {
 			failedConnectingToNode.Inc()
 		}
-		span.End()
+		tracing.EndSpan(span, err)
 	}()
 
-	var targetTeleportVersion string
-	site := r.localSite
+	cluster := r.localCluster
 	if clusterName != r.clusterName {
-		remoteSite, err := r.getRemoteCluster(ctx, clusterName, accessChecker)
-		if err != nil {
-			return nil, targetTeleportVersion, trace.Wrap(err)
+		if scopePin != nil {
+			return nil, trace.AccessDenied("identity pinned to scope %q cannot dial remote cluster %q (scoping does not support cross-cluster operations)", scopePin.GetScope(), clusterName)
 		}
-		site = remoteSite
+		remoteCluster, err := r.getRemoteCluster(ctx, clusterName, clusterAccessChecker)
+		if err != nil {
+			return nil, trace.Wrap(err, "looking up remote cluster %q", clusterName)
+		}
+		cluster = remoteCluster
 	}
 
 	span.AddEvent("looking up server")
-	target, err := r.serverResolver(ctx, host, port, remoteSite{site})
+	target, err := r.serverResolver(ctx, scopePin, host, port, fakeCluster{cluster})
 	if err != nil {
-		return nil, "", trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
 	span.AddEvent("retrieved target server")
 
-	principals := []string{host}
-
-	var (
-		serverID   string
-		serverAddr string
-		proxyIDs   []string
-	)
-
-	if target != nil {
-		proxyIDs = target.GetProxyIDs()
-		serverID = fmt.Sprintf("%v.%v", target.GetName(), clusterName)
-
-		// add hostUUID.cluster to the principals
-		principals = append(principals, serverID)
-
-		// add ip if it exists to the principals
-		serverAddr = target.GetAddr()
-
-		switch {
-		case serverAddr != "":
-			h, _, err := net.SplitHostPort(serverAddr)
-			if err != nil {
-				return nil, "", trace.Wrap(err)
-			}
-
-			principals = append(principals, h)
-		case serverAddr == "" && target.GetUseTunnel():
-			serverAddr = reversetunnel.LocalNode
-		}
-
-		targetTeleportVersion = target.GetTeleportVersion()
-	} else {
-		if port == "" || port == "0" {
-			port = strconv.Itoa(defaults.SSHServerListenPort)
-		}
-
-		serverAddr = net.JoinHostPort(host, port)
-		r.log.Warnf("server lookup failed: using default=%v", serverAddr)
+	serverID := target.GetName() + "." + clusterName
+	hostClusterPrincipal := host + "." + clusterName
+	principals := []string{
+		host,
+		// Add in hostClusterPrincipal for when nodes are on leaf clusters.
+		hostClusterPrincipal,
 	}
 
-	conn, err := site.Dial(reversetunnel.DialParams{
-		From:                  clientSrcAddr,
-		To:                    &utils.NetAddr{AddrNetwork: "tcp", Addr: serverAddr},
-		OriginalClientDstAddr: clientDstAddr,
-		GetUserAgent:          agentGetter,
-		Address:               host,
-		ServerID:              serverID,
-		ProxyIDs:              proxyIDs,
-		Principals:            principals,
-		TeleportVersion:       targetTeleportVersion,
-		ConnType:              types.NodeTunnel,
+	// add hostUUID.cluster to the principals if it's different from hostClusterPrincipal.
+	if serverID != hostClusterPrincipal {
+		principals = append(principals, serverID)
+	}
+
+	serverAddr := target.GetAddr()
+	switch {
+	case serverAddr != "":
+		h, _, err := net.SplitHostPort(serverAddr)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		principals = append(principals, h)
+	case serverAddr == "" && target.GetUseTunnel():
+		serverAddr = reversetunnelclient.LocalNode
+	}
+
+	// If the node is a registered openssh node don't set agentGetter
+	// so a SSH user agent will not be created when connecting to the remote node.
+	var agentlessSignerCreator agentless.SignerCreator
+	if target.IsOpenSSHNode() {
+		agentGetter = nil
+		if target.GetSubKind() == types.SubKindOpenSSHNode {
+			agentlessSignerCreator = signer
+		}
+	}
+
+	conn, err := cluster.Dial(reversetunnelclient.DialParams{
+		From:                   clientSrcAddr,
+		To:                     &utils.NetAddr{AddrNetwork: "tcp", Addr: serverAddr},
+		OriginalClientDstAddr:  clientDstAddr,
+		GetUserAgent:           agentGetter,
+		AgentlessSignerCreator: agentlessSignerCreator,
+		Address:                host,
+		Principals:             apiutils.Deduplicate(principals),
+		ServerID:               serverID,
+		ProxyIDs:               target.GetProxyIDs(),
+		ConnType:               types.NodeTunnel,
+		TargetServer:           target,
+		TargetScope:            target.GetScope(),
 	})
 	if err != nil {
-		return nil, "", trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
 
-	return newProxiedMetricConn(conn), targetTeleportVersion, trace.Wrap(err)
+	// SSH connection MUST start with "SSH-2.0" bytes according to https://datatracker.ietf.org/doc/html/rfc4253#section-4.2
+	conn = newCheckedPrefixWriter(conn, []byte("SSH-2.0"))
+	return NewProxiedMetricConn(conn), trace.Wrap(err)
 }
 
-// getRemoteCluster looks up the provided clusterName to determine if a remote site exists with
+// DialWindowsDesktop dials the desktop that matches the provided desktop name and cluster.
+// If no matching desktop is found, an error is returned.
+func (r *Router) DialWindowsDesktop(ctx context.Context, clientSrcAddr, clientDstAddr net.Addr, desktopName, clusterName string, clusterAccessChecker func(types.RemoteCluster) error) (_ net.Conn, err error) {
+	ctx, span := r.tracer.Start(
+		ctx,
+		"router/DialWindowsDesktop",
+		oteltrace.WithAttributes(
+			attribute.String("desktopName", desktopName),
+			attribute.String("cluster", clusterName),
+		),
+	)
+	defer func() { tracing.EndSpan(span, err) }()
+
+	cluster := r.localCluster
+	if clusterName != r.clusterName {
+		remoteCluster, err := r.getRemoteCluster(ctx, clusterName, clusterAccessChecker)
+		if err != nil {
+			return nil, trace.Wrap(err, "looking up remote cluster %q", clusterName)
+		}
+		cluster = remoteCluster
+	}
+
+	accessPoint, err := cluster.CachingAccessPoint()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	span.AddEvent("looking up Windows desktop service connection")
+
+	serviceConn, _, err := r.windowsDesktopServiceConnector(ctx, &desktop.ConnectionConfig{
+		Log:            r.log,
+		DesktopsGetter: accessPoint,
+		Cluster:        cluster,
+		ClientSrcAddr:  clientSrcAddr,
+		ClientDstAddr:  clientDstAddr,
+		ClusterName:    clusterName,
+		DesktopName:    desktopName,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err, "cannot connect to Windows Desktop Service")
+	}
+
+	span.AddEvent("retrieved Windows desktop service connection")
+
+	return serviceConn, trace.Wrap(err)
+}
+
+// checkedPrefixWriter checks that first data written into it has the specified prefix.
+type checkedPrefixWriter struct {
+	net.Conn
+
+	requiredPrefix  []byte
+	requiredPointer int
+}
+
+func newCheckedPrefixWriter(conn net.Conn, requiredPrefix []byte) *checkedPrefixWriter {
+	return &checkedPrefixWriter{
+		Conn:           conn,
+		requiredPrefix: requiredPrefix,
+	}
+}
+
+// Write writes data into connection, checking if it has required prefix. Not safe for concurrent calls.
+func (c *checkedPrefixWriter) Write(p []byte) (int, error) {
+	// If pointer reached end of required prefix the check is done
+	if len(c.requiredPrefix) == c.requiredPointer {
+		n, err := c.Conn.Write(p)
+		return n, trace.Wrap(err)
+	}
+
+	// Decide which is smaller, provided data or remaining portion of the required prefix
+	small, big := c.requiredPrefix[c.requiredPointer:], p
+	if len(small) > len(big) {
+		big, small = small, big
+	}
+
+	if !bytes.HasPrefix(big, small) {
+		return 0, trace.AccessDenied("required prefix %q was not found", c.requiredPrefix)
+	}
+	n, err := c.Conn.Write(p)
+	// Advance pointer by confirmed portion of the prefix.
+	c.requiredPointer += min(n, len(small))
+	return n, trace.Wrap(err)
+}
+
+// getRemoteCluster looks up the provided clusterName to determine if a remote cluster exists with
 // that name and determines if the user has access to it.
-func (r *Router) getRemoteCluster(ctx context.Context, clusterName string, checker services.AccessChecker) (reversetunnel.RemoteSite, error) {
-	_, span := r.tracer.Start(
+func (r *Router) getRemoteCluster(ctx context.Context, clusterName string, clusterAccessChecker func(types.RemoteCluster) error) (reversetunnelclient.Cluster, error) {
+	ctx, span := r.tracer.Start(
 		ctx,
 		"router/getRemoteCluster",
 		oteltrace.WithAttributes(
-			attribute.String("site", clusterName),
+			attribute.String("cluster", clusterName),
 		),
 	)
 	defer span.End()
 
-	site, err := r.siteGetter.GetSite(clusterName)
+	cluster, err := r.clusterGetter.Cluster(ctx, clusterName)
 	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	rc, err := r.clusterGetter.GetRemoteCluster(clusterName)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	if err := checker.CheckAccessToRemoteCluster(rc); err != nil {
 		return nil, utils.OpaqueAccessDenied(err)
 	}
 
-	return site, nil
+	rc, err := r.localAccessPoint.GetRemoteCluster(ctx, clusterName)
+	if err != nil {
+		return nil, utils.OpaqueAccessDenied(err)
+	}
+
+	if err := clusterAccessChecker(rc); err != nil {
+		return nil, utils.OpaqueAccessDenied(err)
+	}
+
+	return cluster, nil
 }
 
-// site is the minimum interface needed to match servers
-// for a reversetunnel.RemoteSite. It makes testing easier.
-type site interface {
-	GetNodes(fn func(n services.Node) bool) ([]types.Server, error)
-	GetClusterNetworkingConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterNetworkingConfig, error)
+// cluster is the minimum interface needed to match servers
+// for a reversetunnelclient.Cluster. It makes testing easier.
+type cluster interface {
+	GetNodes(ctx context.Context, fn func(n readonly.Server) bool) ([]types.Server, error)
+	GetClusterNetworkingConfig(ctx context.Context) (types.ClusterNetworkingConfig, error)
+	GetGitServers(context.Context, func(readonly.Server) bool) ([]types.Server, error)
 }
 
-// remoteSite is a site implementation that wraps
-// a reversetunnel.RemoteSite
-type remoteSite struct {
-	site reversetunnel.RemoteSite
+// fakeCluster is a cluster implementation that wraps
+// a reversetunnelclient.Cluster
+type fakeCluster struct {
+	cluster reversetunnelclient.Cluster
 }
 
-// GetNodes uses the wrapped sites NodeWatcher to filter nodes
-func (r remoteSite) GetNodes(fn func(n services.Node) bool) ([]types.Server, error) {
-	watcher, err := r.site.NodeWatcher()
+// GetNodes uses the wrapped cluster's NodeWatcher to filter nodes
+func (r fakeCluster) GetNodes(ctx context.Context, fn func(n readonly.Server) bool) ([]types.Server, error) {
+	watcher, err := r.cluster.NodeWatcher()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return watcher.GetNodes(fn), nil
+	servers, err := watcher.CurrentResourcesWithFilter(ctx, fn)
+	return servers, trace.Wrap(err)
 }
 
-// GetClusterNetworkingConfig uses the wrapped sites cache to retrieve the ClusterNetworkingConfig
-func (r remoteSite) GetClusterNetworkingConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterNetworkingConfig, error) {
-	ap, err := r.site.CachingAccessPoint()
+// GetGitServers uses the wrapped cluster's GitServerWatcher to filter git servers.
+func (r fakeCluster) GetGitServers(ctx context.Context, fn func(n readonly.Server) bool) ([]types.Server, error) {
+	watcher, err := r.cluster.GitServerWatcher()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	cfg, err := ap.GetClusterNetworkingConfig(ctx, opts...)
+	return watcher.CurrentResourcesWithFilter(ctx, fn)
+}
+
+// GetClusterNetworkingConfig uses the wrapped cluster's cache to retrieve the ClusterNetworkingConfig
+func (r fakeCluster) GetClusterNetworkingConfig(ctx context.Context) (types.ClusterNetworkingConfig, error) {
+	ap, err := r.cluster.CachingAccessPoint()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	cfg, err := ap.GetClusterNetworkingConfig(ctx)
 	return cfg, trace.Wrap(err)
 }
 
 // getServer attempts to locate a node matching the provided host and port in
-// the provided site.
-func getServer(ctx context.Context, host, port string, site site) (types.Server, error) {
-	if site == nil {
-		return nil, trace.BadParameter("invalid remote site provided")
+// the provided cluster.
+func getServer(ctx context.Context, scopePin *scopesv1.Pin, host, port string, cluster cluster) (types.Server, error) {
+	if org, ok := types.GetGitHubOrgFromNodeAddr(host); ok {
+		if scopePin != nil {
+			return nil, trace.AccessDenied("identity pinned to scope %q cannot dial github server for %q (scoped identities not supported)", scopePin.GetScope(), org)
+		}
+		return getGitHubServer(ctx, org, cluster)
+	}
+	return getServerWithResolver(ctx, scopePin, host, port, cluster, nil /* use default resolver */)
+}
+
+var disableUnqualifiedLookups = os.Getenv("TELEPORT_UNSTABLE_DISABLE_UNQUALIFIED_LOOKUPS") == "yes"
+
+// getServerWithResolver attempts to locate a node matching the provided host and port in
+// the provided cluster. The resolver argument is used in certain tests to mock DNS resolution
+// and can generally be left nil.
+func getServerWithResolver(ctx context.Context, scopePin *scopesv1.Pin, host, port string, cluster cluster, resolver apiutils.HostResolver) (types.Server, error) {
+	if cluster == nil {
+		return nil, trace.BadParameter("invalid remote cluster provided")
 	}
 
 	strategy := types.RoutingStrategy_UNAMBIGUOUS_MATCH
-	if cfg, err := site.GetClusterNetworkingConfig(ctx); err == nil {
+	var caseInsensitiveRouting bool
+	if cfg, err := cluster.GetClusterNetworkingConfig(ctx); err == nil {
 		strategy = cfg.GetRoutingStrategy()
+		caseInsensitiveRouting = cfg.GetCaseInsensitiveRouting()
 	}
 
-	_, err := uuid.Parse(host)
-	dialByID := err == nil || utils.IsEC2NodeID(host)
-
-	ips, _ := net.LookupHost(host)
-
-	var unambiguousIDMatch bool
-	matches, err := site.GetNodes(func(server services.Node) bool {
-		if unambiguousIDMatch {
-			return false
-		}
-
-		// if host is a UUID or EC2 ID match only
-		// by server name and treat matches as unambiguous
-		if dialByID && server.GetName() == host {
-			unambiguousIDMatch = true
-			return true
-		}
-
-		// if the server has connected over a reverse tunnel
-		// then match only by hostname
-		if server.GetUseTunnel() {
-			return host == server.GetHostname()
-		}
-
-		ip, nodePort, err := net.SplitHostPort(server.GetAddr())
-		if err != nil {
-			return false
-		}
-
-		if (host == ip || host == server.GetHostname() || slices.Contains(ips, ip)) &&
-			(port == "" || port == "0" || port == nodePort) {
-			return true
-		}
-
-		return false
+	routeMatcher, err := apiutils.NewSSHRouteMatcherFromConfig(apiutils.SSHRouteMatcherConfig{
+		Host:                      host,
+		Port:                      port,
+		CaseInsensitive:           caseInsensitiveRouting,
+		Resolver:                  resolver,
+		DisableUnqualifiedLookups: disableUnqualifiedLookups,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	var server types.Server
-	switch {
-	case strategy == types.RoutingStrategy_MOST_RECENT:
-		for _, m := range matches {
-			if server == nil || m.Expiry().After(server.Expiry()) {
-				server = m
+	var maxScore int
+	scores := make(map[scopes.QualifiedName]int)
+	matches, err := cluster.GetNodes(ctx, func(server readonly.Server) bool {
+		if scopePin != nil {
+			// TODO(fspmarshall/scopes): implement scope-aware node storage. filtering agents based on scope is sub-optimal. scoping
+			// provides a natural machanism for efficiently storing resources in trees s.t. we only need query the subset of resources
+			// that are subject to the target scope. in very large clusters, reworking our node route table storage such that it is
+			// scope-partitioned could provide significant routing performance improvements.
+			agentScope := scopes.Root
+			if server.GetScope() != "" {
+				agentScope = server.GetScope()
+			}
+
+			if !pinning.PinAppliesToResourceScope(scopePin, agentScope) {
+				return false
 			}
 		}
-	case len(matches) > 1:
-		return nil, trace.NotFound(teleport.NodeIsAmbiguous)
-	case len(matches) == 1:
-		server = matches[0]
-	}
 
-	if dialByID && server == nil {
-		idType := "UUID"
-		if utils.IsEC2NodeID(host) {
-			idType = "EC2"
+		score := routeMatcher.RouteToServerScore(server)
+		if score < 1 {
+			return false
 		}
 
-		return nil, trace.NotFound("unable to locate node matching %s-like target %s", idType, host)
+		// Keyed by scope-qualified name: node names are only unique within a
+		// scope, so same-named nodes in different scopes would otherwise share
+		// a single score entry and overwrite each other.
+		scores[scopes.QualifiedName{Scope: server.GetScope(), Name: server.GetName()}] = score
+		maxScore = max(maxScore, score)
+		return true
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
 
-	return server, nil
+	if routeMatcher.MatchesServerIDs() && len(matches) > 1 {
+		// if a dial request for an id-like target creates multiple matches,
+		// give precedence to the exact match if one exists. If not, handle
+		// multiple matchers per-usual below.
+		//
+		// With the introduction of scope namespacing, it is now technically possible
+		// to create ssh servers with matching id-like names in multiple scopes.
+		// TODO (williamo/scopes): Replace this with SQN based routing
+		var nameMatches []types.Server
+		for _, m := range matches {
+			if m.GetName() == host {
+				nameMatches = append(nameMatches, m)
+			}
+		}
 
+		if len(nameMatches) > 0 {
+			// Narrow to the name matches rather than to a single one. A lone
+			// name match still collapses to it as before, but colliding names
+			// across scopes are left ambiguous for the handling below.
+			// If there is an unscoped server, take it over scoped servers
+			// that collide with its name.
+			matches = nameMatches
+
+			if slices.ContainsFunc(matches, func(m types.Server) bool { return m.GetScope() == "" }) {
+				matches = slices.DeleteFunc(matches, func(m types.Server) bool { return m.GetScope() != "" })
+			}
+		}
+	}
+
+	// NOTE: there is an open question here about whether or not we should be doing scope-aware
+	// disambiguation when multiple matches are found. In some cases, this seems like the obviously
+	// right thing to do.  For example, when there is a match in `/foo` and a match in `/foo/bar`,
+	// it would seem obvious that the match in `/foo` should be preferred per scope hierarchy rules.
+	// However, not all cases are so clear (e.g. `/foo/bar` and `/foo/bax`), and there may be an
+	// argument that disambiguation within the set of scope-subject nodes may inadvertently hide
+	// the nature of scope-based routing and lead to a false sense of security, causing undesirable
+	// outcomes should the node in the parent scope ever go offline. For now, we are opting to leave
+	// scope-aware disambiguation as a future enhancement, in favor of only using scope to exclude those
+	// nodes that would *never* be routable per the provided scope pin.
+
+	if len(matches) > 1 {
+		// in the event of multiple matches, some matches may be of higher quality than others
+		// (e.g. matching an ip/hostname directly versus matching a resolved ip). if we have a
+		// mix of match qualities, filter out the lower quality matches to reduce ambiguity.
+		filtered := matches[:0]
+		for _, m := range matches {
+			if scores[scopes.QualifiedName{Scope: m.GetScope(), Name: m.GetName()}] < maxScore {
+				continue
+			}
+
+			filtered = append(filtered, m)
+		}
+		matches = filtered
+	}
+
+	switch {
+	case len(matches) == 1:
+		return matches[0], nil
+
+	case len(matches) > 1:
+		// TODO(tross) DELETE IN V20.0.0
+		// NodeIsAmbiguous is included in the error message for backwards compatibility
+		// with older nodes that expect to see that string in the error message.
+		if strategy != types.RoutingStrategy_MOST_RECENT {
+			return nil, trace.Wrap(teleport.ErrNodeIsAmbiguous, teleport.NodeIsAmbiguous)
+		}
+
+		var recentServer types.Server
+		for _, m := range matches {
+			if recentServer == nil || m.Expiry().After(recentServer.Expiry()) {
+				recentServer = m
+			}
+		}
+		return recentServer, nil
+
+	default: // no matches
+		if routeMatcher.MatchesServerIDs() {
+			idType := "UUID"
+			if aws.IsEC2NodeID(host) {
+				idType = "EC2"
+			}
+			return nil, trace.NotFound("unable to locate node matching %s-like target %s", idType, host)
+		}
+
+		return nil, trace.ConnectionProblem(nil, "target host %s is offline or does not exist", host)
+	}
 }
 
 // DialSite establishes a connection to the auth server in the provided
 // cluster. If the clusterName is an empty string then a connection to
 // the local auth server will be established.
-func (r *Router) DialSite(ctx context.Context, clusterName string, clientSrcAddr, clientDstAddr net.Addr) (net.Conn, error) {
-	_, span := r.tracer.Start(
+func (r *Router) DialSite(ctx context.Context, clusterName string, clientSrcAddr, clientDstAddr net.Addr) (_ net.Conn, err error) {
+	ctx, span := r.tracer.Start(
 		ctx,
 		"router/DialSite",
 		oteltrace.WithAttributes(
-			attribute.String("site", clusterName),
+			attribute.String("cluster", clusterName),
 		),
 	)
-	defer span.End()
+	defer func() { tracing.EndSpan(span, err) }()
 
 	// default to local cluster if one wasn't provided
 	if clusterName == "" {
@@ -450,20 +652,55 @@ func (r *Router) DialSite(ctx context.Context, clusterName string, clientSrcAddr
 
 	// dial the local auth server
 	if clusterName == r.clusterName {
-		conn, err := r.localSite.DialAuthServer(reversetunnel.DialParams{From: clientSrcAddr, OriginalClientDstAddr: clientDstAddr})
+		conn, err := r.localCluster.DialAuthServer(reversetunnelclient.DialParams{From: clientSrcAddr, OriginalClientDstAddr: clientDstAddr})
 		return conn, trace.Wrap(err)
 	}
 
-	// lookup the site and dial its auth server
-	site, err := r.siteGetter.GetSite(clusterName)
+	// lookup the cluster and dial its auth server
+	cluster, err := r.clusterGetter.Cluster(ctx, clusterName)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	conn, err := site.DialAuthServer(reversetunnel.DialParams{From: clientSrcAddr, OriginalClientDstAddr: clientDstAddr})
+	conn, err := cluster.DialAuthServer(reversetunnelclient.DialParams{From: clientSrcAddr, OriginalClientDstAddr: clientDstAddr})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return newProxiedMetricConn(conn), trace.Wrap(err)
+	return NewProxiedMetricConn(conn), trace.Wrap(err)
+}
+
+// GetSiteClient returns an auth client for the provided cluster.
+func (r *Router) GetSiteClient(ctx context.Context, clusterName string) (authclient.ClientI, error) {
+	if clusterName == r.clusterName {
+		return r.localCluster.GetClient()
+	}
+
+	cluster, err := r.clusterGetter.Cluster(ctx, clusterName)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return cluster.GetClient()
+}
+
+func getGitHubServer(ctx context.Context, gitHubOrg string, cluster cluster) (types.Server, error) {
+	servers, err := cluster.GetGitServers(ctx, func(s readonly.Server) bool {
+		github := s.GetGitHub()
+		return github != nil && github.Organization == gitHubOrg
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	switch len(servers) {
+	case 0:
+		return nil, trace.NotFound("unable to locate Git server for GitHub organization %s", gitHubOrg)
+	case 1:
+		return servers[0], nil
+	default:
+		// It's unusual but possible to have multiple servers per organization
+		// (e.g. possibly a second Git server for a manual CA rotation). Pick a
+		// random one.
+		return servers[rand.N(len(servers))], nil
+	}
 }

@@ -1,38 +1,45 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { useState, type PropsWithChildren } from 'react';
+import styled from 'styled-components';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-
+import { Box, ButtonSecondary, Flex } from 'design';
 import { Danger } from 'design/Alert';
-import { Indicator, Box } from 'design';
+import { SearchPanel } from 'shared/components/Search';
+import { useInfiniteScroll } from 'shared/hooks';
 
+import { ExternalAuditStorageCta } from '@gravitational/teleport/src/components/ExternalAuditStorageCta';
+import { ClusterDropdown } from 'teleport/components/ClusterDropdown/ClusterDropdown';
 import RangePicker from 'teleport/components/EventRangePicker';
 import {
   FeatureBox,
   FeatureHeader,
   FeatureHeaderTitle,
 } from 'teleport/components/Layout';
-import useTeleport from 'teleport/useTeleport';
 import useStickyClusterId from 'teleport/useStickyClusterId';
+import useTeleport from 'teleport/useTeleport';
 
 import EventList from './EventList';
-
+import { EventListSkeleton } from './EventListSkeleton';
 import useAuditEvents, { State } from './useAuditEvents';
 
-export default function Container() {
+export function AuditContainer() {
   const teleCtx = useTeleport();
   const { clusterId } = useStickyClusterId();
   const state = useAuditEvents(teleCtx, clusterId);
@@ -41,41 +48,125 @@ export default function Container() {
 
 export function Audit(props: State) {
   const {
-    attempt,
     range,
     setRange,
-    rangeOptions,
     events,
     clusterId,
-    fetchMore,
-    fetchStatus,
+    fetchNextPage,
+    hasNextPage,
+    isPlaceholderData,
+    isFetchingNextPage,
+    error,
+    isLoading,
+    search,
+    setSearch,
+    sort,
+    setSort,
+    ctx,
+    refetch,
+    isError,
   } = props;
 
+  const [errorMessage, setErrorMessage] = useState('');
+
+  const canFetchNextPage =
+    hasNextPage && !isFetchingNextPage && !isError && !isPlaceholderData;
+
+  const { setTrigger } = useInfiniteScroll({
+    fetch: async () => {
+      if (canFetchNextPage) {
+        fetchNextPage();
+      }
+    },
+  });
+
+  const onRetryClicked = () => {
+    refetch();
+  };
+
+  const onLoadMoreClicked = () => {
+    if (canFetchNextPage) {
+      fetchNextPage();
+    }
+  };
+
+  const showSkeleton =
+    (isLoading && events.length === 0) ||
+    isFetchingNextPage ||
+    isPlaceholderData;
+
   return (
-    <FeatureBox>
+    <FeatureBox unsetHeight>
       <FeatureHeader alignItems="center">
         <FeatureHeaderTitle mr="8">Audit Log</FeatureHeaderTitle>
-        <RangePicker
-          ml="auto"
-          range={range}
-          ranges={rangeOptions}
-          onChangeRange={setRange}
-        />
+        <RangePicker ml="auto" range={range} onChangeRange={setRange} />
       </FeatureHeader>
-      {attempt.status === 'failed' && <Danger> {attempt.statusText} </Danger>}
-      {attempt.status === 'processing' && (
-        <Box textAlign="center" m={10}>
-          <Indicator />
-        </Box>
+      <ExternalAuditStorageCta />
+      {!isLoading && isError && error && (
+        <ErrorsContainer>
+          <DangerWithBackground
+            primaryAction={{
+              content: 'Retry',
+              onClick: onRetryClicked,
+            }}
+          >
+            {error.message}
+          </DangerWithBackground>
+        </ErrorsContainer>
       )}
-      {attempt.status === 'success' && (
-        <EventList
-          events={events}
+      {!errorMessage && (
+        <ClusterDropdown
+          clusterLoader={ctx.clusterService}
           clusterId={clusterId}
-          fetchMore={fetchMore}
-          fetchStatus={fetchStatus}
+          onError={setErrorMessage}
+          mb={2}
         />
       )}
+      {errorMessage && <Danger>{errorMessage}</Danger>}
+      <Box mt={2}>
+        <SearchPanel
+          updateSearch={setSearch}
+          updateQuery={null}
+          hideAdvancedSearch={true}
+          filter={{ search }}
+        />
+        {!isLoading && !isPlaceholderData && (
+          <EventList
+            events={events}
+            search={search}
+            setSearch={setSearch}
+            sort={sort}
+            setSort={setSort}
+          />
+        )}
+        {showSkeleton && <EventListSkeleton />}
+        {!isPlaceholderData && <div ref={setTrigger} />}
+        {isError && events.length > 0 && !isLoading && (
+          <Box mt={2} textAlign="center">
+            <ButtonSecondary onClick={onLoadMoreClicked}>
+              Load more
+            </ButtonSecondary>
+          </Box>
+        )}
+      </Box>
     </FeatureBox>
   );
 }
+
+function ErrorsContainer(props: PropsWithChildren<unknown>) {
+  return <ErrorBox>{props.children}</ErrorBox>;
+}
+
+const ErrorBox = styled(Flex)`
+  position: sticky;
+  flex-direction: column;
+  top: ${props => props.theme.space[3]}px;
+  gap: ${props => props.theme.space[1]}px;
+  padding-top: ${props => props.theme.space[1]}px;
+  padding-bottom: ${props => props.theme.space[3]}px;
+  z-index: 1;
+`;
+
+const DangerWithBackground = styled(Danger)`
+  background: ${props => props.theme.colors.levels.sunken};
+`;

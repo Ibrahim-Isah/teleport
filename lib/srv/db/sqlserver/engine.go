@@ -1,32 +1,37 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package sqlserver
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
+	"runtime/debug"
 
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/types/events"
 	libevents "github.com/gravitational/teleport/lib/events"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/db/common"
+	"github.com/gravitational/teleport/lib/srv/db/common/kerberos"
+	"github.com/gravitational/teleport/lib/srv/db/common/role"
 	"github.com/gravitational/teleport/lib/srv/db/sqlserver/protocol"
 	"github.com/gravitational/teleport/lib/utils"
 )
@@ -35,11 +40,7 @@ import (
 func NewEngine(ec common.EngineConfig) common.Engine {
 	return &Engine{
 		EngineConfig: ec,
-		Connector: &connector{
-			DBAuth:     ec.Auth,
-			AuthClient: ec.AuthClient,
-			DataDir:    ec.DataDir,
-		},
+		Connector:    newConnector(ec.Auth, kerberos.NewClientProvider(ec.AuthClient, ec.Log)),
 	}
 }
 
@@ -64,7 +65,7 @@ func (e *Engine) InitializeConnection(clientConn net.Conn, _ *common.Session) er
 func (e *Engine) SendError(err error) {
 	if err != nil && !utils.IsOKNetworkError(err) {
 		if errSend := protocol.WriteErrorResponse(e.clientConn, err); errSend != nil {
-			e.Log.WithError(errSend).Warnf("Failed to send error to client: %v.", err)
+			e.Log.WarnContext(e.Context, "Failed to send error to client.", "engine_error", err, "send_error", errSend)
 		}
 	}
 }
@@ -72,6 +73,8 @@ func (e *Engine) SendError(err error) {
 // HandleConnection authorizes the incoming client connection, connects to the
 // target SQL Server server and starts proxying messages between client/server.
 func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Session) error {
+	observe := common.GetConnectionSetupTimeObserver(sessionCtx.Database)
+
 	// Pre-Login packet was handled on the Proxy. Now we expect the client to
 	// send us a Login7 packet that contains username/database information and
 	// other connection options.
@@ -102,6 +105,8 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 	e.Audit.OnSessionStart(e.Context, sessionCtx, nil)
 	defer e.Audit.OnSessionEnd(e.Context, sessionCtx)
 
+	observe()
+
 	clientErrCh := make(chan error, 1)
 	serverErrCh := make(chan error, 1)
 	go e.receiveFromClient(e.clientConn, serverConn, clientErrCh, sessionCtx)
@@ -109,11 +114,11 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 
 	select {
 	case err := <-clientErrCh:
-		e.Log.WithError(err).Debug("Client done.")
+		e.Log.DebugContext(e.Context, "Client done.", "error", err)
 	case err := <-serverErrCh:
-		e.Log.WithError(err).Debug("Server done.")
+		e.Log.DebugContext(e.Context, "Server done.", "error", err)
 	case <-ctx.Done():
-		e.Log.Debug("Context canceled.")
+		e.Log.DebugContext(e.Context, "Context canceled.")
 	}
 
 	return nil
@@ -124,47 +129,89 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 func (e *Engine) receiveFromClient(clientConn, serverConn io.ReadWriteCloser, clientErrCh chan<- error, sessionCtx *common.Session) {
 	defer func() {
 		if r := recover(); r != nil {
-			e.Log.Warnf("Recovered while handling DB connection %v", r)
+			e.Log.WarnContext(e.Context, "Recovered while handling DB connection", "problem", r, "stack", debug.Stack())
 			err := trace.BadParameter("failed to handle client connection")
 			e.SendError(err)
 		}
 		serverConn.Close()
-		e.Log.Debug("Stop receiving from client.")
+		e.Log.DebugContext(e.Context, "Stop receiving from client.")
 		close(clientErrCh)
 	}()
+
+	msgFromClient := common.GetMessagesFromClientMetric(sessionCtx.Database)
+	// initialPacketHeader and chunkData are used to accumulate chunked packets
+	// to build a single packet with full contents for auditing.
+	var initialPacketHeader protocol.PacketHeader
+	var chunkData bytes.Buffer
+
 	for {
 		p, err := protocol.ReadPacket(clientConn)
 		if err != nil {
 			if utils.IsOKNetworkError(err) {
-				e.Log.Debug("Client connection closed.")
+				e.Log.DebugContext(e.Context, "Client connection closed.")
 				return
 			}
-			e.Log.WithError(err).Error("Failed to read client packet.")
+			e.Log.ErrorContext(e.Context, "Failed to read client packet.", "error", err)
 			clientErrCh <- err
 			return
 		}
+		msgFromClient.Inc()
 
-		sqlPacket, err := protocol.ToSQLPacket(p)
-		switch {
-		case err != nil:
-			e.Log.WithError(err).Errorf("Failed to parse SQLServer packet.")
-			e.emitMalformedPacket(e.Context, sessionCtx, p)
-		default:
-			e.auditPacket(e.Context, sessionCtx, sqlPacket)
+		// Audit events are going to be emitted only on final messages, this way
+		// the packet parsing can be complete and provide the query/RPC
+		// contents.
+		if protocol.IsFinalPacket(p) {
+			sqlPacket, err := e.toSQLPacket(initialPacketHeader, p, &chunkData)
+			switch {
+			case err != nil:
+				e.Log.WarnContext(e.Context, "Failed to parse SQLServer packet.", "error", err)
+				e.emitMalformedPacket(e.Context, sessionCtx, p)
+			default:
+				e.auditPacket(e.Context, sessionCtx, sqlPacket)
+			}
+		} else {
+			if chunkData.Len() == 0 {
+				initialPacketHeader = p.Header()
+			}
+
+			chunkData.Write(p.Data())
 		}
 
 		_, err = serverConn.Write(p.Bytes())
 		if err != nil {
-			e.Log.WithError(err).Error("Failed to write server packet.")
+			e.Log.ErrorContext(e.Context, "Failed to write server packet.", "error", err)
 			clientErrCh <- err
 			return
 		}
 	}
 }
 
+// toSQLPacket Parses a regular (self-contained) or chunked packet into an SQL
+// packet (used for auditing).
+func (e *Engine) toSQLPacket(header protocol.PacketHeader, packet *protocol.BasicPacket, chunks *bytes.Buffer) (protocol.Packet, error) {
+	if chunks.Len() > 0 {
+		defer chunks.Reset()
+		chunks.Write(packet.Data())
+		// We're safe to "read" chunk using `Bytes()` function because the
+		// packet processing copies the packet contents.
+		packetData := chunks.Bytes()
+
+		var err error
+		// The final chucked packet header must be the first packet header.
+		packet, err = protocol.NewBasicPacket(header, packetData)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	return protocol.ToSQLPacket(packet)
+}
+
 // receiveFromServer relays protocol messages received from MySQL database
 // to MySQL client.
 func (e *Engine) receiveFromServer(serverConn, clientConn io.ReadWriteCloser, serverErrCh chan<- error) {
+	// Note: we don't increment common.GetMessagesFromServerMetric here because messages are not parsed, so we cannot count them.
+	// The total bytes written is still available as a metric.
 	defer clientConn.Close()
 	_, err := io.Copy(clientConn, serverConn)
 	if err != nil && !utils.IsOKNetworkError(err) {
@@ -197,10 +244,12 @@ func (e *Engine) checkAccess(ctx context.Context, sessionCtx *common.Session) er
 	}
 
 	state := sessionCtx.GetAccessState(authPref)
-	err = sessionCtx.Checker.CheckAccess(sessionCtx.Database, state,
-		services.NewDatabaseUserMatcher(sessionCtx.Database, sessionCtx.DatabaseUser),
-	)
-	if err != nil {
+	matchers := role.GetDatabaseRoleMatchers(role.RoleMatchersConfig{
+		Database:     sessionCtx.Database,
+		DatabaseUser: sessionCtx.DatabaseUser,
+		DatabaseName: sessionCtx.DatabaseName,
+	})
+	if err = sessionCtx.Checker.CheckAccess(sessionCtx.Database, state, matchers...); err != nil {
 		e.Audit.OnSessionStart(e.Context, sessionCtx, err)
 		return trace.Wrap(err)
 	}

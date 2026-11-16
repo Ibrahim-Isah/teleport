@@ -1,51 +1,85 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { FitAddon } from '@xterm/addon-fit';
+import { IDisposable, ITheme, Terminal } from '@xterm/xterm';
+import '@xterm/xterm/css/xterm.css';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import 'xterm/css/xterm.css';
-import { IDisposable, Terminal } from 'xterm';
-import { FitAddon } from 'xterm-addon-fit';
+import {
+  SearchAddon,
+  TerminalSearcher,
+} from 'shared/components/TerminalSearch';
 import { debounce } from 'shared/utils/highbar';
 
-import { IPtyProcess } from 'teleterm/sharedProcess/ptyHost';
 import Logger from 'teleterm/logger';
-import theme from 'teleterm/ui/ThemeProvider/theme';
+import { AppConfig, ConfigService } from 'teleterm/services/config';
+import { IPtyProcess, WindowsPty } from 'teleterm/services/pty';
+import { KeyboardShortcutsService } from 'teleterm/ui/services/keyboardShortcuts';
 
 const WINDOW_RESIZE_DEBOUNCE_DELAY = 200;
 
 type Options = {
   el: HTMLElement;
   fontSize: number;
+  theme: ITheme;
+  windowsPty: WindowsPty;
+  openContextMenu(e: MouseEvent): void;
 };
 
-export default class TtyTerminal {
+export default class TtyTerminal implements TerminalSearcher {
   public term: Terminal;
   private el: HTMLElement;
   private fitAddon = new FitAddon();
+  private searchAddon = new SearchAddon();
   private resizeHandler: IDisposable;
   private debouncedResize: () => void;
   private logger = new Logger('lib/term/terminal');
+  private removePtyProcessOnDataListener: () => void;
+  private config: Pick<
+    AppConfig,
+    'terminal.rightClick' | 'terminal.copyOnSelect'
+  >;
+  private customKeyEventHandlers = new Set<(event: KeyboardEvent) => boolean>();
 
-  constructor(private ptyProcess: IPtyProcess, private options: Options) {
+  constructor(
+    private ptyProcess: IPtyProcess,
+    private options: Options,
+    configService: ConfigService,
+    private keyboardShortcutsService: KeyboardShortcutsService
+  ) {
     this.el = options.el;
     this.term = null;
+    this.config = {
+      'terminal.rightClick': configService.get('terminal.rightClick').value,
+      'terminal.copyOnSelect': configService.get('terminal.copyOnSelect').value,
+    };
 
     this.debouncedResize = debounce(
       this.requestResize.bind(this),
       WINDOW_RESIZE_DEBOUNCE_DELAY
     );
+  }
+
+  registerCustomKeyEventHandler(customHandler: (e: KeyboardEvent) => boolean) {
+    this.customKeyEventHandlers.add(customHandler);
+    return {
+      unregister: () => this.customKeyEventHandlers.delete(customHandler),
+    };
   }
 
   open(): void {
@@ -60,39 +94,184 @@ export default class TtyTerminal {
       fontFamily: this.el.style.fontFamily,
       fontSize: this.options.fontSize,
       scrollback: 5000,
-      theme: {
-        background: theme.colors.primary.darker,
+      minimumContrastRatio: 4.5, // minimum for WCAG AA compliance
+      screenReaderMode: true,
+      rightClickSelectsWord: this.config['terminal.rightClick'] === 'menu',
+      theme: this.options.theme,
+      windowsPty: this.options.windowsPty && {
+        backend: this.options.windowsPty.useConpty ? 'conpty' : 'winpty',
+        buildNumber: this.options.windowsPty.buildNumber,
       },
       windowOptions: {
         setWinSizeChars: true,
       },
+      allowProposedApi: true, // required for customizing SearchAddon properties
+    });
+
+    this.term.onSelectionChange(() => {
+      if (this.config['terminal.copyOnSelect'] && this.term.hasSelection()) {
+        void this.copySelection();
+      }
     });
 
     this.term.loadAddon(this.fitAddon);
+    this.term.loadAddon(this.searchAddon);
 
     this.registerResizeHandler();
 
     this.term.open(this.el);
 
+    this.registerCustomKeyEventHandler(e => {
+      const action = this.keyboardShortcutsService.getShortcutAction(e);
+      const isKeyDown = e.type === 'keydown';
+      if (action === 'terminalCopy' && isKeyDown && this.term.hasSelection()) {
+        void this.copySelection();
+        // Do not invoke a copy action from the menu.
+        e.preventDefault();
+        // Event handled, do not process it in xterm.
+        return false;
+      }
+      if (action === 'terminalPaste' && isKeyDown) {
+        void this.paste();
+        // Do not invoke a copy action from the menu.
+        e.preventDefault();
+        // Event handled, do not process it in xterm.
+        return false;
+      }
+
+      return true;
+    });
+
+    // Xterm.js v6 removed the workaround that converted Alt+Arrow to Ctrl+Arrow sequences for word
+    // navigation (https://github.com/xtermjs/xterm.js/pull/5346). Re-add this behavior by sending
+    // the appropriate escape sequences, matching what VS Code does.
+    // https://github.com/microsoft/vscode/blob/5bb327de4bf14578c8c0bd1b553ee14dd2977e18/src/vs/workbench/contrib/terminalContrib/sendSequence/browser/terminal.sendSequence.contribution.ts#L163-L182
+    //
+    // Terminal.app and iTerm2 have bindings only for Alt+Left/Right, so we follow their steps and
+    // send ESC b / ESC f (readline word navigation).
+    this.registerCustomKeyEventHandler(e => {
+      // Only handle pure Alt+Arrow. Other modifier combinations (e.g. Ctrl+Alt+Arrow,
+      // Shift+Alt+Arrow) have their own distinct escape sequences that Xterm.js already handles.
+      if (
+        e.type !== 'keydown' ||
+        !e.altKey ||
+        e.ctrlKey ||
+        e.metaKey ||
+        e.shiftKey
+      ) {
+        return true;
+      }
+
+      let seq: string | undefined;
+      switch (e.key) {
+        case 'ArrowRight':
+          seq = '\x1bf';
+          break;
+        case 'ArrowLeft':
+          seq = '\x1bb';
+          break;
+      }
+
+      if (seq) {
+        this.term.input(seq, false /* wasUserInput */);
+        e.preventDefault();
+        // Event handled, do not process it in xterm.
+        return false;
+      }
+
+      return true;
+    });
+
+    this.term.attachCustomKeyEventHandler(e => {
+      for (const eventHandler of this.customKeyEventHandlers) {
+        if (!eventHandler(e)) {
+          // The event was handled, we can return early.
+          return false;
+        }
+      }
+      // The event wasn't handled, pass it to xterm.
+      return true;
+    });
+
+    this.term.element.addEventListener('contextmenu', e => {
+      // We always call preventDefault because:
+      // 1. When `terminalRightClick` is not `menu`, we don't want to show it.
+      // 2. When `terminalRightClick` is `menu`, opening two menus at
+      //  the same time on Linux causes flickering.
+      e.preventDefault();
+
+      if (this.config['terminal.rightClick'] === 'menu') {
+        this.options.openContextMenu(e);
+      }
+    });
+
+    this.term.element.addEventListener('mousedown', e => {
+      // Secondary button, usually the right button.
+      if (e.button !== 2) {
+        return;
+      }
+
+      e.stopImmediatePropagation();
+      e.stopPropagation();
+      e.preventDefault();
+
+      const terminalRightClick = this.config['terminal.rightClick'];
+
+      switch (terminalRightClick) {
+        case 'paste': {
+          void this.paste();
+          break;
+        }
+        case 'copyPaste': {
+          if (this.term.hasSelection()) {
+            void this.copySelection();
+            this.term.clearSelection();
+          } else {
+            void this.paste();
+          }
+          break;
+        }
+      }
+    });
+
     this.fitAddon.fit();
 
     this.term.onData(data => {
-      this.ptyProcess.write(data);
+      this.ptyProcess.write(data).catch(error => {
+        this.logger.error('Failed to write to the PTY process', error);
+      });
     });
 
     this.term.onResize(size => {
-      this.ptyProcess.resize(size.cols, size.rows);
+      this.ptyProcess.resize(size.cols, size.rows).catch(error => {
+        this.logger.error(
+          'Failed to send resize request to the PTY process',
+          error
+        );
+      });
     });
 
-    this.ptyProcess.onData(data => this.handleData(data));
+    this.removePtyProcessOnDataListener = this.ptyProcess.onData(data =>
+      this.handleData(data)
+    );
 
-    this.ptyProcess.start(this.term.cols, this.term.rows);
+    // TODO(ravicious): Don't call start if the process was already started.
+    // This is what is causing the terminal to visually repeat the input on hot reload.
+    // The shared process version of PtyProcess knows whether it was started or not (the status
+    // field), so it's a matter of exposing this field through gRPC and reading it here.
+    this.ptyProcess.start(this.term.cols, this.term.rows).catch(error => {
+      this.logger.error('Failed to start the PTY process', error);
+    });
 
     window.addEventListener('resize', this.debouncedResize);
   }
 
   focus() {
     this.term.focus();
+  }
+
+  getSearchAddon() {
+    return this.searchAddon;
   }
 
   requestResize(): void {
@@ -105,13 +284,23 @@ export default class TtyTerminal {
   }
 
   destroy(): void {
-    this.ptyProcess?.dispose();
+    this.removePtyProcessOnDataListener?.();
     this.term?.dispose();
     this.fitAddon.dispose();
     this.resizeHandler?.dispose();
     this.el.innerHTML = null;
 
     window.removeEventListener('resize', this.debouncedResize);
+  }
+
+  private async copySelection(): Promise<void> {
+    const selection = this.term.getSelection();
+    await navigator.clipboard.writeText(selection);
+  }
+
+  private async paste(): Promise<void> {
+    const text = await navigator.clipboard.readText();
+    this.term.paste(text);
   }
 
   private registerResizeHandler(): void {

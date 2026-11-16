@@ -1,42 +1,48 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
 	"context"
 	"os"
-	"text/template"
 
-	"github.com/gravitational/kingpin"
+	template "github.com/DataDog/datadog-agent/pkg/template/text"
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	libclient "github.com/gravitational/teleport/lib/client"
-	"github.com/gravitational/teleport/lib/service"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/parse"
+	commonclient "github.com/gravitational/teleport/tool/tctl/common/client"
+	tctlcfg "github.com/gravitational/teleport/tool/tctl/common/config"
+	"github.com/gravitational/teleport/tool/tctl/common/resources"
 )
 
 // AppsCommand implements "tctl apps" group of commands.
 type AppsCommand struct {
-	config *service.Config
+	config *servicecfg.Config
 
 	// format is the output format (text, json, or yaml)
 	format string
@@ -53,7 +59,7 @@ type AppsCommand struct {
 }
 
 // Initialize allows AppsCommand to plug itself into the CLI parser
-func (c *AppsCommand) Initialize(app *kingpin.Application, config *service.Config) {
+func (c *AppsCommand) Initialize(app *kingpin.Application, _ *tctlcfg.GlobalCLIFlags, config *servicecfg.Config) {
 	c.config = config
 
 	apps := app.Command("apps", "Operate on applications registered with the cluster.")
@@ -66,26 +72,34 @@ func (c *AppsCommand) Initialize(app *kingpin.Application, config *service.Confi
 }
 
 // TryRun attempts to run subcommands like "apps ls".
-func (c *AppsCommand) TryRun(ctx context.Context, cmd string, client auth.ClientI) (match bool, err error) {
+func (c *AppsCommand) TryRun(ctx context.Context, cmd string, clientFunc commonclient.InitFunc) (match bool, err error) {
+	var commandFunc func(ctx context.Context, client *authclient.Client) error
 	switch cmd {
 	case c.appsList.FullCommand():
-		err = c.ListApps(ctx, client)
+		commandFunc = c.ListApps
 	default:
 		return false, nil
 	}
+	client, closeFn, err := clientFunc(ctx)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+	err = commandFunc(ctx, client)
+	closeFn(ctx)
+
 	return true, trace.Wrap(err)
 }
 
 // ListApps prints the list of applications that have recently sent heartbeats
 // to the cluster.
-func (c *AppsCommand) ListApps(ctx context.Context, clt auth.ClientI) error {
-	labels, err := libclient.ParseLabelSpec(c.labels)
+func (c *AppsCommand) ListApps(ctx context.Context, clt *authclient.Client) error {
+	labels, err := parse.LabelSelectorSpec(c.labels)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	var servers []types.AppServer
-	resources, err := client.GetResourcesWithFilters(ctx, clt, proto.ListResourcesRequest{
+	appServerResources, err := client.GetResourcesWithFilters(ctx, clt, proto.ListResourcesRequest{
 		ResourceType:        types.KindAppServer,
 		Labels:              labels,
 		PredicateExpression: c.predicateExpr,
@@ -98,21 +112,20 @@ func (c *AppsCommand) ListApps(ctx context.Context, clt auth.ClientI) error {
 		}
 		return trace.Wrap(err)
 	default:
-		servers, err = types.ResourcesWithLabels(resources).AsAppServers()
+		servers, err = types.ResourcesWithLabels(appServerResources).AsAppServers()
 		if err != nil {
 			return trace.Wrap(err)
 		}
 	}
 
-	coll := &appServerCollection{servers: servers, verbose: c.verbose}
-
 	switch c.format {
 	case teleport.Text:
-		return trace.Wrap(coll.writeText(os.Stdout))
+		coll := resources.NewAppServerCollection(servers)
+		return trace.Wrap(coll.WriteText(os.Stdout, c.verbose))
 	case teleport.JSON:
-		return trace.Wrap(coll.writeJSON(os.Stdout))
+		return utils.WriteJSONArray(os.Stdout, servers)
 	case teleport.YAML:
-		return trace.Wrap(coll.writeYAML(os.Stdout))
+		return utils.WriteYAML(os.Stdout, servers)
 	default:
 		return trace.BadParameter("unknown format %q", c.format)
 	}
@@ -126,7 +139,7 @@ Fill out and run this command on a node to make the application available:
 > teleport app start \
    --token={{.token}} \{{range .ca_pins}}
    --ca-pin={{.}} \{{end}}
-   --auth-server={{.auth_server}} \
+   --auth-server={{.proxy_server}} \
    --name={{printf "%-30v" .app_name}} ` + "`" + `# Change "{{.app_name}}" to the name of your application.` + "`" + ` \
    --uri={{printf "%-31v" .app_uri}} ` + "`" + `# Change "{{.app_uri}}" to the address of your application.` + "`" + `
 
@@ -135,7 +148,7 @@ Your application will be available at {{.app_public_addr}}.
 Please note:
 
   - This invitation token will expire in {{.minutes}} minutes.
-  - {{.auth_server}} must be reachable from the new application service.
+  - {{.proxy_server}} must be reachable from the new application service.
   - Update DNS to point {{.app_public_addr}} to the Teleport proxy.
   - Add a TLS certificate for {{.app_public_addr}} to the Teleport proxy under "https_keypairs".
 `))

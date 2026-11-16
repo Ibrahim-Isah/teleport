@@ -1,56 +1,83 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package app
 
 import (
 	"context"
-	"crypto/tls"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
+	"strings"
+	"time"
 
-	"github.com/gravitational/oxy/forward"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
+	"github.com/jonboulle/clockwork"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
+	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/api/types/wrappers"
-	"github.com/gravitational/teleport/lib"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/app/common"
+	"github.com/gravitational/teleport/lib/srv/app/upstreamtls"
+	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
+// responseHeaderTimeout caps how long to wait for an upstream to start
+// sending response headers, so a wedged upstream does not hold the
+// connection indefinitely.
+const responseHeaderTimeout = time.Hour
+
 // transportConfig is configuration for a rewriting transport.
 type transportConfig struct {
-	app          types.Application
-	publicPort   string
-	cipherSuites []uint16
-	jwt          string
-	traits       wrappers.Traits
-	log          logrus.FieldLogger
+	clock         clockwork.Clock
+	app           types.Application
+	publicPort    string
+	cipherSuites  []uint16
+	jwt           string
+	rewriteTraits wrappers.Traits
+	log           *slog.Logger
+	// hostID is purely for troubleshooting purposes (put in the error messages)
+	hostID       string
+	insecureMode bool
+	clusterName  string
+	accessPoint  authclient.AppsAccessPoint
+	authClient   authclient.ClientI
+	// getUserCertFunc is the function used to retrieve session user certificate.
+	getUserCertFunc  func() ([]byte, error)
+	emitter          apievents.Emitter
+	identity         *tlsca.Identity
+	targetHostPolicy common.TargetHostPolicy
 }
 
 // Check validates configuration.
 func (c *transportConfig) Check() error {
+	if c.clock == nil {
+		c.clock = clockwork.NewRealClock()
+	}
 	if c.app == nil {
 		return trace.BadParameter("app missing")
 	}
@@ -61,7 +88,19 @@ func (c *transportConfig) Check() error {
 		return trace.BadParameter("jwt missing")
 	}
 	if c.log == nil {
-		c.log = logrus.WithField(trace.Component, "transport")
+		c.log = slog.With(teleport.ComponentKey, "transport")
+	}
+	if c.clusterName == "" {
+		return trace.BadParameter("cluster name missing")
+	}
+	if c.accessPoint == nil {
+		return trace.BadParameter("access point missing")
+	}
+	if c.authClient == nil {
+		return trace.BadParameter("auth client missing")
+	}
+	if c.getUserCertFunc == nil {
+		return trace.BadParameter("get user cert function missing")
 	}
 
 	return nil
@@ -77,8 +116,6 @@ type transport struct {
 	tr http.RoundTripper
 
 	uri *url.URL
-
-	ws *websocketTransport
 }
 
 // newTransport creates a new transport.
@@ -98,7 +135,30 @@ func newTransport(ctx context.Context, c *transportConfig) (*transport, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	tr.TLSClientConfig, err = configureTLS(c)
+
+	tr.ResponseHeaderTimeout = responseHeaderTimeout
+	if c.targetHostPolicy.Enabled() {
+		dialer := common.NewTargetDialer(c.targetHostPolicy, common.TargetHostAuditConfig{
+			Emitter:  c.emitter,
+			Logger:   c.log,
+			ServerID: c.hostID,
+			Identity: c.identity,
+			App:      c.app,
+		})
+		tr.DialContext = dialer.DialContext
+	}
+
+	tr.TLSClientConfig, err = upstreamtls.Configure(ctx, upstreamtls.Options{
+		Logger:                       c.log,
+		AccessPoint:                  c.accessPoint,
+		Clock:                        c.clock,
+		WorkloadIdentityClientGetter: c.authClient,
+		ClusterName:                  c.clusterName,
+		App:                          c.app,
+		CipherSuites:                 c.cipherSuites,
+		InsecureMode:                 c.insecureMode,
+		GetUserCertFunc:              c.getUserCertFunc,
+	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -108,7 +168,6 @@ func newTransport(ctx context.Context, c *transportConfig) (*transport, error) {
 		transportConfig: c,
 		uri:             uri,
 		tr:              tr,
-		ws:              newWebsocketTransport(uri, tr.TLSClientConfig.Clone(), c),
 	}, nil
 }
 
@@ -145,15 +204,39 @@ func (t *transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	// Forward the request to the target application and emit an audit event.
+	// Forward the request to the target application.
+	//
+	// If a network error occurred when connecting to the target application,
+	// log and return a helpful error message to the user and Teleport
+	// administrator.
 	resp, err := t.tr.RoundTrip(r)
+	if message, ok := utils.CanExplainNetworkError(err); ok {
+		if t.log.Enabled(r.Context(), slog.LevelDebug) {
+			t.log.DebugContext(r.Context(), "application request failed with a network error",
+				"raw_error", err, "human_error", strings.Join(strings.Fields(message), " "))
+		}
+
+		if t.hostID != "" {
+			message = message + "\n\nThe ID of the Teleport Application Service instance that generated this error is " + t.hostID + "."
+		}
+
+		code := trace.ErrorToCode(err)
+		return &http.Response{
+			StatusCode: code,
+			Status:     http.StatusText(code),
+			Proto:      r.Proto,
+			ProtoMajor: r.ProtoMajor,
+			ProtoMinor: r.ProtoMinor,
+			Body:       io.NopCloser(strings.NewReader(charWrap(message))),
+			TLS:        r.TLS,
+		}, nil
+	}
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	status := uint32(resp.StatusCode)
 
 	// Emit the event to the audit log.
-	if err := sessCtx.Audit.OnRequest(t.closeContext, sessCtx, r, status, nil /*aws endpoint*/); err != nil {
+	if err := sessCtx.Audit.OnRequest(t.closeContext, sessCtx, r, uint32(resp.StatusCode), nil /*aws endpoint*/); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -171,41 +254,12 @@ func (t *transport) rewriteRequest(r *http.Request) error {
 	r.URL.Scheme = t.uri.Scheme
 	r.URL.Host = t.uri.Host
 
-	// Add headers from rewrite configuration.
-	rewriteHeaders(r, t.transportConfig)
-
-	return nil
-}
-
-// rewriteHeaders applies headers rewrites from the application configuration.
-func rewriteHeaders(r *http.Request, c *transportConfig) {
 	// Add in JWT headers.
-	r.Header.Set(teleport.AppJWTHeader, c.jwt)
-	r.Header.Set(teleport.AppCFHeader, c.jwt)
-
-	if c.app.GetRewrite() == nil || len(c.app.GetRewrite().Headers) == 0 {
-		return
-	}
-	for _, header := range c.app.GetRewrite().Headers {
-		if common.IsReservedHeader(header.Name) {
-			c.log.Debugf("Not rewriting Teleport header %q.", header.Name)
-			continue
-		}
-		values, err := services.ApplyValueTraits(header.Value, c.traits)
-		if err != nil {
-			c.log.Debugf("Failed to apply traits to %q: %v.", header.Value, err)
-			continue
-		}
-		r.Header.Del(header.Name)
-		for _, value := range values {
-			switch http.CanonicalHeaderKey(header.Name) {
-			case teleport.HostHeader:
-				r.Host = value
-			default:
-				r.Header.Add(header.Name, value)
-			}
-		}
-	}
+	r.Header.Set(teleport.AppJWTHeader, t.jwt)
+	// Add headers from rewrite configuration.
+	rewriteHeaders := common.AppRewriteHeaders(r.Context(), t.app.GetRewrite(), t.log)
+	services.RewriteHeadersAndApplyValueTraits(r, rewriteHeaders, t.rewriteTraits, t.log)
+	return nil
 }
 
 // needsPathRedirect checks if the request should be redirected to a different path.
@@ -216,6 +270,12 @@ func (t *transport) needsPathRedirect(r *http.Request) (string, bool) {
 	uriPath := path.Clean(t.uri.Path)
 	if uriPath == "." {
 		uriPath = "/"
+	}
+	// path.Clean strips trailing slashes, but administrators may configure
+	// URIs like http://backend:9000/dashboard/ where the trailing slash is
+	// significant. Preserve it when the original URI had one.
+	if uriPath != "/" && strings.HasSuffix(t.uri.Path, "/") {
+		uriPath += "/"
 	}
 	if uriPath == "/" {
 		return "", false
@@ -272,19 +332,6 @@ func (t *transport) rewriteRedirect(resp *http.Response) error {
 	return nil
 }
 
-// configureTLS creates and configures a *tls.Config that will be used for
-// mutual authentication.
-func configureTLS(c *transportConfig) (*tls.Config, error) {
-	tlsConfig := utils.TLSConfig(c.cipherSuites)
-
-	// Don't verify the server's certificate if Teleport was started with
-	// the --insecure flag, or 'insecure_skip_verify' was specifically requested in
-	// the application config.
-	tlsConfig.InsecureSkipVerify = (lib.IsInsecureDevMode() || c.app.GetInsecureSkipVerify())
-
-	return tlsConfig, nil
-}
-
 // host returns the host from a host:port string.
 func host(addr string) string {
 	host, _, err := net.SplitHostPort(addr)
@@ -294,42 +341,22 @@ func host(addr string) string {
 	return host
 }
 
-// websocketTransport combines parameters for websockets transport.
-//
-// Implements forward.ReqRewriter.
-type websocketTransport struct {
-	uri    *url.URL
-	dialer forward.Dialer
-	c      *transportConfig
-}
+// charWrap wraps a line to about 80 characters to make it easier to read.
+func charWrap(message string) string {
+	var sb strings.Builder
+	for line := range strings.SplitSeq(message, "\n") {
+		var n int
+		for word := range strings.FieldsSeq(line) {
+			sb.WriteString(word)
+			sb.WriteString(" ")
 
-// newWebsocketTransport returns transport that knows how to rewrite and
-// dial websocket requests.
-func newWebsocketTransport(uri *url.URL, tlsConfig *tls.Config, c *transportConfig) *websocketTransport {
-	return &websocketTransport{
-		uri: uri,
-		dialer: func(network, address string) (net.Conn, error) {
-			// Request is going to "wss://".
-			if uri.Scheme == "https" {
-				return tls.Dial(network, address, tlsConfig)
+			n += len(word) + 1
+			if n > 80 {
+				sb.WriteString("\n")
+				n = 0
 			}
-			// Request is going to "ws://".
-			return net.Dial(network, address)
-		},
-		c: c,
+		}
+		sb.WriteString("\n")
 	}
-}
-
-// Rewrite rewrites the websocket request.
-func (r *websocketTransport) Rewrite(req *http.Request) {
-	// Update scheme and host to those of the target app's to make sure
-	// it's forwarded correctly.
-	req.URL.Scheme = "ws"
-	if r.uri.Scheme == "https" {
-		req.URL.Scheme = "wss"
-	}
-	req.URL.Host = r.uri.Host
-	req.Host = r.uri.Host
-
-	rewriteHeaders(req, r.c)
+	return sb.String()
 }

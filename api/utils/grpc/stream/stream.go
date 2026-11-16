@@ -22,8 +22,8 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/gravitational/trace/trail"
-	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // MaxChunkSize is the maximum number of bytes to send in a single data message.
@@ -47,17 +47,45 @@ type ReadWriter struct {
 	wLock  sync.Mutex
 	rLock  sync.Mutex
 	rBytes []byte
+
+	options *Options
+}
+
+// Options is NewReadWriter config options.
+type Options struct {
+	// DisableChunking disables automatic splitting of data messages
+	// that exceed MaxChunkSize during writes.
+	// This is useful when the receiver does not support chunked reads.
+	DisableChunking bool
+}
+
+// Option allows setting options as functional arguments to NewReadWriter.
+type Option func(s *Options)
+
+// WithDisabledChunking	disables automatic splitting of data messages
+// that exceed MaxChunkSize during writes.
+// This is useful when the receiver does not support chunked reads.
+func WithDisabledChunking() Option {
+	return func(s *Options) {
+		s.DisableChunking = true
+	}
 }
 
 // NewReadWriter creates a new ReadWriter that leverages the provided
 // source to retrieve data from and write data to.
-func NewReadWriter(source Source) (*ReadWriter, error) {
+func NewReadWriter(source Source, opts ...Option) (*ReadWriter, error) {
 	if source == nil {
 		return nil, trace.BadParameter("parameter source required")
 	}
 
+	options := &Options{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	return &ReadWriter{
-		source: source,
+		source:  source,
+		options: options,
 	}, nil
 }
 
@@ -72,11 +100,12 @@ func (c *ReadWriter) Read(b []byte) (n int, err error) {
 
 	if len(c.rBytes) == 0 {
 		data, err := c.source.Recv()
-		if errors.Is(err, io.EOF) {
+		if errors.Is(err, io.EOF) || status.Code(err) == codes.Canceled {
 			return 0, io.EOF
 		}
+
 		if err != nil {
-			return 0, trace.ConnectionProblem(trail.FromGRPC(err), "failed to receive from source")
+			return 0, trace.ConnectionProblem(trace.Wrap(err), "failed to receive from source: %v", err)
 		}
 
 		if data == nil {
@@ -101,7 +130,7 @@ func (c *ReadWriter) Read(b []byte) (n int, err error) {
 // the grpc stream. To prevent exhausting the stream all
 // sends on the stream are limited to be at most MaxChunkSize.
 // If the data exceeds the MaxChunkSize it will be sent in
-// batches.
+// batches. This behavior can be disabled by using WithDisabledChunking.
 func (c *ReadWriter) Write(b []byte) (int, error) {
 	c.wLock.Lock()
 	defer c.wLock.Unlock()
@@ -109,12 +138,12 @@ func (c *ReadWriter) Write(b []byte) (int, error) {
 	var sent int
 	for len(b) > 0 {
 		chunk := b
-		if len(chunk) > MaxChunkSize {
+		if !c.options.DisableChunking && len(chunk) > MaxChunkSize {
 			chunk = chunk[:MaxChunkSize]
 		}
 
 		if err := c.source.Send(chunk); err != nil {
-			return sent, trace.ConnectionProblem(trail.FromGRPC(err), "failed to send on source")
+			return sent, trace.ConnectionProblem(trace.Wrap(err), "failed to send on source: %v", err)
 		}
 
 		sent += len(chunk)
@@ -126,14 +155,11 @@ func (c *ReadWriter) Write(b []byte) (int, error) {
 
 // Close cleans up resources used by the stream.
 func (c *ReadWriter) Close() error {
-	var err error
-	if cstream, ok := c.source.(grpc.ClientStream); ok {
-		c.wLock.Lock()
-		defer c.wLock.Unlock()
-		err = cstream.CloseSend()
+	if cs, ok := c.source.(io.Closer); ok {
+		return trace.Wrap(cs.Close())
 	}
 
-	return trace.Wrap(err)
+	return nil
 }
 
 // Conn wraps [ReadWriter] in a [net.Conn] interface.

@@ -17,13 +17,15 @@ limitations under the License.
 package types
 
 import (
+	"slices"
+	"strings"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
+	"github.com/coreos/go-semver/semver"
 	"github.com/gravitational/trace"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/utils"
 )
 
 // Match checks if the given instance appears to match this filter.
@@ -39,12 +41,87 @@ func (f InstanceFilter) Match(i Instance) bool {
 		return false
 	}
 
+	if fv, ok := parseVersionRelaxed(f.OlderThanVersion); ok {
+		if iv, ok := parseVersionRelaxed(i.GetTeleportVersion()); ok {
+			if !iv.LessThan(fv) {
+				return false
+			}
+		}
+	}
+
+	if fv, ok := parseVersionRelaxed(f.NewerThanVersion); ok {
+		iv, ok := parseVersionRelaxed(i.GetTeleportVersion())
+
+		if !ok {
+			// treat instances with invalid versions are less/older than
+			// valid versions.
+			return false
+		}
+
+		if !fv.LessThan(iv) {
+			return false
+		}
+	}
+
 	// if Services was specified, ensure instance has at least one of the listed services.
 	if len(f.Services) != 0 && slices.IndexFunc(f.Services, i.HasService) == -1 {
 		return false
 	}
 
+	if f.ExternalUpgrader != "" && f.ExternalUpgrader != i.GetExternalUpgrader() {
+		return false
+	}
+
+	// empty upgrader matches all, so we have a separate bool flag for
+	// specifically matching instances with no ext upgrader defined.
+	if f.NoExtUpgrader && i.GetExternalUpgrader() != "" {
+		return false
+	}
+
+	// Empty update group matches all.
+	if f.UpdateGroup != "" {
+		if updateInfo := i.GetUpdaterInfo(); updateInfo == nil || updateInfo.UpdateGroup != f.UpdateGroup {
+			return false
+		}
+	}
+
 	return true
+}
+
+// shorthandChars are expected characters in version shorthand (e.g. "1" or "1.0" are shorthand for "1.0.0").
+const shorthandChars = "0123456789."
+
+// normalizeVersionShorthand attempts to convert go-style semver into the stricter semver
+// notation expected by coreos/go-semver.
+func normalizeVersionShorthand(version string) string {
+	version = strings.TrimPrefix(version, "v")
+	for _, c := range version {
+		if !strings.ContainsRune(shorthandChars, c) {
+			return version
+		}
+	}
+
+	switch strings.Count(version, ".") {
+	case 0:
+		return version + ".0.0"
+	case 1:
+		return version + ".0"
+	default:
+		return version
+	}
+}
+
+// parseVersionRelaxed wraps standard semver parsing with shorthand normalization.
+func parseVersionRelaxed(version string) (ver semver.Version, ok bool) {
+	if version == "" {
+		return semver.Version{}, false
+	}
+
+	if ver.Set(normalizeVersionShorthand(version)) != nil {
+		return semver.Version{}, false
+	}
+
+	return ver, true
 }
 
 // Instance describes the configuration/status of a unique teleport server identity. Each
@@ -81,6 +158,16 @@ type Instance interface {
 	// and resource-level expiry values can be reevaluated.
 	SetLastSeen(time.Time)
 
+	// GetExternalUpgrader gets the upgrader value as represented in the most recent
+	// hello message from this instance. This value corresponds to the TELEPORT_EXT_UPGRADER
+	// env var that is set when agents are configured to export schedule values to external
+	// upgraders.
+	GetExternalUpgrader() string
+
+	// GetExternalUpgraderVersion gets the reported upgrader version. This value corresponds
+	// to the TELEPORT_EXT_UPGRADER_VERSION env var that is set when agents are configured.
+	GetExternalUpgraderVersion() string
+
 	// SyncLogAndResourceExpiry filters expired entries from the control log and updates
 	// the resource-level expiry. All calculations are performed relative to the value of
 	// the LastSeen field, and the supplied TTL is used only as a default. The actual TTL
@@ -98,6 +185,17 @@ type Instance interface {
 	// AppendControlLog appends entries to the control log. The control log is sorted by time,
 	// so appends do not need to be performed in any particular order.
 	AppendControlLog(entries ...InstanceControlLogEntry)
+
+	// GetLastMeasurement returns information about the system clocks of the auth service and
+	// another instance.
+	GetLastMeasurement() *SystemClockMeasurement
+
+	// GetUpdaterInfo returns information about the instance updater.
+	GetUpdaterInfo() *UpdaterV2Info
+
+	// GetAuditQueueStatus returns the depth of the instance's audit-log queue,
+	// or nil if the instance has not reported it.
+	GetAuditQueueStatus() *AuditQueueStatus
 
 	// Clone performs a deep copy on this instance.
 	Clone() Instance
@@ -194,6 +292,18 @@ func (i *InstanceV1) SetLastSeen(t time.Time) {
 	i.Spec.LastSeen = t.UTC()
 }
 
+func (i *InstanceV1) GetExternalUpgrader() string {
+	return i.Spec.ExternalUpgrader
+}
+
+func (i *InstanceV1) GetExternalUpgraderVersion() string {
+	return i.Spec.ExternalUpgraderVersion
+}
+
+func (i *InstanceV1) GetUpdaterInfo() *UpdaterV2Info {
+	return i.Spec.UpdaterInfo
+}
+
 func (i *InstanceV1) GetControlLog() []InstanceControlLogEntry {
 	return i.Spec.ControlLog
 }
@@ -206,9 +316,20 @@ func (i *InstanceV1) AppendControlLog(entries ...InstanceControlLogEntry) {
 		// panics in proto logic).
 		i.Spec.ControlLog[idx].Time = entry.Time.UTC()
 	}
-	slices.SortFunc(i.Spec.ControlLog, func(a, b InstanceControlLogEntry) bool {
-		return a.Time.Before(b.Time)
+	slices.SortFunc(i.Spec.ControlLog, func(a, b InstanceControlLogEntry) int {
+		return a.Time.Compare(b.Time)
 	})
+}
+
+func (i *InstanceV1) GetLastMeasurement() *SystemClockMeasurement {
+	return i.Spec.LastMeasurement
+}
+
+func (i *InstanceV1) GetAuditQueueStatus() *AuditQueueStatus {
+	if i == nil {
+		return nil
+	}
+	return i.Spec.AuditQueueStatus
 }
 
 // expireControlLog removes expired entries from the control log relative to the supplied
@@ -247,10 +368,10 @@ func (i *InstanceV1) expireControlLog(now time.Time, ttl time.Duration) time.Tim
 }
 
 func (i *InstanceV1) Clone() Instance {
-	return proto.Clone(i).(*InstanceV1)
+	return utils.CloneProtoMsg(i)
 }
 
 func (e *InstanceControlLogEntry) Clone() InstanceControlLogEntry {
 	e.Time = e.Time.UTC()
-	return *proto.Clone(e).(*InstanceControlLogEntry)
+	return *utils.CloneProtoMsg(e)
 }

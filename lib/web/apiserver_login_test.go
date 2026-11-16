@@ -1,46 +1,55 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package web
 
 import (
 	"context"
 	"crypto"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/constants"
+	devicepb "github.com/gravitational/teleport/api/gen/proto/go/teleport/devicetrust/v1"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/keys"
-	"github.com/gravitational/teleport/lib/auth"
-	wanlib "github.com/gravitational/teleport/lib/auth/webauthn"
+	apisshutils "github.com/gravitational/teleport/api/utils/sshutils"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/auth/authtest"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
 	"github.com/gravitational/teleport/lib/client"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/modules/modulestest"
+	"github.com/gravitational/teleport/lib/tlsca"
 )
 
 func TestWebauthnLogin_ssh(t *testing.T) {
+	ctx := context.Background()
 	env := newWebPack(t, 1)
 	clusterMFA := configureClusterForMFA(t, env, &types.AuthPreferenceSpecV2{
 		Type:         constants.Local,
@@ -53,102 +62,135 @@ func TestWebauthnLogin_ssh(t *testing.T) {
 	password := clusterMFA.Password
 	device := clusterMFA.WebDev.Key
 
+	// Prepare keys to be signed.
+	sshKey, tlsKey, err := cryptosuites.GenerateUserSSHAndTLSKey(ctx, cryptosuites.GetCurrentSuiteFromAuthPreference(env.server.AuthServer.AuthServer))
+	require.NoError(t, err)
+	sshPubKey, err := ssh.NewPublicKey(sshKey.Public())
+	require.NoError(t, err)
+	sshPubKeyBytes := ssh.MarshalAuthorizedKey(sshPubKey)
+	tlsPubKeyBytes, err := keys.MarshalPublicKey(tlsKey.Public())
+	require.NoError(t, err)
+
 	clt, err := client.NewWebClient(env.proxies[0].webURL.String(), roundtrip.HTTPClient(client.NewInsecureWebClient()))
 	require.NoError(t, err)
 
-	// 1st login step: request challenge.
-	ctx := context.Background()
-	beginResp, err := clt.PostJSON(ctx, clt.Endpoint("webapi", "mfa", "login", "begin"), &client.MFAChallengeRequest{
-		User: user,
-		Pass: password,
-	})
-	require.NoError(t, err)
-	authChallenge := &client.MFAAuthenticateChallenge{}
-	require.NoError(t, json.Unmarshal(beginResp.Bytes(), authChallenge))
-	require.NotNil(t, authChallenge.WebauthnChallenge)
+	for _, tc := range []struct {
+		desc                string
+		sshPubKey           []byte
+		tlsPubKey           []byte
+		expectError         string
+		expectSubjectSSHPub ssh.PublicKey
+		expectSubjectTLSPub crypto.PublicKey
+	}{
+		{
+			desc:                "both keys",
+			sshPubKey:           sshPubKeyBytes,
+			tlsPubKey:           tlsPubKeyBytes,
+			expectSubjectSSHPub: sshPubKey,
+			expectSubjectTLSPub: tlsKey.Public(),
+		},
+		{
+			desc:                "only SSH",
+			sshPubKey:           sshPubKeyBytes,
+			expectSubjectSSHPub: sshPubKey,
+		},
+		{
+			desc:                "only TLS",
+			tlsPubKey:           tlsPubKeyBytes,
+			expectSubjectTLSPub: tlsKey.Public(),
+		},
+		{
+			desc:        "no key",
+			expectError: "'ssh_pub_key' or 'tls_pub_key' must be set",
+		},
+	} {
+		// 1st login step: request challenge.
+		ctx := context.Background()
+		beginResp, err := clt.PostJSON(ctx, clt.Endpoint("webapi", "mfa", "login", "begin"), &client.MFAChallengeRequest{
+			User: user,
+			Pass: password,
+		})
+		require.NoError(t, err)
+		authChallenge := &client.MFAAuthenticateChallenge{}
+		require.NoError(t, json.Unmarshal(beginResp.Bytes(), authChallenge))
+		require.NotNil(t, authChallenge.WebauthnChallenge)
 
-	// Sign Webauthn challenge (requires user interaction in real-world
-	// scenarios).
-	assertionResp, err := device.SignAssertion("https://"+env.server.TLS.ClusterName(), authChallenge.WebauthnChallenge)
-	require.NoError(t, err)
+		// Sign Webauthn challenge (requires user interaction in real-world
+		// scenarios).
+		assertionResp, err := device.SignAssertion("https://"+env.server.TLS.ClusterName(), authChallenge.WebauthnChallenge)
+		require.NoError(t, err)
 
-	// Prepare SSH key to be signed.
-	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-	sshPubKey, err := ssh.NewPublicKey(&privKey.PublicKey)
-	require.NoError(t, err)
-	sshPubKeyBytes := ssh.MarshalAuthorizedKey(sshPubKey)
+		// 2nd login step: reply with signed challenged.
+		finishResp, err := clt.PostJSON(ctx, clt.Endpoint("webapi", "mfa", "login", "finish"), &client.AuthenticateSSHUserRequest{
+			User:                      user,
+			WebauthnChallengeResponse: assertionResp,
+			UserPublicKeys: client.UserPublicKeys{
+				SSHPubKey: tc.sshPubKey,
+				TLSPubKey: tc.tlsPubKey,
+			},
+			TTL: 24 * time.Hour,
+		})
+		if tc.expectError != "" {
+			require.Error(t, err)
+			require.ErrorContains(t, err, tc.expectError)
+			return
+		}
+		require.NoError(t, err)
 
-	// 2nd login step: reply with signed challenged.
-	finishResp, err := clt.PostJSON(ctx, clt.Endpoint("webapi", "mfa", "login", "finish"), &client.AuthenticateSSHUserRequest{
-		User:                      user,
-		WebauthnChallengeResponse: assertionResp,
-		PubKey:                    sshPubKeyBytes,
-		TTL:                       24 * time.Hour,
-	})
-	require.NoError(t, err)
-	loginResp := &auth.SSHLoginResponse{}
-	require.NoError(t, json.Unmarshal(finishResp.Bytes(), loginResp))
-	require.Equal(t, user, loginResp.Username)
-	require.NotEmpty(t, loginResp.Cert)
-	require.NotEmpty(t, loginResp.TLSCert)
-	require.NotEmpty(t, loginResp.HostSigners)
+		loginResp := validateSSHLoginResponse(t, finishResp.Bytes(), tc.expectSubjectSSHPub, tc.expectSubjectTLSPub)
+		require.Equal(t, user, loginResp.Username)
+	}
 }
 
 func TestWebauthnLogin_web(t *testing.T) {
 	env := newWebPack(t, 1)
+	proxy := env.proxies[0]
+
+	rpID := env.server.TLS.ClusterName()
 	clusterMFA := configureClusterForMFA(t, env, &types.AuthPreferenceSpecV2{
 		Type:         constants.Local,
 		SecondFactor: constants.SecondFactorOn,
 		Webauthn: &types.Webauthn{
-			RPID: env.server.TLS.ClusterName(),
+			RPID: rpID,
 		},
 	})
 	user := clusterMFA.User
 	password := clusterMFA.Password
 	device := clusterMFA.WebDev.Key
 
-	clt, err := client.NewWebClient(env.proxies[0].webURL.String(), roundtrip.HTTPClient(client.NewInsecureWebClient()))
-	require.NoError(t, err)
-
-	// 1st login step: request challenge.
 	ctx := context.Background()
-	beginResp, err := clt.PostJSON(ctx, clt.Endpoint("webapi", "mfa", "login", "begin"), &client.MFAChallengeRequest{
-		User: user,
-		Pass: password,
-	})
-	require.NoError(t, err)
-	authChallenge := &client.MFAAuthenticateChallenge{}
-	require.NoError(t, json.Unmarshal(beginResp.Bytes(), authChallenge))
-	require.NotNil(t, authChallenge.WebauthnChallenge)
 
-	// Sign Webauthn challenge (requires user interaction in real-world
-	// scenarios).
-	assertionResp, err := device.SignAssertion("https://"+env.server.TLS.ClusterName(), authChallenge.WebauthnChallenge)
-	require.NoError(t, err)
-
-	// 2nd login step: reply with signed challenged.
-	sessionResp, err := clt.PostJSON(ctx, clt.Endpoint("webapi", "mfa", "login", "finishsession"), &client.AuthenticateWebUserRequest{
-		User:                      user,
-		WebauthnAssertionResponse: assertionResp,
+	sessionResp, _ := loginWebMFA(ctx, t, loginWebMFAParams{
+		webClient:     proxy.newClient(t),
+		rpID:          rpID,
+		user:          user,
+		password:      password,
+		authenticator: device,
 	})
-	require.NoError(t, err)
-	createSessionResp := &CreateSessionResponse{}
-	require.NoError(t, json.Unmarshal(sessionResp.Bytes(), createSessionResp))
-	require.NotEmpty(t, createSessionResp.TokenType)
-	require.NotEmpty(t, createSessionResp.Token)
-	require.NotEmpty(t, createSessionResp.TokenExpiresIn)
-	require.NotEmpty(t, createSessionResp.SessionExpires.Unix())
+
+	// Run various additional response assertions.
+	assert.NotEmpty(t, sessionResp.TokenType)
+	assert.NotEmpty(t, sessionResp.Token)
+	assert.NotEmpty(t, sessionResp.TokenExpiresIn)
+	assert.NotEmpty(t, sessionResp.SessionExpires.Unix())
 }
 
 func TestWebauthnLogin_webWithPrivateKeyEnabledError(t *testing.T) {
+	t.Parallel()
+	testModules := modulestest.OSSModules()
+	testModules.MockAttestationData = &keys.AttestationData{
+		PrivateKeyPolicy: keys.PrivateKeyPolicyNone,
+	}
+	env := newWebPack(t, 1, withModules(testModules))
+	proxy := env.proxies[0]
 	ctx := context.Background()
-	env := newWebPack(t, 1)
+
+	rpID := env.server.TLS.ClusterName()
 	authPref := &types.AuthPreferenceSpecV2{
 		Type:         constants.Local,
 		SecondFactor: constants.SecondFactorOn,
 		Webauthn: &types.Webauthn{
-			RPID: env.server.TLS.ClusterName(),
+			RPID: rpID,
 		},
 	}
 
@@ -163,41 +205,23 @@ func TestWebauthnLogin_webWithPrivateKeyEnabledError(t *testing.T) {
 	cap, err := types.NewAuthPreference(*authPref)
 	require.NoError(t, err)
 	authServer := env.server.Auth()
-	err = authServer.SetAuthPreference(ctx, cap)
+	_, err = authServer.UpsertAuthPreference(ctx, cap)
 	require.NoError(t, err)
 
-	modules.SetTestModules(t, &modules.TestModules{
-		MockAttestHardwareKey: func(_ context.Context, _ interface{}, policy keys.PrivateKeyPolicy, _ *keys.AttestationStatement, _ crypto.PublicKey, _ time.Duration) (keys.PrivateKeyPolicy, error) {
-			return "", keys.NewPrivateKeyPolicyError(policy)
-		},
-	})
-
-	clt, err := client.NewWebClient(env.proxies[0].webURL.String(), roundtrip.HTTPClient(client.NewInsecureWebClient()))
-	require.NoError(t, err)
-
-	// 1st login step: request challenge.
-	beginResp, err := clt.PostJSON(ctx, clt.Endpoint("webapi", "mfa", "login", "begin"), &client.MFAChallengeRequest{
-		User: user,
-		Pass: password,
-	})
-	require.NoError(t, err)
-	authChallenge := &client.MFAAuthenticateChallenge{}
-	require.NoError(t, json.Unmarshal(beginResp.Bytes(), authChallenge))
-	require.NotNil(t, authChallenge.WebauthnChallenge)
-
-	// Sign Webauthn challenge (requires user interaction in real-world
-	// scenarios).
-	assertionResp, err := device.SignAssertion("https://"+env.server.TLS.ClusterName(), authChallenge.WebauthnChallenge)
-	require.NoError(t, err)
-
-	// 2nd login step: reply with signed challenged.
-	sessionResp, err := clt.PostJSON(ctx, clt.Endpoint("webapi", "mfa", "login", "finishsession"), &client.AuthenticateWebUserRequest{
-		User:                      user,
-		WebauthnAssertionResponse: assertionResp,
+	httpResp, body, err := rawLoginWebMFA(ctx, loginWebMFAParams{
+		webClient:     proxy.newClient(t),
+		rpID:          rpID,
+		user:          user,
+		password:      password,
+		authenticator: device,
 	})
 	require.Error(t, err)
+	// Make sure we failed in the last step.
+	require.NotNil(t, httpResp, "HTTP response nil, did it fail in the finishsession step?")
+	require.NotNil(t, body, "HTTP response body nil, did it fail in the finishsession step?")
+
 	var resErr httpErrorResponse
-	require.NoError(t, json.Unmarshal(sessionResp.Bytes(), &resErr))
+	require.NoError(t, json.Unmarshal(body, &resErr))
 	require.Contains(t, resErr.Error.Message, keys.PrivateKeyPolicyHardwareKeyTouch)
 }
 
@@ -225,38 +249,74 @@ func TestAuthenticate_passwordless(t *testing.T) {
 	require.NoError(t, err)
 	userHandle := wla.UserID
 
-	// Prepare SSH key to be signed.
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// Prepare keys to be signed.
+	sshKey, tlsKey, err := cryptosuites.GenerateUserSSHAndTLSKey(ctx, cryptosuites.GetCurrentSuiteFromAuthPreference(env.server.AuthServer.AuthServer))
 	require.NoError(t, err)
-	pub, err := ssh.NewPublicKey(&priv.PublicKey)
+	sshPubKey, err := ssh.NewPublicKey(sshKey.Public())
 	require.NoError(t, err)
-	pubBytes := ssh.MarshalAuthorizedKey(pub)
+	sshPubKeyBytes := ssh.MarshalAuthorizedKey(sshPubKey)
+	tlsPubKeyBytes, err := keys.MarshalPublicKey(tlsKey.Public())
+	require.NoError(t, err)
 
 	clt, err := client.NewWebClient(env.proxies[0].webURL.String(), roundtrip.HTTPClient(client.NewInsecureWebClient()))
 	require.NoError(t, err)
 
 	tests := []struct {
 		name  string
-		login func(t *testing.T, assertionResp *wanlib.CredentialAssertionResponse)
+		login func(t *testing.T, assertionResp *wantypes.CredentialAssertionResponse)
 	}{
 		{
-			name: "ssh",
-			login: func(t *testing.T, assertionResp *wanlib.CredentialAssertionResponse) {
+			name: "ssh both keys",
+			login: func(t *testing.T, assertionResp *wantypes.CredentialAssertionResponse) {
 				ep := clt.Endpoint("webapi", "mfa", "login", "finish")
 				sshResp, err := clt.PostJSON(ctx, ep, &client.AuthenticateSSHUserRequest{
 					WebauthnChallengeResponse: assertionResp, // no username
-					PubKey:                    pubBytes,
-					TTL:                       24 * time.Hour,
+					UserPublicKeys: client.UserPublicKeys{
+						SSHPubKey: sshPubKeyBytes,
+						TLSPubKey: tlsPubKeyBytes,
+					},
+					TTL: 24 * time.Hour,
 				})
 				require.NoError(t, err, "Passwordless authentication failed")
-				loginResp := &auth.SSHLoginResponse{}
-				require.NoError(t, json.Unmarshal(sshResp.Bytes(), loginResp))
+				loginResp := validateSSHLoginResponse(t, sshResp.Bytes(), sshPubKey, tlsKey.Public())
+				require.Equal(t, user, loginResp.Username)
+			},
+		},
+		{
+			name: "ssh ssh key only",
+			login: func(t *testing.T, assertionResp *wantypes.CredentialAssertionResponse) {
+				ep := clt.Endpoint("webapi", "mfa", "login", "finish")
+				sshResp, err := clt.PostJSON(ctx, ep, &client.AuthenticateSSHUserRequest{
+					WebauthnChallengeResponse: assertionResp, // no username
+					UserPublicKeys: client.UserPublicKeys{
+						SSHPubKey: sshPubKeyBytes,
+					},
+					TTL: 24 * time.Hour,
+				})
+				require.NoError(t, err, "Passwordless authentication failed")
+				loginResp := validateSSHLoginResponse(t, sshResp.Bytes(), sshPubKey, nil)
+				require.Equal(t, user, loginResp.Username)
+			},
+		},
+		{
+			name: "ssh tls key only",
+			login: func(t *testing.T, assertionResp *wantypes.CredentialAssertionResponse) {
+				ep := clt.Endpoint("webapi", "mfa", "login", "finish")
+				sshResp, err := clt.PostJSON(ctx, ep, &client.AuthenticateSSHUserRequest{
+					WebauthnChallengeResponse: assertionResp, // no username
+					UserPublicKeys: client.UserPublicKeys{
+						TLSPubKey: tlsPubKeyBytes,
+					},
+					TTL: 24 * time.Hour,
+				})
+				require.NoError(t, err, "Passwordless authentication failed")
+				loginResp := validateSSHLoginResponse(t, sshResp.Bytes(), nil, tlsKey.Public())
 				require.Equal(t, user, loginResp.Username)
 			},
 		},
 		{
 			name: "web",
-			login: func(t *testing.T, assertionResp *wanlib.CredentialAssertionResponse) {
+			login: func(t *testing.T, assertionResp *wantypes.CredentialAssertionResponse) {
 				ep := clt.Endpoint("webapi", "mfa", "login", "finishsession")
 				sessionResp, err := clt.PostJSON(ctx, ep, &client.AuthenticateWebUserRequest{
 					WebauthnAssertionResponse: assertionResp, // no username
@@ -293,6 +353,156 @@ func TestAuthenticate_passwordless(t *testing.T) {
 			test.login(t, assertionResp)
 		})
 	}
+
+	// Test a couple of config-mismatch scenarios.
+	// They progressively alter the cluster's auth preference.
+
+	t.Run("allow_passwordless=false", func(t *testing.T) {
+		// Set allow_passwordless=false
+		authPref, err := authServer.GetAuthPreference(ctx)
+		require.NoError(t, err, "GetAuthPreference failed")
+		authPref.SetAllowPasswordless(false)
+		_, err = authServer.UpsertAuthPreference(ctx, authPref)
+		require.NoError(t, err, "UpsertAuthPreference failed")
+
+		// GET /webapi/mfa/login/begin.
+		ep := clt.Endpoint("webapi", "mfa", "login", "begin")
+		_, err = clt.PostJSON(ctx, ep, &client.MFAChallengeRequest{
+			Passwordless: true, // no username and password
+		})
+		assert.ErrorIs(t, err, types.ErrPasswordlessDisabledBySettings, "/webapi/mfa/login/begin error mismatch")
+	})
+
+	t.Run("webauthn disabled", func(t *testing.T) {
+		authPref, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+			Type:         constants.Local,
+			SecondFactor: constants.SecondFactorOTP, // disable webauthn
+		})
+		require.NoError(t, err, "NewAuthPreference failed")
+		_, err = authServer.UpsertAuthPreference(ctx, authPref)
+		require.NoError(t, err, "UpsertAuthPreference failed")
+
+		// GET /webapi/mfa/login/begin.
+		ep := clt.Endpoint("webapi", "mfa", "login", "begin")
+		_, err = clt.PostJSON(ctx, ep, &client.MFAChallengeRequest{
+			Passwordless: true, // no username and password
+		})
+		assert.ErrorIs(t, err, types.ErrPasswordlessRequiresWebauthn, "/webapi/mfa/login/begin error mismatch")
+	})
+}
+
+// TestPasswordlessProhibitedForSSO is rather similar to
+// lib/auth.TestPasswordlessProhibitedForSSO, but here our main concern is that
+// error messages aren't obfuscated along the way.
+func TestPasswordlessProhibitedForSSO(t *testing.T) {
+	env := newWebPack(t, 1)
+
+	testServer := env.server
+	authServer := testServer.Auth()
+	proxyServer := env.proxies[0]
+	clock := env.clock
+
+	// Prepare user and default devices.
+	mfa := configureClusterForMFA(t, env, &types.AuthPreferenceSpecV2{
+		Type:         constants.Local,
+		SecondFactor: constants.SecondFactorOn,
+		Webauthn: &types.Webauthn{
+			RPID: testServer.ClusterName(),
+		},
+	})
+	user := mfa.User
+	ctx := context.Background()
+
+	// Register a passwordless device.
+	userClient, err := testServer.NewClient(authtest.TestUser(user))
+	require.NoError(t, err, "NewClient failed")
+	pwdlessDev, err := authtest.RegisterTestDevice(
+		ctx, userClient, "pwdless", proto.DeviceType_DEVICE_TYPE_WEBAUTHN, mfa.WebDev, authtest.WithPasswordless())
+	require.NoError(t, err, "RegisterTestDevice failed")
+
+	// Update the user so it looks like an SSO user.
+	_, err = authServer.UpdateAndSwapUser(ctx, user, false /* withSecrets */, func(u types.User) (changed bool, err error) {
+		u.SetCreatedBy(types.CreatedBy{
+			Connector: &types.ConnectorRef{
+				Type:     constants.Github,
+				ID:       "github",
+				Identity: user,
+			},
+			Time: clock.Now(),
+			User: types.UserRef{
+				Name: teleport.UserSystem,
+			},
+		})
+		return true, nil
+	})
+	require.NoError(t, err, "UpdateAndSwapUser failed")
+
+	// Prepare keys to be signed.
+	sshKey, tlsKey, err := cryptosuites.GenerateUserSSHAndTLSKey(ctx, cryptosuites.GetCurrentSuiteFromAuthPreference(env.server.AuthServer.AuthServer))
+	require.NoError(t, err)
+	sshPubKey, err := ssh.NewPublicKey(sshKey.Public())
+	require.NoError(t, err)
+	sshPubKeyBytes := ssh.MarshalAuthorizedKey(sshPubKey)
+	tlsPubKeyBytes, err := keys.MarshalPublicKey(tlsKey.Public())
+	require.NoError(t, err)
+
+	webClient, err := client.NewWebClient(
+		proxyServer.webURL.String(),
+		roundtrip.HTTPClient(client.NewInsecureWebClient()),
+	)
+	require.NoError(t, err, "NewWebClient failed")
+
+	tests := []struct {
+		name  string
+		login func(chalResp *wantypes.CredentialAssertionResponse) error
+	}{
+		{
+			name: "web",
+			login: func(chalResp *wantypes.CredentialAssertionResponse) error {
+				ep := webClient.Endpoint("webapi", "mfa", "login", "finishsession")
+				_, err := webClient.PostJSON(ctx, ep, &client.AuthenticateWebUserRequest{
+					WebauthnAssertionResponse: chalResp,
+				})
+				return err
+			},
+		},
+		{
+			name: "ssh",
+			login: func(chalResp *wantypes.CredentialAssertionResponse) error {
+				ep := webClient.Endpoint("webapi", "mfa", "login", "finish")
+				_, err := webClient.PostJSON(ctx, ep, &client.AuthenticateSSHUserRequest{
+					WebauthnChallengeResponse: chalResp,
+					UserPublicKeys: client.UserPublicKeys{
+						SSHPubKey: sshPubKeyBytes,
+						TLSPubKey: tlsPubKeyBytes,
+					},
+					TTL: 12 * time.Hour,
+				})
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Issue passwordless challenge.
+			ep := webClient.Endpoint("webapi", "mfa", "login", "begin")
+			beginResp, err := webClient.PostJSON(ctx, ep, &client.MFAChallengeRequest{
+				Passwordless: true,
+			})
+			require.NoError(t, err, "POST /webapi/mfa/login/begin")
+			mfaChallenge := &client.MFAAuthenticateChallenge{}
+			require.NoError(t, json.Unmarshal(beginResp.Bytes(), mfaChallenge), "Unmarshal MFA challenge failed")
+
+			// Sign it.
+			origin := "https://" + testServer.ClusterName()
+			chalResp, err := pwdlessDev.Key.SignAssertion(origin, mfaChallenge.WebauthnChallenge)
+			require.NoError(t, err, "SignAssertion failed")
+
+			// Login and verify that the passwordless/SSO error was not obfuscated.
+			err = test.login(chalResp)
+			assert.ErrorIs(t, err, types.ErrPassswordlessLoginBySSOUser, "Login error mismatch")
+		})
+	}
 }
 
 func TestAuthenticate_rateLimiting(t *testing.T) {
@@ -305,7 +515,7 @@ func TestAuthenticate_rateLimiting(t *testing.T) {
 	}{
 		{
 			name:  "/webapi/mfa/login/begin",
-			burst: defaults.LimiterPasswordlessBurst,
+			burst: defaults.LimiterBurst,
 			fn: func(clt *client.WebClient) error {
 				ep := clt.Endpoint("webapi", "mfa", "login", "begin")
 				_, err := clt.PostJSON(ctx, ep, &client.MFAChallengeRequest{})
@@ -314,7 +524,6 @@ func TestAuthenticate_rateLimiting(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -323,7 +532,7 @@ func TestAuthenticate_rateLimiting(t *testing.T) {
 			clt, err := client.NewWebClient(env.proxies[0].webURL.String(), roundtrip.HTTPClient(client.NewInsecureWebClient()))
 			require.NoError(t, err)
 
-			for i := 0; i < test.burst; i++ {
+			for range test.burst {
 				err := test.fn(clt)
 				require.False(t, trace.IsLimitExceeded(err), "got err = %v, want non-LimitExceeded", err)
 			}
@@ -334,9 +543,67 @@ func TestAuthenticate_rateLimiting(t *testing.T) {
 	}
 }
 
+func TestAuthenticate_deviceWebToken(t *testing.T) {
+	pack := newWebPack(t, 1 /* numProxies */)
+	authServer := pack.server.AuthServer.AuthServer
+	proxy := pack.proxies[0]
+	clock := pack.clock
+
+	// Mimic a valid DeviceWebToken, regardless of any parameters.
+	wantToken := &types.DeviceWebToken{
+		Id:    "this is an opaque token ID",
+		Token: "this is an opaque token Token",
+	}
+	authServer.SetCreateDeviceWebTokenFunc(func(context.Context, *devicepb.DeviceWebToken) (*devicepb.DeviceWebToken, error) {
+		return devicepb.DeviceWebToken_builder{
+			Id:    wantToken.Id,
+			Token: wantToken.Token,
+		}.Build(), nil
+	})
+
+	ctx := context.Background()
+
+	t.Run("login using OTP", func(t *testing.T) {
+		// Create a user with password + OTP.
+		const user = "llama1"
+		const pass = "mysupersecretpassword!!1!"
+		otpSecret := newOTPSharedSecret()
+		proxy.createUser(ctx, t, user, user, pass, otpSecret, nil /* roles */)
+
+		sessionResp, _ := loginWebOTP(t, ctx, loginWebOTPParams{
+			webClient: proxy.newClient(t),
+			clock:     clock,
+			user:      user,
+			password:  pass,
+			otpSecret: otpSecret,
+		})
+		assert.Equal(t, wantToken, sessionResp.DeviceWebToken, "WebSession DeviceWebToken mismatch")
+	})
+
+	t.Run("login using WebAuthn", func(t *testing.T) {
+		rpID := pack.server.TLS.ClusterName()
+		mfaResp := configureClusterForMFA(t, pack, &types.AuthPreferenceSpecV2{
+			Type:         constants.Local,
+			SecondFactor: constants.SecondFactorOptional,
+			Webauthn: &types.Webauthn{
+				RPID: rpID,
+			},
+		})
+
+		sessionResp, _ := loginWebMFA(ctx, t, loginWebMFAParams{
+			webClient:     proxy.newClient(t),
+			rpID:          rpID,
+			user:          mfaResp.User,
+			password:      mfaResp.Password,
+			authenticator: mfaResp.WebDev.Key,
+		})
+		assert.Equal(t, wantToken, sessionResp.DeviceWebToken, "WebSession DeviceWebToken mismatch")
+	})
+}
+
 type configureMFAResp struct {
 	User, Password string
-	WebDev         *auth.TestDevice
+	WebDev         *authtest.Device
 }
 
 func configureClusterForMFA(t *testing.T, env *webPack, spec *types.AuthPreferenceSpecV2) *configureMFAResp {
@@ -347,18 +614,18 @@ func configureClusterForMFA(t *testing.T, env *webPack, spec *types.AuthPreferen
 	cap, err := types.NewAuthPreference(*spec)
 	require.NoError(t, err)
 	authServer := env.server.Auth()
-	err = authServer.SetAuthPreference(ctx, cap)
+	_, err = authServer.UpsertAuthPreference(ctx, cap)
 	require.NoError(t, err)
 
 	// Create user.
 	const user = "llama"
-	const password = "password"
-	env.proxies[0].createUser(ctx, t, user, "root", "password", "" /* otpSecret */, nil /* roles */)
+	const password = "password1234"
+	env.proxies[0].createUser(ctx, t, user, "root", "password1234", "" /* otpSecret */, nil /* roles */)
 
 	// Register device.
-	clt, err := env.server.NewClient(auth.TestUser(user))
+	clt, err := env.server.NewClient(authtest.TestUser(user))
 	require.NoError(t, err)
-	webDev, err := auth.RegisterTestDevice(ctx, clt, "webauthn", proto.DeviceType_DEVICE_TYPE_WEBAUTHN, nil /* authenticator */)
+	webDev, err := authtest.RegisterTestDevice(ctx, clt, "webauthn", proto.DeviceType_DEVICE_TYPE_WEBAUTHN, nil /* authenticator */)
 	require.NoError(t, err)
 
 	return &configureMFAResp{
@@ -366,4 +633,31 @@ func configureClusterForMFA(t *testing.T, env *webPack, spec *types.AuthPreferen
 		Password: password,
 		WebDev:   webDev,
 	}
+}
+
+func validateSSHLoginResponse(t *testing.T, resp []byte, expectedSubjectSSHPub ssh.PublicKey, expectedSubjectTLSPub crypto.PublicKey) *authclient.CLILoginResponse {
+	t.Helper()
+
+	var loginResp authclient.CLILoginResponse
+	require.NoError(t, json.Unmarshal(resp, &loginResp))
+	assert.NotEmpty(t, loginResp.Username)
+	assert.NotEmpty(t, loginResp.HostSigners)
+
+	if expectedSubjectSSHPub != nil {
+		if sshCert, err := apisshutils.ParseCertificate(loginResp.Cert); assert.NoError(t, err) {
+			assert.Equal(t, expectedSubjectSSHPub, sshCert.Key)
+		}
+	} else {
+		assert.Empty(t, loginResp.Cert)
+	}
+
+	if expectedSubjectTLSPub != nil {
+		if tlsCert, err := tlsca.ParseCertificatePEM(loginResp.TLSCert); assert.NoError(t, err) {
+			assert.Equal(t, expectedSubjectTLSPub, tlsCert.PublicKey)
+		}
+	} else {
+		assert.Empty(t, loginResp.TLSCert)
+	}
+
+	return &loginResp
 }

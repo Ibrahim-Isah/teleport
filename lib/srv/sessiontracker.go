@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
@@ -79,15 +81,17 @@ const sessionTrackerExpirationUpdateInterval = apidefaults.SessionTrackerTTL / 3
 // SessionTracker to the backend, the write is retried with exponential backoff up until the original
 // SessionTracker expiry.
 func (s *SessionTracker) UpdateExpirationLoop(ctx context.Context, clock clockwork.Clock) error {
-	ticker := clock.NewTicker(sessionTrackerExpirationUpdateInterval)
-	defer func() {
-		// ensure the correct ticker is stopped due to reassignment below
-		ticker.Stop()
-	}()
+	// Use a timer and reset every loop (instead of a ticker) for two reasons:
+	// 1. We always want to wait the full interval after a successful update,
+	//    whether or not a retry was necessary.
+	// 2. It's easier for tests to wait for the timer to be reset, tickers
+	//    always count as a blocker.
+	timer := clock.NewTimer(sessionTrackerExpirationUpdateInterval)
+	defer timer.Stop()
 
 	for {
 		select {
-		case t := <-ticker.Chan():
+		case t := <-timer.Chan():
 			expiry := t.Add(apidefaults.SessionTrackerTTL)
 			if err := s.UpdateExpiration(ctx, expiry); err != nil {
 				// If the tracker doesn't exist in the backend then
@@ -96,20 +100,13 @@ func (s *SessionTracker) UpdateExpirationLoop(ctx context.Context, clock clockwo
 					return trace.Wrap(err)
 				}
 
-				// Stop the ticker so that it doesn't
-				// keep accumulating ticks while we are retrying.
-				ticker.Stop()
-
 				if err := s.retryUpdate(ctx, clock); err != nil {
 					return trace.Wrap(err)
 				}
-
-				// Tracker was updated, create a new ticker and proceed with the update
-				// loop.
-				// Note: clockwork.Ticker doesn't support Reset, if and when it does
-				// we should use that instead of creating a new ticker.
-				ticker = clock.NewTicker(sessionTrackerExpirationUpdateInterval)
 			}
+			// Tracker was updated, reset the timer to wait another full
+			// update interval and proceed with the update loop.
+			timer.Reset(sessionTrackerExpirationUpdateInterval)
 		case <-ctx.Done():
 			return nil
 		case <-s.closeC:
@@ -123,8 +120,9 @@ func (s *SessionTracker) retryUpdate(ctx context.Context, clock clockwork.Clock)
 	retry, err := retryutils.NewLinear(retryutils.LinearConfig{
 		Clock:  clock,
 		Max:    3 * time.Minute,
+		First:  time.Minute,
 		Step:   time.Minute,
-		Jitter: retryutils.NewHalfJitter(),
+		Jitter: retryutils.HalfJitter,
 	})
 	if err != nil {
 		return trace.Wrap(err)
@@ -211,7 +209,9 @@ func (s *SessionTracker) AddParticipant(ctx context.Context, p *types.Participan
 func (s *SessionTracker) RemoveParticipant(ctx context.Context, participantID string) error {
 	s.trackerCond.L.Lock()
 	defer s.trackerCond.L.Unlock()
-	s.tracker.RemoveParticipant(participantID)
+	if err := s.tracker.RemoveParticipant(participantID); err != nil {
+		return trace.Wrap(err)
+	}
 	s.trackerCond.Broadcast()
 
 	if s.service != nil {

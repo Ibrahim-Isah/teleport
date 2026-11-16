@@ -1,46 +1,49 @@
 /*
-Copyright 2015-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
 import (
-	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
-	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
+	"io/fs"
+	"iter"
+	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
-	"github.com/gravitational/teleport/api/types"
+	auditlogpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/auditlog/v1"
+	"github.com/gravitational/teleport/api/internalutils/stream"
 	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/auth/recordingmetadata"
+	"github.com/gravitational/teleport/lib/auth/summarizer"
 	"github.com/gravitational/teleport/lib/defaults"
+	sessionpostprocessing "github.com/gravitational/teleport/lib/events/sessionpostprocessing"
 	"github.com/gravitational/teleport/lib/observability/metrics"
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/utils"
@@ -108,6 +111,10 @@ const (
 	// AbandonedUploadPollingRate defines how often to check for
 	// abandoned uploads which need to be completed.
 	AbandonedUploadPollingRate = apidefaults.SessionTrackerTTL / 6
+
+	// UploadCompleterGracePeriod is the default period after which an upload's
+	// session tracker will be checked to see if it's an abandoned upload.
+	UploadCompleterGracePeriod = 24 * time.Hour
 )
 
 var (
@@ -147,17 +154,43 @@ var (
 		},
 	)
 
-	prometheusCollectors = []prometheus.Collector{auditOpenFiles, auditDiskUsed, auditFailedDisk, AuditFailedEmit, auditEmitEvent}
+	auditEmitEventSizes = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      "audit_emitted_event_sizes",
+			Help:      "Size of single events emitted",
+			Buckets:   prometheus.ExponentialBucketsRange(64, 2*1024*1024*1024 /*2GiB*/, 16),
+		})
+
+	// MetricStoredTrimmedEvents counts the number of events that were trimmed
+	// before being stored.
+	MetricStoredTrimmedEvents = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      "audit_stored_trimmed_events",
+			Help:      "Number of events that were trimmed before being stored",
+		})
+
+	// MetricQueriedTrimmedEvents counts the number of events that were trimmed
+	// before being returned from a query.
+	MetricQueriedTrimmedEvents = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      "audit_queried_trimmed_events",
+			Help:      "Number of events that were trimmed before being returned from a query",
+		})
+
+	prometheusCollectors = []prometheus.Collector{auditOpenFiles, auditDiskUsed, auditFailedDisk, AuditFailedEmit, auditEmitEvent, auditEmitEventSizes, MetricStoredTrimmedEvents, MetricQueriedTrimmedEvents}
 )
 
 // AuditLog is a new combined facility to record Teleport events and
-// sessions. It implements IAuditLog
+// sessions. It implements AuditLogSessionStreamer
 type AuditLog struct {
 	sync.RWMutex
 	AuditLogConfig
 
 	// log specifies the logger
-	log log.FieldLogger
+	log *slog.Logger
 
 	// playbackDir is a directory used for unpacked session recordings
 	playbackDir string
@@ -175,6 +208,9 @@ type AuditLog struct {
 	// localLog is a local events log used
 	// to emit audit events if no external log has been specified
 	localLog *FileLog
+
+	// decrypter wraps session replay with decryption
+	decrypter DecryptionWrapper
 }
 
 // AuditLogConfig specifies configuration for AuditLog server
@@ -215,10 +251,22 @@ type AuditLogConfig struct {
 	UploadHandler MultipartHandler
 
 	// ExternalLog is a pluggable external log service
-	ExternalLog IAuditLog
+	ExternalLog AuditLogger
 
 	// Context is audit log context
 	Context context.Context
+
+	// Decrypter wraps session replay with decryption
+	Decrypter DecryptionWrapper
+
+	// SessionSummarizerProvider provides session summarizers
+	SessionSummarizerProvider *summarizer.SessionSummarizerProvider
+	// RecordingMetadataProvider provides recording metadata service
+	RecordingMetadataProvider *recordingmetadata.Provider
+	// OnUploadComplete is called after an encrypted upload completes to find or
+	// recover the session end event for post-processing. If nil, no
+	// post-processing is performed.
+	OnUploadComplete func(ctx context.Context, sessionID session.ID) (apievents.AuditEvent, error)
 }
 
 // CheckAndSetDefaults checks and sets defaults
@@ -230,7 +278,7 @@ func (a *AuditLogConfig) CheckAndSetDefaults() error {
 		return trace.BadParameter("missing parameter ServerID")
 	}
 	if a.UploadHandler == nil {
-		return trace.BadParameter("missing parameter UploadHandler")
+		return trace.BadParameter("missing parameter DownloadHandler")
 	}
 	if a.Clock == nil {
 		a.Clock = clockwork.NewRealClock()
@@ -244,6 +292,12 @@ func (a *AuditLogConfig) CheckAndSetDefaults() error {
 	if a.DirMask == nil {
 		mask := os.FileMode(teleport.DirMaskSharedGroup)
 		a.DirMask = &mask
+	}
+	if a.SessionSummarizerProvider == nil {
+		a.SessionSummarizerProvider = summarizer.NewSessionSummarizerProvider()
+	}
+	if a.RecordingMetadataProvider == nil {
+		a.RecordingMetadataProvider = recordingmetadata.NewProvider()
 	}
 	if (a.GID != nil && a.UID == nil) || (a.UID != nil && a.GID == nil) {
 		return trace.BadParameter("if UID or GID is set, both should be specified")
@@ -270,14 +324,13 @@ func NewAuditLog(cfg AuditLogConfig) (*AuditLog, error) {
 	}
 	ctx, cancel := context.WithCancel(cfg.Context)
 	al := &AuditLog{
-		playbackDir:    filepath.Join(cfg.DataDir, PlaybackDir, SessionLogsDir, apidefaults.Namespace),
-		AuditLogConfig: cfg,
-		log: log.WithFields(log.Fields{
-			trace.Component: teleport.ComponentAuditLog,
-		}),
+		playbackDir:     filepath.Join(cfg.DataDir, PlaybackDir, SessionLogsDir, apidefaults.Namespace),
+		AuditLogConfig:  cfg,
+		log:             slog.With(teleport.ComponentKey, teleport.ComponentAuditLog),
 		activeDownloads: make(map[string]context.Context),
 		ctx:             ctx,
 		cancel:          cancel,
+		decrypter:       cfg.Decrypter,
 	}
 	// create a directory for audit logs, audit log does not create
 	// session logs before migrations are run in case if the directory
@@ -296,15 +349,15 @@ func NewAuditLog(cfg AuditLogConfig) (*AuditLog, error) {
 		return nil, trace.ConvertSystemError(err)
 	}
 	if cfg.UID != nil && cfg.GID != nil {
-		err := os.Chown(cfg.DataDir, *cfg.UID, *cfg.GID)
+		err := os.Lchown(cfg.DataDir, *cfg.UID, *cfg.GID)
 		if err != nil {
 			return nil, trace.ConvertSystemError(err)
 		}
-		err = os.Chown(sessionDir, *cfg.UID, *cfg.GID)
+		err = os.Lchown(sessionDir, *cfg.UID, *cfg.GID)
 		if err != nil {
 			return nil, trace.ConvertSystemError(err)
 		}
-		err = os.Chown(al.playbackDir, *cfg.UID, *cfg.GID)
+		err = os.Lchown(al.playbackDir, *cfg.UID, *cfg.GID)
 		if err != nil {
 			return nil, trace.ConvertSystemError(err)
 		}
@@ -359,304 +412,6 @@ func getAuthServers(dataDir string) ([]string, error) {
 	return authServers, nil
 }
 
-type sessionIndex struct {
-	dataDir        string
-	namespace      string
-	sid            session.ID
-	events         []indexEntry
-	enhancedEvents map[string][]indexEntry
-	chunks         []indexEntry
-	indexFiles     []string
-}
-
-func (idx *sessionIndex) sort() {
-	sort.Slice(idx.events, func(i, j int) bool {
-		return idx.events[i].Index < idx.events[j].Index
-	})
-	sort.Slice(idx.chunks, func(i, j int) bool {
-		return idx.chunks[i].Offset < idx.chunks[j].Offset
-	})
-
-	// Enhanced events.
-	for _, events := range idx.enhancedEvents {
-		sort.Slice(events, func(i, j int) bool {
-			return events[i].Index < events[j].Index
-		})
-	}
-}
-
-func (idx *sessionIndex) eventsFileName(index int) string {
-	entry := idx.events[index]
-	return filepath.Join(idx.dataDir, entry.authServer, SessionLogsDir, idx.namespace, entry.FileName)
-}
-
-func (idx *sessionIndex) eventsFile(afterN int) (int, error) {
-	for i := len(idx.events) - 1; i >= 0; i-- {
-		entry := idx.events[i]
-		if int64(afterN) >= entry.Index {
-			return i, nil
-		}
-	}
-	return -1, trace.NotFound("%v not found", afterN)
-}
-
-// chunkFileNames returns file names of all session chunk files
-func (idx *sessionIndex) chunkFileNames() []string {
-	fileNames := make([]string, len(idx.chunks))
-	for i := 0; i < len(idx.chunks); i++ {
-		fileNames[i] = idx.chunksFileName(i)
-	}
-	return fileNames
-}
-
-func (idx *sessionIndex) chunksFile(offset int64) (string, int64, error) {
-	for i := len(idx.chunks) - 1; i >= 0; i-- {
-		entry := idx.chunks[i]
-		if offset >= entry.Offset {
-			return idx.chunksFileName(i), entry.Offset, nil
-		}
-	}
-	return "", 0, trace.NotFound("offset %v not found for session %v", offset, idx.sid)
-}
-
-func (idx *sessionIndex) chunksFileName(index int) string {
-	entry := idx.chunks[index]
-	return filepath.Join(idx.dataDir, entry.authServer, SessionLogsDir, idx.namespace, entry.FileName)
-}
-
-func (l *AuditLog) readSessionIndex(namespace string, sid session.ID) (*sessionIndex, error) {
-	index, err := readSessionIndex(l.DataDir, []string{PlaybackDir}, namespace, sid)
-	if err == nil {
-		return index, nil
-	}
-	if !trace.IsNotFound(err) {
-		return nil, trace.Wrap(err)
-	}
-	// some legacy records may be stored unpacked in the JSON format
-	// in the data dir, under server format
-	authServers, err := getAuthServers(l.DataDir)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return readSessionIndex(l.DataDir, authServers, namespace, sid)
-}
-
-func readSessionIndex(dataDir string, authServers []string, namespace string, sid session.ID) (*sessionIndex, error) {
-	index := sessionIndex{
-		sid:       sid,
-		dataDir:   dataDir,
-		namespace: namespace,
-		enhancedEvents: map[string][]indexEntry{
-			SessionCommandEvent: {},
-			SessionDiskEvent:    {},
-			SessionNetworkEvent: {},
-		},
-	}
-	for _, authServer := range authServers {
-		indexFileName := filepath.Join(dataDir, authServer, SessionLogsDir, namespace, fmt.Sprintf("%v.index", sid))
-		indexFile, err := os.OpenFile(indexFileName, os.O_RDONLY, 0640)
-		err = trace.ConvertSystemError(err)
-		if err != nil {
-			if !trace.IsNotFound(err) {
-				return nil, trace.Wrap(err)
-			}
-			continue
-		}
-		index.indexFiles = append(index.indexFiles, indexFileName)
-
-		entries, err := readIndexEntries(indexFile, authServer)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		for _, entry := range entries {
-			switch entry.Type {
-			case fileTypeEvents:
-				index.events = append(index.events, entry)
-			case fileTypeChunks:
-				index.chunks = append(index.chunks, entry)
-			// Enhanced events.
-			case SessionCommandEvent, SessionDiskEvent, SessionNetworkEvent:
-				index.enhancedEvents[entry.Type] = append(index.enhancedEvents[entry.Type], entry)
-			default:
-				return nil, trace.BadParameter("found unknown event type: %q", entry.Type)
-			}
-		}
-
-		err = indexFile.Close()
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-	}
-
-	if len(index.indexFiles) == 0 {
-		return nil, trace.NotFound("session %q not found", sid)
-	}
-
-	index.sort()
-	return &index, nil
-}
-
-func readIndexEntries(file *os.File, authServer string) ([]indexEntry, error) {
-	var entries []indexEntry
-
-	scanner := bufio.NewScanner(file)
-	for lineNo := 0; scanner.Scan(); lineNo++ {
-		var entry indexEntry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			return nil, trace.Wrap(err)
-		}
-		entry.authServer = authServer
-		entries = append(entries, entry)
-	}
-
-	return entries, nil
-}
-
-// createOrGetDownload creates a new download sync entry for a given session,
-// if there is no active download in progress, or returns an existing one.
-// if the new context has been created, cancel function is returned as a
-// second argument. Caller should call this function to signal that download has been
-// completed or failed.
-func (l *AuditLog) createOrGetDownload(path string) (context.Context, context.CancelFunc) {
-	l.Lock()
-	defer l.Unlock()
-	ctx, ok := l.activeDownloads[path]
-	if ok {
-		return ctx, nil
-	}
-	ctx, cancel := context.WithCancel(context.TODO())
-	l.activeDownloads[path] = ctx
-	return ctx, func() {
-		cancel()
-		l.Lock()
-		defer l.Unlock()
-		delete(l.activeDownloads, path)
-	}
-}
-
-func (l *AuditLog) downloadSession(namespace string, sid session.ID) error {
-	tarballPath := filepath.Join(l.playbackDir, string(sid)+".tar")
-
-	ctx, cancel := l.createOrGetDownload(tarballPath)
-	// means that another download is in progress, so simply wait until
-	// it finishes
-	if cancel == nil {
-		l.log.Debugf("Another download is in progress for %v, waiting until it gets completed.", sid)
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-l.ctx.Done():
-			return trace.BadParameter("audit log is closing, aborting the download")
-		}
-	}
-	defer cancel()
-	_, err := os.Stat(tarballPath)
-	err = trace.ConvertSystemError(err)
-	if err == nil {
-		l.log.Debugf("Recording %v is already downloaded and unpacked to %v.", sid, tarballPath)
-		return nil
-	}
-	if !trace.IsNotFound(err) {
-		return trace.Wrap(err)
-	}
-	start := time.Now()
-	l.log.Debugf("Starting download of %v.", sid)
-	tarball, err := os.OpenFile(tarballPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0640)
-	if err != nil {
-		return trace.ConvertSystemError(err)
-	}
-	defer func() {
-		if err := tarball.Close(); err != nil {
-			l.log.WithError(err).Errorf("Failed to close file %q.", tarballPath)
-		}
-	}()
-	if err := l.UploadHandler.Download(l.ctx, sid, tarball); err != nil {
-		// remove partially downloaded tarball
-		if rmErr := os.Remove(tarballPath); rmErr != nil {
-			l.log.WithError(rmErr).Warningf("Failed to remove file %v.", tarballPath)
-		}
-		return trace.Wrap(err)
-	}
-	l.log.WithField("duration", time.Since(start)).Debugf("Downloaded %v to %v.", sid, tarballPath)
-
-	_, err = tarball.Seek(0, 0)
-	if err != nil {
-		return trace.ConvertSystemError(err)
-	}
-	format, err := DetectFormat(tarball)
-	if err != nil {
-		l.log.WithError(err).Debugf("Failed to detect playback %v format.", tarballPath)
-		return trace.Wrap(err)
-	}
-	_, err = tarball.Seek(0, 0)
-	if err != nil {
-		return trace.ConvertSystemError(err)
-	}
-	switch {
-	case format.Proto:
-		start = time.Now()
-		l.log.Debugf("Converting %v to playback format.", tarballPath)
-		protoReader := NewProtoReader(tarball)
-		_, err = WriteForSSHPlayback(l.Context, sid, protoReader, l.playbackDir)
-		if err != nil {
-			l.log.WithError(err).Error("Failed to convert.")
-			return trace.Wrap(err)
-		}
-		stats := protoReader.GetStats().ToFields()
-		stats["duration"] = time.Since(start)
-		l.log.WithFields(stats).Debugf("Converted %v to %v.", tarballPath, l.playbackDir)
-	case format.Tar:
-		if err := utils.Extract(tarball, l.playbackDir); err != nil {
-			return trace.Wrap(err)
-		}
-	default:
-		return trace.BadParameter("Unexpected format %v.", format)
-	}
-
-	// Extract every chunks file on disk while holding the context,
-	// otherwise parallel downloads will try to unpack the file at the same time.
-	idx, err := l.readSessionIndex(namespace, sid)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	for _, fileName := range idx.chunkFileNames() {
-		reader, err := l.unpackFile(fileName)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		if err := reader.Close(); err != nil {
-			l.log.Warningf("Failed to close file: %v.", err)
-		}
-	}
-	l.log.WithField("duration", time.Since(start)).Debugf("Unpacked %v to %v.", tarballPath, l.playbackDir)
-	return nil
-}
-
-// GetSessionChunk returns a reader which console and web clients request
-// to receive a live stream of a given session. The reader allows access to a
-// session stream range from offsetBytes to offsetBytes+maxBytes
-func (l *AuditLog) GetSessionChunk(namespace string, sid session.ID, offsetBytes, maxBytes int) ([]byte, error) {
-	if err := l.downloadSession(namespace, sid); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	var data []byte
-	for {
-		out, err := l.getSessionChunk(namespace, sid, offsetBytes, maxBytes)
-		if err != nil {
-			if err == io.EOF {
-				return data, nil
-			}
-			return nil, trace.Wrap(err)
-		}
-		data = append(data, out...)
-		if len(data) == maxBytes || len(out) == 0 {
-			return data, nil
-		}
-		maxBytes = maxBytes - len(out)
-		offsetBytes = offsetBytes + len(out)
-	}
-}
-
 func (l *AuditLog) cleanupOldPlaybacks() error {
 	// scan the log directory and clean files last
 	// accessed after an hour
@@ -682,188 +437,16 @@ func (l *AuditLog) cleanupOldPlaybacks() error {
 		fileToRemove := filepath.Join(l.playbackDir, fi.Name())
 		err := os.Remove(fileToRemove)
 		if err != nil {
-			l.log.Warningf("Failed to remove file %v: %v.", fileToRemove, err)
+			l.log.WarnContext(l.ctx, "Failed to remove session playback file", "file", fileToRemove, "error", err)
 		}
-		l.log.Debugf("Removed unpacked session playback file %v after %v.", fileToRemove, diff)
+		l.log.DebugContext(l.ctx, "Removed unpacked session playback file", "file", fileToRemove, "diff", diff)
 	}
 	return nil
 }
 
-type readSeekCloser interface {
-	io.Reader
-	io.Seeker
-	io.Closer
-}
-
-func (l *AuditLog) unpackFile(fileName string) (readSeekCloser, error) {
-	basename := filepath.Base(fileName)
-	unpackedFile := filepath.Join(l.playbackDir, strings.TrimSuffix(basename, filepath.Ext(basename)))
-
-	// If client has called GetSessionChunk before session is over
-	// this could lead to cases when not all data will be returned,
-	// because unpackFile will be called concurrently with the unfinished write
-	unpackedInfo, err := os.Stat(unpackedFile)
-	err = trace.ConvertSystemError(err)
-	switch {
-	case err != nil && !trace.IsNotFound(err):
-		return nil, trace.Wrap(err)
-	case err == nil:
-		packedInfo, err := os.Stat(fileName)
-		if err != nil {
-			return nil, trace.ConvertSystemError(err)
-		}
-		// no new data has been added
-		if unpackedInfo.ModTime().Unix() >= packedInfo.ModTime().Unix() {
-			return os.OpenFile(unpackedFile, os.O_RDONLY, 0640)
-		}
-	}
-
-	start := l.Clock.Now()
-	dest, err := os.OpenFile(unpackedFile, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0640)
-	if err != nil {
-		return nil, trace.ConvertSystemError(err)
-	}
-	source, err := os.OpenFile(fileName, os.O_RDONLY, 0640)
-	if err != nil {
-		return nil, trace.ConvertSystemError(err)
-	}
-	defer source.Close()
-	reader, err := gzip.NewReader(source)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	defer reader.Close()
-	if _, err := io.Copy(dest, reader); err != nil {
-		// Unexpected EOF is returned by gzip reader
-		// when the file has not been closed yet,
-		// ignore this error
-		if err != io.ErrUnexpectedEOF {
-			dest.Close()
-			return nil, trace.Wrap(err)
-		}
-	}
-	if _, err := dest.Seek(0, 0); err != nil {
-		dest.Close()
-		return nil, trace.Wrap(err)
-	}
-	l.log.Debugf("Uncompressed %v into %v in %v", fileName, unpackedFile, l.Clock.Now().Sub(start))
-	return dest, nil
-}
-
-func (l *AuditLog) getSessionChunk(namespace string, sid session.ID, offsetBytes, maxBytes int) ([]byte, error) {
-	if namespace == "" {
-		return nil, trace.BadParameter("missing parameter namespace")
-	}
-	idx, err := l.readSessionIndex(namespace, sid)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	fileName, fileOffset, err := idx.chunksFile(int64(offsetBytes))
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	reader, err := l.unpackFile(fileName)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	defer reader.Close()
-
-	// seek to 'offset' from the beginning
-	if _, err := reader.Seek(int64(offsetBytes)-fileOffset, 0); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// copy up to maxBytes from the offset position:
-	var buff bytes.Buffer
-	_, err = io.Copy(&buff, io.LimitReader(reader, int64(maxBytes)))
-	return buff.Bytes(), err
-}
-
-// Returns all events that happen during a session sorted by time
-// (oldest first).
-//
-// Can be filtered by 'after' (cursor value to return events newer than)
-
-func (l *AuditLog) GetSessionEvents(namespace string, sid session.ID, afterN int, includePrintEvents bool) ([]EventFields, error) {
-	l.log.WithFields(log.Fields{"sid": string(sid), "afterN": afterN, "printEvents": includePrintEvents}).Debugf("GetSessionEvents.")
-	if namespace == "" {
-		return nil, trace.BadParameter("missing parameter namespace")
-	}
-	// Print events are stored in the context of the downloaded session
-	// so pull them
-	if !includePrintEvents && l.ExternalLog != nil {
-		events, err := l.ExternalLog.GetSessionEvents(namespace, sid, afterN, includePrintEvents)
-		// some loggers (e.g. FileLog) do not support retrieving session only print events,
-		// in this case rely on local fallback to download the session,
-		// unpack it and use local search
-		if !trace.IsNotImplemented(err) {
-			return events, err
-		}
-	}
-	// If code has to fetch print events (for playback) it has to download
-	// the playback from external storage first
-	if err := l.downloadSession(namespace, sid); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	idx, err := l.readSessionIndex(namespace, sid)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	fileIndex, err := idx.eventsFile(afterN)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	events := make([]EventFields, 0, 256)
-	for i := fileIndex; i < len(idx.events); i++ {
-		skip := 0
-		if i == fileIndex {
-			skip = afterN
-		}
-		out, err := l.fetchSessionEvents(idx.eventsFileName(i), skip)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		events = append(events, out...)
-	}
-	return events, nil
-}
-
-func (l *AuditLog) fetchSessionEvents(fileName string, afterN int) ([]EventFields, error) {
-	logFile, err := os.OpenFile(fileName, os.O_RDONLY, 0640)
-	if err != nil {
-		// no file found? this means no events have been logged yet
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, trace.Wrap(err)
-	}
-	defer logFile.Close()
-	reader, err := gzip.NewReader(logFile)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	defer reader.Close()
-
-	retval := make([]EventFields, 0, 256)
-	// read line by line:
-	scanner := bufio.NewScanner(reader)
-	for lineNo := 0; scanner.Scan(); lineNo++ {
-		if lineNo < afterN {
-			continue
-		}
-		var fields EventFields
-		if err = json.Unmarshal(scanner.Bytes(), &fields); err != nil {
-			log.Error(err)
-			return nil, trace.Wrap(err)
-		}
-		fields[EventCursor] = lineNo
-		retval = append(retval, fields)
-	}
-	return retval, nil
-}
-
 // EmitAuditEvent adds a new event to the local file log
 func (l *AuditLog) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	ctx = context.WithoutCancel(ctx)
 	// If an external logger has been set, use it as the emitter, otherwise
 	// fallback to the local disk based emitter.
 	var emitAuditEvent func(ctx context.Context, event apievents.AuditEvent) error
@@ -880,6 +463,18 @@ func (l *AuditLog) EmitAuditEvent(ctx context.Context, event apievents.AuditEven
 	return nil
 }
 
+// CurrentFileSymlink returns the path to the symlink pointing at the current
+// local file being used for logging.
+func (l *AuditLog) CurrentFileSymlink() string {
+	return filepath.Join(l.localLog.SymlinkDir, SymlinkFilename)
+}
+
+// CurrentFile returns the path to the current local file
+// being used for logging.
+func (l *AuditLog) CurrentFile() string {
+	return l.localLog.file.Name()
+}
+
 // auditDirs returns directories used for audit log storage
 func (l *AuditLog) auditDirs() ([]string, error) {
 	authServers, err := getAuthServers(l.DataDir)
@@ -894,104 +489,135 @@ func (l *AuditLog) auditDirs() ([]string, error) {
 	return out, nil
 }
 
-func (l *AuditLog) SearchEvents(fromUTC, toUTC time.Time, namespace string, eventType []string, limit int, order types.EventOrder, startKey string) ([]apievents.AuditEvent, string, error) {
-	g := l.log.WithFields(log.Fields{"namespace": namespace, "eventType": eventType, "limit": limit})
-	g.Debugf("SearchEvents(%v, %v)", fromUTC, toUTC)
+func (l *AuditLog) SearchEvents(ctx context.Context, req SearchEventsRequest) ([]apievents.AuditEvent, string, error) {
+	g := l.log.With("event_type", req.EventTypes, "limit", req.Limit)
+	g.DebugContext(ctx, "SearchEvents", "from", req.From, "to", req.To)
+	limit := req.Limit
 	if limit <= 0 {
 		limit = defaults.EventsIterationLimit
 	}
 	if limit > defaults.EventsMaxIterationLimit {
 		return nil, "", trace.BadParameter("limit %v exceeds max iteration limit %v", limit, defaults.MaxIterationLimit)
 	}
+	req.Limit = limit
 	if l.ExternalLog != nil {
-		return l.ExternalLog.SearchEvents(fromUTC, toUTC, namespace, eventType, limit, order, startKey)
+		return l.ExternalLog.SearchEvents(ctx, req)
 	}
-	return l.localLog.SearchEvents(fromUTC, toUTC, namespace, eventType, limit, order, startKey)
+	return l.localLog.SearchEvents(ctx, req)
 }
 
-func (l *AuditLog) SearchSessionEvents(fromUTC, toUTC time.Time, limit int, order types.EventOrder, startKey string, cond *types.WhereExpr, sessionID string) ([]apievents.AuditEvent, string, error) {
-	l.log.Debugf("SearchSessionEvents(%v, %v, %v)", fromUTC, toUTC, limit)
+func (l *AuditLog) SearchSessionEvents(ctx context.Context, req SearchSessionEventsRequest) ([]apievents.AuditEvent, string, error) {
+	l.log.DebugContext(ctx, "SearchSessionEvents", "from", req.From, "to", req.To, "limit", req.Limit)
 	if l.ExternalLog != nil {
-		return l.ExternalLog.SearchSessionEvents(fromUTC, toUTC, limit, order, startKey, cond, sessionID)
+		return l.ExternalLog.SearchSessionEvents(ctx, req)
 	}
-	return l.localLog.SearchSessionEvents(fromUTC, toUTC, limit, order, startKey, cond, sessionID)
+	return l.localLog.SearchSessionEvents(ctx, req)
 }
 
-// StreamSessionEvents streams all events from a given session recording. An error is returned on the first
-// channel if one is encountered. Otherwise the event channel is closed when the stream ends.
-// The event channel is not closed on error to prevent race conditions in downstream select statements.
+func (l *AuditLog) SearchUnstructuredEvents(ctx context.Context, req SearchEventsRequest) ([]*auditlogpb.EventUnstructured, string, error) {
+	g := l.log.With("event_type", req.EventTypes, "limit", req.Limit)
+	g.DebugContext(ctx, "SearchUnstructuredEvents", "from", req.From, "to", req.To)
+	limit := req.Limit
+	if limit <= 0 {
+		limit = defaults.EventsIterationLimit
+	}
+	if limit > defaults.EventsMaxIterationLimit {
+		return nil, "", trace.BadParameter("limit %v exceeds max iteration limit %v", limit, defaults.MaxIterationLimit)
+	}
+	req.Limit = limit
+	if l.ExternalLog != nil {
+		return l.ExternalLog.SearchUnstructuredEvents(ctx, req)
+	}
+	return l.localLog.SearchUnstructuredEvents(ctx, req)
+}
+
+func (l *AuditLog) ExportUnstructuredEvents(ctx context.Context, req *auditlogpb.ExportUnstructuredEventsRequest) stream.Stream[*auditlogpb.ExportEventUnstructured] {
+	l.log.DebugContext(ctx, "ExportUnstructuredEvents", "date", req.GetDate(), "chunk", req.GetChunk(), "cursor", req.GetCursor())
+	if l.ExternalLog != nil {
+		return l.ExternalLog.ExportUnstructuredEvents(ctx, req)
+	}
+	return l.localLog.ExportUnstructuredEvents(ctx, req)
+}
+
+func (l *AuditLog) GetEventExportChunks(ctx context.Context, req *auditlogpb.GetEventExportChunksRequest) stream.Stream[*auditlogpb.EventExportChunk] {
+	l.log.DebugContext(ctx, "GetEventExportChunks", "date", req.GetDate())
+	if l.ExternalLog != nil {
+		return l.ExternalLog.GetEventExportChunks(ctx, req)
+	}
+	return l.localLog.GetEventExportChunks(ctx, req)
+}
+
+// StreamSessionEvents implements [SessionStreamer].
 func (l *AuditLog) StreamSessionEvents(ctx context.Context, sessionID session.ID, startIndex int64) (chan apievents.AuditEvent, chan error) {
-	l.log.Debugf("StreamSessionEvents(%v)", sessionID)
+	l.log.DebugContext(ctx, "StreamSessionEvents", "session_id", string(sessionID))
 	e := make(chan error, 1)
 	c := make(chan apievents.AuditEvent)
 
-	tarballPath := filepath.Join(l.playbackDir, string(sessionID)+".stream.tar")
-	downloadCtx, cancel := l.createOrGetDownload(tarballPath)
+	sessionStartCh := make(chan apievents.AuditEvent, 1)
+	if startCb, err := sessionStartCallbackFromContext(ctx); err == nil {
+		go func() {
+			evt, ok := <-sessionStartCh
+			if !ok {
+				startCb(nil, trace.NotFound("session start event not found"))
+				return
+			}
 
-	// Wait until another in progress download finishes and use its tarball.
-	if cancel == nil {
-		l.log.Debugf("Another download is in progress for %v, waiting until it gets completed.", sessionID)
-		select {
-		case <-downloadCtx.Done():
-		case <-l.ctx.Done():
-			e <- trace.BadParameter("audit log is closing, aborting the download")
-			return c, e
+			startCb(evt, nil)
+		}()
+	}
+	reader, err := l.UploadHandler.StreamSessionRecording(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || trace.IsNotFound(err) {
+			err = trace.NotFound("a recording for session %v was not found", sessionID)
 		}
-	} else {
-		defer cancel()
-	}
-
-	rawSession, err := os.OpenFile(tarballPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0640)
-	if err != nil {
 		e <- trace.Wrap(err)
+		close(sessionStartCh)
 		return c, e
 	}
-
-	start := time.Now()
-	if err := l.UploadHandler.Download(l.ctx, sessionID, rawSession); err != nil {
-		// remove partially downloaded tarball
-		if rmErr := os.Remove(tarballPath); rmErr != nil {
-			l.log.WithError(rmErr).Warningf("Failed to remove file %v.", tarballPath)
-		}
-
-		e <- trace.Wrap(err)
-		return c, e
-	}
-
-	l.log.WithField("duration", time.Since(start)).Debugf("Downloaded %v to %v.", sessionID, tarballPath)
-	_, err = rawSession.Seek(0, 0)
-	if err != nil {
-		e <- trace.Wrap(err)
-		return c, e
-	}
-
-	if err != nil {
-		e <- trace.Wrap(err)
-		return c, e
-	}
-
-	protoReader := NewProtoReader(rawSession)
 
 	go func() {
+		defer close(sessionStartCh)
+		defer reader.Close()
+
+		// Ensure that the reader is closed when the context is done, to unblock any
+		// pending reads.
+		stop := context.AfterFunc(ctx, func() {
+			_ = reader.Close()
+		})
+		defer stop()
+
+		protoReader := NewProtoReader(reader, l.decrypter)
+		defer protoReader.Close()
+
+		firstEvent := true
 		for {
 			if ctx.Err() != nil {
 				e <- trace.Wrap(ctx.Err())
-				break
+				return
 			}
 
 			event, err := protoReader.Read(ctx)
 			if err != nil {
-				if err != io.EOF {
+				if !errors.Is(err, io.EOF) {
 					e <- trace.Wrap(err)
 				} else {
 					close(c)
 				}
+				return
+			}
 
-				break
+			if firstEvent {
+				sessionStartCh <- event
+				firstEvent = false
 			}
 
 			if event.GetIndex() >= startIndex {
-				c <- event
+				select {
+				case c <- event:
+				case <-ctx.Done():
+					e <- trace.Wrap(ctx.Err())
+					return
+				}
 			}
 		}
 	}()
@@ -999,8 +625,94 @@ func (l *AuditLog) StreamSessionEvents(ctx context.Context, sessionID session.ID
 	return c, e
 }
 
-// getLocalLog returns the local (file based) audit log.
-func (l *AuditLog) getLocalLog() IAuditLog {
+// UploadEncryptedRecording uploads encrypted recordings using the AuditLog's configured UploadHandler.
+func (l *AuditLog) UploadEncryptedRecording(ctx context.Context, sessionID string, parts iter.Seq2[[]byte, error]) error {
+	sessID, err := session.ParseID(sessionID)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	upload, err := l.UploadHandler.CreateUpload(ctx, *sessID)
+	if err != nil {
+		return trace.Wrap(err, "creating upload")
+	}
+
+	next, stop := iter.Pull2(parts)
+	defer stop()
+
+	part, err, ok := next()
+	if err != nil {
+		return trace.Wrap(err)
+	} else if !ok {
+		return trace.BadParameter("unexpected empty upload")
+	}
+
+	var streamParts []StreamPart
+	// S3 requires that part numbers start at 1, so we do that by default regardless of which uploader is
+	// configured for the auth service
+	var partNumber int64 = 1
+	for {
+		if err := l.UploadHandler.ReserveUploadPart(ctx, *upload, partNumber); err != nil {
+			return trace.Wrap(err, "reserving upload part")
+		}
+
+		nextPart, err, hasNext := next()
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
+		// If the upload part is not at least the minimum upload part size, and this isn't
+		// the last part, add padding to meet the minimum upload size.
+		if hasNext && len(part) < MinUploadPartSizeBytes {
+			part = PadUploadPart(part, MinUploadPartSizeBytes)
+		}
+
+		streamPart, err := l.UploadHandler.UploadPart(ctx, *upload, partNumber, bytes.NewReader(part))
+		if err != nil {
+			return trace.Wrap(err, "uploading part")
+		}
+		streamParts = append(streamParts, *streamPart)
+
+		if !hasNext {
+			break
+		}
+
+		part = nextPart
+		partNumber++
+	}
+	err = l.UploadHandler.CompleteUpload(ctx, *upload, streamParts)
+	if err != nil {
+		return trace.Wrap(err, "completing upload")
+	}
+
+	if l.OnUploadComplete == nil {
+		return nil
+	}
+	sessionEnd, err := l.OnUploadComplete(ctx, upload.SessionID)
+	if err != nil || sessionEnd == nil {
+		return nil
+	}
+	if err := sessionpostprocessing.Process(
+		ctx,
+		sessionpostprocessing.Config{
+			SessionEnd:                sessionEnd,
+			SessionID:                 upload.SessionID,
+			SessionSummarizerProvider: l.SessionSummarizerProvider,
+			RecordingMetadataProvider: l.RecordingMetadataProvider,
+		},
+	); err != nil {
+		l.log.WarnContext(ctx, "session post-processing failed", "error", err)
+	}
+	return nil
+}
+
+// SetOnUploadComplete sets the callback to be invoked after an encrypted upload
+// completes. It must be called before any uploads are processed.
+func (l *AuditLog) SetOnUploadComplete(fn func(ctx context.Context, sessionID session.ID) (apievents.AuditEvent, error)) {
+	l.OnUploadComplete = fn
+}
+
+// getLocalLog returns the local (file based) AuditLogger.
+func (l *AuditLog) getLocalLog() AuditLogger {
 	l.RLock()
 	defer l.RUnlock()
 
@@ -1017,7 +729,7 @@ func (l *AuditLog) getLocalLog() IAuditLog {
 func (l *AuditLog) Close() error {
 	if l.ExternalLog != nil {
 		if err := l.ExternalLog.Close(); err != nil {
-			log.Warningf("Close failure: %v", err)
+			l.log.WarnContext(l.ctx, "Close failure", "error", err)
 		}
 	}
 	l.cancel()
@@ -1026,7 +738,7 @@ func (l *AuditLog) Close() error {
 
 	if l.localLog != nil {
 		if err := l.localLog.Close(); err != nil {
-			log.Warningf("Close failure: %v", err)
+			l.log.WarnContext(l.ctx, "Close failure", "error", err)
 		}
 		l.localLog = nil
 	}
@@ -1043,7 +755,7 @@ func (l *AuditLog) periodicCleanupPlaybacks() {
 			return
 		case <-ticker.C:
 			if err := l.cleanupOldPlaybacks(); err != nil {
-				l.log.Warningf("Error while cleaning up playback files: %v.", err)
+				l.log.WarnContext(l.ctx, "Error while cleaning up playback files", "error", err)
 			}
 		}
 	}
@@ -1063,7 +775,7 @@ func (l *AuditLog) periodicSpaceMonitor() {
 			usedPercent, err := utils.PercentUsed(l.DataDir)
 			if err != nil {
 				auditFailedDisk.Inc()
-				log.Warnf("Disk space monitoring failed: %v.", err)
+				l.log.WarnContext(l.ctx, "Disk space monitoring failed", "error", err)
 				continue
 			}
 
@@ -1072,10 +784,63 @@ func (l *AuditLog) periodicSpaceMonitor() {
 
 			// If used percentage goes above the alerting level, write to logs as well.
 			if usedPercent > float64(DiskAlertThreshold) {
-				log.Warnf("Free disk space for audit log is running low, %v%% of disk used.", usedPercent)
+				l.log.WarnContext(l.ctx, "Free disk space for audit log is running low", "percentage_used", usedPercent)
 			}
 		case <-l.ctx.Done():
 			return
 		}
 	}
+}
+
+// streamSessionEventsContextKey represent context keys used by
+// StreamSessionEvents function.
+type streamSessionEventsContextKey string
+
+const (
+	// sessionStartCallbackContextKey is the context key used to store the
+	// session start callback function.
+	sessionStartCallbackContextKey streamSessionEventsContextKey = "session-start"
+)
+
+// SessionStartCallback is the function used when streaming reaches the start
+// event. If any error, such as session not found, the event will be nil, and
+// the error will be set.
+type SessionStartCallback func(startEvent apievents.AuditEvent, err error)
+
+// ContextWithSessionStartCallback returns a context.Context containing a
+// session start event callback.
+func ContextWithSessionStartCallback(ctx context.Context, cb SessionStartCallback) context.Context {
+	return context.WithValue(ctx, sessionStartCallbackContextKey, cb)
+}
+
+// sessionStartCallbackFromContext returns the session start callback from
+// context.Context.
+func sessionStartCallbackFromContext(ctx context.Context) (SessionStartCallback, error) {
+	if ctx == nil {
+		return nil, trace.BadParameter("context is nil")
+	}
+
+	cb, ok := ctx.Value(sessionStartCallbackContextKey).(SessionStartCallback)
+	if !ok {
+		return nil, trace.BadParameter("session start callback function was not found in the context")
+	}
+
+	return cb, nil
+}
+
+// PadUploadPart adds padding to the given upload part to reach the minimum size.
+func PadUploadPart(uploadPart []byte, minSize int) []byte {
+	// Create padding to reach the target size. Note that the padding cannot
+	// be shorter than the header size.
+	paddingBytes := max(minSize-len(uploadPart), ProtoStreamV2PartHeaderSize)
+	paddedPart := make([]byte, paddingBytes)
+
+	paddedPartHeader := PartHeader{
+		ProtoVersion: ProtoStreamV2,
+		PaddingSize:  uint64(paddingBytes - ProtoStreamV2PartHeaderSize),
+		PartSize:     0,
+	}
+	copy(paddedPart, paddedPartHeader.Bytes())
+
+	return append(uploadPart, paddedPart...)
 }

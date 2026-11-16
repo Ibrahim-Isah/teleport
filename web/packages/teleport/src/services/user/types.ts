@@ -1,24 +1,29 @@
-/*
-Copyright 2019-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import { Cluster } from 'teleport/services/clusters';
+import { MfaChallengeResponse } from 'teleport/services/mfa';
 
 export type AuthType = 'local' | 'sso' | 'passwordless';
 
-export interface AccessStrategy {
+export type WebTerminalClipboardMode = '' | 'unrestricted' | 'no-copy';
+
+interface AccessStrategy {
   type: 'optional' | 'always' | 'reason';
   prompt: string;
 }
@@ -26,17 +31,45 @@ export interface AccessStrategy {
 export interface AccessCapabilities {
   requestableRoles: string[];
   suggestedReviewers: string[];
+  requireReason: boolean;
 }
 
 export interface UserContext {
   authType: AuthType;
   acl: Acl;
   username: string;
+  /** Human-readable name resolved server-side, empty if not distinct from username. */
+  displayPrimary: string;
+  /** Supporting context resolved server-side, usually email. */
+  displaySecondary: string;
   cluster: Cluster;
   accessStrategy: AccessStrategy;
   accessCapabilities: AccessCapabilities;
-  // accessRequestId is the ID of the access request from which additional roles to assume were obtained for the current session.
+  /**
+   * ID of the access request from which additional roles to assume were
+   * obtained for the current session.
+   */
   accessRequestId?: string;
+  allowedSearchAsRoles: string[];
+  /** Indicates whether the user has a password set. */
+  passwordState: PasswordState;
+  /**
+   * A list of scopes available to sign in for this user, based on user's
+   * scoped role assignments.
+   */
+  availableScopes: string[];
+  /** Scope is the scope of current session. Empty if unscoped. */
+  scope: string;
+}
+
+/**
+ * Indicates whether a user has a password set. Corresponds to the PasswordState
+ * protocol buffers enum.
+ */
+export enum PasswordState {
+  PASSWORD_STATE_UNSPECIFIED = 0,
+  PASSWORD_STATE_UNSET = 1,
+  PASSWORD_STATE_SET = 2,
 }
 
 export interface Access {
@@ -47,8 +80,17 @@ export interface Access {
   remove: boolean;
 }
 
+interface AccessWithUse extends Access {
+  use: boolean;
+}
+
+interface MobileDeviceAccess {
+  createEnrollToken: boolean;
+}
+
 export interface Acl {
   directorySharingEnabled: boolean;
+  reviewRequests: boolean;
   desktopSessionRecordingEnabled: boolean;
   clipboardSharingEnabled: boolean;
   authConnectors: Access;
@@ -70,19 +112,80 @@ export interface Acl {
   connectionDiagnostic: Access;
   license: Access;
   download: Access;
+  discoverConfigs: Access;
+  plugins: Access;
+  integrations: AccessWithUse;
+  deviceTrust: Access;
+  lock: Access;
+  samlIdpServiceProvider: Access;
+  accessList: Access;
+  auditQuery: Access;
+  securityReport: Access;
+  externalAuditStorage: Access;
+  accessGraph: Access;
+  bots: Access;
+  accessMonitoringRule: Access;
+  contacts: Access;
+  fileTransferAccess: boolean;
+  /**
+   * webTerminalClipboardMode determines clipboard behavior in the Web UI terminal.
+   */
+  webTerminalClipboardMode: WebTerminalClipboardMode;
+  gitServers: Access;
+  accessGraphSettings: Access;
+  botInstances: Access;
+  instances: Access;
+  workloadIdentity: Access;
+  clientIpRestriction: Access;
+  autoUpdateConfig: Access;
+  autoUpdateVersion: Access;
+  autoUpdateAgentRollout: Access;
+  autoUpdateAgentReport: Access;
+  inferencePolicy: Access;
+  inferenceModel: Access;
+  inferenceSecret: Access;
+  classifier: Access;
+  beam: Access;
+  mobileDevice: MobileDeviceAccess;
 }
+
+// AllTraits represent all the traits defined for a user.
+export type AllUserTraits = Record<string, string[]>;
+
+export type UserOrigin = 'okta' | 'saml' | 'scim';
 
 export interface User {
   // name is the teleport username.
   name: string;
+  // displayPrimary is the human-readable name resolved server-side.
+  displayPrimary?: string;
+  // displaySecondary is supporting display context resolved server-side.
+  displaySecondary?: string;
   // roles is the list of roles user is assigned to.
   roles: string[];
   // authType describes how the user authenticated
   // e.g. locally or with a SSO provider.
   authType?: string;
+  // What kind of upstream IdP has the user come from?
+  origin?: UserOrigin;
   // isLocal is true if json.authType was 'local'.
   isLocal?: boolean;
+  // isBot is true if the user is a Bot User.
+  isBot?: boolean;
+  // traits are preset traits defined in Teleport, such as
+  // logins, db_role etc. These traits are defiend in UserTraits interface.
   traits?: UserTraits;
+  // allTraits contains both preset traits, as well as externalTraits
+  // such as those created by external IdP attributes to roles mapping
+  // or new values as set by Teleport admin.
+  allTraits?: AllUserTraits;
+}
+
+// Backend does not allow User fields "traits" and "allTraits"
+// both to be specified in the same request when creating or updating a user.
+export enum ExcludeUserField {
+  Traits = 'traits',
+  AllTraits = 'allTraits',
 }
 
 // UserTraits contain fields that define traits for local accounts.
@@ -127,3 +230,14 @@ export type OnboardDiscover = {
   // discover page.
   hasVisited?: boolean;
 };
+
+export interface CreateUserVariables {
+  user: User;
+  excludeUserField: ExcludeUserField;
+  mfaResponse?: MfaChallengeResponse;
+}
+
+export interface UpdateUserVariables {
+  user: User;
+  excludeUserField: ExcludeUserField;
+}

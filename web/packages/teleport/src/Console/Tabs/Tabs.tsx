@@ -1,32 +1,31 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
 import styled from 'styled-components';
-import { typography } from 'design/system';
 
-import * as Icons from 'design/Icon';
 import { Box, ButtonIcon } from 'design';
-
+import * as Icons from 'design/Icon';
+import { typography } from 'design/system';
+import { TypographyProps } from 'design/system/typography';
 import { useStore } from 'shared/libs/stores';
 
-import * as stores from 'teleport/Console/stores';
 import { useConsoleContext } from 'teleport/Console/consoleContextProvider';
-
-import { colors } from '../colors';
+import * as stores from 'teleport/Console/stores';
 
 import TabItem from './TabItem';
 
@@ -37,7 +36,7 @@ export default function TabsContainer(props: Props) {
   return <Tabs {...props} parties={ctx.storeParties.state} />;
 }
 
-export function Tabs(props: Props & { parties: stores.Parties }) {
+function Tabs(props: Props & { parties: stores.Parties }) {
   const {
     items,
     parties,
@@ -69,20 +68,14 @@ export function Tabs(props: Props & { parties: stores.Parties }) {
           style={{
             flex: '1',
             flexBasis: '0',
-            flexGrow: '1',
+            flexGrow: '0',
           }}
         />
       );
     });
 
   return (
-    <StyledTabs
-      as="nav"
-      typography="h5"
-      color="text.secondary"
-      bold
-      {...styledProps}
-    >
+    <StyledTabs as="nav" color="text.slightlyMuted" bold {...styledProps}>
       {$items}
       {$items.length > 0 && (
         <ButtonIcon
@@ -92,7 +85,7 @@ export function Tabs(props: Props & { parties: stores.Parties }) {
           title="New Tab"
           onClick={onNew}
         >
-          <Icons.Add fontSize="16px" />
+          <Icons.Add size="small" />
         </ButtonIcon>
       )}
     </StyledTabs>
@@ -108,8 +101,8 @@ type Props = {
   [index: string]: any;
 };
 
-const StyledTabs = styled(Box)`
-  background: ${colors.terminalDark};
+const StyledTabs = styled(Box)<TypographyProps>`
+  background: ${props => props.theme.colors.levels.surface};
   min-height: 32px;
   border-radius: 4px;
   display: flex;

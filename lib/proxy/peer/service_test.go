@@ -1,39 +1,44 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package peer
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"testing"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
+	peerdial "github.com/gravitational/teleport/lib/proxy/peer/dial"
 )
 
 type mockClusterDialer struct {
-	MockDialCluster func(string, DialParams) (net.Conn, error)
+	MockDialCluster func(string, peerdial.DialParams) (net.Conn, error)
 }
 
-func (m *mockClusterDialer) Dial(clusterName string, request DialParams) (net.Conn, error) {
+func (m *mockClusterDialer) Dial(clusterName string, request peerdial.DialParams) (net.Conn, error) {
 	if m.MockDialCluster == nil {
 		return nil, trace.NotImplemented("")
 	}
@@ -48,7 +53,7 @@ func setupService(t *testing.T) (*proxyService, proto.ProxyServiceClient) {
 	require.NoError(t, err)
 
 	proxyService := &proxyService{
-		log: logrus.New(),
+		log: slog.Default(),
 	}
 	proto.RegisterProxyServiceServer(server, proxyService)
 
@@ -89,8 +94,8 @@ func TestSendReceive(t *testing.T) {
 	}
 
 	local, remote := net.Pipe()
-	service.clusterDialer = &mockClusterDialer{
-		MockDialCluster: func(clusterName string, request DialParams) (net.Conn, error) {
+	service.dialer = &mockClusterDialer{
+		MockDialCluster: func(clusterName string, request peerdial.DialParams) (net.Conn, error) {
 			require.Equal(t, "test-cluster", clusterName)
 			require.Equal(t, dialRequest.TunnelType, request.ConnType)
 			require.Equal(t, dialRequest.NodeID, request.ServerID)
@@ -110,7 +115,7 @@ func TestSendReceive(t *testing.T) {
 	_, err = stream.Recv()
 	require.NoError(t, err)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		send := append(send, byte(i))
 		err = stream.Send(&proto.Frame{Message: &proto.Frame_Data{Data: &proto.Data{
 			Bytes: send,

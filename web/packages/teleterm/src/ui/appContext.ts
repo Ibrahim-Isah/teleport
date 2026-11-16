@@ -1,45 +1,54 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { getErrorMessage } from 'shared/utils/error';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
+import { ConfigService } from 'teleterm/services/config';
+import { TshdClient, VnetClient } from 'teleterm/services/tshd/createClient';
 import {
-  MainProcessClient,
   ElectronGlobals,
-  SubscribeToTshdEvent,
+  MainProcessClient,
+  TshdEventContextBridgeService,
 } from 'teleterm/types';
-import {
-  ReloginRequest,
-  SendNotificationRequest,
-} from 'teleterm/services/tshdEvents';
+import { cleanUpBeforeLogout } from 'teleterm/ui/ClusterLogout/cleanUpBeforeLogout';
 import { ClustersService } from 'teleterm/ui/services/clusters';
-import { ModalsService } from 'teleterm/ui/services/modals';
-import { TerminalsService } from 'teleterm/ui/services/terminals';
 import { ConnectionTrackerService } from 'teleterm/ui/services/connectionTracker';
-import { QuickInputService } from 'teleterm/ui/services/quickInput';
-import { StatePersistenceService } from 'teleterm/ui/services/statePersistence';
-import { KeyboardShortcutsService } from 'teleterm/ui/services/keyboardShortcuts';
-import { WorkspacesService } from 'teleterm/ui/services/workspacesService/workspacesService';
-import { NotificationsService } from 'teleterm/ui/services/notifications';
+import { ConnectMyComputerService } from 'teleterm/ui/services/connectMyComputer';
 import { FileTransferService } from 'teleterm/ui/services/fileTransferClient';
-import { ReloginService } from 'teleterm/services/relogin';
-import { TshdNotificationsService } from 'teleterm/services/tshdNotifications';
-import { UsageService } from 'teleterm/ui/services/usage';
+import { HeadlessAuthenticationService } from 'teleterm/ui/services/headlessAuthn/headlessAuthnService';
+import { KeyboardShortcutsService } from 'teleterm/ui/services/keyboardShortcuts';
+import { ModalsService } from 'teleterm/ui/services/modals';
+import { NotificationsService } from 'teleterm/ui/services/notifications';
+import { ReloginService } from 'teleterm/ui/services/relogin/reloginService';
 import { ResourcesService } from 'teleterm/ui/services/resources';
-import { IAppContext } from 'teleterm/ui/types';
+import { StatePersistenceService } from 'teleterm/ui/services/statePersistence';
+import { TerminalsService } from 'teleterm/ui/services/terminals';
+import { TshdNotificationsService } from 'teleterm/ui/services/tshdNotifications/tshdNotificationService';
+import { UsageService } from 'teleterm/ui/services/usage';
+import { WorkspacesService } from 'teleterm/ui/services/workspacesService/workspacesService';
+import {
+  IAppContext,
+  ResourceRefreshListener,
+  UnexpectedVnetShutdownListener,
+} from 'teleterm/ui/types';
 
 import { CommandLauncher } from './commandLauncher';
+import { createTshdEventsContextBridgeService } from './tshdEvents';
 
 export default class AppContext implements IAppContext {
   clustersService: ClustersService;
@@ -47,7 +56,6 @@ export default class AppContext implements IAppContext {
   notificationsService: NotificationsService;
   terminalsService: TerminalsService;
   keyboardShortcutsService: KeyboardShortcutsService;
-  quickInputService: QuickInputService;
   statePersistenceService: StatePersistenceService;
   workspacesService: WorkspacesService;
   mainProcessClient: MainProcessClient;
@@ -55,32 +63,44 @@ export default class AppContext implements IAppContext {
   connectionTracker: ConnectionTrackerService;
   fileTransferService: FileTransferService;
   resourcesService: ResourcesService;
+  tshd: TshdClient;
+  vnet: VnetClient;
   /**
-   * subscribeToTshdEvent lets you add a listener that's going to be called every time a client
-   * makes a particular RPC to the tshd events service. The listener receives the request converted
-   * to a simple JS object since classes cannot be passed through the context bridge.
+   * setupTshdEventContextBridgeService adds a context-bridge-compatible version of a gRPC service
+   * that's going to be called every time a client makes a particular RPC to the tshd events
+   * service. The service receives requests converted to simple JS objects since classes cannot be
+   * passed through the context bridge.
    *
-   * @param {string} eventName - Name of the event.
-   * @param {function} listener - A function that gets called when a client calls the specific
-   * event. It accepts an object with two properties:
-   *
-   * - request is the request payload converted to a simple JS object.
-   * - onCancelled is a function which lets you register a callback which will be called when the
-   * request gets canceled by the client.
+   * See the JSDoc for TshdEventContextBridgeService for more details.
    */
-  subscribeToTshdEvent: SubscribeToTshdEvent;
+  setupTshdEventContextBridgeService: (
+    service: TshdEventContextBridgeService
+  ) => void;
+  getPathForFile: (file: File) => string;
   reloginService: ReloginService;
   tshdNotificationsService: TshdNotificationsService;
+  headlessAuthenticationService: HeadlessAuthenticationService;
   usageService: UsageService;
+  configService: ConfigService;
+  connectMyComputerService: ConnectMyComputerService;
+  private _unexpectedVnetShutdownListener:
+    | UnexpectedVnetShutdownListener
+    | undefined;
+  private _resourceRefreshListener: ResourceRefreshListener | undefined;
 
   constructor(config: ElectronGlobals) {
     const { tshClient, ptyServiceClient, mainProcessClient } = config;
-    this.subscribeToTshdEvent = config.subscribeToTshdEvent;
+    this.tshd = tshClient;
+    this.vnet = config.vnetClient;
+    this.setupTshdEventContextBridgeService =
+      config.setupTshdEventContextBridgeService;
     this.mainProcessClient = mainProcessClient;
     this.notificationsService = new NotificationsService();
+    this.configService = this.mainProcessClient.configService;
+    this.getPathForFile = config.getPathForFile;
     this.usageService = new UsageService(
       tshClient,
-      this.mainProcessClient.configService,
+      this.configService,
       this.notificationsService,
       clusterUri => this.clustersService.findCluster(clusterUri),
       mainProcessClient.getRuntimeSettings()
@@ -110,17 +130,10 @@ export default class AppContext implements IAppContext {
 
     this.keyboardShortcutsService = new KeyboardShortcutsService(
       this.mainProcessClient.getRuntimeSettings().platform,
-      this.mainProcessClient.configService
+      this.configService
     );
 
     this.commandLauncher = new CommandLauncher(this);
-
-    this.quickInputService = new QuickInputService(
-      this.commandLauncher,
-      this.clustersService,
-      this.resourcesService,
-      this.workspacesService
-    );
 
     this.connectionTracker = new ConnectionTrackerService(
       this.statePersistenceService,
@@ -137,27 +150,149 @@ export default class AppContext implements IAppContext {
       this.notificationsService,
       this.clustersService
     );
+    this.connectMyComputerService = new ConnectMyComputerService(
+      this.mainProcessClient,
+      tshClient
+    );
+    this.headlessAuthenticationService = new HeadlessAuthenticationService(
+      mainProcessClient,
+      this.modalsService,
+      tshClient,
+      this.configService
+    );
+
+    this.registerClusterLifecycleHandler();
+    this.subscribeToProfileWatcherErrors();
   }
 
-  async init(): Promise<void> {
-    this.setUpTshdEventSubscriptions();
-    this.clustersService.syncGatewaysAndCatchErrors();
+  async pullInitialState(): Promise<void> {
+    this.setupTshdEventContextBridgeService(
+      createTshdEventsContextBridgeService(this)
+    );
+
+    void this.clustersService.syncGatewaysAndCatchErrors();
     await this.clustersService.syncRootClustersAndCatchErrors();
+    this.workspacesService.restorePersistedState();
+    // The app has been initialized (callbacks are set up, state is restored).
+    // The UI is visible.
+    this.workspacesService.markAsInitialized();
   }
 
-  private setUpTshdEventSubscriptions() {
-    this.subscribeToTshdEvent('relogin', ({ request, onCancelled }) => {
-      // The handler for the relogin event should return only after the relogin procedure finishes.
-      return this.reloginService.relogin(
-        request as ReloginRequest,
-        onCancelled
-      );
-    });
+  /**
+   * addUnexpectedVnetShutdownListener sets the listener and returns a cleanup function which
+   * removes the listener.
+   */
+  addUnexpectedVnetShutdownListener(
+    listener: UnexpectedVnetShutdownListener
+  ): () => void {
+    this._unexpectedVnetShutdownListener = listener;
 
-    this.subscribeToTshdEvent('sendNotification', ({ request }) => {
-      this.tshdNotificationsService.sendNotification(
-        request as SendNotificationRequest
-      );
+    return () => {
+      this._unexpectedVnetShutdownListener = undefined;
+    };
+  }
+
+  /**
+   * unexpectedVnetShutdownListener gets called by tshd events service when it gets a report about
+   * said shutdown from tsh daemon.
+   *
+   * The communication between tshd events service and VnetContext is done through a callback on
+   * AppContext. That's because tshd events service lives outside of React but within the same
+   * process (renderer).
+   */
+  // To force callsites to use addUnexpectedVnetShutdownListener instead of setting the property
+  // directly on appContext, we use a getter which exposes a private property.
+  get unexpectedVnetShutdownListener(): UnexpectedVnetShutdownListener {
+    return this._unexpectedVnetShutdownListener;
+  }
+
+  /** Sets the listener and returns a cleanup function which removes the listener. */
+  addResourceRefreshListener(listener: ResourceRefreshListener): () => void {
+    this._resourceRefreshListener = listener;
+
+    return () => {
+      this._resourceRefreshListener = undefined;
+    };
+  }
+
+  /** Gets called when `ClusterLifecycleManager` requests resource refresh. */
+  get resourceRefreshListener(): ResourceRefreshListener {
+    return this._resourceRefreshListener;
+  }
+
+  private registerClusterLifecycleHandler(): void {
+    // Queue chain ensures sequential processing.
+    let processingQueue = Promise.resolve();
+
+    this.mainProcessClient.registerClusterLifecycleHandler(({ uri, op }) => {
+      // Chain onto the queue and catch errors so it keeps processing
+      const task = processingQueue.then(async () => {
+        switch (op) {
+          case 'did-add-cluster':
+            const cluster = this.clustersService.findCluster(uri);
+            if (!cluster) {
+              throw new Error(`Cluster ${uri} does not exist`);
+            }
+            return this.workspacesService.addWorkspace({
+              uri,
+              proxyHost: cluster.proxyHost,
+            });
+          case 'did-change-proxy-host':
+            const updatedCluster = this.clustersService.findCluster(uri);
+            if (!updatedCluster) {
+              throw new Error(`Cluster ${uri} does not exist`);
+            }
+            return this.workspacesService.updateWorkspaceProxyHost({
+              uri,
+              proxyHost: updatedCluster.proxyHost,
+            });
+          case 'did-change-access':
+            if (!this.clustersService.findCluster(uri)?.connected) {
+              // Only refresh resources when the cluster is connected.
+              return;
+            }
+            return this.resourceRefreshListener(uri);
+          case 'will-logout':
+            return cleanUpBeforeLogout(this, uri, { removeWorkspace: false });
+          case 'will-forget-cluster':
+            return cleanUpBeforeLogout(this, uri, { removeWorkspace: true });
+          default:
+            op satisfies never;
+        }
+      });
+
+      // Update the queue so the next event waits for this one.
+      // Catch errors, they will be returned below.
+      processingQueue = task.catch(() => {});
+
+      return task;
     });
+  }
+
+  private subscribeToProfileWatcherErrors(): void {
+    let notificationId: string | undefined;
+    this.mainProcessClient.subscribeToProfileWatcherErrors(
+      ({ error, reason }) => {
+        let title: string;
+        switch (reason) {
+          case 'processing-error':
+            title =
+              'Failed to process the detected profile update. Changes made through tsh may not be reflected in the app.';
+            break;
+          case 'exited':
+            title =
+              "Stopped monitoring profiles. Changes made through tsh won't be reflected in the app.";
+            break;
+        }
+
+        if (notificationId) {
+          this.notificationsService.removeNotification(notificationId);
+        }
+        notificationId = this.notificationsService.notifyError({
+          title,
+          description: getErrorMessage(error),
+        });
+      }
+    );
   }
 }

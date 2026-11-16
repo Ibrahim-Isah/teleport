@@ -1,36 +1,34 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
 	"context"
-	"fmt"
-	"time"
+	"log/slog"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
-	clients "github.com/gravitational/teleport/lib/cloud"
-	"github.com/gravitational/teleport/lib/cloud/aws"
+	"github.com/gravitational/teleport/lib/cloud/azure"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/services/readonly"
 	discovery "github.com/gravitational/teleport/lib/srv/discovery/common"
 	dbfetchers "github.com/gravitational/teleport/lib/srv/discovery/fetchers/db"
 	"github.com/gravitational/teleport/lib/utils"
@@ -40,14 +38,17 @@ import (
 // databases according to the up-to-date list of database resources and
 // databases imported from the cloud.
 func (s *Server) startReconciler(ctx context.Context) error {
-	reconciler, err := services.NewReconciler(services.ReconcilerConfig{
+	reconciler, err := services.NewReconciler(services.ReconcilerConfig[types.Database]{
 		Matcher:             s.matcher,
 		GetCurrentResources: s.getResources,
-		GetNewResources:     s.monitoredDatabases.get,
-		OnCreate:            s.onCreate,
-		OnUpdate:            s.onUpdate,
-		OnDelete:            s.onDelete,
-		Log:                 s.log,
+		CompareResources: func(d1, d2 types.Database) int {
+			return services.EqualFromBool(d1.IsEqual(d2))
+		},
+		GetNewResources: s.monitoredDatabases.getLocked,
+		OnCreate:        s.onCreate,
+		OnUpdate:        s.onUpdate,
+		OnDelete:        s.onDelete,
+		Logger:          s.log.With("kind", types.KindDatabase),
 	})
 	if err != nil {
 		return trace.Wrap(err)
@@ -56,13 +57,17 @@ func (s *Server) startReconciler(ctx context.Context) error {
 		for {
 			select {
 			case <-s.reconcileCh:
+				// don't let monitored dbs change during reconciliation
+				s.monitoredDatabases.mu.RLock()
 				if err := reconciler.Reconcile(ctx); err != nil {
-					s.log.WithError(err).Error("Failed to reconcile.")
-				} else if s.cfg.OnReconcile != nil {
+					s.log.ErrorContext(ctx, "Failed to reconcile.", "error", err)
+				}
+				if s.cfg.OnReconcile != nil {
 					s.cfg.OnReconcile(s.getProxiedDatabases())
 				}
+				s.monitoredDatabases.mu.RUnlock()
 			case <-ctx.Done():
-				s.log.Debug("Reconciler done.")
+				s.log.DebugContext(ctx, "Reconciler done.")
 				return
 			}
 		}
@@ -72,28 +77,29 @@ func (s *Server) startReconciler(ctx context.Context) error {
 
 // startResourceWatcher starts watching changes to database resources and
 // registers/unregisters the proxied databases accordingly.
-func (s *Server) startResourceWatcher(ctx context.Context) (*services.DatabaseWatcher, error) {
+func (s *Server) startResourceWatcher(ctx context.Context) (*services.GenericWatcher[types.Database, readonly.Database], error) {
 	if len(s.cfg.ResourceMatchers) == 0 {
-		s.log.Debug("Not starting database resource watcher.")
+		s.log.DebugContext(ctx, "Not starting database resource watcher.")
 		return nil, nil
 	}
-	s.log.Debug("Starting database resource watcher.")
+	s.log.DebugContext(ctx, "Starting database resource watcher.")
 	watcher, err := services.NewDatabaseWatcher(ctx, services.DatabaseWatcherConfig{
 		ResourceWatcherConfig: services.ResourceWatcherConfig{
 			Component: teleport.ComponentDatabase,
-			Log:       s.log,
+			Logger:    s.log,
 			Client:    s.cfg.AccessPoint,
 		},
+		DatabaseGetter: s.cfg.AccessPoint,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	go func() {
-		defer s.log.Debug("Database resource watcher done.")
+		defer s.log.DebugContext(ctx, "Database resource watcher done.")
 		defer watcher.Close()
 		for {
 			select {
-			case databases := <-watcher.DatabasesC:
+			case databases := <-watcher.ResourcesC:
 				s.monitoredDatabases.setResources(databases)
 				select {
 				case s.reconcileCh <- struct{}{}:
@@ -111,29 +117,37 @@ func (s *Server) startResourceWatcher(ctx context.Context) (*services.DatabaseWa
 // startCloudWatcher starts fetching cloud databases according to the
 // selectors and register/unregister them appropriately.
 func (s *Server) startCloudWatcher(ctx context.Context) error {
-	awsFetchers, err := dbfetchers.MakeAWSFetchers(s.cfg.CloudClients, s.cfg.AWSMatchers)
+	awsFetchers, err := s.cfg.AWSDatabaseFetcherFactory.MakeFetchers(ctx, s.cfg.AWSMatchers, "" /* discovery config */)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	azureFetchers, err := dbfetchers.MakeAzureFetchers(s.cfg.CloudClients, s.cfg.AzureMatchers)
+	azureFetchers, err := dbfetchers.MakeAzureFetchers(ctx, func(ctx context.Context, integration string) (azure.Clients, error) {
+		if integration != "" {
+			return nil, trace.NotImplemented("db_service discovery does not support Azure OIDC authentication; use discovery_service instead.")
+		}
+		return s.cfg.AzureClients, nil
+	}, s.cfg.AzureMatchers, "" /* discovery config */)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
+	allFetchers := append(awsFetchers, azureFetchers...)
+	if len(allFetchers) == 0 {
+		s.log.DebugContext(ctx, "Not starting cloud database watcher.", "error", err)
+		return nil
+	}
+
 	watcher, err := discovery.NewWatcher(ctx, discovery.WatcherConfig{
-		Fetchers: append(awsFetchers, azureFetchers...),
-		Log:      logrus.WithField(trace.Component, "watcher:cloud"),
+		FetchersFn: discovery.StaticFetchers(allFetchers),
+		Logger:     slog.With(teleport.ComponentKey, "watcher:cloud"),
+		Origin:     types.OriginCloud,
 	})
 	if err != nil {
-		if trace.IsNotFound(err) {
-			s.log.Debugf("Not starting cloud database watcher: %v.", err)
-			return nil
-		}
 		return trace.Wrap(err)
 	}
 	go watcher.Start()
 	go func() {
-		defer s.log.Debug("Cloud database watcher done.")
+		defer s.log.DebugContext(ctx, "Cloud database watcher done.")
 		for {
 			select {
 			case resources := <-watcher.ResourcesC():
@@ -141,7 +155,7 @@ func (s *Server) startCloudWatcher(ctx context.Context) error {
 				if err == nil {
 					s.monitoredDatabases.setCloud(databases)
 				} else {
-					s.log.WithError(err).Warnf("Failed to convert resources to databases.")
+					s.log.WarnContext(ctx, "Failed to convert resources to databases.", "error", err)
 				}
 				select {
 				case s.reconcileCh <- struct{}{}:
@@ -157,181 +171,96 @@ func (s *Server) startCloudWatcher(ctx context.Context) error {
 }
 
 // getResources returns proxied databases as resources.
-func (s *Server) getResources() types.ResourcesWithLabelsMap {
-	return s.getProxiedDatabases().AsResources().ToMap()
+func (s *Server) getResources() map[string]types.Database {
+	return utils.FromSlice(s.getProxiedDatabases(), types.Database.GetName)
 }
 
 // onCreate is called by reconciler when a new database is created.
-func (s *Server) onCreate(ctx context.Context, resource types.ResourceWithLabels) error {
-	database, ok := resource.(types.Database)
-	if !ok {
-		return trace.BadParameter("expected types.Database, got %T", resource)
+func (s *Server) onCreate(ctx context.Context, database types.Database) error {
+	// OnCreate receives a "new" resource from s.monitoredDatabases. Make a
+	// copy here so that any attribute changes to the proxied database will not
+	// affect database objects tracked in s.monitoredDatabases.
+	databaseCopy := database.Copy()
+
+	// only apply resource matcher settings to dynamic resources.
+	if s.monitoredDatabases.isResource_Locked(database) {
+		s.applyAWSResourceMatcherSettings(databaseCopy)
 	}
 
-	if s.monitoredDatabases.isDiscoveryResource(database) {
-		s.cfg.discoveryResourceChecker.check(ctx, database)
+	// Run DiscoveryResourceChecker after resource matchers are applied to make
+	// sure the correct AssumeRoleARN is used.
+	if s.monitoredDatabases.isDiscoveryResource_Locked(database) {
+		if err := s.cfg.discoveryResourceChecker.Check(ctx, databaseCopy); err != nil {
+			return trace.Wrap(err)
+		}
 	}
-	return s.registerDatabase(ctx, database)
+	return s.registerDatabase(ctx, databaseCopy)
 }
 
 // onUpdate is called by reconciler when an already proxied database is updated.
-func (s *Server) onUpdate(ctx context.Context, resource types.ResourceWithLabels) error {
-	database, ok := resource.(types.Database)
-	if !ok {
-		return trace.BadParameter("expected types.Database, got %T", resource)
+func (s *Server) onUpdate(ctx context.Context, database, _ types.Database) error {
+	// OnUpdate receives a "new" resource from s.monitoredDatabases. Make a
+	// copy here so that any attribute changes to the proxied database will not
+	// affect database objects tracked in s.monitoredDatabases.
+	databaseCopy := database.Copy()
+
+	// only apply resource matcher settings to dynamic resources.
+	if s.monitoredDatabases.isResource_Locked(database) {
+		s.applyAWSResourceMatcherSettings(databaseCopy)
 	}
-	return s.updateDatabase(ctx, database)
+
+	// Run DiscoveryResourceChecker after resource matchers are applied to make
+	// sure the correct AssumeRoleARN is used.
+	if s.monitoredDatabases.isDiscoveryResource_Locked(database) {
+		if err := s.cfg.discoveryResourceChecker.Check(ctx, databaseCopy); err != nil {
+			return trace.Wrap(err)
+		}
+	}
+	return s.updateDatabase(ctx, databaseCopy)
 }
 
 // onDelete is called by reconciler when a proxied database is deleted.
-func (s *Server) onDelete(ctx context.Context, resource types.ResourceWithLabels) error {
-	database, ok := resource.(types.Database)
-	if !ok {
-		return trace.BadParameter("expected types.Database, got %T", resource)
-	}
+func (s *Server) onDelete(ctx context.Context, database types.Database) error {
 	return s.unregisterDatabase(ctx, database)
 }
 
 // matcher is used by reconciler to check if database matches selectors.
-func (s *Server) matcher(resource types.ResourceWithLabels) bool {
-	database, ok := resource.(types.Database)
-	if !ok {
-		return false
-	}
-
+func (s *Server) matcher(database types.Database) bool {
 	// In the case of databases discovered by this database server, matchers
 	// should be skipped.
-	if s.monitoredDatabases.isCloud(database) {
+	if s.monitoredDatabases.isCloud_Locked(database) {
 		return true // Cloud fetchers return only matching databases.
 	}
 
 	// Database resources created via CLI, API, or discovery service are
 	// filtered by resource matchers.
-	return services.MatchResourceLabels(s.cfg.ResourceMatchers, database)
+	return services.MatchResourceLabels(s.cfg.ResourceMatchers, database.GetAllLabels())
 }
 
-// discoveryResourceChecker defines an interface for checking database
-// resources created by the discovery service.
-type discoveryResourceChecker interface {
-	// check performs required checks on provided database resource before it
-	// gets registered.
-	check(ctx context.Context, database types.Database)
-}
-
-// cloudCredentialsChecker is a discoveryResourceChecker for validating cloud
-// credentials against the incoming discovery resources.
-type cloudCredentialsChecker struct {
-	cloudClients     clients.Clients
-	resourceMatchers []services.ResourceMatcher
-	log              *logrus.Entry
-	cache            *utils.FnCache
-}
-
-func newCloudCrednentialsChecker(ctx context.Context, cloudClients clients.Clients, resourceMatchers []services.ResourceMatcher) (discoveryResourceChecker, error) {
-	cache, err := utils.NewFnCache(utils.FnCacheConfig{
-		TTL:     10 * time.Minute,
-		Context: ctx,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return &cloudCredentialsChecker{
-		cloudClients:     cloudClients,
-		resourceMatchers: resourceMatchers,
-		log:              logrus.WithField(trace.Component, teleport.ComponentDatabase),
-		cache:            cache,
-	}, nil
-}
-
-// check performs some quick checks to see whether this database agent can handle
-// the incoming database (likely created by discovery service), and logs a
-// warning with suggestions for this situation.
-func (c *cloudCredentialsChecker) check(ctx context.Context, database types.Database) {
-	if database.Origin() != types.OriginCloud {
+func (s *Server) applyAWSResourceMatcherSettings(database types.Database) {
+	if !database.IsAWSHosted() {
+		// dynamic matchers only apply AWS settings (for now), so skip non-AWS
+		// databases.
 		return
 	}
-
-	switch {
-	case database.IsAWSHosted():
-		c.checkAWS(ctx, database)
-	case database.IsAzure():
-		c.checkAzure(ctx, database)
-	default:
-		c.log.Debugf("Database %q has unknown cloud type %q.", database.GetName(), database.GetType())
-	}
-}
-
-func (c *cloudCredentialsChecker) checkAWS(ctx context.Context, database types.Database) {
-	identity, err := utils.FnCacheGet(ctx, c.cache, types.CloudAWS, func(ctx context.Context) (aws.Identity, error) {
-		client, err := c.cloudClients.GetAWSSTSClient("")
-		if err != nil {
-			return nil, trace.Wrap(err)
+	dbLabels := database.GetAllLabels()
+	for _, matcher := range s.cfg.ResourceMatchers {
+		if len(matcher.Labels) == 0 || matcher.AWS.AssumeRoleARN == "" {
+			continue
 		}
-		return aws.GetIdentityWithClient(ctx, client)
-	})
-	if err != nil {
-		c.warn(err, database, "Failed to get AWS caller identity when checking a database created by the discovery service.")
-		return
-	}
+		if match, _, _ := services.MatchLabels(matcher.Labels, dbLabels); !match {
+			continue
+		}
 
+		// Set status AWS instead of spec. Reconciler ignores status fields
+		// when comparing database resources.
+		setStatusAWSAssumeRole(database, matcher.AWS.AssumeRoleARN, matcher.AWS.ExternalID)
+	}
+}
+
+func setStatusAWSAssumeRole(database types.Database, assumeRoleARN, externalID string) {
 	meta := database.GetAWS()
-	if meta.AccountID != "" && meta.AccountID != identity.GetAccountID() {
-		c.warn(nil, database, fmt.Sprintf("The database agent's caller identity and discovered database %q have different AWS account IDs (%s vs %s).",
-			database.GetName(),
-			identity.GetAccountID(),
-			meta.AccountID,
-		))
-		return
-	}
-}
-
-func (c *cloudCredentialsChecker) checkAzure(ctx context.Context, database types.Database) {
-	allSubIDs, err := utils.FnCacheGet(ctx, c.cache, types.CloudAzure, func(ctx context.Context) ([]string, error) {
-		client, err := c.cloudClients.GetAzureSubscriptionClient()
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		return client.ListSubscriptionIDs(ctx)
-	})
-	if err != nil {
-		c.warn(err, database, "Failed to get Azure subscription IDs when checking a database created by the discovery service.")
-		return
-	}
-
-	rid, err := arm.ParseResourceID(database.GetAzure().ResourceID)
-	if err != nil {
-		c.log.Warnf("Failed to parse resource ID of database %q: %v.", database.GetName(), err)
-		return
-	}
-
-	if !slices.Contains(allSubIDs, rid.SubscriptionID) {
-		c.warn(nil, database, fmt.Sprintf("The discovered database %q is in a subscription (ID: %s) that the database agent does not have access to.",
-			database.GetName(),
-			rid.SubscriptionID,
-		))
-		return
-	}
-}
-
-func (c *cloudCredentialsChecker) warn(err error, database types.Database, msg string) {
-	log := c.log.WithField("database", database)
-	if err != nil {
-		log = log.WithField("error", err.Error())
-	}
-
-	logLevel := logrus.InfoLevel
-	if c.isWildcardMatcher() {
-		logLevel = logrus.WarnLevel
-	}
-	log.Logf(logLevel, "%s You can update \"db_service.resources\" section of this agent's config file to filter out unwanted resources (see https://goteleport.com/docs/database-access/reference/configuration/ for more details). If this database is intended to be handled by this agent, please verify that valid cloud credentials are configured for the agent.", msg)
-}
-
-func (c *cloudCredentialsChecker) isWildcardMatcher() bool {
-	if len(c.resourceMatchers) != 1 {
-		return false
-	}
-
-	wildcardLabels := c.resourceMatchers[0].Labels[types.Wildcard]
-	return len(wildcardLabels) == 1 && wildcardLabels[0] == types.Wildcard
+	meta.AssumeRoleARN = assumeRoleARN
+	meta.ExternalID = externalID
+	database.SetStatusAWS(meta)
 }

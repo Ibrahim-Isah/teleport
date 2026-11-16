@@ -1,142 +1,201 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
-import { MemoryRouter } from 'react-router';
+import { StoryObj } from '@storybook/react-vite';
+import { delay, http, HttpResponse } from 'msw';
+import { PropsWithChildren } from 'react';
 
-import { Context as TeleportContext, ContextProvider } from 'teleport';
+import { withoutQuery } from 'build/storybook';
+
 import cfg from 'teleport/config';
-import { clearCachedJoinTokenResult } from 'teleport/Discover/Shared/useJoinTokenSuspender';
-import { PingTeleportProvider } from 'teleport/Discover/Shared/PingTeleportContext';
-import { userContext } from 'teleport/Main/fixtures';
+import {
+  RequiredDiscoverProviders,
+  resourceSpecServerLinuxUbuntu,
+} from 'teleport/Discover/Fixtures/fixtures';
 import { ResourceKind } from 'teleport/Discover/Shared';
+import { clearCachedJoinTokenResult } from 'teleport/Discover/Shared/useJoinTokenSuspender';
+import { AgentMeta } from 'teleport/Discover/useDiscover';
+import {
+  IntegrationKind,
+  IntegrationStatusCode,
+} from 'teleport/services/integrations';
+import {
+  INTERNAL_RESOURCE_ID_LABEL_KEY,
+  JoinToken,
+} from 'teleport/services/joinToken';
 
 import DownloadScript from './DownloadScript';
 
-const { worker, rest } = window.msw;
+const nodesPathWithoutQuery = withoutQuery(cfg.api.nodesPath);
 
 export default {
   title: 'Teleport/Discover/Server/DownloadScripts',
   decorators: [
     Story => {
-      // Reset request handlers added in individual stories.
-      worker.resetHandlers();
-      clearCachedJoinTokenResult(ResourceKind.Server);
+      clearCachedJoinTokenResult([ResourceKind.Server]);
       return <Story />;
     },
   ],
 };
 
-export const Polling = () => {
-  // Use default fetch token handler defined in mocks/handlers
+export const Polling: StoryObj = {
+  beforeEach({ msw }) {
+    msw.use(
+      http.get(nodesPathWithoutQuery, () => {
+        return delay('infinite');
+      }),
+      http.post(cfg.api.discoveryJoinToken.createV2, () => {
+        return HttpResponse.json(joinToken);
+      })
+    );
+  },
 
-  worker.use(
-    rest.get(cfg.api.nodesPath, (req, res, ctx) => {
-      return res(ctx.delay('infinite'));
-    })
-  );
-  return (
-    <Provider>
-      <DownloadScript />
-    </Provider>
-  );
+  render() {
+    return (
+      <Provider>
+        <DownloadScript prevStep={() => null} />
+      </Provider>
+    );
+  },
 };
 
-export const PollingSuccess = () => {
-  // Use default fetch token handler defined in mocks/handlers
+export const PollingSuccess: StoryObj = {
+  beforeEach({ msw }) {
+    msw.use(
+      // Use default fetch token handler defined in mocks/handlers
+      http.get(nodesPathWithoutQuery, () => {
+        return HttpResponse.json({ items: [{}] });
+      }),
+      http.post(cfg.api.discoveryJoinToken.createV2, () => {
+        return HttpResponse.json(joinToken);
+      })
+    );
+  },
 
-  worker.use(
-    rest.get(cfg.api.nodesPath, (req, res, ctx) => {
-      return res(ctx.json({ items: [{}] }));
-    })
-  );
-  return (
-    <Provider interval={5}>
-      <DownloadScript />
-    </Provider>
-  );
+  render() {
+    return (
+      <Provider interval={5}>
+        <DownloadScript prevStep={() => null} />
+      </Provider>
+    );
+  },
 };
 
-export const PollingError = () => {
-  // Use default fetch token handler defined in mocks/handlers
+// TODO(lisa): state will show up after 5 minutes, in order
+// to reduce this time, requires rewriting component in a way
+// that can mock the SHOW_HINT_TIMEOUT for window.setTimeout
+export const PollingError: StoryObj = {
+  beforeEach({ msw }) {
+    msw.use(
+      http.get(nodesPathWithoutQuery, () => {
+        return delay('infinite');
+      }),
+      http.post(cfg.api.discoveryJoinToken.createV2, () => {
+        return HttpResponse.json(joinToken);
+      })
+    );
+  },
 
-  worker.use(
-    rest.get(cfg.api.nodesPath, (req, res, ctx) => {
-      return res(ctx.delay('infinite'));
-    })
-  );
-  return (
-    <Provider timeout={50}>
-      <DownloadScript />
-    </Provider>
-  );
+  render() {
+    return (
+      <Provider interval={50}>
+        <DownloadScript prevStep={() => null} />
+      </Provider>
+    );
+  },
 };
 
-export const Processing = () => {
-  worker.use(
-    rest.post(cfg.api.joinTokenPath, (req, res, ctx) => {
-      return res(ctx.delay('infinite'));
-    })
-  );
-  return (
-    <Provider interval={5}>
-      <DownloadScript />
-    </Provider>
-  );
+export const Processing: StoryObj = {
+  beforeEach({ msw }) {
+    msw.use(
+      http.post(cfg.api.discoveryJoinToken.createV2, () => {
+        return delay('infinite');
+      })
+    );
+  },
+
+  render() {
+    return (
+      <Provider interval={5}>
+        <DownloadScript prevStep={() => null} />
+      </Provider>
+    );
+  },
 };
 
-export const Failed = () => {
-  worker.use(
-    rest.post(cfg.api.joinTokenPath, (req, res, ctx) => {
-      return res.once(ctx.status(500));
-    })
-  );
-  return (
-    <Provider>
-      <DownloadScript />
-    </Provider>
-  );
+export const Failed: StoryObj = {
+  beforeEach({ msw }) {
+    msw.use(
+      http.post(cfg.api.discoveryJoinToken.createV2, () => {
+        return HttpResponse.json(
+          {
+            error: { message: 'Whoops, something went wrong.' },
+          },
+          { status: 500 }
+        );
+      })
+    );
+  },
+
+  render() {
+    return (
+      <Provider>
+        <DownloadScript prevStep={() => null} />
+      </Provider>
+    );
+  },
 };
 
-const Provider = props => {
-  const ctx = createTeleportContext();
+const agentMeta: AgentMeta = {
+  awsIntegration: {
+    kind: IntegrationKind.AwsOidc,
+    name: 'some-name',
+    resourceType: 'integration',
+    spec: {
+      roleArn: 'arn:aws:iam::123456789012:role/test-role-arn',
+      issuerS3Bucket: '',
+      issuerS3Prefix: '',
+    },
+    statusCode: IntegrationStatusCode.Running,
+  },
+};
 
+const Provider: React.FC<PropsWithChildren<{ interval?: number }>> = props => {
   return (
-    <MemoryRouter
-      initialEntries={[
-        { pathname: cfg.routes.discover, state: { entity: 'database' } },
-      ]}
+    <RequiredDiscoverProviders
+      agentMeta={agentMeta}
+      resourceSpec={resourceSpecServerLinuxUbuntu}
+      interval={props.interval}
     >
-      <ContextProvider ctx={ctx}>
-        <PingTeleportProvider
-          interval={props.interval || 100000}
-          resourceKind={ResourceKind.Server}
-        >
-          {props.children}
-        </PingTeleportProvider>
-      </ContextProvider>
-    </MemoryRouter>
+      {props.children}
+    </RequiredDiscoverProviders>
   );
 };
 
-function createTeleportContext() {
-  const ctx = new TeleportContext();
-
-  ctx.isEnterprise = false;
-  ctx.storeUser.setState(userContext);
-
-  return ctx;
-}
+const joinToken: JoinToken = {
+  id: 'some-id',
+  roles: [],
+  isStatic: true,
+  expiry: new Date(),
+  method: 'local',
+  safeName: '',
+  content: '',
+  suggestedLabels: [
+    { name: INTERNAL_RESOURCE_ID_LABEL_KEY, value: 'some-internal' },
+  ],
+};

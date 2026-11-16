@@ -1,63 +1,71 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package sftp
 
 import (
 	"bytes"
-	"context"
+	cryptorand "crypto/rand"
 	"fmt"
 	"io"
-	"math/rand"
+	mathrand "math/rand/v2"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
-	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
+	"github.com/gravitational/teleport/session/sftputils"
 )
 
 const fileMaxSize = 1000
 
 func TestMain(m *testing.M) {
-	utils.InitLoggerForTests()
+	logtest.InitLogger(testing.Verbose)
 	os.Exit(m.Run())
 }
 
-func TestUpload(t *testing.T) {
+func TestTransferFiles(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		srcPaths    []string
-		dstPath     string
-		opts        Options
-		files       []string
-		expectedErr string
+		name            string
+		req             *FileTransferRequest
+		globbedSrcPaths []string
+		files           []string
+		errCheck        require.ErrorAssertionFunc
 	}{
 		{
 			name: "one file",
-			srcPaths: []string{
-				"file",
-			},
-			dstPath: "copied-file",
-			opts: Options{
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{"file"},
+				},
+				Destination: Target{
+					Path: "copied-file",
+				},
 				PreserveAttrs: true,
 			},
 			files: []string{
@@ -66,11 +74,13 @@ func TestUpload(t *testing.T) {
 		},
 		{
 			name: "one file to dir",
-			srcPaths: []string{
-				"file",
-			},
-			dstPath: "dst/",
-			opts: Options{
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{"file"},
+				},
+				Destination: Target{
+					Path: "dst/",
+				},
 				PreserveAttrs: true,
 			},
 			files: []string{
@@ -80,11 +90,13 @@ func TestUpload(t *testing.T) {
 		},
 		{
 			name: "one dir",
-			srcPaths: []string{
-				"src/",
-			},
-			dstPath: "dir/",
-			opts: Options{
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{"src/"},
+				},
+				Destination: Target{
+					Path: "dir/",
+				},
 				PreserveAttrs: true,
 				Recursive:     true,
 			},
@@ -94,12 +106,16 @@ func TestUpload(t *testing.T) {
 		},
 		{
 			name: "two files dst doesn't exist",
-			srcPaths: []string{
-				"src/file1",
-				"src/file2",
-			},
-			dstPath: "dst/",
-			opts: Options{
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{
+						"src/file1",
+						"src/file2",
+					},
+				},
+				Destination: Target{
+					Path: "dst/",
+				},
 				PreserveAttrs: true,
 			},
 			files: []string{
@@ -109,12 +125,16 @@ func TestUpload(t *testing.T) {
 		},
 		{
 			name: "two files dst does exist",
-			srcPaths: []string{
-				"src/file1",
-				"src/file2",
-			},
-			dstPath: "dst/",
-			opts: Options{
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{
+						"src/file1",
+						"src/file2",
+					},
+				},
+				Destination: Target{
+					Path: "dst/",
+				},
 				PreserveAttrs: true,
 			},
 			files: []string{
@@ -125,11 +145,13 @@ func TestUpload(t *testing.T) {
 		},
 		{
 			name: "nested dirs",
-			srcPaths: []string{
-				"s",
-			},
-			dstPath: "dst/",
-			opts: Options{
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{"s"},
+				},
+				Destination: Target{
+					Path: "dst/",
+				},
 				PreserveAttrs: true,
 				Recursive:     true,
 			},
@@ -144,31 +166,261 @@ func TestUpload(t *testing.T) {
 			},
 		},
 		{
-			name: "multiple src dst not dir",
-			srcPaths: []string{
-				"uno",
-				"dos",
-				"tres",
+			name: "globbed files dst doesn't exist",
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{"glob*"},
+				},
+				Destination: Target{
+					Path: "dst/",
+				},
 			},
-			dstPath: "dst_file",
+			globbedSrcPaths: []string{
+				"globS",
+				"globA",
+				"globT",
+				"globB",
+			},
+			files: []string{
+				"globS",
+				"globA",
+				"globT",
+				"globB",
+			},
+		},
+		{
+			name: "globbed files dst does exist",
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{"glob*"},
+				},
+				Destination: Target{
+					Path: "dst/",
+				},
+			},
+			globbedSrcPaths: []string{
+				"globS",
+				"globA",
+				"globT",
+				"globB",
+			},
+			files: []string{
+				"globS",
+				"globA",
+				"globT",
+				"globB",
+				"dst/",
+			},
+		},
+		{
+			name: "multiple glob patterns",
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{
+						"glob*",
+						"*stuff",
+					},
+				},
+				Destination: Target{
+					Path: "dst/",
+				},
+			},
+			globbedSrcPaths: []string{
+				"globS",
+				"globA",
+				"globT",
+				"globB",
+				"mystuff",
+				"yourstuff",
+			},
+			files: []string{
+				"globS",
+				"globA",
+				"globT",
+				"globB",
+				"mystuff",
+				"yourstuff",
+				"dst/",
+			},
+		},
+		{
+			name: "multiple glob patterns with normal path",
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{
+						"glob*",
+						"file",
+						"*stuff",
+					},
+				},
+				Destination: Target{
+					Path: "dst/",
+				},
+			},
+			globbedSrcPaths: []string{
+				"globS",
+				"globA",
+				"globT",
+				"globB",
+				"file",
+				"mystuff",
+				"yourstuff",
+			},
+			files: []string{
+				"globS",
+				"globA",
+				"globT",
+				"globB",
+				"file",
+				"mystuff",
+				"yourstuff",
+				"dst/",
+			},
+		},
+		{
+			name: "recursive glob pattern",
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{"glob*"},
+				},
+				Destination: Target{
+					Path: "dst/",
+				},
+				Recursive:     true,
+				PreserveAttrs: true,
+			},
+			globbedSrcPaths: []string{
+				"globS",
+				"globA",
+				"globT",
+				"globB",
+				"globfile",
+			},
+			files: []string{
+				"globS/",
+				"globS/file",
+				"globA/",
+				"globA/file",
+				"globT/",
+				"globT/file",
+				"globB/",
+				"globB/file",
+				"globfile",
+				"dst/",
+			},
+		},
+		{
+			name: "recursive glob pattern with normal path",
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{
+						"glob*",
+						"file",
+					},
+				},
+				Destination: Target{
+					Path: "dst/",
+				},
+				PreserveAttrs: true,
+				Recursive:     true,
+			},
+			globbedSrcPaths: []string{
+				"globS",
+				"globA",
+				"globT",
+				"globB",
+				"globfile",
+				"file",
+			},
+			files: []string{
+				"globS/",
+				"globS/file",
+				"globA/",
+				"globA/file",
+				"globT/",
+				"globT/file",
+				"globB/",
+				"globB/file",
+				"globfile",
+				"file",
+				"dst/",
+			},
+		},
+		{
+			name: "multiple src dst not dir",
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{
+						"uno",
+						"dos",
+						"tres",
+					},
+				},
+				Destination: Target{
+					Path: "dst_file",
+				},
+			},
 			files: []string{
 				"uno",
 				"dos",
 				"tres",
 				"dst_file",
 			},
-			expectedErr: `local file "%s/dst_file" is not a directory, but multiple source files were specified`,
+			errCheck: func(t require.TestingT, err error, i ...any) {
+				require.EqualError(t, err, fmt.Sprintf(`local file "%s/dst_file" is not a directory, but multiple source files were specified`, i[0]))
+			},
+		},
+		{
+			name: "multiple matches from src dst not dir",
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{"glob*"},
+				},
+				Destination: Target{
+					Path: "dst_file",
+				},
+			},
+			files: []string{
+				"glob1",
+				"glob2",
+				"glob3",
+				"dst_file",
+			},
+			errCheck: func(t require.TestingT, err error, i ...any) {
+				require.EqualError(t, err, fmt.Sprintf(`local file "%s/dst_file" is not a directory, but multiple source files were matched by a glob pattern`, i[0]))
+			},
 		},
 		{
 			name: "src dir with recursive not passed",
-			srcPaths: []string{
-				"src/",
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{"src/"},
+				},
+				Destination: Target{
+					Path: "dst/",
+				},
 			},
-			dstPath: "dst/",
 			files: []string{
 				"src/",
 			},
-			expectedErr: `"%s/src" is a directory, but the recursive option was not passed`,
+			errCheck: func(t require.TestingT, err error, i ...any) {
+				require.EqualError(t, err, fmt.Sprintf(`"%s/src" is a directory, but the recursive option was not passed`, i[0]))
+				require.ErrorAs(t, err, new(*sftputils.NonRecursiveDirectoryTransferError))
+			},
+		},
+		{
+			name: "non-existent src file",
+			req: &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{"idontexist"},
+				},
+				Destination: Target{
+					Path: "whocares",
+				},
+			},
+			errCheck: func(t require.TestingT, err error, i ...any) {
+				require.ErrorIs(t, err, os.ErrNotExist)
+			},
 		},
 	}
 
@@ -179,177 +431,332 @@ func TestUpload(t *testing.T) {
 			for _, file := range tt.files {
 				// if path ends in slash, create dir
 				if strings.HasSuffix(file, string(filepath.Separator)) {
-					createDir(t, tempDir, file)
+					createDir(t, filepath.Join(tempDir, file))
 				} else {
-					createFile(t, tempDir, file)
+					createFile(t, filepath.Join(tempDir, file))
 				}
 			}
-			for i := range tt.srcPaths {
-				tt.srcPaths[i] = filepath.Join(tempDir, tt.srcPaths[i])
+			for i, src := range tt.req.Sources.Paths {
+				tt.req.Sources.Paths[i] = filepath.Join(tempDir, src)
 			}
-			tt.dstPath = filepath.Join(tempDir, tt.dstPath)
+			for i := range tt.globbedSrcPaths {
+				tt.globbedSrcPaths[i] = filepath.Join(tempDir, tt.globbedSrcPaths[i])
+			}
+			tt.req.Destination.Path = filepath.Join(tempDir, tt.req.Destination.Path)
 
-			ctx := context.Background()
-			cfg, err := CreateUploadConfig(tt.srcPaths, tt.dstPath, tt.opts)
-			require.NoError(t, err)
-			// use all local filesystems to avoid SSH overhead
-			cfg.dstFS = &localFS{}
-			err = cfg.initFS(nil, nil)
-			require.NoError(t, err)
-
-			err = cfg.transfer(ctx)
-			if tt.expectedErr == "" {
+			err := TransferFiles(t.Context(), tt.req)
+			if tt.errCheck == nil {
 				require.NoError(t, err)
-				checkTransfer(t, tt.opts.PreserveAttrs, tt.dstPath, tt.srcPaths...)
+				srcPaths := tt.req.Sources.Paths
+				if len(tt.globbedSrcPaths) != 0 {
+					srcPaths = tt.globbedSrcPaths
+				}
+				checkTransfer(t, tt.req.PreserveAttrs, tt.req.Destination.Path, srcPaths...)
 			} else {
-				require.EqualError(t, err, fmt.Sprintf(tt.expectedErr, tempDir))
+				tt.errCheck(t, err, tempDir)
 			}
 		})
 	}
 }
 
-func TestDownload(t *testing.T) {
+func TestCopyingSymlinkedFile(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name        string
-		srcPath     string
-		dstPath     string
-		opts        Options
-		files       []string
-		expectedErr string
-	}{
-		{
-			name:    "one file",
-			srcPath: "file",
-			dstPath: "copied-file",
-			opts: Options{
-				PreserveAttrs: true,
-			},
-			files: []string{
-				"file",
-			},
+	tempDir := t.TempDir()
+	createFile(t, filepath.Join(tempDir, "file"))
+	linkPath := filepath.Join(tempDir, "link")
+	err := os.Symlink(filepath.Join(tempDir, "file"), linkPath)
+	require.NoError(t, err)
+
+	dstPath := filepath.Join(tempDir, "dst")
+	req := &FileTransferRequest{
+		Sources: Sources{
+			Paths: []string{linkPath},
 		},
-		{
-			name:    "one dir",
-			srcPath: "src/",
-			dstPath: "dst/",
-			opts: Options{
-				PreserveAttrs: true,
-				Recursive:     true,
-			},
-			files: []string{
-				"src/",
-				"s/file",
-				"s/r/",
-				"s/r/file",
-				"s/r/c/",
-				"s/r/c/file",
-				"dst/",
-			},
-		},
-		{
-			name:    "src dir with recursive not passed",
-			srcPath: "src/",
-			dstPath: "dst/",
-			files: []string{
-				"src/",
-			},
-			expectedErr: `"%s/src" is a directory, but the recursive option was not passed`,
+		Destination: Target{
+			Path: dstPath,
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// create necessary files
-			tempDir := t.TempDir()
-			for _, file := range tt.files {
-				// if path ends in slash, create dir
-				if strings.HasSuffix(file, string(filepath.Separator)) {
-					createDir(t, tempDir, file)
-				} else {
-					createFile(t, tempDir, file)
-				}
+	err = TransferFiles(t.Context(), req)
+	require.NoError(t, err)
+
+	checkTransfer(t, false, dstPath, linkPath)
+}
+
+type mockFile struct {
+	sftputils.File
+	altDataSource io.Reader
+}
+
+func (m *mockFile) Read(p []byte) (int, error) {
+	return m.altDataSource.Read(p)
+}
+
+type mockFS struct {
+	sftputils.LocalFS
+	fileAccesses map[string]int
+	altData      io.Reader
+}
+
+func (m *mockFS) Open(path string) (sftputils.File, error) {
+	if m.fileAccesses == nil {
+		m.fileAccesses = make(map[string]int)
+	}
+	realPath, err := m.LocalFS.RealPath(path)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	m.fileAccesses[realPath]++
+	file, err := m.LocalFS.Open(path)
+	if err != nil || m.altData == nil {
+		return file, err
+	}
+	return &mockFile{
+		File:          file,
+		altDataSource: m.altData,
+	}, nil
+}
+
+func TestRecursiveSymlinks(t *testing.T) {
+	// Create files and symlinks.
+	root := t.TempDir()
+	t.Chdir(root)
+	srcDir := filepath.Join(root, "a")
+	createDir(t, filepath.Join(srcDir, "b/c"))
+	fileA := "a/a.txt"
+	fileB := "a/b/b.txt"
+	fileC := "a/b/c/c.txt"
+	for _, file := range []string{fileA, fileB, fileC} {
+		createFile(t, filepath.Join(root, file))
+	}
+	require.NoError(t, os.Symlink(srcDir, filepath.Join(srcDir, "abs_link")))
+	require.NoError(t, os.Symlink("..", filepath.Join(srcDir, "b/rel_link")))
+
+	tests := []struct {
+		name   string
+		srcDir string
+	}{
+		{
+			name:   "absolute",
+			srcDir: srcDir,
+		},
+		{
+			name:   "relative",
+			srcDir: filepath.Base(srcDir),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Perform the transfer.
+			dstDir := filepath.Join(root, "dst")
+			t.Cleanup(func() { os.RemoveAll(dstDir) })
+
+			srcFS := &mockFS{}
+			req := &FileTransferRequest{
+				Sources: Sources{
+					Paths: []string{tc.srcDir},
+				},
+				Destination: Target{
+					Path: dstDir,
+				},
+				Recursive: true,
+				srcFS:     srcFS,
 			}
-			tt.srcPath = filepath.Join(tempDir, tt.srcPath)
-			tt.dstPath = filepath.Join(tempDir, tt.dstPath)
+			require.NoError(t, TransferFiles(t.Context(), req))
 
-			ctx := context.Background()
-			cfg, err := CreateDownloadConfig(tt.srcPath, tt.dstPath, tt.opts)
-			require.NoError(t, err)
-			// use all local filesystems to avoid SSH overhead
-			cfg.srcFS = &localFS{}
-			err = cfg.initFS(nil, nil)
-			require.NoError(t, err)
-
-			err = cfg.transfer(ctx)
-			if tt.expectedErr == "" {
+			// Check results. Don't use checkTransfer() as the directories will not have
+			// matching sizes (the symlinks that aren't copied over).
+			for _, file := range []string{fileA, fileB, fileC} {
+				srcFile, err := srcFS.RealPath(filepath.Join(filepath.Dir(tc.srcDir), file))
 				require.NoError(t, err)
-				checkTransfer(t, tt.opts.PreserveAttrs, tt.dstPath, tt.srcPath)
-			} else {
-				require.EqualError(t, err, fmt.Sprintf(tt.expectedErr, tempDir))
+				srcInfo, err := os.Stat(srcFile)
+				require.NoError(t, err)
+				dstFile, err := srcFS.RealPath(filepath.Join(dstDir, file))
+				require.NoError(t, err)
+				dstInfo, err := os.Stat(dstFile)
+				require.NoError(t, err)
+				compareFiles(t, false, dstInfo, srcInfo, dstFile, srcFile)
+				// Check that the file was only opened once.
+				accesses := srcFS.fileAccesses[srcFile]
+				require.Equal(t, 1, accesses, "file %q was opened %d times", srcFile, accesses)
 			}
 		})
 	}
 }
 
-func TestHomeDirExpansion(t *testing.T) {
-	tests := []struct {
-		name         string
-		path         string
-		expandedPath string
-	}{
-		{
-			name:         "absolute path",
-			path:         "/foo/bar",
-			expandedPath: "/foo/bar",
-		},
-		{
-			name:         "path with tilde",
-			path:         "~/foo/bar",
-			expandedPath: "/home/user/foo/bar",
-		},
-		{
-			name:         "just tilde",
-			path:         "~",
-			expandedPath: "/home/user",
-		},
-	}
+func TestHTTPUpload(t *testing.T) {
+	t.Parallel()
 
-	getHomeDirFunc := func() (string, error) {
-		return "/home/user", nil
-	}
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "source")
+	dst := filepath.Join(tempDir, "destination")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			expanded, err := expandPath(tt.path, getHomeDirFunc)
-			require.NoError(t, err)
-			require.Equal(t, tt.expandedPath, expanded)
-		})
-	}
+	createFile(t, src)
+	f, err := os.Open(src)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		f.Close()
+	})
+
+	req, err := http.NewRequest("POST", "/", f)
+	require.NoError(t, err)
+
+	fi, err := f.Stat()
+	require.NoError(t, err)
+	req.Header.Set("Content-Length", strconv.FormatInt(fi.Size(), 10))
+
+	transferReq, err := CreateHTTPUploadRequest(
+		HTTPTransferRequest{
+			Src: Target{
+				Path: "source",
+			},
+			Dst: Target{
+				Path: dst,
+			},
+			HTTPRequest: req,
+		},
+	)
+	require.NoError(t, err)
+	transferReq.dstFS = &sftputils.LocalFS{}
+
+	err = TransferFiles(t.Context(), transferReq)
+	require.NoError(t, err)
+
+	srcContents, err := os.ReadFile(src)
+	require.NoError(t, err)
+	dstContents, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(string(srcContents), string(dstContents)))
 }
 
-func createFile(t *testing.T, rootDir, path string) {
+func TestHTTPDownload(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "source")
+
+	createFile(t, src)
+	f, err := os.Open(src)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		f.Close()
+	})
+
+	contents, err := os.ReadFile(src)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	transferReq, err := CreateHTTPDownloadRequest(
+		HTTPTransferRequest{
+			Src: Target{
+				Path: src,
+			},
+			Dst: Target{
+				Path: "/home/robots.txt",
+			},
+			HTTPResponse: w,
+		},
+	)
+	require.NoError(t, err)
+
+	err = TransferFiles(t.Context(), transferReq)
+	require.NoError(t, err)
+
+	data, err := io.ReadAll(w.Body)
+	require.NoError(t, err)
+	contentLengthStr := strconv.Itoa(len(data))
+
+	require.Empty(t, cmp.Diff(string(contents), string(data)))
+	require.Empty(t, cmp.Diff(contentLengthStr, w.Header().Get("Content-Length")))
+	require.Empty(t, cmp.Diff("application/octet-stream", w.Header().Get("Content-Type")))
+	require.Empty(t, cmp.Diff(`attachment;filename="robots.txt"`, w.Header().Get("Content-Disposition")))
+}
+
+func TestTransferUnexpectedLargerFile(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	srcFile := filepath.Join(tempDir, "in")
+	require.NoError(t, os.WriteFile(srcFile, []byte("original file data\n"), 0o755))
+	dstFile := filepath.Join(tempDir, "out")
+	srcFileReader, err := os.Open(srcFile)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, srcFileReader.Close()) })
+
+	srcFS := &mockFS{altData: io.MultiReader(srcFileReader, strings.NewReader("extra data\n"))}
+	req := &FileTransferRequest{
+		Sources: Sources{
+			Paths: []string{srcFile},
+		},
+		Destination: Target{
+			Path: dstFile,
+		},
+		// Ensure progress bar is created.
+		ProgressWriter: io.Discard,
+		srcFS:          srcFS,
+	}
+	require.NoError(t, TransferFiles(t.Context(), req))
+	require.FileExists(t, dstFile)
+	dstFileData, err := os.ReadFile(dstFile)
+	require.NoError(t, err)
+	require.Equal(t, "original file data\nextra data\n", string(dstFileData))
+}
+
+func TestTransferModeMask(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	srcFile := filepath.Join(tempDir, "in")
+	require.NoError(t, os.WriteFile(srcFile, []byte("the source"), 0o7755))
+	dstFile := filepath.Join(tempDir, "out")
+	f, err := os.Create(srcFile)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	req := &FileTransferRequest{
+		Sources: Sources{
+			Paths: []string{srcFile},
+		},
+		Destination: Target{
+			Path: dstFile,
+		},
+		ProgressWriter: io.Discard,
+	}
+
+	err = TransferFiles(t.Context(), req)
+	require.NoError(t, err)
+
+	dstInfo, err := os.Stat(dstFile)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o755), dstInfo.Mode())
+}
+
+func createFile(t *testing.T, path string) {
 	dir := filepath.Dir(path)
 	if dir != path {
-		createDir(t, rootDir, dir)
+		createDir(t, dir)
 	}
 
-	f, err := os.OpenFile(filepath.Join(rootDir, path), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o664)
+	// use non-standard permissions to verify that transferred files
+	// permissions match the originals
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o654)
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, f.Close())
 	}()
 
 	// populate file with random amount of random contents
-	r := rand.New(rand.NewSource(time.Now().Unix()))
-	lr := io.LimitReader(r, r.Int63n(fileMaxSize)+1)
-	_, err = io.Copy(f, lr)
+	buf := make([]byte, mathrand.N(fileMaxSize)+1)
+	_, err = cryptorand.Read(buf)
+	require.NoError(t, err)
+	_, err = f.Write(buf)
 	require.NoError(t, err)
 }
 
-func createDir(t *testing.T, rootDir, path string) {
-	err := os.MkdirAll(filepath.Join(rootDir, path), 0o775)
+func createDir(t *testing.T, path string) {
+	// use non-standard permissions to verify that transferred dirs
+	// permissions match the originals
+	err := os.MkdirAll(path, 0o765)
 	require.NoError(t, err)
 }
 
@@ -390,7 +797,7 @@ func checkTransfer(t *testing.T, preserveAttrs bool, dst string, srcs ...string)
 			dstPath := filepath.Join(dst, relPath)
 			dstInfo, err := os.Stat(dstPath)
 			if err != nil {
-				return fmt.Errorf("error getting dst file info: %v", err)
+				return fmt.Errorf("error getting dst file info: %w", err)
 			}
 			require.Equal(t, info.IsDir(), dstInfo.IsDir(), "expected %q IsDir=%t, got %t", dstPath, info.IsDir(), dstInfo.IsDir())
 
@@ -419,7 +826,7 @@ func compareFiles(t *testing.T, preserveAttrs bool, dstInfo, srcInfo os.FileInfo
 	require.NoError(t, err)
 	srcBytes, err := os.ReadFile(src)
 	require.NoError(t, err)
-	require.True(t, bytes.Equal(dstBytes, srcBytes), "%q and %q contents not equal", dst, src[0])
+	require.True(t, bytes.Equal(dstBytes, srcBytes), "%q and %q contents not equal", dst, src)
 }
 
 func compareFileInfos(t *testing.T, preserveAttrs bool, dstInfo, srcInfo os.FileInfo, dst, src string) {

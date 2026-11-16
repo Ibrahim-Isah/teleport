@@ -1,427 +1,932 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package web
 
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
+	"crypto"
 	"crypto/tls"
-	"encoding/base64"
-	"encoding/binary"
-	"encoding/pem"
 	"errors"
-	"fmt"
 	"io"
-	"math/rand"
+	"log/slog"
 	"net"
 	"net/http"
-	"strconv"
-	"strings"
-	"sync"
+	"net/url"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
 	"github.com/julienschmidt/httprouter"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/constants"
+	tdpbv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/desktop/v1"
+	"github.com/gravitational/teleport/api/mfa"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/keys"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/client"
-	"github.com/gravitational/teleport/lib/httplib"
-	"github.com/gravitational/teleport/lib/reversetunnel"
-	"github.com/gravitational/teleport/lib/srv/desktop"
+	"github.com/gravitational/teleport/lib/client/sso"
+	"github.com/gravitational/teleport/lib/desktop"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/srv/desktop/tdp"
+	"github.com/gravitational/teleport/lib/srv/desktop/tdp/protocol/legacy"
+	"github.com/gravitational/teleport/lib/srv/desktop/tdp/protocol/tdpb"
 	"github.com/gravitational/teleport/lib/utils"
-	"github.com/gravitational/teleport/lib/web/scripts"
+	"github.com/gravitational/teleport/lib/utils/diagnostics/latency"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
-// GET /webapi/sites/:site/desktops/:desktopName/connect?access_token=<bearer_token>&username=<username>&width=<width>&height=<height>
-func (h *Handler) desktopConnectHandle(
+const (
+	tdpbQueryParameter = "tdpb"
+	protocolTDP        = "teleport-tdp"
+)
+
+// GET /webapi/sites/:site/linuxdesktops/:desktopName/connect?username=<username>
+func (h *Handler) linuxDesktopConnectHandle(
 	w http.ResponseWriter,
 	r *http.Request,
 	p httprouter.Params,
 	sctx *SessionContext,
-	site reversetunnel.RemoteSite,
-) (interface{}, error) {
+	cluster reversetunnelclient.Cluster,
+	ws *websocket.Conn,
+) (any, error) {
 	desktopName := p.ByName("desktopName")
 	if desktopName == "" {
 		return nil, trace.BadParameter("missing desktopName in request URL")
 	}
 
-	log := sctx.cfg.Log.WithField("desktop-name", desktopName).WithField("cluster-name", site.GetName())
-	log.Debug("New desktop access websocket connection")
+	log := sctx.cfg.Log.With(
+		"desktop_name", desktopName,
+		"cluster_name", cluster.GetName(),
+	)
+	log.DebugContext(r.Context(), "New desktop access websocket connection")
 
-	if err := h.createDesktopConnection(w, r, desktopName, site.GetName(), log, sctx, site); err != nil {
-		// createDesktopConnection makes a best effort attempt to send an error to the user
+	if err := h.createDesktopConnection(r, desktopName, log, sctx, cluster, ws, desktop.ConnectToLinuxService, proto.UserCertsRequest_LinuxDesktop); err != nil {
+		// createDesktopConnection makes a best-effort attempt to send an error to the user
 		// (via websocket) before terminating the connection. We log the error here, but
 		// return nil because our HTTP middleware will try to write the returned error in JSON
 		// format, and this will fail since the HTTP connection has been upgraded to websockets.
-		log.Error(err)
+		log.ErrorContext(r.Context(), "creating desktop connection failed", "error", err)
 	}
 
 	return nil, nil
 }
 
-const (
-	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/cbe1ed0a-d320-4ea5-be5a-f2eb6e032853#Appendix_A_45
-	maxRDPScreenWidth  = 8192
-	maxRDPScreenHeight = 8192
-)
-
-func (h *Handler) createDesktopConnection(
+// GET /webapi/sites/:site/desktops/:desktopName/connect?username=<username>
+func (h *Handler) desktopConnectHandle(
 	w http.ResponseWriter,
 	r *http.Request,
-	desktopName string,
-	clusterName string,
-	log *logrus.Entry,
+	p httprouter.Params,
 	sctx *SessionContext,
-	site reversetunnel.RemoteSite,
-) error {
-	upgrader := websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
+	cluster reversetunnelclient.Cluster,
+	ws *websocket.Conn,
+) (any, error) {
+	desktopName := p.ByName("desktopName")
+	if desktopName == "" {
+		return nil, trace.BadParameter("missing desktopName in request URL")
 	}
-	ws, err := upgrader.Upgrade(w, r, nil)
+
+	log := sctx.cfg.Log.With(
+		"desktop_name", desktopName,
+		"cluster_name", cluster.GetName(),
+	)
+	log.DebugContext(r.Context(), "New desktop access websocket connection")
+
+	if err := h.createDesktopConnection(r, desktopName, log, sctx, cluster, ws, desktop.ConnectToWindowsService, proto.UserCertsRequest_WindowsDesktop); err != nil {
+		// createDesktopConnection makes a best-effort attempt to send an error to the user
+		// (via websocket) before terminating the connection. We log the error here, but
+		// return nil because our HTTP middleware will try to write the returned error in JSON
+		// format, and this will fail since the HTTP connection has been upgraded to websockets.
+		log.ErrorContext(r.Context(), "creating desktop connection failed", "error", err)
+	}
+
+	return nil, nil
+}
+
+// Adapts a websocket to a tdp.MessageReadWriter.
+// Quietly discards TDP messages.
+type desktopWebsocketAdapter struct {
+	conn *websocket.Conn
+	// Avoid allocating a new byte slice with each received message
+	// be re-using a buffer.
+	buf bytes.Buffer
+}
+
+// ReadMessage returns a new Message read from the underlying websocket.
+func (w *desktopWebsocketAdapter) ReadMessage() (tdp.Message, error) {
+	for {
+		w.buf.Reset()
+
+		mType, rdr, err := w.conn.NextReader()
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		if mType != websocket.BinaryMessage {
+			return nil, trace.Errorf("expected binary message, got: %d", mType)
+		}
+
+		if _, err := io.Copy(&w.buf, rdr); err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		msg, err := tdpb.DecodeWithTDPDiscard(w.buf.Bytes())
+		if err != nil {
+			if errors.Is(err, tdpb.ErrIsTDP) {
+				continue
+			}
+			return nil, trace.Wrap(err)
+		}
+		return msg, nil
+	}
+}
+
+// WriteMessage writes a new Message to the underlying websocket.
+func (w *desktopWebsocketAdapter) WriteMessage(m tdp.Message) error {
+	data, err := m.Encode()
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	defer ws.Close()
+	return trace.Wrap(w.conn.WriteMessage(websocket.BinaryMessage, data))
+}
 
-	sendTDPError := func(err error) error {
-		sendErr := sendTDPNotification(ws, err, tdp.SeverityError)
-		if sendErr != nil {
-			return sendErr
-		}
-		return err
+// implements handshaker for legacy TDP clients
+// TODO(rhammonds) DELETE IN v20.0.0
+type tdpHandshaker struct {
+	connection tdp.MessageReadWriter
+	withheld   []tdp.Message
+	screenSpec legacy.ClientScreenSpec
+	// May or may not be nil. Not all web client versions will send a keyboard layout.
+	keyboardLayout *legacy.ClientKeyboardLayout
+}
+
+func (t *tdpHandshaker) sendError(ctx context.Context, log *slog.Logger, err error) error {
+	if err == nil {
+		log.WarnContext(ctx, "SendError called with empty message")
+		err = errors.New("an unknown error has occurred")
 	}
 
-	q := r.URL.Query()
-	username := q.Get("username")
-	if username == "" {
-		return sendTDPError(trace.BadParameter("missing username"))
-	}
-	width, err := strconv.Atoi(q.Get("width"))
+	return trace.Wrap(t.connection.WriteMessage(&legacy.Alert{
+		Message:  err.Error(),
+		Severity: legacy.SeverityError,
+	}))
+}
+
+func (t *tdpHandshaker) getPromptBuilder(log *slog.Logger) mfaPromptBuilder {
+	return legacy.NewTDPMFAPrompt(t.connection, &t.withheld, log)
+}
+
+func (t *tdpHandshaker) performInitialHandshake(ctx context.Context, log *slog.Logger) error {
+	msg, err := t.connection.ReadMessage()
 	if err != nil {
-		return sendTDPError(trace.BadParameter("width missing or invalid"))
-	}
-	height, err := strconv.Atoi(q.Get("height"))
-	if err != nil {
-		return sendTDPError(trace.BadParameter("height missing or invalid"))
+		return trace.Wrap(err)
 	}
 
-	if width > maxRDPScreenWidth || height > maxRDPScreenHeight {
-		return sendTDPError(trace.BadParameter(
+	screenSpec, ok := msg.(legacy.ClientScreenSpec)
+	if !ok {
+		return trace.BadParameter("client sent unexpected message %T", msg)
+	}
+	t.screenSpec = screenSpec
+
+	width, height := screenSpec.Width, screenSpec.Height
+	if width > types.MaxRDPScreenWidth || height > types.MaxRDPScreenHeight {
+		return trace.BadParameter(
 			"screen size of %d x %d is greater than the maximum allowed by RDP (%d x %d)",
-			width, height, maxRDPScreenWidth, maxRDPScreenHeight,
-		))
+			width, height, types.MaxRDPScreenWidth, types.MaxRDPScreenHeight,
+		)
 	}
 
-	log.Debugf("Attempting to connect to desktop using username=%v, width=%v, height=%v\n", username, width, height)
+	msg, err = t.connection.ReadMessage()
+	if err != nil {
+		return trace.Wrap(err)
+	}
 
-	// Pick a random Windows desktop service as our gateway.
-	// When agent mode is implemented in the service, we'll have to filter out
-	// the services in agent mode.
-	//
-	// In the future, we may want to do something smarter like latency-based
-	// routing.
-	clt, err := sctx.GetUserClient(r.Context(), site)
+	keyboardLayout, gotKeyboardLayout := msg.(legacy.ClientKeyboardLayout)
+	if !gotKeyboardLayout {
+		t.withheld = append(t.withheld, msg)
+		log.InfoContext(ctx, "client did not send keyboard layout", "message_type", logutils.TypeAttr(msg), "width", width, "height", height)
+	} else {
+		t.keyboardLayout = &keyboardLayout
+	}
+	return nil
+}
+
+func (t *tdpHandshaker) forwardTDP(w io.Writer, username string, forwardKeyboardLayout bool) error {
+	messages := make([]tdp.Message, 0, 3)
+	messages = append(messages, legacy.ClientUsername{Username: username})
+	messages = append(messages, t.screenSpec)
+
+	if t.keyboardLayout != nil && forwardKeyboardLayout {
+		// TDPB clients will always send the keyboard layout with the Client Hello.
+		messages = append(messages, t.keyboardLayout)
+	}
+
+	return sendAll(w, append(messages, t.withheld...))
+}
+
+func (t *tdpHandshaker) forwardTDPB(w io.Writer, username string, _ bool) error {
+	// Convert to Client Hello
+	hello := &tdpb.ClientHello{
+		ScreenSpec: tdpbv1.ClientScreenSpec_builder{
+			Height: t.screenSpec.Height,
+			Width:  t.screenSpec.Width,
+		}.Build(),
+		Username: username,
+	}
+	if t.keyboardLayout != nil {
+		hello.KeyboardLayout = t.keyboardLayout.KeyboardLayout
+	}
+
+	withheld, err := translateAll(t.withheld, tdpb.TranslateToModern)
 	if err != nil {
-		return sendTDPError(trace.Wrap(err))
+		return trace.Wrap(err)
 	}
-	winDesktops, err := clt.GetWindowsDesktops(r.Context(), types.WindowsDesktopFilter{Name: desktopName})
-	if err != nil {
-		return sendTDPError(trace.Wrap(err, "cannot get Windows desktops"))
-	}
-	if len(winDesktops) == 0 {
-		return sendTDPError(trace.NotFound("no Windows desktops were found"))
-	}
-	var validServiceIDs []string
-	for _, desktop := range winDesktops {
-		if desktop.GetHostID() == "" {
-			// desktops with empty host ids are invalid and should
-			// only occur when migrating from an old version of teleport
-			continue
+	return trace.Wrap(sendAll(w, append([]tdp.Message{hello}, withheld...)))
+}
+
+func translateAll(messages []tdp.Message, translate func(tdp.Message) ([]tdp.Message, error)) ([]tdp.Message, error) {
+	translated := make([]tdp.Message, 0, len(messages))
+	for _, msg := range messages {
+		out, err := translate(msg)
+		if err != nil {
+			return nil, trace.Wrap(err)
 		}
-		validServiceIDs = append(validServiceIDs, desktop.GetHostID())
-	}
-	rand.Shuffle(len(validServiceIDs), func(i, j int) {
-		validServiceIDs[i], validServiceIDs[j] = validServiceIDs[j], validServiceIDs[i]
-	})
 
-	c := &connector{
-		log:      log,
-		clt:      clt,
-		site:     site,
-		userAddr: r.RemoteAddr,
+		if len(out) > 0 {
+			translated = append(translated, out...)
+		}
 	}
-	serviceConn, err := c.connectToWindowsService(clusterName, validServiceIDs)
+	return translated, nil
+}
+
+// implements handshaker for TDPB clients
+type tdpbHandshaker struct {
+	connection tdp.MessageReadWriter
+	withheld   []tdp.Message
+	hello      *tdpb.ClientHello
+}
+
+func (t *tdpbHandshaker) sendError(ctx context.Context, log *slog.Logger, err error) error {
+	if err == nil {
+		log.WarnContext(ctx, "sendError called with empty message")
+		err = errors.New("an unknown error has occurred")
+	}
+
+	return trace.Wrap(t.connection.WriteMessage(&tdpb.Alert{
+		Message:  err.Error(),
+		Severity: tdpbv1.AlertSeverity_ALERT_SEVERITY_ERROR,
+	}))
+}
+
+func (t *tdpbHandshaker) getPromptBuilder(log *slog.Logger) mfaPromptBuilder {
+	return mfaPromptBuilder(tdpb.NewTDPBMFAPrompt(t.connection, &t.withheld, log))
+}
+
+func (t *tdpbHandshaker) performInitialHandshake(ctx context.Context, log *slog.Logger) error {
+	upgrade := legacy.TDPUpgrade{}
+	err := t.connection.WriteMessage(upgrade)
 	if err != nil {
-		return sendTDPError(trace.Wrap(err, "cannot connect to Windows Desktop Service"))
+		return trace.Wrap(err)
+	}
+
+	// Now wait patiently for the client to reply with a CLIENT_HELLO TDPB message
+	// The ReadWriter implementation is expected to discard any legacy TDP messages
+	// while waiting for the client hello.
+	msg, err := t.connection.ReadMessage()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	var ok bool
+	t.hello, ok = msg.(*tdpb.ClientHello)
+	if !ok {
+		return trace.Errorf("Expected client hello message but got %T", msg)
+	}
+
+	log.InfoContext(ctx, "Received client hello message", "message", t.hello)
+	return nil
+}
+
+func (t *tdpbHandshaker) forwardTDP(w io.Writer, username string, forwardKeyboardLayout bool) error {
+	messages := make([]tdp.Message, 0, 3)
+	messages = append(messages, legacy.ClientUsername{Username: username})
+
+	screenSpec := legacy.ClientScreenSpec{
+		Height: t.hello.ScreenSpec.GetHeight(),
+		Width:  t.hello.ScreenSpec.GetWidth(),
+	}
+	messages = append(messages, screenSpec)
+
+	if forwardKeyboardLayout {
+		// TDPB clients will always send the keyboard layout with the Client Hello.
+		messages = append(messages, legacy.ClientKeyboardLayout{KeyboardLayout: t.hello.KeyboardLayout})
+	}
+
+	withheld, err := translateAll(t.withheld, tdpb.TranslateToLegacy)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	return sendAll(w, append(messages, withheld...))
+}
+
+func (t *tdpbHandshaker) forwardTDPB(w io.Writer, username string, _ bool) error {
+	t.hello.Username = username
+	return trace.Wrap(sendAll(w, append([]tdp.Message{t.hello}, t.withheld...)))
+}
+
+func sendAll(w io.Writer, messages []tdp.Message) error {
+	for _, msg := range messages {
+		if err := tdp.EncodeTo(w, msg); err != nil {
+			return trace.Wrap(err)
+		}
+	}
+	return nil
+}
+
+type handshaker interface {
+	sendError(context.Context, *slog.Logger, error) error
+	getPromptBuilder(*slog.Logger) mfaPromptBuilder
+	performInitialHandshake(context.Context, *slog.Logger) error
+	forwardTDP(io.Writer, string, bool) error
+	forwardTDPB(io.Writer, string, bool) error
+}
+
+// creates a handshaker instance that interops with either TDP or TDPB clients
+func newHandshaker(protocol string, ws *websocket.Conn) handshaker {
+	if protocol == tdpb.ProtocolName {
+		return &tdpbHandshaker{
+			connection: &desktopWebsocketAdapter{conn: ws},
+		}
+	}
+	// Default to TDP
+	return &tdpHandshaker{
+		connection: tdp.NewConn(&WebsocketIO{Conn: ws}, legacy.Decode, legacy.WarningConstructor),
+	}
+}
+
+type mfaPromptBuilder func(string) mfa.PromptFunc
+
+type connectorFunc func(ctx context.Context, config *desktop.ConnectionConfig) (conn net.Conn, version string, err error)
+
+func (h *Handler) createDesktopConnection(
+	r *http.Request,
+	desktopName string,
+	log *slog.Logger,
+	sctx *SessionContext,
+	cluster reversetunnelclient.Cluster,
+	ws *websocket.Conn,
+	connectFunc connectorFunc,
+	certUsage proto.UserCertsRequest_CertUsage,
+) error {
+	defer ws.Close()
+	ctx := r.Context()
+
+	clusterName := cluster.GetName()
+
+	// Client may speak TDP or TDPB. We'll know based on the existence of the 'tdpb' query parameter.
+	// - If the 'tdpb' query parameter is present, then we'll need to send an upgrade message to the client
+	//   and listen for a client_hello message (while discarding any TDP messages received).
+	//   Note: We *always* upgrade the client connection to TDPB if possible.
+	// - Otherwise fall back to the "legacy" behavior
+	//
+	// After either receiving a client_hello or our initial TDP messages, we can dial the agent which
+	// *also* might speak TDP or TDPB. Unlike the client, the agent only speaks one or the other so we'll
+	// translate on its behalf if needed.
+	clientProtocol, err := readClientProtocol(r)
+	if err != nil {
+		log.ErrorContext(ctx, "Error reading client desktop protocol", "error", err)
+		return trace.Wrap(err)
+	}
+	log.InfoContext(ctx, "Creating Desktop connection", "client_protocol", clientProtocol)
+
+	handshaker := newHandshaker(clientProtocol, ws)
+	// Read the initial set of TDP messages, or handle TDP upgrade and subsequent
+	// Client Hello message.
+	err = handshaker.performInitialHandshake(ctx, log)
+	if err != nil {
+		return handshaker.sendError(ctx, log, err)
+	}
+
+	username, err := readUsername(r)
+	if err != nil {
+		return handshaker.sendError(ctx, log, err)
+	}
+
+	// Parse the private key of the user from the session context.
+	pk, err := keys.ParsePrivateKey(sctx.cfg.Session.GetTLSPriv())
+	if err != nil {
+		return handshaker.sendError(ctx, log, err)
+	}
+
+	// Check if MFA is required and create a UserCertsRequest.
+	mfaRequired, certsReq, err := h.prepareForCertIssuance(ctx, sctx, cluster, pk.Public(), desktopName, username, certUsage)
+	if err != nil {
+		return handshaker.sendError(ctx, log, err)
+	}
+
+	// Issue certificate for the user/desktop combination and perform MFA ceremony if required.
+	certs, err := h.issueCerts(ctx, sctx, mfaRequired, certsReq, handshaker.getPromptBuilder(log))
+	if err != nil {
+		return handshaker.sendError(ctx, log, err)
+	}
+
+	// Create a TLS config for connecting to the Windows Desktop Service.
+	tlsConfig, err := h.createDesktopTLSConfig(ctx, sctx, desktopName, pk, certs)
+	if err != nil {
+		return handshaker.sendError(ctx, log, err)
+	}
+
+	clt, err := sctx.GetUserClient(ctx, cluster)
+	if err != nil {
+		return handshaker.sendError(ctx, log, err)
+	}
+
+	log.DebugContext(ctx, "Attempting to connect to agent")
+	clientSrcAddr, clientDstAddr := authz.ClientAddrsFromContext(ctx)
+	serviceConn, version, err := connectFunc(ctx, &desktop.ConnectionConfig{
+		Log:            log,
+		DesktopsGetter: clt,
+		Cluster:        cluster,
+		ClientSrcAddr:  clientSrcAddr,
+		ClientDstAddr:  clientDstAddr,
+		DesktopName:    desktopName,
+		ClusterName:    clusterName,
+	})
+	if err != nil {
+		return handshaker.sendError(ctx, log, trace.Wrap(err, "cannot connect to Windows Desktop Service"))
 	}
 	defer serviceConn.Close()
 
-	pc, err := proxyClient(r.Context(), sctx, h.ProxyHostPort(), username)
-	if err != nil {
-		return sendTDPError(trace.Wrap(err))
-	}
-	defer pc.Close()
-
-	tlsConfig, err := desktopTLSConfig(r.Context(), ws, pc, sctx, desktopName, username, site.GetName())
-	if err != nil {
-		return sendTDPError(err)
-	}
 	serviceConnTLS := tls.Client(serviceConn, tlsConfig)
 
-	if err := serviceConnTLS.HandshakeContext(r.Context()); err != nil {
-		return sendTDPError(err)
-	}
-	log.Debug("Connected to windows_desktop_service")
-
-	tdpConn := tdp.NewConn(serviceConnTLS)
-	err = tdpConn.WriteMessage(tdp.ClientUsername{Username: username})
-	if err != nil {
-		return sendTDPError(err)
-	}
-	err = tdpConn.WriteMessage(tdp.ClientScreenSpec{Width: uint32(width), Height: uint32(height)})
-	if err != nil {
-		return sendTDPError(err)
+	if err := serviceConnTLS.HandshakeContext(ctx); err != nil {
+		return handshaker.sendError(ctx, log, err)
 	}
 
-	// proxyWebsocketConn hangs here until connection is closed
-	handleProxyWebsocketConnErr(
-		proxyWebsocketConn(ws, serviceConnTLS), log)
+	// ALPN informs us which dialect the server will be using.
+	// Now that we have a connection to the Windows Desktop Service, we can
+	// forward the client_hello message (TDPB) or username and screen spec (TDP)
+	// to the service, and any withheld messages that were received before the MFA
+	// ceremony was completed.
+	serverProtocol := serviceConnTLS.ConnectionState().NegotiatedProtocol
+	switch serverProtocol {
+	case "":
+		serverProtocol = protocolTDP
+		sendKeyboardLayout, _ := utils.MinVerWithoutPreRelease(version, "18.0.0")
+		err = handshaker.forwardTDP(serviceConnTLS, username, sendKeyboardLayout)
+	case tdpb.ProtocolName:
+		err = handshaker.forwardTDPB(serviceConnTLS, username, true /* unused */)
+	default:
+		err = trace.BadParameter("Unknown desktop agent protocol %v", serverProtocol)
+	}
+	log.InfoContext(ctx, "Connected to agent", "protocol", serverProtocol)
+
+	if err != nil {
+		return handshaker.sendError(ctx, log, err)
+	}
+	// this blocks until the connection is closed
+	handleDesktopWebsocketProxyErr(
+		ctx,
+		desktopWebsocketProxy{
+			ws,
+			serviceConnTLS,
+			version,
+			clientProtocol,
+			serverProtocol,
+			log,
+		}.run(ctx),
+		log,
+	)
 
 	return nil
 }
 
-func proxyClient(ctx context.Context, sessCtx *SessionContext, addr, windowsUser string) (*client.ProxyClient, error) {
-	cfg, err := makeTeleportClientConfig(ctx, sessCtx)
+const (
+	// SNISuffix is the server name suffix used during SNI to specify the
+	// target desktop to connect to. The client (proxy_service) will use SNI
+	// like "${UUID}.desktop.teleport.cluster.local" to pass the UUID of the
+	// desktop.
+	// This is a copy of the same constant in `lib/srv/desktop/desktop.go` to
+	// prevent depending on `lib/srv` in `lib/web`.
+	SNISuffix = ".desktop." + constants.APIDomain
+)
+
+func createUserCertsRequest(sctx *SessionContext, publicKey crypto.PublicKey, desktopName, username, siteName string, certUsage proto.UserCertsRequest_CertUsage) (*proto.UserCertsRequest, error) {
+	tlsCert, err := sctx.GetX509Certificate()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	// Set HostLogin to avoid the default behavior of looking up the
-	// Unix user Teleport is running as (which doesn't work in containerized
-	// environments where we're running as an arbitrary UID)
-	cfg.HostLogin = windowsUser
-
-	if err := cfg.ParseProxyHost(addr); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	tc, err := client.NewClient(cfg)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	pc, err := tc.ConnectToProxy(ctx)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return pc, nil
-}
-
-func desktopTLSConfig(ctx context.Context, ws *websocket.Conn, pc *client.ProxyClient, sessCtx *SessionContext, desktopName, username, siteName string) (*tls.Config, error) {
-	pk, err := keys.ParsePrivateKey(sessCtx.cfg.Session.GetPriv())
+	publicKeyPEM, err := keys.MarshalPublicKey(publicKey)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	stream, err := NewTerminalStream(ws)
-	if err != nil {
-		return nil, trace.Wrap(err)
+	certsReq := proto.UserCertsRequest{
+		TLSPublicKey:   publicKeyPEM,
+		Username:       tlsCert.Subject.CommonName,
+		Expires:        tlsCert.NotAfter,
+		RouteToCluster: siteName,
 	}
-	key, err := pc.IssueUserCertsWithMFA(ctx, client.ReissueParams{
-		RouteToWindowsDesktop: proto.RouteToWindowsDesktop{
+
+	certsReq.Usage = certUsage
+
+	if certUsage == proto.UserCertsRequest_LinuxDesktop {
+		certsReq.RouteToLinuxDesktop = proto.RouteToLinuxDesktop{
+			LinuxDesktop: desktopName,
+			Login:        username,
+		}
+	} else {
+		certsReq.RouteToWindowsDesktop = proto.RouteToWindowsDesktop{
 			WindowsDesktop: desktopName,
 			Login:          username,
-		},
-		RouteToCluster: siteName,
-		ExistingCreds: &client.Key{
-			PrivateKey:          pk,
-			Cert:                sessCtx.cfg.Session.GetPub(),
-			TLSCert:             sessCtx.cfg.Session.GetTLSCert(),
-			WindowsDesktopCerts: make(map[string][]byte),
-		},
-	}, promptMFAChallenge(stream, tdpMFACodec{}))
+		}
+	}
+
+	return &certsReq, nil
+}
+
+// prepareForCertIssuance prepares for certificate issuance by checking if MFA
+// is required for the user/desktop combination and creating a UserCertsRequest.
+func (h *Handler) prepareForCertIssuance(
+	ctx context.Context,
+	sctx *SessionContext,
+	cluster reversetunnelclient.Cluster,
+	publicKey crypto.PublicKey,
+	desktopName, username string,
+	certUsage proto.UserCertsRequest_CertUsage,
+) (mfaRequired bool, certsReq *proto.UserCertsRequest, err error) {
+	// Check if MFA is required for this user/desktop combination.
+	var mfaRequest *IsMFARequiredRequest
+	if certUsage == proto.UserCertsRequest_LinuxDesktop {
+		mfaRequest = &IsMFARequiredRequest{
+			LinuxDesktop: &isMFARequiredLinuxDesktop{
+				DesktopName: desktopName,
+				Login:       username,
+			},
+		}
+	} else {
+		mfaRequest = &IsMFARequiredRequest{
+			WindowsDesktop: &isMFARequiredWindowsDesktop{
+				DesktopName: desktopName,
+				Login:       username,
+			},
+		}
+	}
+	mfaRequired, err = h.checkMFARequired(ctx, mfaRequest, sctx, cluster)
+	if err != nil {
+		return false, nil, trace.Wrap(err)
+	}
+
+	certsReq, err = createUserCertsRequest(sctx, publicKey, desktopName, username, cluster.GetName(), certUsage)
+	if err != nil {
+		return false, nil, trace.Wrap(err)
+	}
+
+	return mfaRequired, certsReq, nil
+}
+
+// issueCerts issues certificates for the user/desktop combination, performing
+// the MFA ceremony if required.
+func (h *Handler) issueCerts(
+	ctx context.Context,
+	sctx *SessionContext,
+	mfaRequired bool,
+	certsReq *proto.UserCertsRequest,
+	promptConstructor mfaPromptBuilder,
+) (certs *proto.Certs, err error) {
+	if mfaRequired {
+		certs, err = h.performSessionMFACeremony(ctx, sctx, certsReq, promptConstructor)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+	} else {
+		certs, err = sctx.cfg.RootClient.GenerateUserCerts(ctx, *certsReq)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	return certs, nil
+}
+
+// createDesktopTLSConfig creates a TLS config for connecting to a Windows Desktop Service
+// using the user's private key and the issued certificates.
+func (h *Handler) createDesktopTLSConfig(
+	ctx context.Context,
+	sctx *SessionContext,
+	desktopName string,
+	pk *keys.PrivateKey,
+	certs *proto.Certs,
+) (*tls.Config, error) {
+	certConf, err := pk.TLSCertificate(certs.TLS)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	windowsDesktopCerts, ok := key.WindowsDesktopCerts[desktopName]
-	if !ok {
-		return nil, trace.NotFound("failed to find windows desktop certificates for %q", desktopName)
-	}
-	certConf, err := pk.TLSCertificate(windowsDesktopCerts)
+
+	tlsConfig, err := sctx.ClientTLSConfig(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	tlsConfig, err := sessCtx.ClientTLSConfig(ctx)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+
 	tlsConfig.Certificates = []tls.Certificate{certConf}
+	tlsConfig.NextProtos = []string{tdpb.ProtocolName}
 	// Pass target desktop name via SNI.
-	tlsConfig.ServerName = desktopName + desktop.SNISuffix
+	tlsConfig.ServerName = desktopName + SNISuffix
 	return tlsConfig, nil
 }
 
-type connector struct {
-	log      *logrus.Entry
-	clt      auth.ClientI
-	site     reversetunnel.RemoteSite
-	userAddr string
-}
+// performSessionMFACeremony completes the mfa ceremony and returns the raw TLS certificate
+// on success. The user will be prompted to tap their security key by the UI
+// in order to perform the assertion.
+func (h *Handler) performSessionMFACeremony(
+	ctx context.Context,
+	sctx *SessionContext,
+	certsReq *proto.UserCertsRequest,
+	promptConstructor mfaPromptBuilder,
+) (_ *proto.Certs, err error) {
+	ctx, span := h.tracer.Start(ctx, "desktop/performSessionMFACeremony")
+	defer func() {
+		span.RecordError(err)
+		span.End()
+	}()
 
-// connectToWindowsService tries to make a connection to a Windows Desktop Service
-// by trying each of the services provided. It returns an error if it could not connect
-// to any of the services or if it encounters an error that is not a connection problem.
-func (c *connector) connectToWindowsService(clusterName string, desktopServiceIDs []string) (net.Conn, error) {
-	for _, id := range desktopServiceIDs {
-		conn, err := c.tryConnect(clusterName, id)
-		if err != nil && !trace.IsConnectionProblem(err) {
-			return nil, trace.WrapWithMessage(err,
-				"error connecting to windows_desktop_service %q", id)
-		}
-		if trace.IsConnectionProblem(err) {
-			c.log.Warnf("failed to connect to windows_desktop_service %q: %v", id, err)
-			continue
-		}
-		if err == nil {
-			return conn, err
-		}
+	// channelID is used by the front end to differentiate between separate ongoing SSO challenges.
+	channelID := uuid.NewString()
+
+	mfaCeremony := &mfa.Ceremony{
+		CreateAuthenticateChallenge: sctx.cfg.RootClient.CreateAuthenticateChallenge,
+		MFACeremonyConstructor: func(_ context.Context) (mfa.CallbackCeremony, error) {
+			u, err := url.Parse(sso.WebMFARedirect)
+			if err != nil {
+				return nil, trace.Wrap(err)
+			}
+			u.RawQuery = url.Values{"channel_id": {channelID}}.Encode()
+			return &sso.MFACeremony{
+				ClientCallbackURL: u.String(),
+				ProxyAddress:      h.PublicProxyAddr(),
+			}, nil
+		},
+		PromptConstructor: func(po ...mfa.PromptOpt) mfa.Prompt {
+			return promptConstructor(channelID)
+		},
 	}
-	return nil, trace.Errorf("failed to connect to any windows_desktop_service")
-}
 
-func (c *connector) tryConnect(clusterName, desktopServiceID string) (net.Conn, error) {
-	service, err := c.clt.GetWindowsDesktopService(context.Background(), desktopServiceID)
+	result, err := client.PerformSessionMFACeremony(ctx, client.PerformSessionMFACeremonyParams{
+		CurrentAuthClient: nil, // Only RootAuthClient is used.
+		RootAuthClient:    sctx.cfg.RootClient,
+		MFACeremony:       mfaCeremony,
+		MFAAgainstRoot:    true,
+		MFARequiredReq:    nil, // No need to verify.
+		CertsReq:          certsReq,
+		KeyRing:           nil, // We just want the certs.
+	})
 	if err != nil {
-		log.Errorf("Error finding service with id %s", desktopServiceID)
-		return nil, trace.NotFound("could not find windows desktop service %s: %v", desktopServiceID, err)
+		return nil, trace.Wrap(err)
 	}
 
-	*c.log = *c.log.WithField("windows-service-uuid", service.GetName())
-	*c.log = *c.log.WithField("windows-service-addr", service.GetAddr())
-	return c.site.DialTCP(reversetunnel.DialParams{
-		From:     &utils.NetAddr{AddrNetwork: "tcp", Addr: c.userAddr},
-		To:       &utils.NetAddr{AddrNetwork: "tcp", Addr: service.GetAddr()},
-		ConnType: types.WindowsDesktopTunnel,
-		ServerID: service.GetName() + "." + clusterName,
-		ProxyIDs: service.GetProxyIDs(),
+	return result.NewCerts, nil
+}
+
+func readUsername(r *http.Request) (string, error) {
+	q := r.URL.Query()
+	username := q.Get("username")
+	if username == "" {
+		return "", trace.BadParameter("missing username in URL")
+	}
+
+	return username, nil
+}
+
+func readClientProtocol(r *http.Request) (string, error) {
+	q := r.URL.Query()
+	tdpbVersion := q.Get(tdpbQueryParameter)
+	switch tdpbVersion {
+	case "":
+		return protocolTDP, nil
+	case tdpb.ProtocolName:
+		return tdpb.ProtocolName, nil
+	default:
+		return "", trace.BadParameter("unknown TDPB version %q", tdpbVersion)
+	}
+}
+
+// desktopPinger measures latency between proxy and the desktop by sending legacy.Ping messages
+// Windows Desktop Service and measuring the time it takes to receive message with the same UUID back.
+type desktopPinger struct {
+	server tdp.MessageWriter
+	client tdp.MessageWriter
+	// when false, the interceptor function swallows ping messages
+	// without writing to the channel
+	latencySupported bool
+	ch               chan []byte
+}
+
+func (d desktopPinger) intercept(msg tdp.Message) ([]tdp.Message, error) {
+	var uuid []byte
+	switch m := msg.(type) {
+	case legacy.Ping:
+		uuid = m.UUID[:]
+	case *tdpb.Ping:
+		uuid = m.Uuid
+	default:
+		// This may be some other legacy TDP message
+		return []tdp.Message{msg}, nil
+	}
+
+	if !d.latencySupported {
+		return nil, trace.BadParameter("received unexpected Ping message from server (this is a bug)")
+	}
+
+	d.ch <- uuid
+	// We've handled the ping. Do not pass it along to the proxy.
+	return nil, nil
+}
+
+func (d desktopPinger) ping(ctx context.Context, ping []byte, msg tdp.Message) error {
+	// The provided 'ping' byte slice should match the UUID contained in 'msg'
+	if err := d.server.WriteMessage(msg); err != nil {
+		return trace.Wrap(err)
+	}
+	for {
+		select {
+		case pong := <-d.ch:
+			if bytes.Equal(ping, pong) {
+				return nil
+			}
+		case <-ctx.Done():
+			return trace.Wrap(ctx.Err())
+		}
+	}
+}
+
+func (d desktopPinger) reportTDPB(_ context.Context, stats latency.Statistics) error {
+	return d.client.WriteMessage(&tdpb.LatencyStats{
+		ClientLatencyMs: uint32(stats.Client),
+		ServerLatencyMs: uint32(stats.Server),
 	})
 }
 
-// proxyWebsocketConn does a bidrectional copy between the websocket
-// connection to the browser (ws) and the mTLS connection to Windows
-// Desktop Serivce (wds)
-func proxyWebsocketConn(ws *websocket.Conn, wds net.Conn) error {
-	var closeOnce sync.Once
-	close := func() {
-		ws.Close()
-		wds.Close()
-	}
-
-	errs := make(chan error, 2)
-
-	go func() {
-		defer closeOnce.Do(close)
-
-		// we avoid using io.Copy here, as we want to make sure
-		// each TDP message is sent as a unit so that a single
-		// 'message' event is emitted in the browser
-		// (io.Copy's internal buffer could split one message
-		// into multiple ws.WriteMessage calls)
-		tc := tdp.NewConn(wds)
-
-		// we don't care about the content of the message, we just
-		// need to split the stream into individual messages and
-		// write them to the websocket
-		for {
-			msg, err := tc.ReadMessage()
-			if utils.IsOKNetworkError(err) {
-				errs <- nil
-				return
-			} else if err != nil {
-				isFatal := tdp.IsFatalErr(err)
-				severity := tdp.SeverityError
-				if !isFatal {
-					severity = tdp.SeverityWarning
-				}
-				sendErr := sendTDPNotification(ws, err, severity)
-
-				// If the error wasn't fatal and we successfully
-				// sent it back to the client, continue.
-				if !isFatal && sendErr == nil {
-					continue
-				}
-
-				// If the error was fatal or we failed to send it back
-				// to the client, send it to the errs channel and end
-				// the session.
-				if sendErr != nil {
-					err = sendErr
-				}
-				errs <- err
-				return
-			}
-			encoded, err := msg.Encode()
-			if err != nil {
-				errs <- err
-				return
-			}
-			err = ws.WriteMessage(websocket.BinaryMessage, encoded)
-			if utils.IsOKNetworkError(err) {
-				errs <- nil
-				return
-			}
-			if err != nil {
-				errs <- err
-				return
-			}
-		}
-	}()
-
-	go func() {
-		defer closeOnce.Do(close)
-
-		// io.Copy is fine here, as the Windows Desktop Service
-		// operates on a stream and doesn't care if TPD messages
-		// are fragmented
-		stream := &WebsocketIO{Conn: ws}
-		_, err := io.Copy(wds, stream)
-		if utils.IsOKNetworkError(err) {
-			err = nil
-		}
-		errs <- err
-	}()
-
-	var retErrs []error
-	for i := 0; i < 2; i++ {
-		retErrs = append(retErrs, <-errs)
-	}
-	return trace.NewAggregate(retErrs...)
+func (d desktopPinger) reportTDP(_ context.Context, stats latency.Statistics) error {
+	return d.client.WriteMessage(legacy.LatencyStats{
+		ClientLatency: uint32(stats.Client),
+		ServerLatency: uint32(stats.Server)},
+	)
 }
 
-// handleProxyWebsocketConnErr handles the error returned by proxyWebsocketConn by
+func (d desktopPinger) pingTDP(ctx context.Context) error {
+	ping := uuid.New()
+	return d.ping(ctx, ping[:], legacy.Ping{UUID: ping})
+}
+
+func (d desktopPinger) pingTDPB(ctx context.Context) error {
+	uuid := uuid.New()
+	return d.ping(ctx, uuid[:], &tdpb.Ping{
+		Uuid: uuid[:],
+	})
+}
+
+func newConn(rwc io.ReadWriteCloser, protocol string) *tdp.Conn {
+	if protocol == tdpb.ProtocolName {
+		return tdp.NewConn(rwc, tdp.DecoderAdapter(tdpb.DecodePermissive), tdpb.WarningConstructor)
+	}
+	return tdp.NewConn(rwc, legacy.Decode, legacy.WarningConstructor)
+}
+
+type desktopWebsocketProxy struct {
+	// Client websocket connection
+	ws *websocket.Conn
+	// Desktop agent connection
+	wds net.Conn
+	// Version of the Desktop Agent
+	version string
+	// Client protocol (TDP/TDPB)
+	clientProtocol string
+	// Server protocol (TDP/TDPB)
+	serverProtocol string
+	log            *slog.Logger
+}
+
+// run does a bidrectional copy between the websocket
+// connection to the browser (ws) and the mTLS connection to Windows
+// Desktop Serivce (wds)
+func (p desktopWebsocketProxy) run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer func() {
+		cancel()
+		p.ws.Close()
+		p.wds.Close()
+	}()
+
+	var err error
+	latencySupported := p.serverProtocol == tdpb.ProtocolName
+	if !latencySupported {
+		latencySupported, err = utils.MinVerWithoutPreRelease(p.version, "17.5.0")
+		if err != nil {
+			return trace.Wrap(err)
+		}
+	}
+
+	// Create a single pair of legacy.Conn instances. legacy.Conn protects the underlying
+	// streams with a mutex to allow for concurrent writes.
+	serverConn := tdp.MessageReadWriteCloser(newConn(p.wds, p.serverProtocol))
+	clientConn := tdp.MessageReadWriteCloser(newConn(&WebsocketIO{Conn: p.ws}, p.clientProtocol))
+
+	pinger := desktopPinger{
+		// The pinger handles translation internally.
+		server:           serverConn,
+		client:           clientConn,
+		latencySupported: latencySupported,
+		ch:               make(chan []byte),
+	}
+
+	// The ping interceptor is installed on the server connection
+	// regardless of whether or not translation is needed
+	serverConn = tdp.NewReadWriteInterceptor(serverConn, pinger.intercept, nil)
+
+	// Translation interceptors will be (optionally) installed in the *write* paths of each connection.
+	needTranslation := p.clientProtocol != p.serverProtocol
+	if needTranslation {
+		// Translation is needed
+		if p.serverProtocol == tdpb.ProtocolName {
+			p.log.InfoContext(ctx, "Proxying desktop connection with translation", "server_dialect", tdpb.ProtocolName, "client_dialect", protocolTDP)
+			// Agent speaks TDPB
+			// Translate to TDPB when writing to the server. Intercept pings when reading from the server.
+			serverConn = tdp.NewReadWriteInterceptor(serverConn, nil, tdpb.TranslateToModern)
+			// Client speaks TDP
+			// Translate to TDP (legacy) when writing to this connection
+			clientConn = tdp.NewReadWriteInterceptor(clientConn, nil, tdpb.TranslateToLegacy)
+		} else {
+			p.log.InfoContext(ctx, "Proxying desktop connection with translation", "server_dialect", protocolTDP, "client_dialect", tdpb.ProtocolName)
+			// Agent speaks TDP
+			// Translate to TDPB when reading from this connection.
+			serverConn = tdp.NewReadWriteInterceptor(serverConn, nil, tdpb.TranslateToLegacy)
+			// The client speaks TDPB
+			// Translate to TDPB (modern) when writing to this connection
+			clientConn = tdp.NewReadWriteInterceptor(clientConn, nil, tdpb.TranslateToModern)
+		}
+	} else {
+		p.log.InfoContext(ctx, "Proxying desktop connection without translation", "dialect", p.serverProtocol)
+	}
+
+	proxy := tdp.NewConnProxy(clientConn, serverConn)
+
+	if latencySupported {
+		// Default to TDPB
+		pingerFunc := pinger.pingTDPB
+		reportFunc := pinger.reportTDPB
+		// Optionally use TDP versions
+		if p.serverProtocol == protocolTDP {
+			pingerFunc = pinger.pingTDP
+		}
+		if p.clientProtocol == protocolTDP {
+			reportFunc = pinger.reportTDP
+		}
+
+		go monitorLatency(
+			ctx,
+			clockwork.NewRealClock(),
+			p.ws,
+			latency.PingerFunc(pingerFunc),
+			latency.ReporterFunc(reportFunc),
+		)
+	}
+
+	// Run joins and returns any read, write, or close errors from each side of the
+	// connection proxy. We can inspect this singular error chain for any "real"
+	// network errors (as opposed to errors that are expected from a normal teardown).
+	err = proxy.Run()
+	if utils.IsOKNetworkError(err) {
+		err = nil
+	}
+
+	return trace.Wrap(err)
+}
+
+// handleDesktopWebsocketProxyErr handles the error returned by desktopWebsocketProxy by
 // unwrapping it and determining whether to log an error.
-func handleProxyWebsocketConnErr(proxyWsConnErr error, log *logrus.Entry) {
+func handleDesktopWebsocketProxyErr(ctx context.Context, proxyWsConnErr error, log *slog.Logger) {
 	if proxyWsConnErr == nil {
-		log.Debug("proxyWebsocketConn returned with no error")
+		log.DebugContext(ctx, "desktopWebsocketProxy returned with no error")
 		return
 	}
 
@@ -430,14 +935,16 @@ func handleProxyWebsocketConnErr(proxyWsConnErr error, log *logrus.Entry) {
 		err := errs[0] // pop first error
 		errs = errs[1:]
 
-		switch err := err.(type) {
-		case trace.Aggregate:
-			errs = append(errs, err.Errors()...)
-		case *websocket.CloseError:
-			switch err.Code {
+		var aggregateErr trace.Aggregate
+		var closeErr *websocket.CloseError
+		switch {
+		case errors.As(err, &aggregateErr):
+			errs = append(errs, aggregateErr.Errors()...)
+		case errors.As(err, &closeErr):
+			switch closeErr.Code {
 			case websocket.CloseNormalClosure, // when the user hits "disconnect" from the menu
 				websocket.CloseGoingAway: // when the user closes the tab
-				log.Debugf("Web socket closed by client with code: %v", err.Code)
+				log.DebugContext(ctx, "Web socket closed by client", "close_code", closeErr.Code)
 				return
 			}
 			return
@@ -448,120 +955,5 @@ func handleProxyWebsocketConnErr(proxyWsConnErr error, log *logrus.Entry) {
 		}
 	}
 
-	log.WithError(proxyWsConnErr).Warning("Error proxying a desktop protocol websocket to windows_desktop_service")
-}
-
-// createCertificateBlob creates Certificate BLOB
-// It has following structure:
-//
-//	CertificateBlob {
-//		PropertyID: u32, little endian,
-//		Reserved: u32, little endian, must be set to 0x01 0x00 0x00 0x00
-//		Length: u32, little endian
-//		Value: certificate data
-//	}
-func createCertificateBlob(certData []byte) []byte {
-	buf := new(bytes.Buffer)
-	buf.Grow(len(certData) + 12)
-	// PropertyID for certificate is 32
-	binary.Write(buf, binary.LittleEndian, int32(32))
-	binary.Write(buf, binary.LittleEndian, int32(1))
-	binary.Write(buf, binary.LittleEndian, int32(len(certData)))
-	buf.Write(certData)
-
-	return buf.Bytes()
-}
-
-func (h *Handler) desktopAccessScriptConfigureHandle(w http.ResponseWriter, r *http.Request, p httprouter.Params) (interface{}, error) {
-	tokenStr := p.ByName("token")
-	if tokenStr == "" {
-		return "", trace.BadParameter("invalid token")
-	}
-
-	// verify that the token exists
-	token, err := h.GetProxyClient().GetToken(r.Context(), tokenStr)
-	if err != nil {
-		return "", trace.BadParameter("invalid token")
-	}
-
-	proxyServers, err := h.GetProxyClient().GetProxies()
-	if err != nil {
-		return "", trace.Wrap(err)
-	}
-
-	if len(proxyServers) == 0 {
-		return "", trace.NotFound("no proxy servers found")
-	}
-
-	clusterName, err := h.GetProxyClient().GetDomainName(r.Context())
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	certAuthority, err := h.GetProxyClient().GetCertAuthority(
-		r.Context(),
-		types.CertAuthID{Type: types.UserCA, DomainName: clusterName},
-		false,
-	)
-
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	if len(certAuthority.GetActiveKeys().TLS) != 1 {
-		return nil, trace.BadParameter("expected one TLS key pair, got %v", len(certAuthority.GetActiveKeys().TLS))
-	}
-
-	var internalResourceID string
-	for labelKey, labelValues := range token.GetSuggestedLabels() {
-		if labelKey == types.InternalResourceIDLabel {
-			internalResourceID = strings.Join(labelValues, " ")
-			break
-		}
-	}
-
-	keyPair := certAuthority.GetActiveKeys().TLS[0]
-	block, _ := pem.Decode(keyPair.Cert)
-	if block == nil {
-		return nil, trace.BadParameter("no PEM data in CA data")
-	}
-
-	httplib.SetScriptHeaders(w.Header())
-	w.WriteHeader(http.StatusOK)
-	err = scripts.DesktopAccessScriptConfigure.Execute(w, map[string]string{
-		"caCertPEM":          string(keyPair.Cert),
-		"caCertSHA1":         fmt.Sprintf("%X", sha1.Sum(block.Bytes)),
-		"caCertBase64":       base64.StdEncoding.EncodeToString(createCertificateBlob(block.Bytes)),
-		"proxyPublicAddr":    proxyServers[0].GetPublicAddr(),
-		"provisionToken":     tokenStr,
-		"internalResourceID": internalResourceID,
-	})
-
-	return nil, trace.Wrap(err)
-
-}
-
-func (h *Handler) desktopAccessScriptInstallADDSHandle(w http.ResponseWriter, r *http.Request, p httprouter.Params) (interface{}, error) {
-	httplib.SetScriptHeaders(w.Header())
-	w.WriteHeader(http.StatusOK)
-	_, err := io.WriteString(w, scripts.DesktopAccessScriptInstallADDS)
-	return nil, trace.Wrap(err)
-}
-
-func (h *Handler) desktopAccessScriptInstallADCSHandle(w http.ResponseWriter, r *http.Request, p httprouter.Params) (interface{}, error) {
-	httplib.SetScriptHeaders(w.Header())
-	w.WriteHeader(http.StatusOK)
-	_, err := io.WriteString(w, scripts.DesktopAccessScriptInstallADCS)
-	return nil, trace.Wrap(err)
-}
-
-// sendTDPNotification sends a tdp Notification over the supplied websocket with the
-// error message of err.
-func sendTDPNotification(ws *websocket.Conn, err error, severity tdp.Severity) error {
-	msg := tdp.Notification{Message: err.Error(), Severity: severity}
-	b, err := msg.Encode()
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	return ws.WriteMessage(websocket.BinaryMessage, b)
+	log.WarnContext(ctx, "Error proxying a desktop protocol websocket to windows_desktop_service", "error", proxyWsConnErr)
 }

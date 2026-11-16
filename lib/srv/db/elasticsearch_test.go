@@ -1,31 +1,32 @@
 /*
-
- Copyright 2022 Gravitational, Inc.
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"net"
-	"strings"
+	"net/http"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
@@ -49,6 +50,7 @@ func newTestElasticsearchEngine(ec common.EngineConfig) common.Engine {
 }
 
 func TestAccessElasticsearch(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	testCtx := setupTestContext(ctx, t, withElasticsearch("Elasticsearch"))
 	go testCtx.startHandlingConnections()
@@ -102,7 +104,6 @@ func TestAccessElasticsearch(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			// Create user/role with the requested permissions.
 			testCtx.createUserAndRole(ctx, t, test.user, test.role, test.allowDbUsers, []string{})
@@ -117,26 +118,27 @@ func TestAccessElasticsearch(t *testing.T) {
 			require.NoError(t, err)
 
 			// Execute a query.
-			result, err := dbConn.SQL.Query(strings.NewReader(`{ "query": "SELECT 42" }`))
+			result, err := dbConn.Query(`{ "query": "SELECT 42" }`)
 			require.NoError(t, err)
 
 			if test.err {
 				t.Logf("result: %v", result)
-				require.True(t, result.IsError())
-				require.Equal(t, 401, result.StatusCode)
+				assert.NoError(t, result.Body.Close())
+				require.Equal(t, http.StatusUnauthorized, result.StatusCode)
 				return
 			}
-			require.NoError(t, err)
-			require.False(t, result.IsError())
-			require.False(t, result.HasWarnings())
-			require.Equal(t, `[200 OK] {"columns":[{"name":"42","type":"integer"}],"rows":[[42]]}`, result.String())
 
-			require.NoError(t, result.Body.Close())
+			out, err := io.ReadAll(result.Body)
+			assert.NoError(t, err)
+			assert.NoError(t, result.Body.Close())
+			require.Equal(t, http.StatusOK, result.StatusCode)
+			require.Equal(t, `{"columns":[{"name":"42","type":"integer"}],"rows":[[42]]}`, string(out))
 		})
 	}
 }
 
 func TestAuditElasticsearch(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	testCtx := setupTestContext(ctx, t, withElasticsearch("Elasticsearch"))
 	go testCtx.startHandlingConnections()
@@ -149,9 +151,9 @@ func TestAuditElasticsearch(t *testing.T) {
 		require.NoError(t, err)
 
 		resp, err := dbConn.Ping()
-
 		require.NoError(t, err)
-		require.True(t, resp.IsError())
+		assert.NoError(t, resp.Body.Close())
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 
 		waitForEvent(t, testCtx, libevents.DatabaseSessionStartFailureCode)
 		proxy.Close()
@@ -170,15 +172,19 @@ func TestAuditElasticsearch(t *testing.T) {
 		// Connect should trigger successful session start event.
 		resp, err := dbConn.Ping()
 		require.NoError(t, err)
-		require.False(t, resp.IsError())
+		assert.NoError(t, resp.Body.Close())
+		require.Equal(t, http.StatusOK, resp.StatusCode)
 		waitForEvent(t, testCtx, libevents.DatabaseSessionStartCode)
 	})
 
 	t.Run("command sends", func(t *testing.T) {
 		// should trigger Query event.
-		result, err := dbConn.SQL.Query(strings.NewReader(`{ "query": "SELECT 42" }`))
+		result, err := dbConn.Query(`{ "query": "SELECT 42" }`)
 		require.NoError(t, err)
-		require.Equal(t, `[200 OK] {"columns":[{"name":"42","type":"integer"}],"rows":[[42]]}`, result.String())
+		out, err := io.ReadAll(result.Body)
+		assert.NoError(t, err)
+		assert.NoError(t, result.Body.Close())
+		assert.Equal(t, `{"columns":[{"name":"42","type":"integer"}],"rows":[[42]]}`, string(out))
 
 		_ = waitForEvent(t, testCtx, libevents.ElasticsearchRequestCode)
 
@@ -190,7 +196,7 @@ func TestAuditElasticsearch(t *testing.T) {
 }
 
 func withElasticsearch(name string, opts ...elasticsearch.TestServerOption) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
 		ElasticsearchServer, err := elasticsearch.NewTestServer(common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,

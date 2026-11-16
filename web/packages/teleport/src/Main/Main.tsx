@@ -1,65 +1,85 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React, { Suspense, useEffect, useMemo } from 'react';
+import {
+  createContext,
+  ReactNode,
+  Suspense,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useState,
+} from 'react';
+import { matchPath, useLocation } from 'react-router';
 import styled from 'styled-components';
-import { Indicator } from 'design';
+
+import { Box, Flex, Indicator } from 'design';
 import { Failed } from 'design/CardError';
-
+import {
+  InfoGuidePanelProvider,
+  useInfoGuide,
+} from 'shared/components/SlidingSidePanel/InfoGuide';
+import { marginTransitionCss } from 'shared/components/SlidingSidePanel/InfoGuide/const';
+import { ToastNotifications } from 'shared/components/ToastNotification';
 import useAttempt from 'shared/hooks/useAttemptNext';
+import { useStore } from 'shared/libs/stores';
 
-import { matchPath, useHistory } from 'react-router';
-
-import { Redirect, Route, Switch } from 'teleport/components/Router';
-import { CatchError } from 'teleport/components/CatchError';
-import cfg from 'teleport/config';
-import useTeleport from 'teleport/useTeleport';
-import { TopBar } from 'teleport/TopBar';
 import { BannerList } from 'teleport/components/BannerList';
-import localStorage from 'teleport/services/localStorage';
-
-import { ClusterAlert, LINK_LABEL } from 'teleport/services/alerts/alerts';
-
-import { Navigation } from 'teleport/Navigation';
-
+import type { BannerType } from 'teleport/components/BannerList/BannerList';
 import { useAlerts } from 'teleport/components/BannerList/useAlerts';
-
+import { CatchError } from 'teleport/components/CatchError';
+import { Redirect, Route, Switch } from 'teleport/components/Router';
+import { InfoGuideSidePanel } from 'teleport/components/SlidingSidePanel/InfoGuideSidePanel';
+import cfg from 'teleport/config';
+import { canShowFeature } from 'teleport/features';
 import { FeaturesContextProvider, useFeatures } from 'teleport/FeaturesContext';
-
-import { getFirstRouteForCategory } from 'teleport/Navigation/Navigation';
-
-import { NavigationCategory } from 'teleport/Navigation/categories';
+import { Navigation } from 'teleport/Navigation';
+import {
+  ClusterAlert,
+  LINK_DESTINATION_LABEL,
+  LINK_TEXT_LABEL,
+} from 'teleport/services/alerts/alerts';
+import history from 'teleport/services/history/history';
+import { storageService } from 'teleport/services/storageService';
+import { TopBar } from 'teleport/TopBar';
+import type { LockedFeatures, TeleportFeature } from 'teleport/types';
+import { useUser } from 'teleport/User/UserContext';
+import useTeleport from 'teleport/useTeleport';
 
 import { MainContainer } from './MainContainer';
-import { OnboardDiscover } from './OnboardDiscover';
 
-import type { BannerType } from 'teleport/components/BannerList/BannerList';
-import type { TeleportFeature } from 'teleport/types';
-
-interface MainProps {
+export interface MainProps {
   initialAlerts?: ClusterAlert[];
-  customBanners?: React.ReactNode[];
+  customBanners?: ReactNode[];
   features: TeleportFeature[];
+  billingBanners?: ReactNode[];
+  CustomLogo?: () => React.ReactElement;
 }
 
 export function Main(props: MainProps) {
   const ctx = useTeleport();
-  const history = useHistory();
+  const storeUser = useStore(ctx.storeUser);
+  const location = useLocation();
 
   const { attempt, setAttempt, run } = useAttempt('processing');
+
+  const { preferences } = useUser();
 
   useEffect(() => {
     if (ctx.storeUser.state) {
@@ -67,19 +87,32 @@ export function Main(props: MainProps) {
       return;
     }
 
-    run(() => ctx.init());
+    run(() => ctx.init(preferences));
   }, []);
 
   const featureFlags = ctx.getFeatureFlags();
 
+  const scope = storeUser?.getScope();
   const features = useMemo(
-    () => props.features.filter(feature => feature.hasAccess(featureFlags)),
-    [featureFlags, props.features]
+    () =>
+      props.features.filter(
+        feature =>
+          canShowFeature(feature, featureFlags) &&
+          supportsCurrentScope(feature, scope)
+      ),
+    [featureFlags, props.features, scope]
   );
 
   const { alerts, dismissAlert } = useAlerts(props.initialAlerts);
 
-  const [showOnboardDiscover, setShowOnboardDiscover] = React.useState(true);
+  useEffect(() => {
+    if (
+      ctx.redirectUrl &&
+      matchPath({ path: ctx.redirectUrl, end: true }, location.pathname)
+    ) {
+      ctx.redirectUrl = null;
+    }
+  }, [ctx, location.pathname]);
 
   if (attempt.status === 'failed') {
     return <Failed message={attempt.statusText} />;
@@ -93,29 +126,35 @@ export function Main(props: MainProps) {
     );
   }
 
-  function handleOnboard() {
-    updateOnboardDiscover();
-    history.push(cfg.routes.discover);
-  }
+  const availableScopes = ctx.storeUser.getAvailableScopes();
+  const isScopePickerRoute = !!matchPath(
+    { path: cfg.routes.scopePicker, end: true },
+    location.pathname
+  );
 
-  function handleOnClose() {
-    updateOnboardDiscover();
-    setShowOnboardDiscover(false);
-  }
-
-  function updateOnboardDiscover() {
-    const discover = localStorage.getOnboardDiscover();
-    localStorage.setOnboardDiscover({ ...discover, notified: true });
+  // TODO(bl-nero): Don't redirect once the user picks a scope.
+  // For now, as the scope picker is not fully operational, we only enable it
+  // if a local storage flag is on.
+  if (storageService.getUseLoginScopePicker()) {
+    if (
+      cfg.scopesEnabled &&
+      availableScopes.length > 0 &&
+      !isScopePickerRoute &&
+      !storageService.getScopeSelected()
+    ) {
+      return <Redirect to={history.getScopePickerUrl()} />;
+    }
   }
 
   // redirect to the default feature when hitting the root /web URL
-  if (
-    matchPath(history.location.pathname, { path: cfg.routes.root, exact: true })
-  ) {
-    const indexRoute = getFirstRouteForCategory(
-      features,
-      NavigationCategory.Resources
-    );
+  if (matchPath(cfg.routes.root, location.pathname)) {
+    if (ctx.redirectUrl) {
+      return <Redirect to={ctx.redirectUrl} />;
+    }
+
+    const indexRoute = cfg.isDashboard
+      ? cfg.routes.downloadCenter
+      : cfg.getUnifiedResourcesRoute(cfg.proxyCluster);
 
     return <Redirect to={indexRoute} />;
   }
@@ -132,50 +171,86 @@ export function Main(props: MainProps) {
     return 'danger';
   };
 
-  const banners: BannerType[] = alerts.map(alert => ({
+  const banners: BannerType[] = alerts.map((alert): BannerType => ({
     message: alert.spec.message,
     severity: mapSeverity(alert.spec.severity),
-    link: alert.metadata.labels[LINK_LABEL],
+    linkDestination: alert.metadata.labels[LINK_DESTINATION_LABEL],
+    linkText: alert.metadata.labels[LINK_TEXT_LABEL],
     id: alert.metadata.name,
   }));
 
-  const onboard = localStorage.getOnboardDiscover();
-  const requiresOnboarding =
-    onboard && !onboard.hasResource && !onboard.notified;
-
   return (
     <FeaturesContextProvider value={features}>
-      <BannerList
-        banners={banners}
-        customBanners={props.customBanners}
-        onBannerDismiss={dismissAlert}
-      >
+      <TopBar
+        CustomLogo={props.CustomLogo}
+        scopePickerMode={isScopePickerRoute}
+      />
+      <Wrapper>
         <MainContainer>
-          <Navigation />
-          <HorizontalSplit>
-            <ContentMinWidth>
-              <Suspense fallback={null}>
-                <TopBar />
-                <FeatureRoutes />
-              </Suspense>
-            </ContentMinWidth>
-          </HorizontalSplit>
+          <Navigation showPoweredByLogo={!!props.CustomLogo} />
+          <InfoGuidePanelProvider>
+            <ContentWrapper>
+              <ContentMinWidth>
+                <BannerList
+                  banners={banners}
+                  customBanners={props.customBanners}
+                  billingBanners={featureFlags.billing && props.billingBanners}
+                  onBannerDismiss={dismissAlert}
+                />
+                <ToastNotifications />
+                <Suspense fallback={null}>
+                  <FeatureRoutes lockedFeatures={ctx.lockedFeatures} />
+                </Suspense>
+              </ContentMinWidth>
+            </ContentWrapper>
+          </InfoGuidePanelProvider>
         </MainContainer>
-      </BannerList>
-      {requiresOnboarding && showOnboardDiscover && (
-        <OnboardDiscover onClose={handleOnClose} onOnboard={handleOnboard} />
-      )}
+      </Wrapper>
     </FeaturesContextProvider>
   );
 }
 
-function renderRoutes(features: TeleportFeature[]) {
+function renderRoutes(
+  features: TeleportFeature[],
+  lockedFeatures: LockedFeatures
+) {
   const routes = [];
 
   for (const [index, feature] of features.entries()) {
+    const isParentLocked =
+      feature.parent && new feature.parent().isLocked?.(lockedFeatures);
+
+    // remove features with parents locked.
+    // The parent itself will be rendered if it has a lockedRoute,
+    // but the children shouldn't be.
+    if (isParentLocked) {
+      continue;
+    }
+
+    // add the route of the 'locked' variants of the features
+    if (feature.isLocked?.(lockedFeatures)) {
+      if (!feature.lockedRoute) {
+        throw new Error('a locked feature without a locked route was found');
+      }
+
+      const { path, title, exact, component: Component } = feature.lockedRoute;
+      routes.push(
+        <Route title={title} key={index} path={path} exact={exact}>
+          <CatchError>
+            <Suspense fallback={null}>
+              <Component />
+            </Suspense>
+          </CatchError>
+        </Route>
+      );
+
+      // return early so we don't add the original route
+      continue;
+    }
+
+    // add regular feature routes
     if (feature.route) {
       const { path, title, exact, component: Component } = feature.route;
-
       routes.push(
         <Route title={title} key={index} path={path} exact={exact}>
           <CatchError>
@@ -191,25 +266,93 @@ function renderRoutes(features: TeleportFeature[]) {
   return routes;
 }
 
-function FeatureRoutes() {
+function supportsCurrentScope(
+  feature: TeleportFeature,
+  scope: string
+): boolean {
+  return !scope || feature.supportsScopes;
+}
+
+function FeatureRoutes({ lockedFeatures }: { lockedFeatures: LockedFeatures }) {
   const features = useFeatures();
-  const routes = renderRoutes(features);
+  const routes = renderRoutes(features, lockedFeatures);
 
   return <Switch>{routes}</Switch>;
 }
 
-export const ContentMinWidth = styled.div`
-  min-width: calc(1250px - var(--sidebar-width));
-`;
+// This context allows children components to disable this min-width in case they want to be able to shrink smaller.
+type MinWidthContextState = {
+  setEnforceMinWidth: (enforceMinWidth: boolean) => void;
+};
 
-export const HorizontalSplit = styled.div`
+const ContentMinWidthContext = createContext<MinWidthContextState>(null);
+
+/**
+ * @deprecated Use useNoMinWidth instead.
+ */
+export const useContentMinWidthContext = () =>
+  useContext(ContentMinWidthContext);
+
+export const useNoMinWidth = () => {
+  const { setEnforceMinWidth } = useContext(ContentMinWidthContext);
+
+  useLayoutEffect(() => {
+    setEnforceMinWidth(false);
+
+    return () => {
+      setEnforceMinWidth(true);
+    };
+  }, []);
+};
+
+export const ContentMinWidth = ({ children }: { children: ReactNode }) => {
+  const [enforceMinWidth, setEnforceMinWidth] = useState(true);
+  const { infoGuideConfig, panelWidth } = useInfoGuide();
+  const infoGuideSidePanelOpened = infoGuideConfig != null;
+
+  return (
+    <ContentMinWidthContext.Provider value={{ setEnforceMinWidth }}>
+      <div
+        css={`
+          display: flex;
+          flex-direction: column;
+          flex: 1;
+          ${enforceMinWidth ? 'min-width: 1000px;' : ''}
+          min-height: 0;
+          overflow-y: auto;
+          ${marginTransitionCss({
+            sidePanelOpened: infoGuideSidePanelOpened,
+            panelWidth: infoGuideConfig?.viewHasOwnSidePanel ? 0 : panelWidth,
+          })}
+        `}
+      >
+        {children}
+      </div>
+      <InfoGuideSidePanel />
+    </ContentMinWidthContext.Provider>
+  );
+};
+
+export const ContentWrapper = styled.div`
   display: flex;
   flex-direction: column;
   flex: 1;
   overflow-x: auto;
+  max-width: 100%;
 `;
 
-export const StyledIndicator = styled(HorizontalSplit)`
+export const StyledIndicator = styled(Flex)`
   align-items: center;
   justify-content: center;
+  position: absolute;
+  overflow: hidden;
+  top: 50%;
+  left: 50%;
+`;
+
+const Wrapper = styled(Box)`
+  display: flex;
+  height: 100vh;
+  flex-direction: column;
+  max-width: 100vw;
 `;

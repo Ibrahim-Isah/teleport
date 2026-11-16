@@ -1,101 +1,85 @@
 /*
-Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package db
 
 import (
 	"context"
-	"fmt"
+	"log/slog"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/memorydb"
-	"github.com/aws/aws-sdk-go/service/memorydb/memorydbiface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	memorydb "github.com/aws/aws-sdk-go-v2/service/memorydb"
+	memorydbtypes "github.com/aws/aws-sdk-go-v2/service/memorydb/types"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 	libcloudaws "github.com/gravitational/teleport/lib/cloud/aws"
-	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/cloud/awsconfig"
 	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
-// memoryDBFetcherConfig is the MemoryDB databases fetcher configuration.
-type memoryDBFetcherConfig struct {
-	// Labels is a selector to match cloud databases.
-	Labels types.Labels
-	// MemoryDB is the MemoryDB API client.
-	MemoryDB memorydbiface.MemoryDBAPI
-	// Region is the AWS region to query databases in.
-	Region string
+// MemoryDBClient is a subset of the AWS MemoryDB API.
+type MemoryDBClient interface {
+	memorydb.DescribeClustersAPIClient
+	memorydb.DescribeSubnetGroupsAPIClient
+
+	ListTags(ctx context.Context, in *memorydb.ListTagsInput, optFns ...func(*memorydb.Options)) (*memorydb.ListTagsOutput, error)
 }
 
-// CheckAndSetDefaults validates the config and sets defaults.
-func (c *memoryDBFetcherConfig) CheckAndSetDefaults() error {
-	if len(c.Labels) == 0 {
-		return trace.BadParameter("missing parameter Labels")
-	}
-	if c.MemoryDB == nil {
-		return trace.BadParameter("missing parameter MemoryDB")
-	}
-	if c.Region == "" {
-		return trace.BadParameter("missing parameter Region")
-	}
-	return nil
+// memoryDBPlugin retrieves MemoryDB Redis databases.
+type memoryDBPlugin struct{}
+
+// newMemoryDBFetcher returns a new AWS fetcher for MemoryDB databases.
+func newMemoryDBFetcher(cfg awsFetcherConfig) (common.Fetcher, error) {
+	return newAWSFetcher(cfg, &memoryDBPlugin{})
 }
 
-// memoryDBFetcher retrieves MemoryDB Redis databases.
-type memoryDBFetcher struct {
-	awsFetcher
-
-	cfg memoryDBFetcherConfig
-	log logrus.FieldLogger
+func (f *memoryDBPlugin) ComponentShortName() string {
+	return "memorydb"
 }
 
-// newMemoryDBFetcher returns a new MemoryDB databases fetcher instance.
-func newMemoryDBFetcher(config memoryDBFetcherConfig) (common.Fetcher, error) {
-	if err := config.CheckAndSetDefaults(); err != nil {
+// GetDatabases returns MemoryDB databases matching the watcher's selectors.
+func (f *memoryDBPlugin) GetDatabases(ctx context.Context, cfg *awsFetcherConfig) (types.Databases, error) {
+	awsCfg, err := cfg.AWSConfigProvider.GetConfig(ctx, cfg.Region,
+		awsconfig.WithAssumeRole(cfg.AssumeRole.RoleARN, cfg.AssumeRole.ExternalID),
+		awsconfig.WithCredentialsMaybeIntegration(awsconfig.IntegrationMetadata{Name: cfg.Integration}),
+	)
+	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return &memoryDBFetcher{
-		cfg: config,
-		log: logrus.WithFields(logrus.Fields{
-			trace.Component: "watch:memorydb",
-			"labels":        config.Labels,
-			"region":        config.Region,
-		}),
-	}, nil
-}
-
-// Get returns MemoryDB databases matching the watcher's selectors.
-func (f *memoryDBFetcher) Get(ctx context.Context) (types.ResourcesWithLabels, error) {
-	clusters, err := getMemoryDBClusters(ctx, f.cfg.MemoryDB)
+	clt := cfg.awsClients.GetMemoryDBClient(awsCfg)
+	clusters, err := getMemoryDBClusters(ctx, clt, cfg.Logger)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	var eligibleClusters []*memorydb.Cluster
+	var eligibleClusters []memorydbtypes.Cluster
 	for _, cluster := range clusters {
-		if !services.IsMemoryDBClusterSupported(cluster) {
-			f.log.Debugf("MemoryDB cluster %q is not supported. Skipping.", aws.StringValue(cluster.Name))
+		if !libcloudaws.IsMemoryDBClusterSupported(&cluster) {
+			cfg.Logger.DebugContext(ctx, "Skipping unsupported MemoryDB cluster", "cluster", aws.ToString(cluster.Name))
 			continue
 		}
 
-		if !services.IsMemoryDBClusterAvailable(cluster) {
-			f.log.Debugf("The current status of MemoryDB cluster %q is %q. Skipping.",
-				aws.StringValue(cluster.Name),
-				aws.StringValue(cluster.Status))
+		if !libcloudaws.IsMemoryDBClusterAvailable(&cluster) {
+			cfg.Logger.DebugContext(ctx, "Skipping unavailable MemoryDB cluster",
+				"cluster", aws.ToString(cluster.Name),
+				"status", aws.ToString(cluster.Status),
+			)
 			continue
 		}
 
@@ -103,99 +87,85 @@ func (f *memoryDBFetcher) Get(ctx context.Context) (types.ResourcesWithLabels, e
 	}
 
 	if len(eligibleClusters) == 0 {
-		return types.ResourcesWithLabels{}, nil
+		return nil, nil
 	}
 
 	// Fetch more information to provide extra labels. Do not fail because some
 	// of these labels are missing.
-	allSubnetGroups, err := getMemoryDBSubnetGroups(ctx, f.cfg.MemoryDB)
+	allSubnetGroups, err := getMemoryDBSubnetGroups(ctx, clt, cfg.Logger)
 	if err != nil {
 		if trace.IsAccessDenied(err) {
-			f.log.WithError(err).Debug("No permissions to describe subnet groups")
+			cfg.Logger.DebugContext(ctx, "No permissions to describe subnet groups", "error", err)
 		} else {
-			f.log.WithError(err).Info("Failed to describe subnet groups.")
+			cfg.Logger.InfoContext(ctx, "Failed to describe subnet groups", "error", err)
 		}
 	}
 
 	var databases types.Databases
 	for _, cluster := range eligibleClusters {
-		tags, err := getMemoryDBResourceTags(ctx, f.cfg.MemoryDB, cluster.ARN)
+		tags, err := getMemoryDBResourceTags(ctx, clt, cluster.ARN)
 		if err != nil {
 			if trace.IsAccessDenied(err) {
-				f.log.WithError(err).Debug("No permissions to list resource tags")
+				cfg.Logger.DebugContext(ctx, "No permissions to list resource tags", "error", err)
 			} else {
-				f.log.WithError(err).Infof("Failed to list resource tags for MemoryDB cluster %q.", aws.StringValue(cluster.Name))
+				cfg.Logger.InfoContext(ctx, "Failed to list resource tags for MemoryDB cluster ",
+					"error", err,
+					"cluster", aws.ToString(cluster.Name),
+				)
 			}
 		}
 
-		extraLabels := services.ExtraMemoryDBLabels(cluster, tags, allSubnetGroups)
-		database, err := services.NewDatabaseFromMemoryDBCluster(cluster, extraLabels)
+		extraLabels := common.ExtraMemoryDBLabels(&cluster, tags, allSubnetGroups)
+		database, err := common.NewDatabaseFromMemoryDBCluster(&cluster, extraLabels)
 		if err != nil {
-			f.log.WithError(err).Infof("Could not convert memorydb cluster %q configuration endpoint to database resource.", aws.StringValue(cluster.Name))
+			cfg.Logger.InfoContext(ctx, "Could not convert memorydb cluster configuration endpoint to database resource",
+				"error", err,
+				"cluster", aws.ToString(cluster.Name),
+			)
 		} else {
 			databases = append(databases, database)
 		}
 	}
-	return filterDatabasesByLabels(databases, f.cfg.Labels, f.log).AsResources(), nil
-}
-
-// String returns the fetcher's string description.
-func (f *memoryDBFetcher) String() string {
-	return fmt.Sprintf("memorydbFetcher(Region=%v, Labels=%v)",
-		f.cfg.Region, f.cfg.Labels)
+	return databases, nil
 }
 
 // getMemoryDBClusters fetches all MemoryDB clusters.
-func getMemoryDBClusters(ctx context.Context, client memorydbiface.MemoryDBAPI) ([]*memorydb.Cluster, error) {
-	var clusters []*memorydb.Cluster
-	var nextToken *string
-
-	// MemoryDBAPI does NOT have "page" version of the describe API so use the
-	// NextToken from the output in a loop.
-	for pageNum := 0; pageNum < maxAWSPages; pageNum++ {
-		output, err := client.DescribeClustersWithContext(ctx,
-			&memorydb.DescribeClustersInput{
-				NextToken: nextToken,
-			},
-		)
+func getMemoryDBClusters(ctx context.Context, client MemoryDBClient, log *slog.Logger) ([]memorydbtypes.Cluster, error) {
+	var out []memorydbtypes.Cluster
+	pager := memorydb.NewDescribeClustersPaginator(client,
+		&memorydb.DescribeClustersInput{},
+		func(opts *memorydb.DescribeClustersPaginatorOptions) {
+			opts.StopOnDuplicateToken = true
+		},
+	)
+	for page, err := range pagesWithLimit(ctx, pager, log) {
 		if err != nil {
 			return nil, trace.Wrap(libcloudaws.ConvertRequestFailureError(err))
 		}
-
-		clusters = append(clusters, output.Clusters...)
-		if nextToken = output.NextToken; nextToken == nil {
-			break
-		}
+		out = append(out, page.Clusters...)
 	}
-	return clusters, nil
+	return out, nil
 }
 
 // getMemoryDBSubnetGroups fetches all MemoryDB subnet groups.
-func getMemoryDBSubnetGroups(ctx context.Context, client memorydbiface.MemoryDBAPI) ([]*memorydb.SubnetGroup, error) {
-	var subnetGroups []*memorydb.SubnetGroup
-	var nextToken *string
-
-	for pageNum := 0; pageNum < maxAWSPages; pageNum++ {
-		output, err := client.DescribeSubnetGroupsWithContext(ctx,
-			&memorydb.DescribeSubnetGroupsInput{
-				NextToken: nextToken,
-			},
-		)
+func getMemoryDBSubnetGroups(ctx context.Context, client MemoryDBClient, log *slog.Logger) ([]memorydbtypes.SubnetGroup, error) {
+	var out []memorydbtypes.SubnetGroup
+	pager := memorydb.NewDescribeSubnetGroupsPaginator(client,
+		&memorydb.DescribeSubnetGroupsInput{},
+		func(opts *memorydb.DescribeSubnetGroupsPaginatorOptions) { opts.StopOnDuplicateToken = true },
+	)
+	for page, err := range pagesWithLimit(ctx, pager, log) {
 		if err != nil {
 			return nil, trace.Wrap(libcloudaws.ConvertRequestFailureError(err))
 		}
-
-		subnetGroups = append(subnetGroups, output.SubnetGroups...)
-		if nextToken = output.NextToken; nextToken == nil {
-			break
-		}
+		out = append(out, page.SubnetGroups...)
 	}
-	return subnetGroups, nil
+	return out, nil
 }
 
 // getMemoryDBResourceTags fetches resource tags for provided ARN.
-func getMemoryDBResourceTags(ctx context.Context, client memorydbiface.MemoryDBAPI, resourceARN *string) ([]*memorydb.Tag, error) {
-	output, err := client.ListTagsWithContext(ctx, &memorydb.ListTagsInput{
+func getMemoryDBResourceTags(ctx context.Context, client MemoryDBClient, resourceARN *string) ([]memorydbtypes.Tag, error) {
+	output, err := client.ListTags(ctx, &memorydb.ListTagsInput{
 		ResourceArn: resourceARN,
 	})
 	if err != nil {

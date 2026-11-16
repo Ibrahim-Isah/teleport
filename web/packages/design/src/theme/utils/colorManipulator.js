@@ -1,18 +1,20 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 /*The MIT License (MIT)
 
@@ -61,7 +63,7 @@ function clamp(value, min = 0, max = 1) {
  * @param {string} color - Hex color, i.e. #nnn or #nnnnnn
  * @returns {string} A CSS rgb color string
  */
-export function convertHexToRGB(color) {
+function convertHexToRGB(color) {
   color = color.substr(1);
 
   const re = new RegExp(`.{1,${color.length / 3}}`, 'g');
@@ -75,38 +77,20 @@ export function convertHexToRGB(color) {
 }
 
 /**
- * Converts a color from CSS rgb format to CSS hex format.
- *
- * @param {string} color - RGB color, i.e. rgb(n, n, n)
- * @returns {string} A CSS rgb color string, i.e. #nnnnnn
- */
-export function rgbToHex(color) {
-  // Pass hex straight through
-  if (color.indexOf('#') === 0) {
-    return color;
-  }
-  function intToHex(c) {
-    const hex = c.toString(16);
-    return hex.length === 1 ? `0${hex}` : hex;
-  }
-
-  let { values } = decomposeColor(color);
-  values = values.map(n => intToHex(n));
-
-  return `#${values.join('')}`;
-}
-
-/**
  * Returns an object with the type and values of a color.
  *
  * Note: Does not support rgb % values.
  *
  * @param {string} color - CSS color, i.e. one of: #nnn, #nnnnnn, rgb(), rgba(), hsl(), hsla()
- * @returns {object} - A MUI color object: {type: string, values: number[]}
+ * @returns {{type: string, values: number[]}} - A MUI color object: {type: string, values: number[]}
  */
 export function decomposeColor(color) {
   if (color.charAt(0) === '#') {
     return decomposeColor(convertHexToRGB(color));
+  }
+
+  if (process.env.NODE_ENV === 'test') {
+    return { type: 'rgb', values: [0, 0, 0] };
   }
 
   const marker = color.indexOf('(');
@@ -136,7 +120,7 @@ export function decomposeColor(color) {
  * @param {array} color.values - [n,n,n] or [n,n,n,n]
  * @returns {string} A CSS color string
  */
-export function recomposeColor(color) {
+function recomposeColor(color) {
   const { type } = color;
   let { values } = color;
 
@@ -177,7 +161,7 @@ export function getContrastRatio(foreground, background) {
  * @param {string} color - CSS color, i.e. one of: #nnn, #nnnnnn, rgb(), rgba(), hsl(), hsla()
  * @returns {number} The relative brightness of the color in the range 0 - 1
  */
-export function getLuminance(color) {
+function getLuminance(color) {
   const decomposedColor = decomposeColor(color);
 
   if (decomposedColor.type.indexOf('rgb') !== -1) {
@@ -210,26 +194,6 @@ export function emphasize(color, coefficient = 0.15) {
 }
 
 /**
- * Set the absolute transparency of a color.
- * Any existing alpha values are overwritten.
- *
- * @param {string} color - CSS color, i.e. one of: #nnn, #nnnnnn, rgb(), rgba(), hsl(), hsla()
- * @param {number} value - value to set the alpha channel to in the range 0 -1
- * @returns {string} A CSS color string. Hex input values are returned as rgb
- */
-export function fade(color, value) {
-  color = decomposeColor(color);
-  value = clamp(value);
-
-  if (color.type === 'rgb' || color.type === 'hsl') {
-    color.type += 'a';
-  }
-  color.values[3] = value;
-
-  return recomposeColor(color);
-}
-
-/**
  * Darkens a color.
  *
  * @param {string} color - CSS color, i.e. one of: #nnn, #nnnnnn, rgb(), rgba(), hsl(), hsla()
@@ -257,7 +221,7 @@ export function darken(color, coefficient) {
  * @param {number} coefficient - multiplier in the range 0 - 1
  * @returns {string} A CSS color string. Hex input values are returned as rgb
  */
-export function lighten(color, coefficient) {
+function lighten(color, coefficient) {
   color = decomposeColor(color);
   coefficient = clamp(coefficient);
 

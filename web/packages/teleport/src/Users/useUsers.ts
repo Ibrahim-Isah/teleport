@@ -1,33 +1,44 @@
 /**
- * Copyright 2020 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { useState, useEffect } from 'react';
-import { useAttempt } from 'shared/hooks';
+import { ReactElement, useState } from 'react';
 
+import cfg, { UrlListUsersParams } from 'teleport/config';
+import { storageService } from 'teleport/services/storageService';
 import { User } from 'teleport/services/user';
 import useTeleport from 'teleport/useTeleport';
 
-export default function useUsers() {
+import {
+  UserDetails as DefaultUserDetails,
+  UserDetailsProps,
+} from './UserDetails/UserDetails';
+
+export default function useUsers({
+  InviteCollaborators,
+  EmailPasswordReset,
+  UserDetails = DefaultUserDetails,
+}: UsersContainerProps) {
   const ctx = useTeleport();
-  const [attempt, attemptActions] = useAttempt({ isProcessing: true });
-  const [users, setUsers] = useState([] as User[]);
-  const [roles, setRoles] = useState([] as string[]);
   const [operation, setOperation] = useState({
     type: 'none',
   } as Operation);
+  const [inviteCollaboratorsOpen, setInviteCollaboratorsOpen] =
+    useState<boolean>(false);
 
   function onStartCreate() {
     const user = { name: '', roles: [], created: new Date() };
@@ -49,6 +60,11 @@ export default function useUsers() {
     setOperation({ type: 'reset', user });
   }
 
+  function onStartInviteCollaborators(user: User) {
+    setOperation({ type: 'invite-collaborators', user });
+    setInviteCollaboratorsOpen(true);
+  }
+
   function onClose() {
     setOperation({ type: 'none' });
   }
@@ -57,65 +73,86 @@ export default function useUsers() {
     return ctx.userService.createResetPasswordToken(name, 'password');
   }
 
-  function onDelete(name: string) {
-    return ctx.userService.deleteUser(name).then(() => {
-      const updatedUsers = users.filter(user => user.name !== name);
-      setUsers(updatedUsers);
-    });
+  function onInviteCollaboratorsClose() {
+    setInviteCollaboratorsOpen(false);
+    setOperation({ type: 'none' });
   }
 
-  function onUpdate(u: User) {
-    return ctx.userService.updateUser(u).then(result => {
-      setUsers([result, ...users.filter(i => i.name !== u.name)]);
-    });
+  function onEmailPasswordResetClose() {
+    setOperation({ type: 'none' });
   }
 
-  function onCreate(u: User) {
-    return ctx.userService
-      .createUser(u)
-      .then(result => setUsers([result, ...users]))
-      .then(() => ctx.userService.createResetPasswordToken(u.name, 'invite'));
+  function onDismissUsersMauNotice() {
+    storageService.setUsersMAUAcknowledged();
   }
 
-  useEffect(() => {
-    function fetchRoles() {
-      if (ctx.getFeatureFlags().roles) {
-        return ctx.resourceService
-          .fetchRoles()
-          .then(resources => resources.map(role => role.name));
-      }
+  // if the cluster has billing enabled, and usageBasedBilling, and they haven't acknowledged
+  // the info yet
+  const showMauInfo =
+    ctx.getFeatureFlags().billing &&
+    cfg.isUsageBasedBilling &&
+    !storageService.getUsersMauAcknowledged();
 
-      return Promise.resolve([]);
-    }
+  const usersAcl = ctx.storeUser.getUserAccess();
 
-    attemptActions.do(() =>
-      Promise.all([fetchRoles(), ctx.userService.fetchUsers()]).then(values => {
-        setRoles(values[0]);
-        setUsers(values[1]);
-      })
-    );
-  }, []);
+  function fetch(params?: UrlListUsersParams, signal?: AbortSignal) {
+    return ctx.userService.fetchUsersV2(params, signal);
+  }
 
   return {
-    attempt,
-    users,
-    roles,
+    usersAcl,
     operation,
     onStartCreate,
     onStartDelete,
     onStartEdit,
     onStartReset,
+    onStartInviteCollaborators,
     onClose,
-    onDelete,
-    onCreate,
-    onUpdate,
     onReset,
+    onInviteCollaboratorsClose,
+    InviteCollaborators,
+    inviteCollaboratorsOpen,
+    onEmailPasswordResetClose,
+    EmailPasswordReset,
+    UserDetails,
+    showMauInfo,
+    onDismissUsersMauNotice,
+    fetch,
   };
 }
 
 type Operation = {
-  type: 'create' | 'edit' | 'delete' | 'reset' | 'none';
+  type:
+    | 'create'
+    | 'invite-collaborators'
+    | 'edit'
+    | 'delete'
+    | 'reset'
+    | 'none';
   user?: User;
+};
+
+interface InviteCollaboratorsDialogProps {
+  onClose: (users?: User[]) => void;
+}
+
+interface EmailPasswordResetDialogProps {
+  username: string;
+  onClose: () => void;
+}
+
+type InviteCollaboratorsElement = (
+  props: InviteCollaboratorsDialogProps
+) => ReactElement;
+type EmailPasswordResetElement = (
+  props: EmailPasswordResetDialogProps
+) => ReactElement;
+type UserDetailsElement = (props: UserDetailsProps) => ReactElement;
+
+export type UsersContainerProps = {
+  InviteCollaborators?: InviteCollaboratorsElement;
+  EmailPasswordReset?: EmailPasswordResetElement;
+  UserDetails?: UserDetailsElement;
 };
 
 export type State = ReturnType<typeof useUsers>;

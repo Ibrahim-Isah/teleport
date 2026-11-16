@@ -1,42 +1,50 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useState } from 'react';
-import styled from 'styled-components';
-import { Text, Box } from 'design';
-import Validation, { Validator } from 'shared/components/Validation';
+import { useState } from 'react';
+
+import { Box, H3, Subtitle3 } from 'design';
 import FieldInput from 'shared/components/FieldInput';
-import { requiredField } from 'shared/components/Validation/rules';
 import FieldSelect from 'shared/components/FieldSelect';
 import { Option } from 'shared/components/Select';
+import Validation, { Validator } from 'shared/components/Validation';
+import { requiredField } from 'shared/components/Validation/rules';
 
+import ReAuthenticate from 'teleport/components/ReAuthenticate';
 import TextSelectCopy from 'teleport/components/TextSelectCopy';
 import { generateTshLoginCommand } from 'teleport/lib/util';
+import type { KubeImpersonation } from 'teleport/services/agents';
+import { MfaChallengeScope } from 'teleport/services/auth/auth';
 
 import {
   ActionButtons,
-  HeaderSubtitle,
-  HeaderWithBackBtn,
   ConnectionDiagnosticResult,
+  Header,
+  HeaderSubtitle,
+  StyledBox,
 } from '../../Shared';
-
-import { useTestConnection, State } from './useTestConnection';
-
 import type { AgentStepProps } from '../../types';
+import { State, useTestConnection } from './useTestConnection';
 
+/**
+ * @deprecated Refactor Discover/Kubernetes/TestConnection away from the container component
+ * pattern. See https://github.com/gravitational/teleport/pull/34952.
+ */
 export default function Container(props: AgentStepProps) {
   const state = useTestConnection(props);
 
@@ -54,6 +62,8 @@ export function TestConnection({
   authType,
   username,
   clusterId,
+  showMfaDialog,
+  cancelMfaDialog,
 }: State) {
   const userOpts = kube.users.map(l => ({ value: l, label: l }));
   const groupOpts = kube.groups.map(l => ({ value: l, label: l }));
@@ -72,29 +82,40 @@ export function TestConnection({
       return;
     }
 
-    testConnection({
+    testConnection(makeTestConnRequest());
+  }
+
+  function makeTestConnRequest(): KubeImpersonation {
+    return {
       namespace,
       user: selectedUser?.value,
       groups: selectedGroups?.map(g => g.value),
-    });
+    };
   }
 
   return (
     <Validation>
       {({ validator }) => (
         <Box>
-          <HeaderWithBackBtn onPrev={prevStep}>
-            Test Connection
-          </HeaderWithBackBtn>
+          {showMfaDialog && (
+            <ReAuthenticate
+              onMfaResponse={async res =>
+                testConnection(makeTestConnRequest(), res)
+              }
+              onClose={cancelMfaDialog}
+              challengeScope={MfaChallengeScope.USER_SESSION}
+            />
+          )}
+          <Header>Test Connection</Header>
           <HeaderSubtitle>
             Optionally verify that you can successfully connect to the
             Kubernetes cluster you just added.
           </HeaderSubtitle>
           <StyledBox mb={5}>
-            <Text bold>Step 1</Text>
-            <Text typography="subtitle1" mb={3}>
-              Define the namespace to test.
-            </Text>
+            <header>
+              <H3>Step 1</H3>
+              <Subtitle3 mb={3}>Define the namespace to test.</Subtitle3>
+            </header>
             <Box width="500px">
               <FieldInput
                 label="Namespace"
@@ -107,13 +128,13 @@ export function TestConnection({
             </Box>
           </StyledBox>
           <StyledBox mb={5}>
-            <Text bold>Step 2</Text>
-            <Text typography="subtitle1" mb={3}>
-              Select groups and a user to test.
-            </Text>
+            <header>
+              <H3>Step 2</H3>
+              <Subtitle3 mb={3}>Select groups and a user to test.</Subtitle3>
+            </header>
             <Box width="500px">
               <FieldSelect
-                label="Kubernetes groups"
+                label="Kubernetes Groups"
                 placeholder={
                   groupOpts.length === 0
                     ? 'No groups defined'
@@ -132,8 +153,8 @@ export function TestConnection({
             </Box>
             <Box width="500px">
               <FieldSelect
-                label={'Kubernetes user'}
-                labelTip={
+                label={'Kubernetes User'}
+                helperText={
                   userOpts.length === 0
                     ? 'Defaulted to your teleport username'
                     : ''
@@ -156,12 +177,10 @@ export function TestConnection({
             canTestConnection={canTestConnection}
             testConnection={() => handleTestConnection(validator)}
             stepNumber={3}
-            stepDescription="Verify that the Kubernetes is accessible"
+            stepDescription="Verify that the Kubernetes cluster is accessible"
           />
           <StyledBox>
-            <Text bold mb={3}>
-              To Access your Kubernetes cluster
-            </Text>
+            <H3 mb={3}>To Access your Kubernetes cluster</H3>
             <Box mb={2}>
               Log into your Teleport cluster
               <TextSelectCopy
@@ -182,16 +201,13 @@ export function TestConnection({
               <TextSelectCopy mt="1" text="kubectl get pods" />
             </Box>
           </StyledBox>
-          <ActionButtons onProceed={nextStep} lastStep={true} />
+          <ActionButtons
+            onProceed={nextStep}
+            lastStep={true}
+            onPrev={prevStep}
+          />
         </Box>
       )}
     </Validation>
   );
 }
-
-const StyledBox = styled(Box)`
-  max-width: 800px;
-  background-color: rgba(255, 255, 255, 0.05);
-  border-radius: 8px;
-  padding: 20px;
-`;

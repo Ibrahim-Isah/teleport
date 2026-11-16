@@ -20,12 +20,15 @@ package profile_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 
+	"github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/profile"
+	"github.com/gravitational/teleport/api/utils/keys"
 )
 
 // TestProfileBasics verifies basic profile operations such as
@@ -39,12 +42,12 @@ func TestProfileBasics(t *testing.T) {
 		WebProxyAddr:          "proxy:3088",
 		SSHProxyAddr:          "proxy:3023",
 		Username:              "testuser",
-		ForwardedPorts:        []string{"8000:example.com:8000"},
 		DynamicForwardedPorts: []string{"localhost:8080"},
 		Dir:                   dir,
 		SiteName:              "example.com",
 		AuthConnector:         "passwordless",
 		MFAMode:               "auto",
+		Scope:                 "/team-a",
 	}
 
 	// verify that profile name is proxy host component
@@ -75,6 +78,10 @@ func TestProfileBasics(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, p.Name(), name)
 
+	// Update the dial timeout because when the profile is loaded, an
+	// empty timeout is implicitly set to match the default value.
+	p.SSHDialTimeout = defaults.DefaultIOTimeout
+
 	// load and verify current profile
 	clone, err := profile.FromDir(dir, "")
 	require.NoError(t, err)
@@ -99,6 +106,87 @@ func TestAppPath(t *testing.T) {
 		SiteName:     "example.com",
 	}
 
-	expected := filepath.Join(dir, "keys", "proxy", "testuser-app", "example.com", "banana-x509.pem")
-	require.Equal(t, expected, p.AppCertPath("banana"))
+	expectCertPath := filepath.Join(dir, "keys", "proxy", "testuser-app", "example.com", "banana.crt")
+	require.Equal(t, expectCertPath, p.AppCertPath("banana"))
+	expectKeyPath := filepath.Join(dir, "keys", "proxy", "testuser-app", "example.com", "banana.key")
+	require.Equal(t, expectKeyPath, p.AppKeyPath("banana"))
+}
+
+func TestProfilePath(t *testing.T) {
+	switch runtime.GOOS {
+	case "darwin", "linux":
+	default:
+		t.Skip("this test only runs on Unix")
+	}
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	require.Equal(t, "/foo/bar", profile.FullProfilePath("/foo/bar"))
+	require.Equal(t, filepath.Join(dir, ".tsh"), profile.FullProfilePath(""))
+}
+
+func TestRequireKubeLocalProxy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		inputProfile *profile.Profile
+		checkResult  require.BoolAssertionFunc
+	}{
+		{
+			name: "kube not enabled",
+			inputProfile: &profile.Profile{
+				WebProxyAddr:                  "example.com:443",
+				TLSRoutingEnabled:             true,
+				TLSRoutingConnUpgradeRequired: true,
+			},
+			checkResult: require.False,
+		},
+		{
+			name: "ALPN connection upgrade not required",
+			inputProfile: &profile.Profile{
+				WebProxyAddr:      "example.com:443",
+				KubeProxyAddr:     "example.com:443",
+				TLSRoutingEnabled: true,
+			},
+			checkResult: require.False,
+		},
+		{
+			name: "kube uses separate listener",
+			inputProfile: &profile.Profile{
+				WebProxyAddr:                  "example.com:443",
+				KubeProxyAddr:                 "example.com:3026",
+				TLSRoutingEnabled:             false,
+				TLSRoutingConnUpgradeRequired: true,
+			},
+			checkResult: require.False,
+		},
+		{
+			name: "local proxy required",
+			inputProfile: &profile.Profile{
+				WebProxyAddr:                  "example.com:443",
+				KubeProxyAddr:                 "example.com:443",
+				TLSRoutingEnabled:             true,
+				TLSRoutingConnUpgradeRequired: true,
+			},
+			checkResult: require.True,
+		},
+		{
+			// A hardware-key policy requires the local proxy even without a TLS
+			// routing connection upgrade (the exec-plugin path can't serialize the key).
+			name: "hardware key policy requires local proxy",
+			inputProfile: &profile.Profile{
+				WebProxyAddr:     "example.com:443",
+				KubeProxyAddr:    "example.com:3026",
+				PrivateKeyPolicy: keys.PrivateKeyPolicyHardwareKeyTouch,
+			},
+			checkResult: require.True,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.checkResult(t, test.inputProfile.RequireKubeLocalProxy())
+		})
+	}
 }

@@ -1,279 +1,289 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useRef, useEffect } from 'react';
+import { Meta, StoryObj } from '@storybook/react-vite';
+import { useLayoutEffect } from 'react';
+
 import Flex from 'design/Flex';
+import { Timestamp } from 'gen-proto-ts/google/protobuf/timestamp_pb';
+import { TrustedDeviceRequirement } from 'gen-proto-ts/teleport/legacy/types/trusted_device_requirement_pb';
+import { Cluster } from 'gen-proto-ts/teleport/lib/teleterm/v1/cluster_pb';
 
-import * as tshd from 'teleterm/services/tshd/types';
+import {
+  makeLoggedInUser,
+  makeRootCluster,
+} from 'teleterm/services/tshd/testHelpers';
+import { MockAppContextProvider } from 'teleterm/ui/fixtures/MockAppContextProvider';
+import { MockAppContext } from 'teleterm/ui/fixtures/mocks';
+import { RootClusterUri } from 'teleterm/ui/uri';
 
-import { Identity, IdentityHandler, IdentityProps } from './Identity';
-import { IdentityRootCluster } from './useIdentity';
+import { IdentityContainer } from './Identity';
 
-export default {
+interface StoryProps {
+  clusters: ('violet' | 'orange' | 'green')[];
+  activeCluster: boolean;
+  activeClusterExpired: boolean;
+  deviceTrust: 'enrolled' | 'required-not-enrolled' | 'not-enrolled';
+  showProfileErrors: boolean;
+  roles: string[];
+}
+
+function withUuidSuffix(roles: string[]): string[] {
+  return roles.map(role => `${role}-${crypto.randomUUID().split('-').at(0)}`);
+}
+
+const baseRoles = [
+  'circle-mark-app-access',
+  'grafana-lite-app-access',
+  'grafana-gold-app-access',
+  'release-lion-app-access',
+  'release-fox-app-access',
+  'sales-center-lorem-app-access',
+  'sales-center-ipsum-db-access',
+  'sales-center-shop-app-access',
+  'sales-center-floor-db-access',
+];
+
+const roles = withUuidSuffix(baseRoles);
+
+const meta: Meta<StoryProps> = {
   title: 'Teleterm/Identity',
+  component: props => {
+    const hasOrange = props.clusters.includes('orange');
+    const hasViolet = props.clusters.includes('violet');
+    const hasGreen = props.clusters.includes('green');
+    const clusters = [
+      hasOrange &&
+        makeRootCluster({
+          ...clusterOrange,
+          profileStatusError: props.showProfileErrors ? profileStatusError : '',
+        }),
+      hasViolet &&
+        makeRootCluster({
+          ...clusterViolet,
+          profileStatusError: props.showProfileErrors ? profileStatusError : '',
+        }),
+      hasGreen &&
+        makeRootCluster({
+          ...clusterGreen,
+          profileStatusError: props.showProfileErrors ? profileStatusError : '',
+        }),
+    ].filter(Boolean);
+
+    const hasClusterWithLoggedInUser =
+      props.activeCluster && (hasOrange || hasViolet);
+    if (hasClusterWithLoggedInUser) {
+      clusters[0].connected = true;
+      clusters[0].loggedInUser = makeLoggedInUser({
+        ...clusters[0].loggedInUser,
+        validUntil: Timestamp.fromDate(
+          props.activeClusterExpired
+            ? new Date()
+            : new Date(Date.now() + 24 * 60 * 60 * 1000)
+        ),
+        roles: props.roles || clusters[0].loggedInUser.roles,
+        isDeviceTrusted: props.deviceTrust === 'enrolled',
+        trustedDeviceRequirement:
+          props.deviceTrust === 'required-not-enrolled'
+            ? TrustedDeviceRequirement.REQUIRED
+            : TrustedDeviceRequirement.NOT_REQUIRED,
+      });
+    }
+
+    return (
+      <OpenIdentityPopover
+        clusters={clusters}
+        activeClusterUri={hasClusterWithLoggedInUser && clusters[0]?.uri}
+      />
+    );
+  },
+  argTypes: {
+    clusters: {
+      control: { type: 'check' },
+      options: ['violet', 'orange', 'green'],
+      description: 'List of clusters to show.',
+    },
+    activeCluster: {
+      control: { type: 'boolean' },
+      description: 'Makes "violet" or "orange" an active cluster.',
+    },
+    deviceTrust: {
+      control: { type: 'radio' },
+      options: ['enrolled', 'required-not-enrolled', 'not-enrolled'],
+      description: 'Controls device trust requirement.',
+    },
+    activeClusterExpired: {
+      control: { type: 'boolean' },
+      description: 'Whether the active cluster has expired cert.',
+    },
+    showProfileErrors: {
+      control: { type: 'boolean' },
+      description: 'Shows profile errors for all clusters.',
+    },
+  },
+  args: {
+    clusters: ['violet', 'orange', 'green'],
+    activeCluster: true,
+    deviceTrust: 'not-enrolled',
+    activeClusterExpired: false,
+    showProfileErrors: false,
+  },
 };
 
-const makeTitle = (userWithClusterName: string) => userWithClusterName;
+export default meta;
 
-const OpenedIdentity = (props: IdentityProps) => {
-  const ref = useRef<IdentityHandler>();
-  useEffect(() => {
-    if (ref.current) {
-      ref.current.togglePopover();
-    }
-  }, [ref.current]);
+const clusterOrange = makeRootCluster({
+  name: 'orange-psv-eindhoven-eredivisie-production-lorem-ipsum',
+  loggedInUser: makeLoggedInUser({
+    name: 'ruud-van-nistelrooy-van-der-sar',
+    roles,
+  }),
+  uri: '/clusters/orange',
+});
+const clusterViolet = makeRootCluster({
+  name: 'violet',
+  loggedInUser: makeLoggedInUser({
+    name: 'sammy',
+    roles: ['access', 'editor'],
+  }),
+  uri: '/clusters/violet',
+});
+const clusterGreen = makeRootCluster({
+  name: 'green',
+  loggedInUser: undefined,
+  connected: false,
+  uri: '/clusters/green',
+});
+
+const profileStatusError =
+  'No YubiKey device connected with serial number 14358031. Connect the device and try again.';
+
+const OpenIdentityPopover = (props: {
+  clusters: Cluster[];
+  activeClusterUri: RootClusterUri | undefined;
+}) => {
+  const ctx = new MockAppContext();
+  ctx.statePersistenceService.putState({
+    ...ctx.statePersistenceService.getState(),
+    showTshHomeMigrationBanner: true,
+  });
+  props.clusters.forEach(c => {
+    ctx.addRootCluster(c);
+  });
+  ctx.workspacesService.addWorkspace(clusterGreen);
+  ctx.workspacesService.addWorkspace(clusterViolet);
+  ctx.workspacesService.addWorkspace(clusterOrange);
+  ctx.workspacesService.setState(draftState => {
+    draftState.rootClusterUri = props.activeClusterUri;
+    draftState.workspaces[clusterGreen.uri].color = 'green';
+    draftState.workspaces[clusterViolet.uri].color = 'purple';
+    draftState.workspaces[clusterOrange.uri].color = 'yellow';
+  });
+  useOpenPopover();
 
   return (
     <Flex justifyContent="end" height="40px">
-      <Identity ref={ref} {...props} />
+      <MockAppContextProvider appContext={ctx}>
+        <IdentityContainer />
+      </MockAppContextProvider>
     </Flex>
   );
 };
 
-export function NoRootClusters() {
-  return (
-    <OpenedIdentity
-      makeTitle={makeTitle}
-      activeRootCluster={undefined}
-      rootClusters={[]}
-      changeRootCluster={() => Promise.resolve()}
-      logout={() => {}}
-      addCluster={() => {}}
-    />
-  );
-}
+const useOpenPopover = () => {
+  useLayoutEffect(() => {
+    const isProfileSelectorOpen = !!document.querySelector(
+      'button[title~="logout"i]'
+    );
 
-export function OneClusterWithNoActiveCluster() {
-  const identityRootCluster: IdentityRootCluster = {
-    active: false,
-    clusterName: 'teleport-localhost',
-    userName: '',
-    uri: '/clusters/localhost',
-    connected: false,
-  };
+    if (isProfileSelectorOpen) {
+      return;
+    }
 
-  return (
-    <OpenedIdentity
-      makeTitle={makeTitle}
-      activeRootCluster={undefined}
-      rootClusters={[identityRootCluster]}
-      changeRootCluster={() => Promise.resolve()}
-      logout={() => {}}
-      addCluster={() => {}}
-    />
-  );
-}
+    const button = document.querySelector(
+      'button[title~="profiles"i]'
+    ) as HTMLButtonElement;
 
-export function OneClusterWithActiveCluster() {
-  const identityRootCluster: IdentityRootCluster = {
-    active: true,
-    clusterName: 'Teleport-Localhost',
-    userName: 'alice',
-    uri: '/clusters/localhost',
-    connected: true,
-  };
+    button?.click();
+  }, []);
+};
 
-  const cluster: tshd.Cluster = {
-    uri: '/clusters/localhost',
-    name: 'teleport-localhost',
-    proxyHost: 'localhost:3080',
-    connected: true,
-    leaf: false,
-    authClusterId: '73c4746b-d956-4f16-9848-4e3469f70762',
-    loggedInUser: {
-      activeRequestsList: [],
-      name: 'alice',
-      rolesList: ['access', 'editor'],
-      sshLoginsList: ['root'],
-      requestableRolesList: [],
-      suggestedReviewersList: [],
+export const NoRootClusters: StoryObj<StoryProps> = {
+  args: {
+    clusters: [],
+  },
+};
+
+export const OneClusterWithNoActiveCluster: StoryObj<StoryProps> = {
+  args: {
+    clusters: ['orange'],
+    activeCluster: false,
+  },
+};
+
+export const OneClusterWithActiveCluster: StoryObj<StoryProps> = {
+  args: {
+    clusters: ['violet'],
+  },
+};
+
+export const ManyRoles: StoryObj<StoryProps> = {
+  args: {
+    clusters: ['violet'],
+    roles: Array.from({ length: 30 }, () => withUuidSuffix(baseRoles)).flat(),
+  },
+};
+
+export const ManyClustersWithNoActiveCluster: StoryObj<StoryProps> = {
+  args: {
+    clusters: ['orange', 'green', 'violet'],
+    activeCluster: false,
+  },
+};
+
+export const ManyClustersWithActiveCluster: StoryObj<StoryProps> = {
+  args: {
+    clusters: ['orange', 'green', 'violet'],
+  },
+};
+
+export const ManyClustersWithProfileErrorsAndActiveCluster: StoryObj<StoryProps> =
+  {
+    args: {
+      clusters: ['orange', 'green', 'violet'],
+      showProfileErrors: true,
     },
   };
 
-  return (
-    <OpenedIdentity
-      makeTitle={makeTitle}
-      activeRootCluster={cluster}
-      rootClusters={[identityRootCluster]}
-      changeRootCluster={() => Promise.resolve()}
-      logout={() => {}}
-      addCluster={() => {}}
-    />
-  );
-}
+export const TrustedDeviceEnrolled: StoryObj<StoryProps> = {
+  args: {
+    deviceTrust: 'enrolled',
+  },
+};
 
-export function ManyClustersWithNoActiveCluster() {
-  const identityRootCluster1: IdentityRootCluster = {
-    active: false,
-    clusterName: 'orange',
-    userName: 'bob',
-    uri: '/clusters/orange',
-    connected: true,
-  };
-  const identityRootCluster2: IdentityRootCluster = {
-    active: false,
-    clusterName: 'violet',
-    userName: 'sammy',
-    uri: '/clusters/violet',
-    connected: true,
-  };
-  const identityRootCluster3: IdentityRootCluster = {
-    active: false,
-    clusterName: 'green',
-    userName: '',
-    uri: '/clusters/green',
-    connected: true,
-  };
+export const TrustedDeviceRequiredButNotEnrolled: StoryObj<StoryProps> = {
+  args: {
+    deviceTrust: 'required-not-enrolled',
+  },
+};
 
-  return (
-    <OpenedIdentity
-      makeTitle={makeTitle}
-      activeRootCluster={undefined}
-      rootClusters={[
-        identityRootCluster1,
-        identityRootCluster2,
-        identityRootCluster3,
-      ]}
-      changeRootCluster={() => Promise.resolve()}
-      logout={() => {}}
-      addCluster={() => {}}
-    />
-  );
-}
-
-export function ManyClustersWithActiveCluster() {
-  const identityRootCluster1: IdentityRootCluster = {
-    active: false,
-    clusterName: 'orange',
-    userName: 'bob',
-    uri: '/clusters/orange',
-    connected: true,
-  };
-  const identityRootCluster2: IdentityRootCluster = {
-    active: true,
-    clusterName: 'violet',
-    userName: 'sammy',
-    uri: '/clusters/violet',
-    connected: true,
-  };
-  const identityRootCluster3: IdentityRootCluster = {
-    active: false,
-    clusterName: 'green',
-    userName: '',
-    uri: '/clusters/green',
-    connected: true,
-  };
-
-  const activeIdentityRootCluster = identityRootCluster2;
-  const activeCluster: tshd.Cluster = {
-    uri: activeIdentityRootCluster.uri,
-    name: activeIdentityRootCluster.clusterName,
-    proxyHost: 'localhost:3080',
-    connected: true,
-    leaf: false,
-    authClusterId: '73c4746b-d956-4f16-9848-4e3469f70762',
-    loggedInUser: {
-      activeRequestsList: [],
-      name: activeIdentityRootCluster.userName,
-      rolesList: ['access', 'editor'],
-      sshLoginsList: ['root'],
-      requestableRolesList: [],
-      suggestedReviewersList: [],
-    },
-  };
-
-  return (
-    <OpenedIdentity
-      makeTitle={makeTitle}
-      activeRootCluster={activeCluster}
-      rootClusters={[
-        identityRootCluster1,
-        identityRootCluster2,
-        identityRootCluster3,
-      ]}
-      changeRootCluster={() => Promise.resolve()}
-      logout={() => {}}
-      addCluster={() => {}}
-    />
-  );
-}
-
-export function LongNamesWithManyRoles() {
-  const identityRootCluster1: IdentityRootCluster = {
-    active: false,
-    clusterName: 'orange',
-    userName: 'bob',
-    uri: '/clusters/orange',
-    connected: true,
-  };
-  const identityRootCluster2: IdentityRootCluster = {
-    active: true,
-    clusterName: 'psv-eindhoven-eredivisie-production-lorem-ipsum',
-    userName: 'ruud-van-nistelrooy-van-der-sar',
-    uri: '/clusters/psv',
-    connected: true,
-  };
-  const identityRootCluster3: IdentityRootCluster = {
-    active: false,
-    clusterName: 'green',
-    userName: '',
-    uri: '/clusters/green',
-    connected: true,
-  };
-
-  const activeIdentityRootCluster = identityRootCluster2;
-  const activeCluster: tshd.Cluster = {
-    uri: activeIdentityRootCluster.uri,
-    name: activeIdentityRootCluster.clusterName,
-    proxyHost: 'localhost:3080',
-    connected: true,
-    leaf: false,
-    authClusterId: '73c4746b-d956-4f16-9848-4e3469f70762',
-    loggedInUser: {
-      activeRequestsList: [],
-      name: activeIdentityRootCluster.userName,
-      rolesList: [
-        'circle-mark-app-access',
-        'grafana-lite-app-access',
-        'grafana-gold-app-access',
-        'release-lion-app-access',
-        'release-fox-app-access',
-        'sales-center-lorem-app-access',
-        'sales-center-ipsum-db-access',
-        'sales-center-shop-app-access',
-        'sales-center-floor-db-access',
-      ],
-      sshLoginsList: ['root'],
-      requestableRolesList: [],
-      suggestedReviewersList: [],
-    },
-  };
-
-  return (
-    <OpenedIdentity
-      makeTitle={makeTitle}
-      activeRootCluster={activeCluster}
-      rootClusters={[
-        identityRootCluster1,
-        identityRootCluster2,
-        identityRootCluster3,
-      ]}
-      changeRootCluster={() => Promise.resolve()}
-      logout={() => {}}
-      addCluster={() => {}}
-    />
-  );
-}
+export const ActiveClusterExpired: StoryObj<StoryProps> = {
+  args: {
+    activeClusterExpired: true,
+  },
+};

@@ -18,6 +18,7 @@ limitations under the License.
 package defaults
 
 import (
+	"os"
 	"sync"
 	"time"
 
@@ -28,9 +29,11 @@ const (
 	// Namespace is default namespace
 	Namespace = "default"
 
-	// DefaultDialTimeout is a default TCP dial timeout we set for our
-	// connection attempts
-	DefaultDialTimeout = 30 * time.Second
+	// DefaultIOTimeout is a default network IO timeout.
+	DefaultIOTimeout = 30 * time.Second
+
+	// DefaultIdleTimeout is a default idle connection timeout.
+	DefaultIdleTimeout = 30 * time.Second
 
 	// KeepAliveCountMax is the number of keep-alive messages that can be sent
 	// without receiving a response from the client before the client is
@@ -46,11 +49,15 @@ const (
 	// CertDuration is a default certificate duration.
 	CertDuration = 12 * time.Hour
 
-	// ServerAnnounceTTL is a period between heartbeats
-	// Median sleep time between node pings is this value / 2 + random
-	// deviation added to this time to avoid lots of simultaneous
-	// heartbeats coming to auth server
-	ServerAnnounceTTL = 600 * time.Second
+	// ServerAnnounceTTL is the default TTL of server presence resources.
+	ServerAnnounceTTL = 10 * time.Minute
+
+	// InstanceHeartbeatTTL is the default TTL of the instance presence resource.
+	InstanceHeartbeatTTL = 20 * time.Minute
+
+	// MaxInstanceHeartbeatInterval is the upper bound of the variable instance
+	// heartbeat interval.
+	MaxInstanceHeartbeatInterval = 18 * time.Minute
 
 	// SessionTrackerTTL defines the default base ttl of a session tracker.
 	SessionTrackerTTL = 30 * time.Minute
@@ -82,14 +89,38 @@ var (
 
 	// serverKeepAliveTTL is a period between server keep-alives,
 	// when servers announce only presence without sending full data
-	serverKeepAliveTTL = 60 * time.Second
+	serverKeepAliveTTL = 1 * time.Minute
 
 	// keepAliveInterval is interval at which Teleport will send keep-alive
 	// messages to the client. The default interval of 5 minutes (300 seconds) is
 	// set to help keep connections alive when using AWS NLBs (which have a default
 	// timeout of 350 seconds)
 	keepAliveInterval = 5 * time.Minute
+
+	// minInstanceHeartbeatInterval is the lower bound of the variable instance
+	// heartbeat interval.
+	minInstanceHeartbeatInterval = 3 * time.Minute
 )
+
+// ProxyAnnounceTTL is announce ttl used for proxy presence.
+// This defaults to [ServerAnnounceTTL].
+func ProxyAnnounceTTL() time.Duration {
+	v := os.Getenv("TELEPORT_UNSTABLE_PROXY_ANNOUNCE_TTL")
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	return ServerAnnounceTTL
+}
+
+// AuthAnnounceTTL is announce ttl used for auth presence.
+// This defaults to [ServerAnnounceTTL].
+func AuthAnnounceTTL() time.Duration {
+	v := os.Getenv("TELEPORT_UNSTABLE_AUTH_ANNOUNCE_TTL")
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	return ServerAnnounceTTL
+}
 
 func SetTestTimeouts(svrKeepAliveTTL, keepAliveTick time.Duration) {
 	moduleLock.Lock()
@@ -97,12 +128,22 @@ func SetTestTimeouts(svrKeepAliveTTL, keepAliveTick time.Duration) {
 
 	serverKeepAliveTTL = svrKeepAliveTTL
 	keepAliveInterval = keepAliveTick
+
+	// maintain the proportional relationship of instance hb interval to
+	// server hb interval.
+	minInstanceHeartbeatInterval = svrKeepAliveTTL * 3
 }
 
 func ServerKeepAliveTTL() time.Duration {
 	moduleLock.RLock()
 	defer moduleLock.RUnlock()
 	return serverKeepAliveTTL
+}
+
+func MinInstanceHeartbeatInterval() time.Duration {
+	moduleLock.RLock()
+	defer moduleLock.RUnlock()
+	return minInstanceHeartbeatInterval
 }
 
 func KeepAliveInterval() time.Duration {
@@ -125,6 +166,12 @@ const (
 )
 
 const (
+	// DefaultMaxErrorMessageSize is the default maximum size of an error message.
+	// This can be used to truncate large error messages, which might cause gRPC messages to exceed the maximum allowed size.
+	DefaultMaxErrorMessageSize = 1024 * 100 // 100KB
+)
+
+const (
 	// When running in "SSH Proxy" role this port will be used for incoming
 	// connections from SSH nodes who wish to use "reverse tunnell" (when they
 	// run behind an environment/firewall which only allows outgoing connections)
@@ -143,4 +190,32 @@ const (
 const (
 	// TunnelPublicAddrEnvar optionally specifies the alternative reverse tunnel address.
 	TunnelPublicAddrEnvar = "TELEPORT_TUNNEL_PUBLIC_ADDR"
+
+	// TLSRoutingConnUpgradeEnvVar overwrites the test result for deciding if
+	// ALPN connection upgrade is required.
+	//
+	// Sample values:
+	// true
+	// <some.cluster.com>=yes,<another.cluster.com>=no
+	// 0,<some.cluster.com>=1
+	//
+	// TODO(greedy52) DELETE in ??. Note that this toggle was planned to be
+	// deleted in 15.0 when the feature exits preview. However, many users
+	// still rely on this manual toggle as IsALPNConnUpgradeRequired cannot
+	// detect many situations where connection upgrade is required. This can be
+	// deleted once IsALPNConnUpgradeRequired is improved.
+	TLSRoutingConnUpgradeEnvVar = "TELEPORT_TLS_ROUTING_CONN_UPGRADE"
+)
+
+const (
+	// HealthCheckInterval is the default resource health check interval.
+	HealthCheckInterval time.Duration = 30 * time.Second
+	// HealthCheckTimeout is the default resource health check timeout.
+	HealthCheckTimeout time.Duration = 5 * time.Second
+	// HealthCheckHealthyThreshold is the default resource health check healthy
+	// threshold.
+	HealthCheckHealthyThreshold uint32 = 2
+	// HealthCheckUnhealthyThreshold is the default resource health check
+	// unhealthy threshold.
+	HealthCheckUnhealthyThreshold uint32 = 1
 )

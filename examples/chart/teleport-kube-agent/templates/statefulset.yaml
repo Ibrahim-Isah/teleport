@@ -2,6 +2,7 @@
 # Warning to maintainers, any changes to this file that are not specific to the StatefulSet need to also be duplicated
 # in the deployment.yaml file.
 #
+{{- $topologySpreadConstraints := and (semverCompare ">=1.18.0-0" .Capabilities.KubeVersion.Version) (not .Values.disableTopologySpreadConstraints) }}
 {{- $replicaCount := (coalesce .Values.replicaCount .Values.highAvailability.replicaCount "1") }}
 apiVersion: apps/v1
 kind: StatefulSet
@@ -12,6 +13,10 @@ metadata:
     app: {{ .Release.Name }}
   {{- if .Values.extraLabels.deployment }}
     {{- toYaml .Values.extraLabels.deployment | nindent 4 }}
+  {{- end }}
+  {{- if .Values.annotations.deployment }}
+  annotations:
+    {{- toYaml .Values.annotations.deployment | nindent 4 }}
   {{- end }}
 spec:
   serviceName: {{ .Release.Name }}
@@ -33,14 +38,22 @@ spec:
   {{- toYaml .Values.extraLabels.pod | nindent 8 }}
 {{- end }}
     spec:
+      automountServiceAccountToken: true
       {{- if .Values.dnsConfig }}
       dnsConfig: {{- toYaml .Values.dnsConfig | nindent 8 }}
       {{- end }}
       {{- if .Values.dnsPolicy }}
       dnsPolicy: {{ .Values.dnsPolicy | quote }}
       {{- end }}
-      securityContext:
-        fsGroup: 9807
+      {{- if .Values.hostAliases }}
+      hostAliases: {{- toYaml .Values.hostAliases | nindent 8 }}
+      {{- end }}
+      {{- if .Values.podSecurityContext }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8}}
+      {{- end }}
+      {{- if .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- end }}
       {{- if or .Values.affinity (gt (int $replicaCount) 1) }}
       affinity:
         {{- if .Values.affinity }}
@@ -73,6 +86,25 @@ spec:
         {{- end }}
         {{- end }}
       {{- end }}
+{{- if $topologySpreadConstraints }}
+  {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints: {{- toYaml .Values.topologySpreadConstraints | nindent 8 }}
+  {{- else }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: {{ .Release.Name }}
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: {{ .Release.Name }}
+  {{- end }}
+{{- end }}
       {{- if .Values.tolerations }}
       tolerations:
         {{- toYaml .Values.tolerations | nindent 6 }}
@@ -103,6 +135,11 @@ spec:
           name: "teleport-tls-ca"
           readOnly: true
           {{- end }}
+          {{- if contains "jamf" (.Values.roles | toString) }}
+        - mountPath: /etc/teleport-jamf-api-credentials
+          name: "jamf-api-credentials"
+          readOnly: true
+          {{- end }}
   {{- if .Values.extraVolumeMounts }}
     {{- toYaml .Values.extraVolumeMounts | nindent 8 }}
   {{- end }}
@@ -110,18 +147,27 @@ spec:
 {{- if .Values.priorityClassName }}
       priorityClassName: {{ .Values.priorityClassName }}
 {{- end }}
-      serviceAccountName: {{ template "teleport.serviceAccountName" . }}
+      serviceAccountName: {{ template "teleport-kube-agent.serviceAccountName" . }}
       {{- if .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml .Values.nodeSelector | nindent 8 }}
       {{- end }}
       containers:
       - name: "teleport"
-        image: "{{ if .Values.enterprise }}{{ .Values.enterpriseImage }}{{ else }}{{ .Values.image }}{{ end }}:{{ .teleportVersion }}"
+        image: {{ include "teleport-kube-agent.image" . | quote }}
         {{- if .Values.imagePullPolicy }}
         imagePullPolicy: {{ toYaml .Values.imagePullPolicy }}
         {{- end }}
         env:
+        {{- $gomemlimit := include "teleport-kube-agent.gomemlimit" . }}
+        {{- if $gomemlimit }}
+          - name: GOMEMLIMIT
+            value: {{ $gomemlimit | quote }}
+        {{- end }}
+          # This variable is set for telemetry purposes.
+          # Telemetry is opt-in and controlled at the auth level.
+          - name: TELEPORT_INSTALL_METHOD_HELM_KUBE_AGENT
+            value: "true"
           - name: TELEPORT_REPLICA_NAME
             valueFrom:
               fieldRef:
@@ -132,12 +178,30 @@ spec:
                 fieldPath: metadata.namespace
           - name: RELEASE_NAME
             value: {{ .Release.Name }}
+          {{- if .Values.updater.enabled }}
+          - name: TELEPORT_EXT_UPGRADER
+            value: kube
+          - name: TELEPORT_EXT_UPGRADER_VERSION
+            value: {{ include "teleport-kube-agent.version" . }}
+          {{- end }}
+          {{- if .Values.clusterDomain }}
+          - name: TELEPORT_KUBE_CLUSTER_DOMAIN
+            value: {{ .Values.clusterDomain | quote }}
+          {{- end }}
           {{- if .Values.tls.existingCASecretName }}
           - name: SSL_CERT_FILE
-            value: /etc/teleport-tls-ca/ca.pem
+            value: "/etc/teleport-tls-ca/{{ required "tls.existingCASecretKeyName must be set if tls.existingCASecretName is set in chart values" .Values.tls.existingCASecretKeyName }}" 
           {{- end }}
           {{- if .Values.extraEnv }}
             {{- toYaml .Values.extraEnv | nindent 10 }}
+          {{- end }}
+          {{- if .Values.teleportClusterName }}
+          - name: KUBERNETES_TOKEN_PATH
+            value: /var/run/secrets/tokens/join-sa-token
+          {{- end }}
+          {{- if .Values.updater.enabled }}
+          - name: "TELEPORT_UPDATE_CONFIG_FILE"
+            value: "/etc/updater-config/update.yaml"
           {{- end }}
         args:
         - "--diag-addr=0.0.0.0:3000"
@@ -181,6 +245,11 @@ spec:
         - mountPath: /etc/teleport-secrets
           name: "auth-token"
           readOnly: true
+{{- if .Values.teleportClusterName }}
+        - mountPath: /var/run/secrets/tokens
+          name: join-sa-token
+          readOnly: true
+{{- end }}
 {{- if .Values.storage.enabled }}
         - mountPath: /var/lib/teleport
           name: "{{ .Release.Name }}-teleport-data"
@@ -193,8 +262,21 @@ spec:
           name: "teleport-tls-ca"
           readOnly: true
 {{- end }}
+{{- if contains "jamf" (.Values.roles | toString) }}
+        - mountPath: /etc/teleport-jamf-api-credentials
+          name: "jamf-api-credentials"
+          readOnly: true
+{{- end }}
+{{- if .Values.updater.enabled }}
+        - mountPath: /etc/updater-config
+          name: "updater-config"
+          readOnly: true
+{{- end }}
 {{- if .Values.extraVolumeMounts }}
   {{- toYaml .Values.extraVolumeMounts | nindent 8 }}
+{{- end }}
+{{- if .Values.extraContainers }}
+  {{- toYaml .Values.extraContainers | nindent 6 }}
 {{- end }}
       volumes:
       - name: "config"
@@ -202,7 +284,20 @@ spec:
           name: {{ .Release.Name }}
       - name: "auth-token"
         secret:
-          secretName: {{ .Values.secretName }}
+          secretName: {{ coalesce .Values.secretName .Values.joinTokenSecret.name }}
+      {{- if .Values.teleportClusterName }}
+      {{- /* This volume is used to obtain a service account token that can be used
+       to join the Teleport cluster using the kubernetes join method.
+       To ensure backward compatibility, we use .Values.teleportClusterName as a feature flag.
+       The token must have the cluster name as audience, and its TTL must not exceed 30 minutes. */}}
+      - name: join-sa-token
+        projected:
+          sources:
+            - serviceAccountToken:
+                path: join-sa-token
+                expirationSeconds: 600
+                audience: {{ .Values.teleportClusterName }}
+      {{- end }}
 {{- if not .Values.storage.enabled }}
       - name: "data"
         emptyDir: {}
@@ -211,6 +306,16 @@ spec:
       - name: "teleport-tls-ca"
         secret:
           secretName: {{ .Values.tls.existingCASecretName }}
+{{- end }}
+{{- if contains "jamf" (.Values.roles | toString) }}
+      - name: "jamf-api-credentials"
+        secret:
+          secretName: {{ .Values.jamfCredentialsSecret.name }}
+{{- end }}
+{{- if .Values.updater.enabled }}
+      - name: "updater-config"
+        configMap:
+          name: {{ .Release.Name }}-updater
 {{- end }}
 {{- if .Values.extraVolumes }}
   {{- toYaml .Values.extraVolumes | nindent 6 }}

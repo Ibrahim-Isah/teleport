@@ -1,49 +1,71 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+import { formatSortType } from 'design/DataTable/sort';
 import { SortType } from 'design/DataTable/types';
+import { ResourceHealthStatus } from 'shared/components/UnifiedResources';
 
-const ADVANCED_SEARCH_PARAM = 'query=';
-const SIMPLE_SEARCH_PARAM = 'search=';
-const SORT_SEARCH_PARAM = 'sort=';
+export type EncodeUrlQueryParamsProps = {
+  pathname: string;
+  searchString?: string;
+  sort?: SortType | null;
+  kinds?: string[] | null;
+  statuses?: ResourceHealthStatus[] | null;
+  isAdvancedSearch?: boolean;
+  pinnedOnly?: boolean;
+};
 
-export function encodeUrlQueryParams(
-  pathname: string,
-  searchString: string,
-  sort: SortType,
-  isAdvancedSearch: boolean
-) {
-  if (!searchString && !sort) {
-    return pathname;
-  }
-  const encodedQuery = encodeURIComponent(searchString);
+export function encodeUrlQueryParams({
+  pathname,
+  searchString = '',
+  sort,
+  kinds,
+  isAdvancedSearch = false,
+  pinnedOnly = false,
+  statuses,
+}: EncodeUrlQueryParamsProps) {
+  const urlParams = new URLSearchParams();
 
-  const searchParam = isAdvancedSearch
-    ? ADVANCED_SEARCH_PARAM
-    : SIMPLE_SEARCH_PARAM;
-
-  if (encodedQuery && !sort) {
-    return `${pathname}?${searchParam}${encodedQuery}`;
-  }
-
-  const sortParam = `${sort.fieldName}:${sort.dir.toLowerCase()}`;
-
-  if (!encodedQuery && sort) {
-    return `${pathname}?${SORT_SEARCH_PARAM}${sortParam}`;
+  if (searchString) {
+    urlParams.append(isAdvancedSearch ? 'query' : 'search', searchString);
   }
 
-  return `${pathname}?${searchParam}${encodedQuery}&${SORT_SEARCH_PARAM}${sortParam}`;
+  if (sort) {
+    urlParams.append('sort', formatSortType(sort));
+  }
+
+  if (pinnedOnly !== undefined) {
+    urlParams.append('pinnedOnly', `${pinnedOnly}`);
+  }
+
+  if (kinds) {
+    for (const kind of kinds) {
+      urlParams.append('kinds', kind);
+    }
+  }
+
+  if (statuses) {
+    for (const status of statuses) {
+      urlParams.append('status', status);
+    }
+  }
+
+  const encodedParams = urlParams.toString();
+
+  return encodedParams ? `${pathname}?${encodedParams}` : pathname;
 }

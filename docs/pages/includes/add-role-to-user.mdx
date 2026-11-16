@@ -1,129 +1,183 @@
-{{ role="myrole" }}
-Assign the `{{ role }}` role to your Teleport user by running the following
-commands, depending on whether you authenticate as a local Teleport user or via
-the `github`, `saml`, or `oidc` authentication connectors: 
+{{ role="myrole" user="your Teleport user" }}
+Assign the `{{ role }}` role to {{ user }}. The commands to run depend on how
+you authenticate to Teleport, that is, whether you have a local Teleport user, a
+single sign-on authentication connector, or a non-interactive user:
 
 <Tabs>
 <TabItem label="Local User">
 
-Retrieve your local user's configuration resource:
+1. Retrieve your local user's roles as a comma-separated list:
+   
+   ```code
+   $ ROLES=$(tsh status -f json | jq -r '.active.roles | join(",")')
+   ```
 
-```code
-$ tctl get users/$(tsh status -f json | jq -r '.active.username') > out.yaml
-```
+1. Edit your local user to add the new role:
 
-Edit `out.yaml`, adding `{{ role }}` to the list of existing roles:
+   ```code
+   $ tctl users update $(tsh status -f json | jq -r '.active.username') \
+     --set-roles "${ROLES?},{{ role }}"
+   ```
 
-```diff
-  roles:
-   - access
-   - auditor
-   - editor
-+  - {{ role }}
-```
-
-Apply your changes:
-
-```code
-$ tctl create -f out.yaml
-```
+1. Sign out of the Teleport cluster and sign in again to assume the new role.
 
 </TabItem>
 <TabItem label="GitHub">
 
-Retrieve your `github`  configuration resource:
+1. Open your `github` authentication connector in a text editor:
 
-```code
-$ tctl get github/github > github.yaml
-```
+   ```code
+   $ tctl edit github/github
+   ```
 
-Edit `github.yaml`, adding `{{ role }}` to the
-`teams_to_roles` section. The team you will map to this role will depend on how
-you have designed your organization's RBAC, but it should be the smallest team
-possible within your organization. This team must also include your user.
+1. Edit the `github` connector, adding `{{ role }}` to the `teams_to_roles` section. 
+   
+   The team you should map to this role depends on how you have designed your 
+   organization's role-based access controls (RBAC). However, the team must include your user account and
+   should be the smallest team possible within your organization.
 
-Here is an example:
+   Here is an example:
+   
+   ```diff
+     teams_to_roles:
+       - organization: octocats
+         team: admins
+         roles:
+           - access
+   +       - {{ role }}
+   ```
 
-```diff
-  teams_to_roles:
-    - organization: octocats 
-      team: admins 
-      roles:
-        - access
-+       - {{ role }}
-```
-
-Apply your changes:
-
-```code
-$ tctl create -f github.yaml
-```
+1. Apply your changes by saving and closing the file in your editor.
+   
+1. Sign out of the Teleport cluster and sign in again to assume the new role.
 
 </TabItem>
 <TabItem label="SAML">
 
-Retrieve your `saml`  configuration resource:
+1. Retrieve your `saml`  configuration resource:
 
-```code
-$ tctl get saml/mysaml > saml.yaml
-```
+   ```code
+   $ tctl get --with-secrets saml/mysaml > saml.yaml
+   ```
 
-Edit `saml.yaml`, adding `{{ role }}` to the
-`attributes_to_roles` section. The attribute you will map to this role will
-depend on how you have designed your organization's RBAC, but it should be the
-smallest group possible within your organization. This group must also include
-your user.
+   Note that the `--with-secrets` flag adds the value of `spec.signing_key_pair.private_key` 
+   to the `saml.yaml` file. Because this key contains a sensitive value, you should remove the 
+   saml.yaml file immediately after updating the resource.
 
-Here is an example:
+1. Edit `saml.yaml`, adding `{{ role }}` to the `attributes_to_roles` section. 
+   
+   The attribute you should map to this role depends on how you have designed your 
+   organization's role-based access controls (RBAC). However, the group must include your 
+   user account and should be the smallest group possible within your organization.
+   
+   Here is an example:
+   
+   ```diff
+     attributes_to_roles:
+       - name: "groups"
+         value: "my-group"
+         roles:
+           - access
+   +       - {{ role }}
+   ```
 
-```diff
-  attributes_to_roles:
-    - name: "groups" 
-      value: "my-group" 
-      roles:
-        - access
-+       - {{ role }}
-```
+1. Apply your changes:
 
-Apply your changes:
+   ```code
+   $ tctl create -f saml.yaml
+   ```
 
-```code
-$ tctl create -f saml.yaml
-```
+1. Sign out of the Teleport cluster and sign in again to assume the new role.
 
 </TabItem>
 <TabItem label="OIDC">
 
-Retrieve your `oidc`  configuration resource:
+1. Retrieve your `oidc`  configuration resource:
+   
+   ```code
+   $ tctl get oidc/myoidc --with-secrets > oidc.yaml
+   ```
 
-```code
-$ tctl get oidc/myoidc > oidc.yaml
-```
+   Note that the `--with-secrets` flag adds the value of `spec.signing_key_pair.private_key` 
+   to the `oidc.yaml` file. Because this key contains a sensitive value, you should remove the 
+   oidc.yaml file immediately after updating the resource.
 
-Edit `oidc.yaml`, adding `{{ role }}` to the
-`claims_to_roles` section. The claim you will map to this role will depend on
-how you have designed your organization's RBAC, but it should be the smallest
-group possible within your organization. This group must also include your
-user.
+1. Edit `oidc.yaml`, adding `{{ role }}` to the `claims_to_roles` section. 
 
-Here is an example:
+   The claim you should map to this role depends on how you have designed your organization's 
+   role-based access controls (RBAC). However, the group must include your user account and
+   should be the smallest group possible within your organization.
 
-```diff
-  claims_to_roles:
-    - name: "groups" 
-      value: "my-group" 
-      roles:
-        - access
-+       - {{ role }}
-```
+   Here is an example:
 
-Apply your changes:
+   ```diff
+     claims_to_roles:
+       - name: "groups"
+         value: "my-group"
+         roles:
+           - access
+   +       - {{ role }}
+   ```
 
-```code
-$ tctl create -f saml.yaml
-```
+1. Apply your changes:
+
+   ```code
+   $ tctl create -f oidc.yaml
+   ```
+
+1. Sign out of the Teleport cluster and sign in again to assume the new role.
+
+</TabItem>
+<TabItem label="Non-Interactive">
+
+For non-interactive users such as AI agents and CI/CD runners, follow these
+steps.
+
+If you are using Machine ID to issue identity files to your user:
+
+1. Add the new role to your bot. Assign <Var name="mybot" /> to the name of the
+   Machine ID bot that issues your certificate:
+
+   ```code
+   $ tctl bots update <Var name="mybot" /> --add-roles {{ role }}
+   ```
+
+1. Force `tbot` to regenerate the certificate:
+
+   ```code
+   $ pkill -HUP tbot
+   ```
+
+   The bot will also generate a certificate with the new role on its next
+   renewal.
+
+Otherwise, update your user and regenerate your identity file:
+
+1. Retrieve your local user's roles as a comma-separated list. Make sure
+   <Var name="username" /> is the Teleport user you want to assign the new role
+   to.
+
+   ```code
+   $ ROLES=$(tctl get user/<Var name="username" /> --format=json | jq -r '.[].spec.roles | join(",")')
+   ```
+
+1. Edit your local user to add the new role:
+
+   ```code
+   $ tctl users update <Var name="username" /> \
+     --set-roles "${ROLES?},{{ role }}"
+   ```
+
+1. Regenerate the identity file. Make sure <Var name="path/to/identity/file" />
+   corresponds to the correct output path:
+
+   ```code
+   $ tctl auth sign \
+     --user=<Var name="username" /> \
+     --out=<Var name="path/to/identity/file" /> \
+     --overwrite
+   ```
 
 </TabItem>
 </Tabs>
 
-Log out of your Teleport cluster and log in again to assume the new role.

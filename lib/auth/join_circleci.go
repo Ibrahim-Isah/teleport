@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -20,53 +22,35 @@ import (
 	"context"
 
 	"github.com/gravitational/trace"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/circleci"
+	"github.com/gravitational/teleport/lib/join/circleci"
 )
 
-func (a *Server) checkCircleCIJoinRequest(ctx context.Context, req *types.RegisterUsingTokenRequest) (*circleci.IDTokenClaims, error) {
-	if req.IDToken == "" {
-		return nil, trace.BadParameter("IDToken not provided for %q join request", types.JoinMethodCircleCI)
-	}
-	pt, err := a.GetToken(ctx, req.Token)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	token, ok := pt.(*types.ProvisionTokenV2)
-	if !ok {
-		return nil, trace.BadParameter("%q join method only support ProvisionTokenV2, '%T' was provided", types.JoinMethodCircleCI, pt)
-	}
-
-	claims, err := a.circleCITokenValidate(
-		ctx,
-		token.Spec.CircleCI.OrganizationID,
-		req.IDToken,
-	)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return claims, trace.Wrap(checkCircleCIAllowRules(token, claims))
+// GetCircleCITokenValidate returns the currently configured CircleCI OIDC token
+// validator.
+func (a *Server) GetCircleCITokenValidator() circleci.Validator {
+	return a.circleCITokenValidate
 }
 
-func checkCircleCIAllowRules(token *types.ProvisionTokenV2, claims *circleci.IDTokenClaims) error {
-	// If a single rule passes, accept the IDToken
-	for _, rule := range token.Spec.CircleCI.Allow {
-		if rule.ProjectID != "" && claims.ProjectID != rule.ProjectID {
-			continue
-		}
+// SetCircleCITokenValidate sets the CircleCI OIDC token validator
+// implementation. Used in tests.
+func (a *Server) SetCircleCITokenValidator(validator circleci.Validator) {
+	a.circleCITokenValidate = validator
+}
 
-		// If ContextID is specified in rule, it must be contained in the slice
-		// of ContextIDs within the claims.
-		if rule.ContextID != "" && !slices.Contains(claims.ContextIDs, rule.ContextID) {
-			continue
-		}
+func (a *Server) checkCircleCIJoinRequest(
+	ctx context.Context,
+	req *types.RegisterUsingTokenRequest,
+	pt types.ProvisionToken,
+) (*circleci.IDTokenClaims, error) {
+	claims, err := circleci.CheckIDToken(ctx, &circleci.CheckIDTokenParams{
+		ProvisionToken: pt,
+		IDToken:        []byte(req.IDToken),
+		Validator:      a.circleCITokenValidate,
+	})
 
-		// All provided rules met.
-		return nil
-	}
-
-	return trace.AccessDenied("id token claims did not match any allow rules")
+	// Note: try to return claims even if there was an error, they may provide
+	// useful auditing context.
+	return claims, trace.Wrap(err)
 }

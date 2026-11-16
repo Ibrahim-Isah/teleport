@@ -32,17 +32,63 @@ func TestLinear(t *testing.T) {
 		Max:  3 * time.Second,
 	})
 	require.NoError(t, err)
-	require.Equal(t, r.Duration(), time.Duration(0))
+	testLinear(t, r)
+}
+
+func TestLinearV2(t *testing.T) {
+	t.Parallel()
+
+	r2, err := NewRetryV2(RetryV2Config{
+		Driver: NewLinearDriver(time.Second),
+		Max:    3 * time.Second,
+	})
+	require.NoError(t, err)
+	testLinear(t, r2)
+}
+
+func testLinear(t *testing.T, r Retry) {
+	require.Equal(t, time.Duration(0), r.Duration())
 	r.Inc()
-	require.Equal(t, r.Duration(), time.Second)
+	require.Equal(t, time.Second, r.Duration())
 	r.Inc()
-	require.Equal(t, r.Duration(), 2*time.Second)
+	require.Equal(t, 2*time.Second, r.Duration())
 	r.Inc()
-	require.Equal(t, r.Duration(), 3*time.Second)
+	require.Equal(t, 3*time.Second, r.Duration())
 	r.Inc()
-	require.Equal(t, r.Duration(), 3*time.Second)
+	require.Equal(t, 3*time.Second, r.Duration())
 	r.Reset()
-	require.Equal(t, r.Duration(), time.Duration(0))
+	require.Equal(t, time.Duration(0), r.Duration())
+}
+
+func TestExponential(t *testing.T) {
+	t.Parallel()
+
+	r, err := NewRetryV2(RetryV2Config{
+		Driver: NewExponentialDriver(time.Second),
+		Max:    12 * time.Second,
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, time.Duration(0), r.Duration())
+	r.Inc()
+	require.Equal(t, time.Second, r.Duration())
+	r.Inc()
+	require.Equal(t, 2*time.Second, r.Duration())
+	r.Inc()
+	require.Equal(t, 4*time.Second, r.Duration())
+	r.Inc()
+	require.Equal(t, 8*time.Second, r.Duration())
+	r.Inc()
+	// should hit configured maximum
+	require.Equal(t, 12*time.Second, r.Duration())
+	r.Reset()
+	require.Equal(t, time.Duration(0), r.Duration())
+
+	// verify that exponentiation is capped s.t. we don't wrap
+	for i := 0; i < 128; i++ {
+		r.Inc()
+		require.True(t, r.Duration() > 0 && r.Duration() <= time.Second*12)
+	}
 }
 
 func TestLinearRetryMax(t *testing.T) {
@@ -59,7 +105,7 @@ func TestLinearRetryMax(t *testing.T) {
 				First:  time.Second * 45,
 				Step:   time.Second * 30,
 				Max:    time.Minute,
-				Jitter: NewFullJitter(),
+				Jitter: FullJitter,
 			},
 			previousCompareFn: require.NotEqual,
 		},
@@ -69,7 +115,7 @@ func TestLinearRetryMax(t *testing.T) {
 				First:  time.Second * 45,
 				Step:   time.Second * 30,
 				Max:    time.Minute,
-				Jitter: NewHalfJitter(),
+				Jitter: HalfJitter,
 			},
 			previousCompareFn: require.NotEqual,
 		},
@@ -79,7 +125,7 @@ func TestLinearRetryMax(t *testing.T) {
 				First:  time.Second * 45,
 				Step:   time.Second * 30,
 				Max:    time.Minute,
-				Jitter: NewSeventhJitter(),
+				Jitter: SeventhJitter,
 			},
 			previousCompareFn: require.NotEqual,
 		},

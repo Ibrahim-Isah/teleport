@@ -1,5 +1,7 @@
 {{- $auth := mustMergeOverwrite (mustDeepCopy .Values) .Values.auth -}}
 {{- $replicated := gt (int $auth.highAvailability.replicaCount) 1 -}}
+{{- $projectedServiceAccountToken := semverCompare ">=1.20.0-0" .Capabilities.KubeVersion.Version }}
+{{- $topologySpreadConstraints := and (semverCompare ">=1.18.0-0" .Capabilities.KubeVersion.Version) (not $auth.disableTopologySpreadConstraints) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,6 +10,9 @@ metadata:
   labels:
     {{- include "teleport-cluster.auth.labels" . | nindent 4 }}
     app: {{ .Release.Name }}
+    {{- if $auth.extraLabels.deployment }}
+    {{- toYaml $auth.extraLabels.deployment | nindent 4 }}
+    {{- end }}
 {{- if $auth.annotations.deployment }}
   annotations: {{- toYaml $auth.annotations.deployment | nindent 4 }}
 {{- end }}
@@ -42,9 +47,32 @@ spec:
       labels:
         {{- include "teleport-cluster.auth.labels" . | nindent 8 }}
         app: {{ .Release.Name }}
+        {{- if $auth.extraLabels.pod }}
+        {{- toYaml $auth.extraLabels.pod | nindent 8 }}
+        {{- end }}
+{{- if eq $auth.chartMode "azure"}}
+        azure.workload.identity/use: "true"
+{{- end }}
     spec:
 {{- if $auth.nodeSelector }}
       nodeSelector: {{- toYaml $auth.nodeSelector | nindent 8 }}
+{{- end }}
+{{- if $topologySpreadConstraints }}
+  {{- if $auth.topologySpreadConstraints }}
+      topologySpreadConstraints: {{- toYaml $auth.topologySpreadConstraints | nindent 8 }}
+  {{- else }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "teleport-cluster.auth.selectorLabels" . | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "teleport-cluster.auth.selectorLabels" . | nindent 14 }}
+  {{- end }}
 {{- end }}
       affinity:
 {{- if $auth.affinity }}
@@ -65,7 +93,7 @@ spec:
                   - key: app.kubernetes.io/component
                     operator: In
                     values:
-                      - proxy
+                      - auth
               topologyKey: "kubernetes.io/hostname"
   {{- else if $replicated }}
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -80,12 +108,16 @@ spec:
                     - key: app.kubernetes.io/component
                       operator: In
                       values:
-                        - proxy
+                        - auth
                 topologyKey: "kubernetes.io/hostname"
   {{- end }}
 {{- end }}
 {{- if $auth.tolerations }}
       tolerations: {{- toYaml $auth.tolerations | nindent 6 }}
+{{- end }}
+{{- if $auth.imagePullSecrets }}
+      imagePullSecrets:
+  {{- toYaml $auth.imagePullSecrets | nindent 6 }}
 {{- end }}
 {{- if $auth.initContainers }}
       initContainers:
@@ -111,6 +143,11 @@ spec:
             readOnly: true
           - mountPath: /var/lib/teleport
             name: "data"
+    {{- if $projectedServiceAccountToken }}
+          - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+            name: auth-serviceaccount-token
+            readOnly: true
+    {{- end }}
     {{- if $auth.extraVolumeMounts }}
       {{- toYaml $auth.extraVolumeMounts | nindent 10 }}
     {{- end }}
@@ -118,16 +155,21 @@ spec:
 {{- end }}
       containers:
       - name: "teleport"
-        image: '{{ if $auth.enterprise }}{{ $auth.enterpriseImage }}{{ else }}{{ $auth.image }}{{ end }}:{{ include "teleport-cluster.version" . }}'
+        image: '{{ if $auth.enterprise }}{{ $auth.enterpriseImage }}{{ else }}{{ $auth.image }}{{ end }}:{{ include "teleport-util-lib.version" . }}'
         imagePullPolicy: {{ $auth.imagePullPolicy }}
-        {{- if or $auth.extraEnv $auth.tls.existingCASecretName }}
+        {{- $gomemlimit := include "teleport-util-lib.gomemlimit" $auth }}
+        {{- if or $auth.extraEnv $auth.tls.existingCASecretName $gomemlimit }}
         env:
+        {{- if $gomemlimit }}
+        - name: GOMEMLIMIT
+          value: {{ $gomemlimit | quote }}
+        {{- end }}
         {{- if (gt (len $auth.extraEnv) 0) }}
           {{- toYaml $auth.extraEnv | nindent 8 }}
         {{- end }}
         {{- if $auth.tls.existingCASecretName }}
         - name: SSL_CERT_FILE
-          value: /etc/teleport-tls-ca/ca.pem
+          value: "/etc/teleport-tls-ca/{{ required "tls.existingCASecretKeyName must be set if tls.existingCASecretName is set in chart values" .Values.tls.existingCASecretKeyName }}" 
         {{- end }}
         {{- end }}
         args:
@@ -158,15 +200,16 @@ spec:
           initialDelaySeconds: 5 # wait 5s for agent to start
           periodSeconds: 5 # poll health every 5s
           failureThreshold: 6 # consider agent unhealthy after 30s (6 * 5s)
-          timeoutSeconds: {{ .Values.probeTimeoutSeconds }}
+          timeoutSeconds: {{ $auth.probeTimeoutSeconds }}
         readinessProbe:
           httpGet:
             path: /readyz
             port: diag
-          initialDelaySeconds: 5 # wait 5s for agent to register
-          periodSeconds: 5 # poll health every 5s
-          failureThreshold: 12 # consider agent unhealthy after 60s (12 * 5s)
-          timeoutSeconds: {{ .Values.probeTimeoutSeconds }}
+          initialDelaySeconds: {{ $auth.readinessProbe.initialDelaySeconds }}
+          periodSeconds: {{ $auth.readinessProbe.periodSeconds }}
+          failureThreshold: {{$auth.readinessProbe.failureThreshold}}
+          successThreshold: {{$auth.readinessProbe.successThreshold}}
+          timeoutSeconds: {{ $auth.probeTimeoutSeconds }}
         lifecycle:
           # waiting during preStop ensures no new request will hit the Terminating pod
           # on clusters using kube-proxy (kube-proxy syncs the node iptables rules every 30s)
@@ -210,41 +253,44 @@ spec:
           readOnly: true
         - mountPath: /var/lib/teleport
           name: "data"
+{{- if $projectedServiceAccountToken }}
+        - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          name: auth-serviceaccount-token
+          readOnly: true
+{{- end }}
 {{- if $auth.extraVolumeMounts }}
   {{- toYaml $auth.extraVolumeMounts | nindent 8 }}
 {{- end }}
-{{- /* Operator uses '.Values' instead of '$auth' as it will likely be moved out of the auth pods */}}
-{{- if .Values.operator.enabled }}
-      - name: "operator"
-        image: '{{ .Values.operator.image }}:{{ include "teleport-cluster.version" . }}'
-        imagePullPolicy: {{ .Values.imagePullPolicy }}
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: 8081
-          initialDelaySeconds: 15
-          periodSeconds: 20
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: 8081
-          initialDelaySeconds: 5
-          periodSeconds: 10
-  {{- if .Values.operator.resources }}
-        resources: {{- toYaml .Values.operator.resources | nindent 10 }}
-  {{- end }}
-        volumeMounts:
-        - mountPath: /etc/teleport
-          name: "config"
-          readOnly: true
-        - mountPath: /var/lib/teleport
-          name: "data"
-{{ end }}
+{{- if $auth.extraContainers }}
+  {{- toYaml $auth.extraContainers | nindent 6 }}
+{{- end }}
+{{- if $projectedServiceAccountToken }}
+      automountServiceAccountToken: false
+{{- end }}
       volumes:
+{{- if $projectedServiceAccountToken }}
+      # This projected token volume mimics the `automountServiceAccountToken`
+      # behaviour but defaults to a 1h TTL instead of 1y.
+      - name: auth-serviceaccount-token
+        projected:
+          sources:
+            - serviceAccountToken:
+                path: token
+            - configMap:
+                items:
+                - key: ca.crt
+                  path: ca.crt
+                name: kube-root-ca.crt
+            - downwardAPI:
+                items:
+                  - path: "namespace"
+                    fieldRef:
+                      fieldPath: metadata.namespace
+{{- end }}
 {{- if $auth.enterprise }}
       - name: license
         secret:
-          secretName: "license"
+          secretName: {{ $auth.licenseSecretName | quote }}
 {{- end }}
 {{- if and ($auth.gcp.credentialSecretName) (eq $auth.chartMode "gcp") }}
       - name: gcp-credentials
@@ -260,7 +306,7 @@ spec:
         configMap:
           name: {{ .Release.Name }}-auth
       - name: "data"
-        {{- if and ($auth.persistence.enabled) ( and (not (eq $auth.chartMode "gcp")) (not (eq $auth.chartMode "aws"))) }}
+        {{- if and ($auth.persistence.enabled) ( and (not (eq $auth.chartMode "gcp")) (not (eq $auth.chartMode "aws")) (not (eq $auth.chartMode "azure"))) }}
         persistentVolumeClaim:
           claimName: {{ if $auth.persistence.existingClaimName }}{{ $auth.persistence.existingClaimName }}{{ else }}{{ .Release.Name }}{{ end }}
         {{- else }}
@@ -271,6 +317,9 @@ spec:
 {{- end }}
 {{- if $auth.priorityClassName }}
       priorityClassName: {{ $auth.priorityClassName }}
+{{- end }}
+{{- if $auth.podSecurityContext }}
+      securityContext: {{- toYaml $auth.podSecurityContext | nindent 8 }}
 {{- end }}
       serviceAccountName: {{ include "teleport-cluster.auth.serviceAccountName" . }}
       terminationGracePeriodSeconds: {{ $auth.terminationGracePeriodSeconds }}

@@ -17,7 +17,10 @@ limitations under the License.
 package sshutils
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
+	"fmt"
 	"net"
 
 	"github.com/gravitational/trace"
@@ -26,17 +29,29 @@ import (
 	"github.com/gravitational/teleport/api/constants"
 )
 
+type FIPSError struct {
+	message string
+}
+
+func (f *FIPSError) Error() string {
+	return f.message
+}
+
+func newFIPSError(message string, args ...any) error {
+	return &FIPSError{fmt.Sprintf("FIPS: "+message, args...)}
+}
+
 // CertChecker is a drop-in replacement for ssh.CertChecker. In FIPS mode,
 // checks if the certificate (or key) were generated with a supported algorithm.
 type CertChecker struct {
 	ssh.CertChecker
 
 	// FIPS means in addition to checking the validity of the key or
-	// certificate, also check that FIPS 140-2 algorithms were used.
+	// certificate, also check that FIPS algorithms were used.
 	FIPS bool
 
 	// OnCheckCert is called when validating host certificate.
-	OnCheckCert func(*ssh.Certificate)
+	OnCheckCert func(*ssh.Certificate) error
 }
 
 // Authenticate checks the validity of a user certificate.
@@ -67,7 +82,9 @@ func (c *CertChecker) CheckCert(principal string, cert *ssh.Certificate) error {
 	}
 
 	if c.OnCheckCert != nil {
-		c.OnCheckCert(cert)
+		if err := c.OnCheckCert(cert); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 
 	return nil
@@ -86,7 +103,9 @@ func (c *CertChecker) CheckHostKey(addr string, remote net.Addr, key ssh.PublicK
 	}
 
 	if cert, ok := key.(*ssh.Certificate); ok && c.OnCheckCert != nil {
-		c.OnCheckCert(cert)
+		if err := c.OnCheckCert(cert); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 
 	return nil
@@ -117,14 +136,23 @@ func (c *CertChecker) validateFIPS(key ssh.PublicKey) error {
 func validateFIPSAlgorithm(key ssh.PublicKey) error {
 	cryptoKey, ok := key.(ssh.CryptoPublicKey)
 	if !ok {
-		return trace.BadParameter("unable to determine underlying public key")
+		return trace.Wrap(newFIPSError("unable to determine underlying public key"))
 	}
-	k, ok := cryptoKey.CryptoPublicKey().(*rsa.PublicKey)
-	if !ok {
-		return trace.BadParameter("only RSA keys supported")
-	}
-	if k.N.BitLen() != constants.RSAKeySize {
-		return trace.BadParameter("found %v-bit key, only %v-bit supported", k.N.BitLen(), constants.RSAKeySize)
+	switch k := cryptoKey.CryptoPublicKey().(type) {
+	case *rsa.PublicKey:
+		if k.N.BitLen() != constants.RSAKeySize {
+			return trace.Wrap(newFIPSError("found %v-bit RSA key, only %v-bit supported", k.N.BitLen(), constants.RSAKeySize))
+		}
+	case *ecdsa.PublicKey:
+		if k.Curve != elliptic.P256() && k.Curve != elliptic.P384() {
+			params := k.Curve.Params()
+			if params == nil {
+				return trace.BadParameter("unable to determine curve of ECDSA public key")
+			}
+			return trace.Wrap(newFIPSError("found ECDSA key with curve %s, only P-256 and P-384 are supported", params.Name))
+		}
+	default:
+		return trace.Wrap(newFIPSError("only RSA and ECDSA keys supported"))
 	}
 	return nil
 }

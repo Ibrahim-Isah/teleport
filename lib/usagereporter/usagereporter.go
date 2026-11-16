@@ -1,30 +1,31 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package usagereporter
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
-	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 )
@@ -93,8 +94,8 @@ type SubmittedEvent[T any] struct {
 }
 
 type UsageReporter[T any] struct {
-	// Entry is a log entry
-	*logrus.Entry
+	// logger  writes log messages
+	logger *slog.Logger
 
 	// clock is the clock used for the main batching goroutine
 	clock clockwork.Clock
@@ -121,7 +122,8 @@ type UsageReporter[T any] struct {
 	// maxBatchSize is the maximum size of a batch that may be sent at once.
 	maxBatchSize int
 
-	// maxBatchAge is the
+	// maxBatchAge is the maximum time we're going to wait before we send a
+	// batch, no matter how small it is.
 	maxBatchAge time.Duration
 
 	// maxBufferSize is the maximum number of events that can be queued in the
@@ -153,44 +155,47 @@ func (r *UsageReporter[T]) runSubmit(ctx context.Context) {
 	defer r.wg.Done()
 
 	for {
+		var batch []*SubmittedEvent[T]
+		var ok bool
 		select {
 		case <-ctx.Done():
 			return
-		case batch, ok := <-r.submissionQueue:
-			if !ok {
-				return
-			}
-			t0 := time.Now()
-
-			if failed, err := r.submit(r, batch); err != nil {
-				r.WithField("batch_size", len(batch)).Warnf("failed to submit batch of usage events: %v", err)
-				usageBatchesFailed.Inc()
-
-				var resubmit []*SubmittedEvent[T]
-				for _, e := range failed {
-					e.retriesRemaining--
-
-					if e.retriesRemaining > 0 {
-						resubmit = append(resubmit, e)
-					}
-				}
-
-				droppedCount := len(failed) - len(resubmit)
-				if droppedCount > 0 {
-					r.WithField("dropped_count", droppedCount).Warnf("dropping events due to error: %+v", err)
-					usageEventsDropped.Add(float64(droppedCount))
-				}
-
-				// Put the failed events back on the queue.
-				r.resubmitEvents(resubmit)
-			} else {
-				usageBatchesSubmitted.Inc()
-
-				r.WithField("batch_size", len(batch)).Debug("successfully submitted batch of usage events")
-			}
-
-			usageBatchSubmissionDuration.Observe(time.Since(t0).Seconds())
+		case batch, ok = <-r.submissionQueue:
 		}
+		if !ok {
+			return
+		}
+
+		t0 := time.Now()
+
+		if failed, err := r.submit(r, batch); err != nil {
+			r.logger.WarnContext(ctx, "failed to submit batch of usage events", "batch_size", len(batch), "error", err)
+			usageBatchesFailed.Inc()
+
+			var resubmit []*SubmittedEvent[T]
+			for _, e := range failed {
+				e.retriesRemaining--
+
+				if e.retriesRemaining > 0 {
+					resubmit = append(resubmit, e)
+				}
+			}
+
+			droppedCount := len(failed) - len(resubmit)
+			if droppedCount > 0 {
+				r.logger.WarnContext(ctx, "dropping events due to error", "dropped_count", droppedCount, "error", err)
+				usageEventsDropped.Add(float64(droppedCount))
+			}
+
+			// Put the failed events back on the queue.
+			r.resubmitEvents(resubmit)
+		} else {
+			usageBatchesSubmitted.Inc()
+
+			r.logger.DebugContext(ctx, "successfully submitted batch of usage events", "batch_size", len(batch))
+		}
+
+		usageBatchSubmissionDuration.Observe(time.Since(t0).Seconds())
 
 		// Always sleep a bit to avoid spamming the server. We need a secondary
 		// (possibly fake) clock here for testing to ensure
@@ -199,45 +204,7 @@ func (r *UsageReporter[T]) runSubmit(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-r.submitClock.After(r.submitDelay):
-			continue
 		}
-	}
-}
-
-// enqueueBatch prepares a batch for submission, removing it from the buffer and
-// adding it to the submission queue.
-func (r *UsageReporter[T]) enqueueBatch() {
-	if len(r.buf) == 0 {
-		// Nothing to do.
-		return
-	}
-
-	var events []*SubmittedEvent[T]
-	var remaining []*SubmittedEvent[T]
-	if len(r.buf) > r.maxBatchSize {
-		// Split the request and send the first batch. Any remaining events will
-		// sit in the buffer to send with the next batch.
-		events = r.buf[:r.maxBatchSize]
-		remaining = r.buf[r.maxBatchSize:]
-	} else {
-		// The event buf is small enough to send in one request. We'll replace
-		// the buf to allow any excess memory from the last buf to be GC'd.
-		events = r.buf
-		remaining = make([]*SubmittedEvent[T], 0, r.minBatchSize)
-	}
-
-	select {
-	case r.submissionQueue <- events:
-		// Wrote to the queue successfully, so swap buf with the shortened one.
-		r.buf = remaining
-
-		usageBatchesTotal.Inc()
-
-		r.WithField("batch_size", len(events)).Debug("enqueued batch of usage events")
-	default:
-		// The queue is full, we'll try again later. Leave the existing buf in
-		// place.
-		r.WithField("batch_size", len(r.buf)).Debug("waiting to submit batch due to full queue")
 	}
 }
 
@@ -264,41 +231,102 @@ func (r *UsageReporter[T]) GracefulStop(ctx context.Context) error {
 // Run begins processing incoming usage events. It should be run in a goroutine.
 func (r *UsageReporter[T]) Run(ctx context.Context) {
 	defer r.wg.Done()
+
+	splitBuffer := func() (batch []*SubmittedEvent[T], rest []*SubmittedEvent[T]) {
+		if len(r.buf) > r.maxBatchSize {
+			return r.buf[:r.maxBatchSize], r.buf[r.maxBatchSize:]
+		}
+		return r.buf, nil
+	}
+
+	// minBatchSize is the current minimum batch size, set to either 1 or to
+	// r.minBatchSize depending on the batch age timer
+	minBatchSize := r.minBatchSize
+
+	// timer is the "batch age" timer, which triggers early batch submissions by
+	// setting the minBatchSize to 1 temporarily. It should only be running if
+	// r.buf is nonempty.
 	timer := r.clock.NewTimer(r.maxBatchAge)
+	defer timer.Stop()
+	if len(r.buf) == 0 {
+		if !timer.Stop() {
+			<-timer.Chan()
+		}
+	}
 
 	// Also start the submission goroutine.
 	r.wg.Add(1)
 	go r.runSubmit(ctx)
 	defer close(r.submissionQueue)
 
-	r.Debug("usage reporter is ready")
+	r.logger.DebugContext(ctx, "usage reporter is ready")
 
 	for {
+		var subQueue chan []*SubmittedEvent[T]
+		var subBatch, subRest []*SubmittedEvent[T]
+		if len(r.buf) >= minBatchSize {
+			subQueue = r.submissionQueue
+			subBatch, subRest = splitBuffer()
+		}
+
 		select {
 		case <-ctx.Done():
+			if len(r.buf) > 0 {
+				r.logger.WarnContext(ctx, "dropped events due to context close", "discarded_count", len(r.buf))
+			}
 			return
-		case <-r.eventsClosed:
-			r.enqueueBatch()
-			return
-		case <-timer.Chan():
-			// Once the timer triggers, send any non-empty batch.
-			timer.Reset(r.maxBatchAge)
-			r.enqueueBatch()
-		case events := <-r.events:
-			// If the buffer's already full, just warn and discard.
-			if len(r.buf) >= r.maxBufferSize {
-				r.WithField("discarded_count", len(events)).Warn("usage event buffer is full, events will be discarded")
 
-				usageEventsDropped.Add(float64(len(events)))
-				break
+		case <-r.eventsClosed:
+			for len(r.buf) > 0 {
+				subBatch, subRest := splitBuffer()
+				select {
+				case <-ctx.Done():
+					r.logger.WarnContext(ctx, "dropped events due to context close during graceful stop", "discarded_count", len(r.buf))
+					return
+				case r.submissionQueue <- subBatch:
+					usageBatchesTotal.Inc()
+					r.logger.DebugContext(ctx, "enqueued batch of usage events during graceful stop", "batch_size", len(subBatch))
+					r.buf = subRest
+				}
+			}
+			return
+
+		case <-timer.Chan():
+			minBatchSize = 1
+
+		case subQueue <- subBatch:
+			usageBatchesTotal.Inc()
+			r.logger.DebugContext(ctx, "enqueued batch of usage events", "batch_size", len(subBatch))
+			r.buf = subRest
+			minBatchSize = r.minBatchSize
+
+			if !timer.Stop() {
+				select {
+				case <-timer.Chan():
+				default:
+				}
+			}
+			if len(r.buf) > 0 {
+				timer.Reset(r.maxBatchAge)
 			}
 
+		case events := <-r.events:
 			if len(r.buf)+len(events) > r.maxBufferSize {
-				keep := r.maxBufferSize - len(r.buf)
-				r.WithField("discarded_count", len(events)-keep).Warn("usage event buffer is full, events will be discarded")
+				keep := max(r.maxBufferSize-len(r.buf), 0)
+
+				r.logger.WarnContext(ctx, "usage event buffer is full, events will be discarded", "discarded_count", len(events)-keep)
 				events = events[:keep]
 
 				usageEventsDropped.Add(float64(len(events) - keep))
+			}
+
+			if len(events) == 0 {
+				break
+			}
+
+			// about to become nonempty
+			if len(r.buf) == 0 {
+				timer.Reset(r.maxBatchAge)
 			}
 
 			r.buf = append(r.buf, events...)
@@ -306,16 +334,6 @@ func (r *UsageReporter[T]) Run(ctx context.Context) {
 			// call the receiver if any
 			if r.receiveFunc != nil {
 				r.receiveFunc()
-			}
-
-			// If we've accumulated enough events to trigger an early send, do
-			// so and reset the timer.
-			if len(r.buf) >= r.minBatchSize {
-				if !timer.Stop() {
-					<-timer.Chan()
-				}
-				timer.Reset(r.maxBatchAge)
-				r.enqueueBatch()
 			}
 		}
 	}
@@ -331,7 +349,13 @@ func (r *UsageReporter[T]) AddEventsToQueue(events ...*T) {
 	}
 
 	usageEventsSubmitted.Add(float64(len(events)))
-	r.submitEvents(submitted)
+	// this should not be a separate goroutine, but under high load it's
+	// possible to get noticeable contention (up to the hundreds of
+	// milliseconds) when sending to the events channel, so for the user-facing
+	// method we just spawn a short-lived goroutine for this
+	//
+	// TODO(espadolini): fix the usagereporter logic so that this is not needed
+	go r.submitEvents(submitted)
 }
 
 // resubmitEvents resubmits events that have already been processed (in case of
@@ -349,8 +373,8 @@ func (r *UsageReporter[T]) submitEvents(events []*SubmittedEvent[T]) {
 }
 
 type Options[T any] struct {
-	Log logrus.FieldLogger
-	//Submit is a func that submits a batch of usage events.
+	Logger *slog.Logger
+	// Submit is a func that submits a batch of usage events.
 	Submit SubmitFunc[T]
 	// MinBatchSize determines the size at which a batch is sent
 	// regardless of elapsed time.
@@ -382,8 +406,8 @@ type Options[T any] struct {
 // NewUsageReporter creates a new usage reporter. `Run()` must be executed to
 // process incoming events.
 func NewUsageReporter[T any](options *Options[T]) *UsageReporter[T] {
-	if options.Log == nil {
-		options.Log = logrus.StandardLogger()
+	if options.Logger == nil {
+		options.Logger = slog.Default()
 	}
 	if options.Clock == nil {
 		options.Clock = clockwork.NewRealClock()
@@ -393,10 +417,7 @@ func NewUsageReporter[T any](options *Options[T]) *UsageReporter[T] {
 	}
 
 	reporter := &UsageReporter[T]{
-		Entry: options.Log.WithField(
-			trace.Component,
-			teleport.Component(teleport.ComponentUsageReporting),
-		),
+		logger:          options.Logger.With(teleport.ComponentKey, teleport.ComponentUsageReporting),
 		events:          make(chan []*SubmittedEvent[T], 1),
 		submissionQueue: make(chan []*SubmittedEvent[T], 1),
 		eventsClosed:    make(chan struct{}),
@@ -415,5 +436,4 @@ func NewUsageReporter[T any](options *Options[T]) *UsageReporter[T] {
 	reporter.wg.Add(1)
 
 	return reporter
-
 }

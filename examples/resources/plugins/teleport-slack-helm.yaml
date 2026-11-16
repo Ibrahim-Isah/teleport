@@ -1,11 +1,15 @@
-teleport: {}
-  # address: "teleportauth:3025"                        # Teleport Auth Server GRPC API address
-  # identitySecretName: teleport-plugin-slack-identity  # Secret containing identity
+teleport:
+  # Teleport HTTPS Proxy Web Address, for Teleport Enterprise Cloud should be in the form "your-account.teleport.sh:443"
+  address: ""
+  # Secret containing identity, e.g., teleport-plugin-slack-identity
+  identitySecretName: ""
+  # Path within the secret containing the identity file.
+  identitySecretPath: ""
 
 slack:
-  token: "xoxb-11xx"  # Slack Bot OAuth token
+  token: ""  # Slack Bot OAuth token
 
 # Mapping from role to recipients
-roleToRecipients: []
+roleToRecipients: {}
   # "dev": "devs-slack-channel"
   # "*": ["admin@email.com", "admin-slack-channel"]

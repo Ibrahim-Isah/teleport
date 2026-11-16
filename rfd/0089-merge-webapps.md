@@ -55,7 +55,7 @@ the webapps folder is an elegant way of approaching this issue
 
 ### Backports
 
-To avoid having different proceses and build systems depending on the version
+To avoid having different processes and build systems depending on the version
 of teleport, all supported release branches (v10, v11, v12) will have their
 respective versions of the webapps repository merged.
 
@@ -155,7 +155,7 @@ build systems to successfully build Teleport.
 - [ ] Update [the default path to tsh in dev mode](https://github.com/gravitational/webapps/blob/27c615b3ff6f317a85fac4aa28b8e73fa4aa0d28/packages/teleterm/src/mainProcess/runtimeSettings.ts#L18-L23) for Connect.
 - [ ] Update the `README.md` to indicate that this repository is no longer the
       source of truth and instead link to the `teleport` repo. Due to us needing
-      topotentially update older releases we are not able to archive the
+      to potentially update older releases we are not able to archive the
       repository at this time. We can revisit this in 6mo.
 
 ### Webapps.e repository
@@ -195,7 +195,7 @@ build systems to successfully build Teleport.
       the correct version in the `teleport.e/web` folder.
 - [ ] Only require teleport build processes to run on teleport paths and the webapp
       ones to run on the webapp paths
-- [ ] Update Connect's build pipelines (in teleport/dronegen) as webapps will no longer need to be cloned.
+- [ ] Update Connect's build pipelines as webapps will no longer need to be cloned.
 
 #### CI jobs
 

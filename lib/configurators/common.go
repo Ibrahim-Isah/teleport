@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package configurators
 
@@ -18,10 +22,54 @@ import (
 	"context"
 )
 
+// TargetService is the target service for bootstrapping.
+type TargetService int
+
+const (
+	// DatabaseService indicates the bootstrap is for database service. Cloud
+	// matchers and static databases are scanned from `database_service` and
+	// both discovery and access/auth permissions will be collected.
+	DatabaseService TargetService = iota
+	// DiscoveryService indicates the bootstrap is for discovery service. Cloud
+	// matchers are scanned from `discovery_service` and discovery permissions
+	// will be collected.
+	DiscoveryService
+	// DatabaseServiceByDiscoveryServiceConfig indicates the bootstrap is for
+	// database service that is receiving dynamic/discovered resources from the
+	// discovery service. Cloud matchers are scanned from `discovery_service`
+	// and access/auth permissions will be collected.
+	DatabaseServiceByDiscoveryServiceConfig
+)
+
+// Name returns the target service name.
+func (t TargetService) Name() string {
+	switch t {
+	case DatabaseService,
+		DatabaseServiceByDiscoveryServiceConfig:
+		return "Database Service"
+	case DiscoveryService:
+		return "Discovery Service"
+	default:
+		return "unknown service"
+	}
+}
+
+// IsDiscovery returns true if target is discovery service.
+func (t TargetService) IsDiscovery() bool {
+	return t == DiscoveryService
+}
+
+// UseDiscoveryServiceConfig returns true if target is using discovery service
+// config.
+func (t TargetService) UseDiscoveryServiceConfig() bool {
+	return t == DiscoveryService || t == DatabaseServiceByDiscoveryServiceConfig
+}
+
 // BootstrapFlags flags provided by users to configure and define how the
 // configurators will work.
 type BootstrapFlags struct {
-	DiscoveryService bool
+	// Service specifies the target service for bootstrapping.
+	Service TargetService
 	// ConfigPath database agent configuration path.
 	ConfigPath string
 	// Manual boolean indicating if the configurator will perform the
@@ -43,10 +91,28 @@ type BootstrapFlags struct {
 	ForceRedshiftServerlessPermissions bool
 	// ForceElastiCachePermissions forces the presence of ElastiCache permissions.
 	ForceElastiCachePermissions bool
+	// ForceElastiCacheServerlessPermissions forces the presence of ElastiCacheServerless permissions.
+	ForceElastiCacheServerlessPermissions bool
 	// ForceMemoryDBPermissions forces the presence of MemoryDB permissions.
 	ForceMemoryDBPermissions bool
 	// ForceEC2Permissions forces the presence of EC2 permissions.
 	ForceEC2Permissions bool
+	// ForceAWSKeyspacesPermissions forces the presence of AWS Keyspaces permissions.
+	ForceAWSKeyspacesPermissions bool
+	// ForceDynamoDBPermissions forces the presence of DynamoDB permissions.
+	ForceDynamoDBPermissions bool
+	// ForceOpenSearchPermissions forces the presence of OpenSearch permissions.
+	ForceOpenSearchPermissions bool
+	// ForceDocumentDBPermissions forces the presence of DocumentDB permissions.
+	ForceDocumentDBPermissions bool
+	// Proxy is the address of the Teleport proxy to use.
+	Proxy string
+	// ForceAssumesRoles forces the presence of additional external AWS IAM roles to assume.
+	ForceAssumesRoles string
+	// AssumeRoleARN is the ARN of the role to assume while bootstrapping.
+	AssumeRoleARN string
+	// ExternalID is the external ID to use when assuming a role.
+	ExternalID string
 }
 
 // ConfiguratorActionContext context passed across configurator actions. It is
@@ -54,8 +120,6 @@ type BootstrapFlags struct {
 type ConfiguratorActionContext struct {
 	// AWSPolicyArn AWS ARN of the created policy.
 	AWSPolicyArn string
-	// AWS ARN of the created policy boundary.
-	AWSPolicyBoundaryArn string
 }
 
 // ConfiguratorAction is single configurator action, its details can be retrieved
@@ -85,6 +149,8 @@ type Configurator interface {
 	Actions() []ConfiguratorAction
 	// Name returns the configurator name.
 	Name() string
+	// Description returns a brief description of the configurator.
+	Description() string
 	// IsEmpty defines if the configurator will have to perform any action.
 	IsEmpty() bool
 }

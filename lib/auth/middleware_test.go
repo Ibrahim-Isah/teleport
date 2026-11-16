@@ -1,308 +1,301 @@
 /*
-Copyright 2020 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-package auth
+package auth_test
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
+	"fmt"
+	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/coreos/go-semver/semver"
+	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/metadata"
 
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authtest"
+	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
-func TestMiddlewareGetUser(t *testing.T) {
+type fakeConn struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (f *fakeConn) Close() error {
+	f.closed.CompareAndSwap(false, true)
+	return nil
+}
+
+func (f *fakeConn) RemoteAddr() net.Addr {
+	return &utils.NetAddr{
+		Addr:        "127.0.0.1:6514",
+		AddrNetwork: "tcp",
+	}
+}
+
+func TestValidateClientVersion(t *testing.T) {
 	t.Parallel()
-	const (
-		localClusterName  = "local"
-		remoteClusterName = "remote"
-	)
-	s := newTestServices(t)
-	// Set up local cluster name in the backend.
-	cn, err := services.NewClusterNameWithRandomID(types.ClusterNameSpecV2{
-		ClusterName: localClusterName,
-	})
-	require.NoError(t, err)
-	require.NoError(t, s.UpsertClusterName(cn))
-
-	now := time.Date(2020, time.November, 5, 0, 0, 0, 0, time.UTC)
-
-	var (
-		localUserIdentity = tlsca.Identity{
-			Username:        "foo",
-			Groups:          []string{"devs"},
-			TeleportCluster: localClusterName,
-			Expires:         now,
-		}
-		localUserIdentityNoTeleportCluster = tlsca.Identity{
-			Username: "foo",
-			Groups:   []string{"devs"},
-			Expires:  now,
-		}
-		localSystemRole = tlsca.Identity{
-			Username:        "node",
-			Groups:          []string{string(types.RoleNode)},
-			TeleportCluster: localClusterName,
-			Expires:         now,
-		}
-		remoteUserIdentity = tlsca.Identity{
-			Username:        "foo",
-			Groups:          []string{"devs"},
-			TeleportCluster: remoteClusterName,
-			Expires:         now,
-		}
-		remoteUserIdentityNoTeleportCluster = tlsca.Identity{
-			Username: "foo",
-			Groups:   []string{"devs"},
-			Expires:  now,
-		}
-		remoteSystemRole = tlsca.Identity{
-			Username:        "node",
-			Groups:          []string{string(types.RoleNode)},
-			TeleportCluster: remoteClusterName,
-			Expires:         now,
-		}
-	)
-
-	tests := []struct {
-		desc      string
-		peers     []*x509.Certificate
-		wantID    IdentityGetter
-		assertErr require.ErrorAssertionFunc
+	cases := []struct {
+		name          string
+		middleware    *auth.Middleware
+		clientVersion string
+		errAssertion  func(t *testing.T, err error)
 	}{
 		{
-			desc: "no client cert",
-			wantID: BuiltinRole{
-				Role:        types.RoleNop,
-				Username:    string(types.RoleNop),
-				ClusterName: localClusterName,
-				Identity:    tlsca.Identity{},
+			name:       "rejection disabled",
+			middleware: &auth.Middleware{},
+			errAssertion: func(t *testing.T, err error) {
+				require.NoError(t, err)
 			},
-			assertErr: require.NoError,
 		},
 		{
-			desc: "local user",
-			peers: []*x509.Certificate{{
-				Subject:  subject(t, localUserIdentity),
-				NotAfter: now,
-				Issuer:   pkix.Name{Organization: []string{localClusterName}},
-			}},
-			wantID: LocalUser{
-				Username: localUserIdentity.Username,
-				Identity: localUserIdentity,
+			name:       "rejection enabled and client version not specified",
+			middleware: &auth.Middleware{OldestSupportedVersion: teleport.MinClientSemVer()},
+			errAssertion: func(t *testing.T, err error) {
+				require.NoError(t, err)
 			},
-			assertErr: require.NoError,
 		},
 		{
-			desc: "local user no teleport cluster in cert subject",
-			peers: []*x509.Certificate{{
-				Subject:  subject(t, localUserIdentityNoTeleportCluster),
-				NotAfter: now,
-				Issuer:   pkix.Name{Organization: []string{localClusterName}},
-			}},
-			wantID: LocalUser{
-				Username: localUserIdentity.Username,
-				Identity: localUserIdentity,
+			name:          "client rejected",
+			middleware:    &auth.Middleware{OldestSupportedVersion: teleport.MinClientSemVer()},
+			clientVersion: semver.Version{Major: api.VersionMajor - 2}.String(),
+			errAssertion: func(t *testing.T, err error) {
+				require.True(t, trace.IsAccessDenied(err), "got %T, expected access denied error", err)
 			},
-			assertErr: require.NoError,
 		},
 		{
-			desc: "local system role",
-			peers: []*x509.Certificate{{
-				Subject:  subject(t, localSystemRole),
-				NotAfter: now,
-				Issuer:   pkix.Name{Organization: []string{localClusterName}},
-			}},
-			wantID: BuiltinRole{
-				Username:    localSystemRole.Username,
-				Role:        types.RoleNode,
-				ClusterName: localClusterName,
-				Identity:    localSystemRole,
+			name:          "valid client v-1",
+			middleware:    &auth.Middleware{OldestSupportedVersion: teleport.MinClientSemVer()},
+			clientVersion: semver.Version{Major: api.VersionMajor - 1}.String(),
+			errAssertion: func(t *testing.T, err error) {
+				require.NoError(t, err)
 			},
-			assertErr: require.NoError,
 		},
 		{
-			desc: "remote user",
-			peers: []*x509.Certificate{{
-				Subject:  subject(t, remoteUserIdentity),
-				NotAfter: now,
-				Issuer:   pkix.Name{Organization: []string{remoteClusterName}},
-			}},
-			wantID: RemoteUser{
-				ClusterName: remoteClusterName,
-				Username:    remoteUserIdentity.Username,
-				RemoteRoles: remoteUserIdentity.Groups,
-				Identity:    remoteUserIdentity,
+			name:          "valid client v-0",
+			middleware:    &auth.Middleware{OldestSupportedVersion: teleport.MinClientSemVer()},
+			clientVersion: semver.Version{Major: api.VersionMajor}.String(),
+			errAssertion: func(t *testing.T, err error) {
+				require.NoError(t, err)
 			},
-			assertErr: require.NoError,
 		},
 		{
-			desc: "remote user no teleport cluster in cert subject",
-			peers: []*x509.Certificate{{
-				Subject:  subject(t, remoteUserIdentityNoTeleportCluster),
-				NotAfter: now,
-				Issuer:   pkix.Name{Organization: []string{remoteClusterName}},
-			}},
-			wantID: RemoteUser{
-				ClusterName: remoteClusterName,
-				Username:    remoteUserIdentity.Username,
-				RemoteRoles: remoteUserIdentity.Groups,
-				Identity:    remoteUserIdentity,
+			name:          "invalid client version",
+			middleware:    &auth.Middleware{OldestSupportedVersion: teleport.MinClientSemVer()},
+			clientVersion: "abc123",
+			errAssertion: func(t *testing.T, err error) {
+				require.True(t, trace.IsAccessDenied(err), "got %T, expected access denied error", err)
 			},
-			assertErr: require.NoError,
 		},
 		{
-			desc: "remote system role",
-			peers: []*x509.Certificate{{
-				Subject:  subject(t, remoteSystemRole),
-				NotAfter: now,
-				Issuer:   pkix.Name{Organization: []string{remoteClusterName}},
-			}},
-			wantID: RemoteBuiltinRole{
-				Username:    remoteSystemRole.Username,
-				Role:        types.RoleNode,
-				ClusterName: remoteClusterName,
-				Identity:    remoteSystemRole,
+			name:          "pre-release client allowed",
+			middleware:    &auth.Middleware{OldestSupportedVersion: teleport.MinClientSemVer()},
+			clientVersion: semver.Version{Major: api.VersionMajor - 1, PreRelease: "dev.abcd.123"}.String(),
+			errAssertion: func(t *testing.T, err error) {
+				require.NoError(t, err)
 			},
-			assertErr: require.NoError,
+		},
+		{
+			name:          "pre-release client rejected",
+			middleware:    &auth.Middleware{OldestSupportedVersion: teleport.MinClientSemVer()},
+			clientVersion: semver.Version{Major: api.VersionMajor - 2, PreRelease: "dev.abcd.123"}.String(),
+			errAssertion: func(t *testing.T, err error) {
+				require.True(t, trace.IsAccessDenied(err), "got %T, expected access denied error", err)
+			},
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.desc, func(t *testing.T) {
 
-			m := &Middleware{
-				ClusterName: localClusterName,
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tt.clientVersion != "" {
+				ctx = metadata.NewIncomingContext(ctx, metadata.New(map[string]string{"version": tt.clientVersion}))
 			}
 
-			id, err := m.GetUser(tls.ConnectionState{PeerCertificates: tt.peers})
-			tt.assertErr(t, err)
-			if err != nil {
-				return
-			}
-			require.Empty(t, cmp.Diff(id, tt.wantID, cmpopts.EquateEmpty()))
+			tt.errAssertion(t, tt.middleware.ValidateClientVersion(ctx, auth.IdentityInfo{Conn: &fakeConn{}, IdentityGetter: authtest.TestBuiltin(types.RoleNode).I}))
 		})
 	}
 }
 
-// testConn is a connection that implements utils.TLSConn for testing WrapContextWithUser.
-type testConn struct {
-	tls.Conn
-
-	state           tls.ConnectionState
-	handshakeCalled bool
-}
-
-func (t *testConn) ConnectionState() tls.ConnectionState   { return t.state }
-func (t *testConn) Handshake() error                       { t.handshakeCalled = true; return nil }
-func (t *testConn) HandshakeContext(context.Context) error { return t.Handshake() }
-
-func TestWrapContextWithUser(t *testing.T) {
-	localClusterName := "local"
-	s := newTestServices(t)
-
-	// Set up local cluster name in the backend.
-	cn, err := services.NewClusterNameWithRandomID(types.ClusterNameSpecV2{
-		ClusterName: localClusterName,
-	})
-	require.NoError(t, err)
-	require.NoError(t, s.UpsertClusterName(cn))
-
-	now := time.Date(2020, time.November, 5, 0, 0, 0, 0, time.UTC)
-	localUserIdentity := tlsca.Identity{
-		Username:        "foo",
-		Groups:          []string{"devs"},
-		TeleportCluster: localClusterName,
-		Expires:         now,
+func TestRejectedClientClusterAlertContents(t *testing.T) {
+	t.Parallel()
+	var alerts []types.ClusterAlert
+	mw := auth.Middleware{
+		OldestSupportedVersion: teleport.MinClientSemVer(),
+		AlertCreator: func(ctx context.Context, a types.ClusterAlert) error {
+			alerts = append(alerts, a)
+			return nil
+		},
 	}
+
+	alertVersion := semver.Version{
+		Major: mw.OldestSupportedVersion.Major,
+		Minor: mw.OldestSupportedVersion.Minor,
+		Patch: mw.OldestSupportedVersion.Patch,
+	}.String()
+
+	version := semver.Version{Major: api.VersionMajor - 5}.String()
 
 	tests := []struct {
-		desc           string
-		peers          []*x509.Certificate
-		wantID         IdentityGetter
-		needsHandshake bool
+		name      string
+		userAgent string
+		identity  authz.IdentityGetter
+		expected  string
 	}{
 		{
-			desc: "local user doesn't need handshake",
-			peers: []*x509.Certificate{{
-				Subject:  subject(t, localUserIdentity),
-				NotAfter: now,
-				Issuer:   pkix.Name{Organization: []string{localClusterName}},
-			}},
-			wantID: LocalUser{
-				Username: localUserIdentity.Username,
-				Identity: localUserIdentity,
-			},
-			needsHandshake: false,
+			name:     "invalid node",
+			identity: authtest.TestServerID(types.RoleNode, "1-2-3-4").I,
+			expected: fmt.Sprintf("Connection from Node 1-2-3-4 at 127.0.0.1:6514, running an unsupported version of v%s was rejected. Connections will be allowed after upgrading the agent to v%s or newer", version, alertVersion),
 		},
 		{
-			desc: "local user needs handshake",
-			peers: []*x509.Certificate{{
-				Subject:  subject(t, localUserIdentity),
-				NotAfter: now,
-				Issuer:   pkix.Name{Organization: []string{localClusterName}},
-			}},
-			wantID: LocalUser{
-				Username: localUserIdentity.Username,
-				Identity: localUserIdentity,
+			name:      "invalid tsh",
+			userAgent: "tsh/" + teleport.Version,
+			identity:  authtest.TestUser("llama").I,
+			expected:  fmt.Sprintf("Connection from tsh v%s by llama was rejected. Connections will be allowed after upgrading tsh to v%s or newer", version, alertVersion),
+		},
+		{
+			name: "invalid remote node",
+			identity: authz.RemoteBuiltinRole{
+				Role:        types.RoleNode,
+				Username:    string(types.RoleNode),
+				ClusterName: "leaf",
+				Identity: tlsca.Identity{
+					Username: "1-2-3-4",
+				},
 			},
-			needsHandshake: true,
+			expected: fmt.Sprintf("Connection from Node 1-2-3-4 at 127.0.0.1:6514 in cluster leaf, running an unsupported version of v%s was rejected. Connections will be allowed after upgrading the agent to v%s or newer", version, alertVersion),
+		},
+
+		{
+			name:     "invalid tool",
+			identity: authtest.TestUser("llama").I,
+			expected: fmt.Sprintf("Connection from tsh, tctl, tbot, or a plugin running v%s by llama was rejected. Connections will be allowed after upgrading to v%s or newer", version, alertVersion),
 		},
 	}
 
-	clusterName, err := s.GetClusterName()
-	require.NoError(t, err)
-	for _, tt := range tests {
-		t.Run(tt.desc, func(t *testing.T) {
-			m := &Middleware{
-				ClusterName: clusterName.GetClusterName(),
-			}
+	// Trigger alerts from a variety of identities and validate the content of emitted alerts.
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
 
-			conn := &testConn{
-				state: tls.ConnectionState{PeerCertificates: tt.peers,
-					HandshakeComplete: !tt.needsHandshake},
-			}
+			ctx := metadata.NewIncomingContext(context.Background(), metadata.New(map[string]string{
+				"version":    version,
+				"user-agent": test.userAgent,
+			}))
 
-			parentCtx := context.Background()
-			ctx, err := m.WrapContextWithUser(parentCtx, conn)
-			require.NoError(t, err)
-			require.Equal(t, tt.needsHandshake, conn.handshakeCalled)
+			err := mw.ValidateClientVersion(ctx, auth.IdentityInfo{Conn: &fakeConn{}, IdentityGetter: test.identity})
+			assert.Error(t, err)
 
-			cert := ctx.Value(contextUserCertificate)
-			user := ctx.Value(ContextUser)
-			require.Empty(t, cmp.Diff(cert, tt.peers[0], cmpopts.EquateEmpty()))
-			require.Empty(t, cmp.Diff(user, tt.wantID, cmpopts.EquateEmpty()))
+			// Assert that only an alert was created and the content matches expectations.
+			require.Len(t, alerts, 1)
+			require.Equal(t, "rejected-unsupported-connection", alerts[0].GetName())
+			require.Equal(t, test.expected, alerts[0].Spec.Message)
+
+			// Reset the test alerts.
+			alerts = nil
+
+			// Reset the last alert time to a time beyond the rate limit, allowing the next
+			// rejection to trigger another alert.
+			mw.SetLastRejectedTime(time.Now().Add(-25 * time.Hour))
 		})
 	}
 }
 
-// Helper func for generating fake certs.
-func subject(t *testing.T, id tlsca.Identity) pkix.Name {
-	s, err := id.Subject()
-	require.NoError(t, err)
-	// ExtraNames get moved to Names when generating a real x509 cert.
-	// Since we're just mimicking certs in memory, move manually.
-	s.Names = s.ExtraNames
-	return s
+func TestRejectedClientClusterAlert(t *testing.T) {
+	t.Parallel()
+	var alerts []types.ClusterAlert
+	mw := auth.Middleware{
+		OldestSupportedVersion: teleport.MinClientSemVer(),
+		AlertCreator: func(ctx context.Context, a types.ClusterAlert) error {
+			alerts = append(alerts, a)
+			return nil
+		},
+	}
+
+	// Validate an unsupported client, which should trigger an alert
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.New(map[string]string{
+		"version": semver.Version{Major: api.VersionMajor - 20}.String(),
+	}))
+	err := mw.ValidateClientVersion(ctx, auth.IdentityInfo{Conn: &fakeConn{}, IdentityGetter: authtest.TestBuiltin(types.RoleNode).I})
+	assert.Error(t, err)
+
+	// Validate a client with an unknown version, which should trigger an alert, however,
+	// due to rate limiting of 1 alert per 24h no alert should be created.
+	ctx = metadata.NewIncomingContext(context.Background(), metadata.New(map[string]string{
+		"version": "abcd",
+	}))
+	err = mw.ValidateClientVersion(ctx, auth.IdentityInfo{Conn: &fakeConn{}, IdentityGetter: authtest.TestBuiltin(types.RoleNode).I})
+	assert.Error(t, err)
+
+	// Assert that only a single alert was created based on the above rejections.
+	require.Len(t, alerts, 1)
+	require.Equal(t, "rejected-unsupported-connection", alerts[0].GetName())
+	// Assert that the version in the message does not contain any prereleases
+	require.NotContains(t, alerts[0].Spec.Message, "-aa")
+
+	for _, tool := range []string{"tsh", "tctl", "tbot"} {
+		t.Run(tool, func(t *testing.T) {
+			// Reset the test alerts.
+			alerts = nil
+
+			// Reset the last alert time to a time beyond the rate limit, allowing the next
+			// rejection to trigger another alert.
+			mw.SetLastRejectedTime(time.Now().Add(-25 * time.Hour))
+
+			// Create a new context with the user-agent set to a client tool. This should alter the
+			// text in the alert to indicate the connection was from a client tool and not an agent.
+			ctx = metadata.NewIncomingContext(context.Background(), metadata.New(map[string]string{
+				"version":    semver.Version{Major: api.VersionMajor - 20}.String(),
+				"user-agent": tool + "/" + teleport.Version,
+			}))
+
+			// Validate two unsupported clients in parallel to verify that concurrent attempts
+			// to create an alert are prevented.
+			var wg sync.WaitGroup
+			for range 2 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					err := mw.ValidateClientVersion(ctx, auth.IdentityInfo{Conn: &fakeConn{}, IdentityGetter: authtest.TestBuiltin(types.RoleNode).I})
+					assert.Error(t, err)
+				}()
+			}
+
+			wg.Wait()
+
+			// Assert that only a single additional alert was created and that
+			// it was created for clients and not agents.
+			require.Len(t, alerts, 1)
+			assert.Equal(t, "rejected-unsupported-connection", alerts[0].GetName())
+			require.Contains(t, alerts[0].Spec.Message, tool)
+			// Assert that the version in the message does not contain any prereleases
+			require.NotContains(t, alerts[0].Spec.Message, "-aa")
+		})
+	}
 }

@@ -1,33 +1,41 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package alpnproxy
 
 import (
 	"crypto/subtle"
+	"log/slog"
 	"net/http"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
+
+	"github.com/gravitational/teleport"
 )
 
 // AuthorizationCheckerMiddleware is a middleware that checks `Authorization` header of incoming requests.
 // If the header is missing, the request is passed through.
 // If it is present, the middleware checks it is a bearer token with value matching the secret.
 type AuthorizationCheckerMiddleware struct {
+	DefaultLocalProxyHTTPMiddleware
+
 	// Log is the Logger.
-	Log logrus.FieldLogger
+	Log *slog.Logger
 	// Secret is the expected value of a bearer token.
 	Secret string
 }
@@ -37,7 +45,7 @@ var _ LocalProxyHTTPMiddleware = (*AuthorizationCheckerMiddleware)(nil)
 // CheckAndSetDefaults checks configuration validity and sets defaults.
 func (m *AuthorizationCheckerMiddleware) CheckAndSetDefaults() error {
 	if m.Log == nil {
-		m.Log = logrus.WithField(trace.Component, "gcp")
+		m.Log = slog.With(teleport.ComponentKey, "authz")
 	}
 
 	if m.Secret == "" {
@@ -50,7 +58,7 @@ func (m *AuthorizationCheckerMiddleware) CheckAndSetDefaults() error {
 func (m *AuthorizationCheckerMiddleware) HandleRequest(rw http.ResponseWriter, req *http.Request) bool {
 	auth := req.Header.Get("Authorization")
 	if auth == "" {
-		m.Log.Debugf("No Authorization header present, ignoring request.")
+		m.Log.DebugContext(req.Context(), "No Authorization header present, ignoring request")
 		return false
 	}
 
@@ -62,8 +70,4 @@ func (m *AuthorizationCheckerMiddleware) HandleRequest(rw http.ResponseWriter, r
 	}
 
 	return false
-}
-
-func (m *AuthorizationCheckerMiddleware) HandleResponse(*http.Response) error {
-	return nil
 }

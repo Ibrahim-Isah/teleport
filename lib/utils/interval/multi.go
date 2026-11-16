@@ -1,25 +1,30 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package interval
 
 import (
 	"errors"
+	"slices"
 	"sync"
 	"time"
+
+	"github.com/jonboulle/clockwork"
 
 	"github.com/gravitational/teleport/api/utils/retryutils"
 )
@@ -37,6 +42,7 @@ import (
 // but it is still a potential source of bugs/confusion when transitioning to using this type from one
 // of the single-interval alternatives.
 type MultiInterval[T comparable] struct {
+	clock     clockwork.Clock
 	subs      []subIntervalEntry[T]
 	push      chan subIntervalEntry[T]
 	ch        chan Tick[T]
@@ -62,6 +68,12 @@ type SubInterval[T any] struct {
 	// Duration is the duration on which the interval "ticks" (if a jitter is
 	// applied, this represents the upper bound of the range).
 	Duration time.Duration
+
+	// VariableDuration, if supplied, replaces the 'Duration' paramater with a
+	// variable duration generator. Variable durations are used to calculate
+	// some heartbeat intervals so that the time between heartbeats scales up
+	// as concurrent load increases.
+	VariableDuration *VariableDuration
 
 	// FirstDuration is an optional special duration to be used for the first
 	// "tick" of the interval.  This duration is not jittered.
@@ -102,6 +114,9 @@ func (s *subIntervalEntry[T]) duration(now time.Time) time.Duration {
 
 func (s *subIntervalEntry[T]) reset(now time.Time) {
 	d := s.Duration
+	if s.VariableDuration != nil {
+		d = s.VariableDuration.Duration()
+	}
 	if s.Jitter != nil {
 		d = s.Jitter(d)
 	}
@@ -114,12 +129,17 @@ func (s *subIntervalEntry[T]) increment() {
 
 // NewMulti creates a new multi-interval instance.  This function panics on non-positive
 // interval durations (equivalent to time.NewTicker) or if no sub-intervals are provided.
-func NewMulti[T comparable](intervals ...SubInterval[T]) *MultiInterval[T] {
+func NewMulti[T comparable](clock clockwork.Clock, intervals ...SubInterval[T]) *MultiInterval[T] {
 	if len(intervals) == 0 {
 		panic(errors.New("empty sub-interval set for interval.NewMulti"))
 	}
 
+	if clock == nil {
+		clock = clockwork.NewRealClock()
+	}
+
 	interval := &MultiInterval[T]{
+		clock: clock,
 		subs:  make([]subIntervalEntry[T], 0, len(intervals)),
 		push:  make(chan subIntervalEntry[T]),
 		ch:    make(chan Tick[T], 1),
@@ -129,9 +149,9 @@ func NewMulti[T comparable](intervals ...SubInterval[T]) *MultiInterval[T] {
 	}
 
 	// check and initialize our sub-intervals.
-	now := time.Now()
+	now := clock.Now()
 	for _, sub := range intervals {
-		if sub.Duration <= 0 {
+		if sub.Duration <= 0 && (sub.VariableDuration == nil || sub.VariableDuration.Duration() <= 0) {
 			panic(errors.New("non-positive sub interval for interval.NewMulti"))
 		}
 		entry := subIntervalEntry[T]{
@@ -145,7 +165,7 @@ func NewMulti[T comparable](intervals ...SubInterval[T]) *MultiInterval[T] {
 
 	// start the timer in this goroutine to improve
 	// consistency of first tick.
-	timer := time.NewTimer(d)
+	timer := clock.NewTimer(d)
 
 	go interval.run(timer, key)
 
@@ -155,14 +175,14 @@ func NewMulti[T comparable](intervals ...SubInterval[T]) *MultiInterval[T] {
 // Push adds a new sub-interval, potentially overwriting an existing sub-interval with the same key.
 // This method panics on non-positive durations (equivalent to time.NewTicker).
 func (i *MultiInterval[T]) Push(sub SubInterval[T]) {
-	if sub.Duration <= 0 {
+	if sub.Duration <= 0 && (sub.VariableDuration == nil || sub.VariableDuration.Duration() <= 0) {
 		panic(errors.New("non-positive sub interval for MultiInterval.Push"))
 	}
 	entry := subIntervalEntry[T]{
 		SubInterval: sub,
 	}
 	// we initialize here in order to improve consistency of start time
-	entry.init(time.Now())
+	entry.init(i.clock.Now())
 	select {
 	case i.push <- entry:
 	case <-i.done:
@@ -246,7 +266,7 @@ func (i *MultiInterval[T]) pushEntry(entry subIntervalEntry[T]) {
 	i.subs = append(i.subs, entry)
 }
 
-func (i *MultiInterval[T]) run(timer *time.Timer, key T) {
+func (i *MultiInterval[T]) run(timer clockwork.Timer, key T) {
 	defer timer.Stop()
 
 	var pending pendingTicks[T]
@@ -265,7 +285,7 @@ func (i *MultiInterval[T]) run(timer *time.Timer, key T) {
 		}
 
 		select {
-		case t := <-timer.C:
+		case t := <-timer.Chan():
 			// increment the sub-interval for the current key
 			i.increment(key)
 
@@ -281,7 +301,7 @@ func (i *MultiInterval[T]) run(timer *time.Timer, key T) {
 			timer.Reset(d)
 
 		case resetKey := <-i.reset:
-			now := time.Now()
+			now := i.clock.Now()
 
 			// reset the sub-interval for the target key
 			i.resetEntry(now, resetKey)
@@ -296,14 +316,14 @@ func (i *MultiInterval[T]) run(timer *time.Timer, key T) {
 
 			// stop and drain timer
 			if !timer.Stop() {
-				<-timer.C
+				<-timer.Chan()
 			}
 
 			// apply the new duration
 			timer.Reset(d)
 
 		case fireKey := <-i.fire:
-			now := time.Now()
+			now := i.clock.Now()
 
 			// reset the sub-interval for the key we are firing
 			i.resetEntry(now, fireKey)
@@ -318,13 +338,13 @@ func (i *MultiInterval[T]) run(timer *time.Timer, key T) {
 
 			// stop and drain timer.
 			if !timer.Stop() {
-				<-timer.C
+				<-timer.Chan()
 			}
 
 			// re-set the timer
 			timer.Reset(d)
 		case entry := <-i.push:
-			now := time.Now()
+			now := i.clock.Now()
 
 			// add the new sub-interval entry
 			i.pushEntry(entry)
@@ -340,7 +360,7 @@ func (i *MultiInterval[T]) run(timer *time.Timer, key T) {
 
 			// stop and drain timer
 			if !timer.Stop() {
-				<-timer.C
+				<-timer.Chan()
 			}
 
 			// apply the new duration
@@ -369,10 +389,8 @@ type pendingTicks[T comparable] struct {
 
 func (p *pendingTicks[T]) add(now time.Time, key T) {
 	p.time = now
-	for _, k := range p.keys {
-		if k == key {
-			return
-		}
+	if slices.Contains(p.keys, key) {
+		return
 	}
 	p.keys = append(p.keys, key)
 }
@@ -390,7 +408,7 @@ func (p *pendingTicks[T]) next() (tick Tick[T], ok bool) {
 func (p *pendingTicks[T]) remove(key T) {
 	for idx := range p.keys {
 		if p.keys[idx] == key {
-			p.keys = append(p.keys[:idx], p.keys[idx+1:]...)
+			p.keys = slices.Delete(p.keys, idx, idx+1)
 			return
 		}
 	}

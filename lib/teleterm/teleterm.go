@@ -1,21 +1,26 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package teleterm
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -23,11 +28,15 @@ import (
 	"syscall"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
+	"github.com/jonboulle/clockwork"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/gravitational/teleport/api/utils/keys/piv"
+	"github.com/gravitational/teleport/lib/client"
+	libhwk "github.com/gravitational/teleport/lib/hardwarekey"
 	"github.com/gravitational/teleport/lib/teleterm/apiserver"
+	"github.com/gravitational/teleport/lib/teleterm/clusteridcache"
 	"github.com/gravitational/teleport/lib/teleterm/clusters"
 	"github.com/gravitational/teleport/lib/teleterm/daemon"
 )
@@ -43,28 +52,48 @@ func Serve(ctx context.Context, cfg Config) error {
 		return trace.Wrap(err)
 	}
 
+	clock := clockwork.NewRealClock()
+
+	// Prepare tshdEventsClient with lazy loading.
+	tshdEventsClient := daemon.NewTshdEventsClient(grpcCredentials.tshdEvents)
+
+	// Always use the direct YubiKey PIV service since Connect provides the best UX.
+	hwks := piv.NewYubiKeyService(tshdEventsClient.NewHardwareKeyPrompt())
+
 	storage, err := clusters.NewStorage(clusters.Config{
-		Dir:                cfg.HomeDir,
+		Clock:              clock,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
+		AddKeysToAgent:     cfg.AddKeysToAgent,
+		WebauthnLogin:      cfg.WebauthnLogin,
+		ClientStore:        client.NewFSClientStore(cfg.HomeDir, client.WithHardwareKeyService(hwks)),
 	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
+	clusterIDCache := &clusteridcache.Cache{}
+
 	daemonService, err := daemon.New(daemon.Config{
-		Storage:                         storage,
-		CreateTshdEventsClientCredsFunc: grpcCredentials.tshdEvents,
-		PrehogAddr:                      cfg.PrehogAddr,
+		Storage:          storage,
+		PrehogAddr:       cfg.PrehogAddr,
+		KubeconfigsDir:   cfg.KubeconfigsDir,
+		AgentsDir:        cfg.AgentsDir,
+		ClusterIDCache:   clusterIDCache,
+		TshdEventsClient: tshdEventsClient,
 	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	apiServer, err := apiserver.New(apiserver.Config{
-		HostAddr:        cfg.Addr,
-		Daemon:          daemonService,
-		TshdServerCreds: grpcCredentials.tshd,
-		ListeningC:      cfg.ListeningC,
+		HostAddr:           cfg.Addr,
+		InsecureSkipVerify: cfg.InsecureSkipVerify,
+		Daemon:             daemonService,
+		TshdServerCreds:    grpcCredentials.tshd,
+		ListeningC:         cfg.ListeningC,
+		ClusterIDCache:     clusterIDCache,
+		InstallationID:     cfg.InstallationID,
+		Clock:              clock,
 	})
 	if err != nil {
 		return trace.Wrap(err)
@@ -76,6 +105,20 @@ func Serve(ctx context.Context, cfg Config) error {
 		serverAPIWait <- err
 	}()
 
+	var hardwareKeyAgentServer *libhwk.Server
+	if cfg.HardwareKeyAgent {
+		hardwareKeyAgentServer, err = libhwk.NewAgentServer(ctx, hwks, libhwk.DefaultAgentDir(), storage.ClientStore.KnownHardwareKey)
+		if err != nil {
+			slog.WarnContext(ctx, "failed to create the hardware key agent server", "err", err)
+		} else {
+			go func() {
+				if err := hardwareKeyAgentServer.Serve(ctx); err != nil {
+					slog.WarnContext(ctx, "hardware key agent server error", "err", err)
+				}
+			}()
+		}
+	}
+
 	// Wait for shutdown signals
 	go func() {
 		shutdownSignals := []os.Signal{os.Interrupt, syscall.SIGTERM}
@@ -84,13 +127,17 @@ func Serve(ctx context.Context, cfg Config) error {
 
 		select {
 		case <-ctx.Done():
-			log.Info("Context closed, stopping service.")
+			slog.InfoContext(ctx, "Context closed, stopping service")
 		case sig := <-c:
-			log.Infof("Captured %s, stopping service.", sig)
+			slog.InfoContext(ctx, "Captured signal, stopping service", "signal", sig)
 		}
 
 		daemonService.Stop()
 		apiServer.Stop()
+
+		if hardwareKeyAgentServer != nil {
+			hardwareKeyAgentServer.Stop()
+		}
 	}()
 
 	errAPI := <-serverAPIWait
@@ -120,21 +167,25 @@ func createGRPCCredentials(tshdServerAddress string, certsDir string) (*grpcCred
 	}
 
 	rendererCertPath := filepath.Join(certsDir, rendererCertFileName)
+	mainProcessCertPath := filepath.Join(certsDir, mainProcessCertFileName)
 	tshdCertPath := filepath.Join(certsDir, tshdCertFileName)
 	tshdKeyPair, err := generateAndSaveCert(tshdCertPath)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	// rendererCertPath will be read on an incoming client connection so we can assume that at this
-	// point the renderer process has saved its public key under that path.
-	tshdCreds, err := createServerCredentials(tshdKeyPair, rendererCertPath)
+	tshdCreds, err := createServerCredentials(
+		tshdKeyPair,
+		// Client certs will be read on an incoming connection.  The client setup in the Electron app is
+		// orchestrated in a way where the client saves its cert to disk before initiating a connection.
+		[]string{rendererCertPath, mainProcessCertPath},
+	)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	// To create client creds, we need to read the server cert. However, at this point we'd need to
-	// wait for the Electron app to save the cert under rendererCertPath.
+	// To create client creds for tshd events service, we need to read the server cert. However, at
+	// this point we'd need to wait for the Electron app to save the cert under rendererCertPath.
 	//
 	// Instead of waiting for it, we're going to capture the logic in a function that's going to be
 	// called after the Electron app calls UpdateTshdEventsServerAddress of the Terminal service.

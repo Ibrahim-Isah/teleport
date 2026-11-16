@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gcp
 
@@ -126,7 +130,7 @@ func TestProjectIDFromServiceAccountName(t *testing.T) {
 			name:           "empty string",
 			serviceAccount: "",
 			want:           "",
-			wantErr: func(t require.TestingT, err error, i ...interface{}) {
+			wantErr: func(t require.TestingT, err error, i ...any) {
 				require.ErrorContains(t, err, "invalid service account format: empty string received")
 			},
 		},
@@ -134,7 +138,7 @@ func TestProjectIDFromServiceAccountName(t *testing.T) {
 			name:           "missing @",
 			serviceAccount: "test",
 			want:           "",
-			wantErr: func(t require.TestingT, err error, i ...interface{}) {
+			wantErr: func(t require.TestingT, err error, i ...any) {
 				require.ErrorContains(t, err, "invalid service account format: missing @")
 			},
 		},
@@ -142,7 +146,7 @@ func TestProjectIDFromServiceAccountName(t *testing.T) {
 			name:           "missing domain after @",
 			serviceAccount: "test@",
 			want:           "",
-			wantErr: func(t require.TestingT, err error, i ...interface{}) {
+			wantErr: func(t require.TestingT, err error, i ...any) {
 				require.ErrorContains(t, err, "invalid service account format: missing <project-id>.iam.gserviceaccount.com after @")
 			},
 		},
@@ -150,7 +154,7 @@ func TestProjectIDFromServiceAccountName(t *testing.T) {
 			name:           "missing user before @",
 			serviceAccount: "@project",
 			want:           "",
-			wantErr: func(t require.TestingT, err error, i ...interface{}) {
+			wantErr: func(t require.TestingT, err error, i ...any) {
 				require.ErrorContains(t, err, "invalid service account format: empty user")
 			},
 		},
@@ -158,7 +162,7 @@ func TestProjectIDFromServiceAccountName(t *testing.T) {
 			name:           "missing domain",
 			serviceAccount: "test@myproject-123456",
 			want:           "",
-			wantErr: func(t require.TestingT, err error, i ...interface{}) {
+			wantErr: func(t require.TestingT, err error, i ...any) {
 				require.ErrorContains(t, err, "invalid service account format: missing <project-id>.iam.gserviceaccount.com after @")
 			},
 		},
@@ -166,7 +170,7 @@ func TestProjectIDFromServiceAccountName(t *testing.T) {
 			name:           "wrong domain suffix",
 			serviceAccount: "test@myproject-123456.iam.gserviceaccount",
 			want:           "",
-			wantErr: func(t require.TestingT, err error, i ...interface{}) {
+			wantErr: func(t require.TestingT, err error, i ...any) {
 				require.ErrorContains(t, err, "invalid service account format: expected suffix \"iam.gserviceaccount.com\", got \"iam.gserviceaccount\"")
 			},
 		},
@@ -174,7 +178,7 @@ func TestProjectIDFromServiceAccountName(t *testing.T) {
 			name:           "missing project id",
 			serviceAccount: "test@.iam.gserviceaccount.com",
 			want:           "",
-			wantErr: func(t require.TestingT, err error, i ...interface{}) {
+			wantErr: func(t require.TestingT, err error, i ...any) {
 				require.ErrorContains(t, err, "invalid service account format: missing project ID")
 			},
 		},
@@ -188,3 +192,73 @@ func TestProjectIDFromServiceAccountName(t *testing.T) {
 		})
 	}
 }
+
+func TestGetServiceAccountFromCredentialsJSON(t *testing.T) {
+	tests := []struct {
+		name               string
+		credentialsJSON    []byte
+		checkError         require.ErrorAssertionFunc
+		wantServiceAccount string
+	}{
+		{
+			name:               "service_account credentials",
+			credentialsJSON:    []byte(fakeServiceAccountCredentialsJSON),
+			checkError:         require.NoError,
+			wantServiceAccount: "my-service-account@teleport-example-123456.iam.gserviceaccount.com",
+		},
+		{
+			name:               "external_account credentials with sa impersonation",
+			credentialsJSON:    []byte(fakeExternalAccountCredentialsJSON),
+			checkError:         require.NoError,
+			wantServiceAccount: "my-service-account@teleport-example-987654.iam.gserviceaccount.com",
+		},
+		{
+			name:            "unknown credentials",
+			credentialsJSON: []byte(`{}`),
+			checkError:      require.Error,
+		},
+		{
+			name:            "bad json",
+			credentialsJSON: []byte(`{}`),
+			checkError:      require.Error,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sa, err := GetServiceAccountFromCredentialsJSON(tc.credentialsJSON)
+			tc.checkError(t, err)
+			require.Equal(t, tc.wantServiceAccount, sa)
+		})
+	}
+}
+
+const (
+	fakeServiceAccountCredentialsJSON = `{
+  "type": "service_account",
+  "project_id": "teleport-example-123456",
+  "private_key_id": "1234569890abcdef1234567890abcdef12345678",
+  "private_key": "fake-private-key",
+  "client_email": "my-service-account@teleport-example-123456.iam.gserviceaccount.com",
+  "client_id": "111111111111111111111",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/my-service-account%40teleport-example-123456.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}`
+	fakeExternalAccountCredentialsJSON = `{
+  "type": "external_account",
+  "audience": "//iam.googleapis.com/projects/111111111111/locations/global/workloadIdentityPools/my-identity-pool/providers/my-provider",
+  "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
+  "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/my-service-account@teleport-example-987654.iam.gserviceaccount.com:generateAccessToken",
+  "token_url": "https://sts.googleapis.com/v1/token",
+  "credential_source": {
+    "environment_id": "aws1",
+    "region_url": "http://169.254.169.254/latest/meta-data/placement/availability-zone",
+    "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials",
+    "regional_cred_verification_url": "https://sts.{region}.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15",
+    "imdsv2_session_token_url": "http://169.254.169.254/latest/api/token"
+  }
+}`
+)

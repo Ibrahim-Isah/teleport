@@ -1,31 +1,35 @@
-/*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import { createMemoryHistory } from 'history';
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import history from './history';
 
 describe('services/history', () => {
   const fallbackRoute = '/web';
   let browserHistory;
+  let location;
 
   beforeEach(() => {
-    history.init(createMemoryHistory());
-    browserHistory = history.original(/* be default returns inMemory history*/);
-    jest.spyOn(browserHistory, 'push');
+    location = { pathname: '', search: '', hash: '' };
+    browserHistory = {
+      navigate: jest.fn(),
+      getLocation: () => location,
+    };
+    history.init(browserHistory);
     jest.spyOn(history, 'getRoutes');
     jest.spyOn(history, '_pageRefresh').mockImplementation();
   });
@@ -65,7 +69,7 @@ describe('services/history', () => {
     const push = actual => ({
       andExpect(expected) {
         history.push(actual);
-        expect(browserHistory.push).toHaveBeenCalledWith(expected);
+        expect(browserHistory.navigate).toHaveBeenCalledWith(expected);
       },
     });
 
@@ -108,6 +112,16 @@ describe('services/history', () => {
       history.push(route, true);
       expect(history._pageRefresh).toHaveBeenCalledWith(route);
     });
+
+    it('should refresh a page if navigation is not initialized', () => {
+      const route = '/';
+      jest.spyOn(history, 'getRoutes').mockReturnValue([route]);
+      history.init(null);
+
+      history.push(route);
+
+      expect(history._pageRefresh).toHaveBeenCalledWith(route);
+    });
   });
 
   describe('goToLogin()', () => {
@@ -115,12 +129,118 @@ describe('services/history', () => {
       jest
         .spyOn(history, 'getRoutes')
         .mockReturnValue(['/web/login', '/current-location']);
-      history.original().location.pathname = '/current-location';
-      history.goToLogin(true);
+      location.pathname = '/current-location';
+      history.goToLogin({ rememberLocation: true });
 
       const expected =
-        '/web/login?redirect_uri=http://localhost/current-location';
+        '/web/login?redirect_uri=http%3A%2F%2Flocalhost%2Fcurrent-location';
       expect(history._pageRefresh).toHaveBeenCalledWith(expected);
     });
+
+    it('should not attempt to redirect from an unknown path', () => {
+      jest
+        .spyOn(history, 'getRoutes')
+        .mockReturnValue(['/web/login', '/another-location']);
+      location.pathname = '/bogus-location';
+      history.goToLogin({ rememberLocation: true });
+
+      const expected = '/web/login?redirect_uri=http%3A%2F%2Flocalhost%2Fweb';
+      expect(history._pageRefresh).toHaveBeenCalledWith(expected);
+    });
+
+    it('should navigate to login with access_changed param and no redirect_uri', () => {
+      jest
+        .spyOn(history, 'getRoutes')
+        .mockReturnValue(['/web/login', '/current-location']);
+      location.pathname = '/current-location';
+      history.goToLogin({ withAccessChangedMessage: true });
+
+      const expected = '/web/login?access_changed=';
+      expect(history._pageRefresh).toHaveBeenCalledWith(expected);
+    });
+
+    it('should navigate to login with access_changed param and redirect_uri', () => {
+      jest
+        .spyOn(history, 'getRoutes')
+        .mockReturnValue(['/web/login', '/current-location']);
+      location.pathname = '/current-location';
+      history.goToLogin({
+        rememberLocation: true,
+        withAccessChangedMessage: true,
+      });
+
+      const expected =
+        '/web/login?access_changed=&redirect_uri=http%3A%2F%2Flocalhost%2Fcurrent-location';
+      expect(history._pageRefresh).toHaveBeenCalledWith(expected);
+    });
+
+    it('should navigate to login with no params', () => {
+      jest
+        .spyOn(history, 'getRoutes')
+        .mockReturnValue(['/web/login', '/current-location']);
+      location.pathname = '/current-location';
+      history.goToLogin();
+
+      const expected = '/web/login';
+      expect(history._pageRefresh).toHaveBeenCalledWith(expected);
+    });
+
+    it('should preserve query params in the redirect_uri', () => {
+      jest
+        .spyOn(history, 'getRoutes')
+        .mockReturnValue(['/web/login', '/current-location']);
+      location.pathname = '/current-location';
+      location.search = '?test=value';
+      history.goToLogin({
+        rememberLocation: true,
+        withAccessChangedMessage: true,
+      });
+
+      const expected =
+        '/web/login?access_changed=&redirect_uri=http%3A%2F%2Flocalhost%2Fcurrent-location%3Ftest%3Dvalue';
+      expect(history._pageRefresh).toHaveBeenCalledWith(expected);
+    });
+
+    it('should preserve query params when router navigation is not initialized yet', () => {
+      jest
+        .spyOn(history, 'getRoutes')
+        .mockReturnValue(['/web/login', '/current-location']);
+
+      history.init(null);
+      window.history.replaceState({}, '', '/current-location?test=value');
+
+      history.goToLogin({
+        rememberLocation: true,
+        withAccessChangedMessage: true,
+      });
+
+      const expected =
+        '/web/login?access_changed=&redirect_uri=http%3A%2F%2Flocalhost%2Fcurrent-location%3Ftest%3Dvalue';
+      expect(history._pageRefresh).toHaveBeenCalledWith(expected);
+
+      window.history.replaceState({}, '', '/');
+    });
+  });
+
+  describe('getScopePickerUrl', () => {
+    it('should have a redirection to the current page', () => {
+      jest
+        .spyOn(history, 'getRoutes')
+        .mockReturnValue(['/web/login', '/current-location']);
+      location.pathname = '/current-location';
+      expect(history.getScopePickerUrl()).toBe(
+        '/web/scope_picker?redirect_uri=http%3A%2F%2Flocalhost%2Fcurrent-location'
+      );
+    });
+  });
+
+  it('should not attempt to redirect from an unknown path', () => {
+    jest
+      .spyOn(history, 'getRoutes')
+      .mockReturnValue(['/web/login', '/another-location']);
+    location.pathname = '/bogus-location';
+    expect(history.getScopePickerUrl()).toBe(
+      '/web/scope_picker?redirect_uri=http%3A%2F%2Flocalhost%2Fweb'
+    );
   });
 });

@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package conntest
 
@@ -29,6 +31,7 @@ import (
 
 	apiclient "github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/client/proto"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/client/conntest/database"
@@ -58,7 +61,7 @@ type ClientDatabaseConnectionTester interface {
 	client.ALPNAuthClient
 
 	services.ConnectionsDiagnostic
-	apiclient.ListResourcesClient
+	apiclient.GetResourcesClient
 }
 
 // DatabaseConnectionTesterConfig defines the config fields for DatabaseConnectionTester.
@@ -134,8 +137,8 @@ func (s *DatabaseConnectionTester) TestConnection(ctx context.Context, req TestC
 			types.ConnectionDiagnosticTrace_RBAC_DATABASE,
 			"Database not found. "+
 				"Ensure your role grants access by adding it to the 'db_labels' property. "+
-				"This can also happen when you don't have a Database Agent proxying the database - "+
-				"you can fix that by adding the database labels to the 'db_service.resources.labels' in 'teleport.yaml' file of the database agent.",
+				"This can also happen when you don't have a Teleport Database Service proxying the database - "+
+				"you can fix that by adding the database labels to the 'db_service.resources.labels' in 'teleport.yaml' file of the Database Service.",
 			trace.NotFound("%s not found", req.ResourceName),
 		)
 		if err != nil {
@@ -165,7 +168,7 @@ func (s *DatabaseConnectionTester) TestConnection(ctx context.Context, req TestC
 	if _, err := s.appendDiagnosticTrace(ctx,
 		connectionDiagnosticID,
 		types.ConnectionDiagnosticTrace_RBAC_DATABASE,
-		"A Database Agent is available to proxy the connection to the Database.",
+		"A Teleport Database Service is available to proxy the connection to the Database.",
 		nil,
 	); err != nil {
 		return nil, trace.Wrap(err)
@@ -182,7 +185,9 @@ func (s *DatabaseConnectionTester) TestConnection(ctx context.Context, req TestC
 		return nil, trace.Wrap(err)
 	}
 
-	if pingErr := databasePinger.Ping(ctx, ping); pingErr != nil {
+	pingCtx, cancel := context.WithTimeout(ctx, apidefaults.DefaultIOTimeout)
+	defer cancel()
+	if pingErr := databasePinger.Ping(pingCtx, ping); pingErr != nil {
 		connDiag, err := s.handlePingError(ctx, connectionDiagnosticID, pingErr, databasePinger)
 		return connDiag, trace.Wrap(err)
 	}
@@ -201,6 +206,11 @@ func (s *DatabaseConnectionTester) runALPNTunnel(ctx context.Context, req TestCo
 		return nil, trace.Wrap(err)
 	}
 
+	mfaResponse, err := req.MFAResponse.GetOptionalMFAResponseProtoReq()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	err = client.RunALPNAuthTunnel(ctx, client.ALPNAuthTunnelConfig{
 		AuthClient:             s.cfg.UserClient,
 		Listener:               list,
@@ -210,6 +220,7 @@ func (s *DatabaseConnectionTester) runALPNTunnel(ctx context.Context, req TestCo
 		ConnectionDiagnosticID: connectionDiagnosticID,
 		RouteToDatabase:        routeToDatabase,
 		InsecureSkipVerify:     req.InsecureSkipVerify,
+		MFAResponse:            mfaResponse,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -220,17 +231,12 @@ func (s *DatabaseConnectionTester) runALPNTunnel(ctx context.Context, req TestCo
 
 func (s *DatabaseConnectionTester) getDatabaseServers(ctx context.Context, databaseName string) ([]types.DatabaseServer, error) {
 	// Lookup the Database Server that's proxying the requested Database.
-	listResourcesResponse, err := s.cfg.UserClient.ListResources(ctx, proto.ListResourcesRequest{
-		PredicateExpression: fmt.Sprintf(`name == "%s"`, databaseName),
+	page, err := apiclient.GetResourcePage[types.DatabaseServer](ctx, s.cfg.UserClient, &proto.ListResourcesRequest{
+		PredicateExpression: fmt.Sprintf(`name == %q`, databaseName),
 		ResourceType:        types.KindDatabaseServer,
 		Limit:               defaults.MaxIterationLimit,
 	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	databaseServers, err := types.ResourcesWithLabels(listResourcesResponse.Resources).AsDatabaseServers()
-	return databaseServers, trace.Wrap(err)
+	return page.Resources, trace.Wrap(err)
 }
 
 func checkDatabaseLogin(protocol, databaseUser, databaseName string) error {
@@ -270,7 +276,7 @@ func newPing(alpnProxyAddr, databaseUser, databaseName string) (database.PingPar
 func (s DatabaseConnectionTester) handlePingSuccess(ctx context.Context, connectionDiagnosticID string) (types.ConnectionDiagnostic, error) {
 	if _, err := s.appendDiagnosticTrace(ctx, connectionDiagnosticID,
 		types.ConnectionDiagnosticTrace_CONNECTIVITY,
-		"Database is accessible from the Database Agent.",
+		"Database is accessible from the Teleport Database Service.",
 		nil,
 	); err != nil {
 		return nil, trace.Wrap(err)
@@ -338,12 +344,12 @@ func (s DatabaseConnectionTester) handlePingError(ctx context.Context, connectio
 		return connDiag, nil
 	}
 
-	if databasePinger.IsConnectionRefusedError(pingErr) {
+	if databasePinger.IsConnectionRefusedError(pingErr) || strings.Contains(pingErr.Error(), "context deadline exceeded") {
 		connDiag, err := s.appendDiagnosticTrace(ctx,
 			connectionDiagnosticID,
 			types.ConnectionDiagnosticTrace_CONNECTIVITY,
-			"There was a connection problem between the Database Agent and the Database. "+
-				"Ensure the Database is running and accessible from the Database Agent.",
+			"There was a connection problem between the Teleport Database Service and the database. "+
+				"Ensure the database is running and accessible from the Database Service over the network.",
 			pingErr,
 		)
 		if err != nil {
@@ -418,6 +424,8 @@ func getDatabaseConnTester(protocol string) (databasePinger, error) {
 		return &database.PostgresPinger{}, nil
 	case defaults.ProtocolMySQL:
 		return &database.MySQLPinger{}, nil
+	case defaults.ProtocolSQLServer:
+		return &database.SQLServerPinger{}, nil
 	}
 	return nil, trace.NotImplemented("database protocol %q is not supported yet for testing connection", protocol)
 }

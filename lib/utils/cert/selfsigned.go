@@ -1,19 +1,19 @@
 /*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Copyright 2022 Gravitational, Inc.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- * /
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package cert
@@ -28,9 +28,9 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
-	"github.com/gravitational/teleport/lib/auth/native"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 )
 
 // macMaxTLSCertValidityPeriod is the maximum validity period
@@ -39,7 +39,7 @@ import (
 // verifier and not in Go.
 const macMaxTLSCertValidityPeriod = 825 * 24 * time.Hour
 
-// Credentials keeps the typical 3 components of a proper HTTPS configuration
+// Credentials keeps the typical 3 components of a proper TLS configuration
 type Credentials struct {
 	// PublicKey in PEM format
 	PublicKey []byte
@@ -49,13 +49,26 @@ type Credentials struct {
 }
 
 // GenerateSelfSignedCert generates a self-signed certificate that
-// is valid for given domain names and ips, returns PEM-encoded bytes with key and cert
-func GenerateSelfSignedCert(hostNames []string) (*Credentials, error) {
-	priv, err := native.GenerateRSAPrivateKey()
+// is valid for given domain names and IPs. If extended key usage
+// is not specified, the cert will be generated for server auth.
+func GenerateSelfSignedCert(hostNames []string, ipAddresses []string, eku []x509.ExtKeyUsage, now func() time.Time) (*Credentials, error) {
+	if len(eku) == 0 {
+		// if not specified, assume this cert is for server auth,
+		// which is required for validation on macOS:
+		// https://support.apple.com/en-in/HT210176
+		eku = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	}
+
+	priv, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	notBefore := time.Now()
+
+	if now == nil {
+		now = time.Now
+	}
+
+	notBefore := now()
 	notAfter := notBefore.Add(macMaxTLSCertValidityPeriod)
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
@@ -76,7 +89,8 @@ func GenerateSelfSignedCert(hostNames []string) (*Credentials, error) {
 		Subject:               entity,
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           eku,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 	}
@@ -87,20 +101,31 @@ func GenerateSelfSignedCert(hostNames []string) (*Credentials, error) {
 	if ips != nil {
 		template.IPAddresses = append(ips, net.ParseIP("::1"))
 	}
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	for _, ip := range ipAddresses {
+		ipParsed := net.ParseIP(ip)
+		if ipParsed == nil {
+			return nil, trace.Errorf("Unable to parse IP address for self-signed certificate (%v)", ip)
+		}
+		template.IPAddresses = append(template.IPAddresses, ipParsed)
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, priv.Public(), priv)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	publicKeyBytes, err := x509.MarshalPKIXPublicKey(priv.Public())
+	privateKeyBytes, err := keys.MarshalPrivateKey(priv)
 	if err != nil {
-		logrus.Error(err)
+		return nil, trace.Wrap(err)
+	}
+	publicKeyBytes, err := keys.MarshalPublicKey(priv.Public())
+	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	return &Credentials{
-		PublicKey:  pem.EncodeToMemory(&pem.Block{Type: "RSA PUBLIC KEY", Bytes: publicKeyBytes}),
-		PrivateKey: pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}),
+		PrivateKey: privateKeyBytes,
+		PublicKey:  publicKeyBytes,
 		Cert:       pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes}),
 	}, nil
 }

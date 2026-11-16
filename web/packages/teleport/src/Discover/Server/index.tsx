@@ -1,68 +1,120 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import React from 'react';
 
-import { Server } from 'design/Icon';
-
-import { Resource } from 'teleport/Discover/flow';
+import cfg from 'teleport/config';
+import { ResourceViewConfig } from 'teleport/Discover/flow';
 import { DownloadScript } from 'teleport/Discover/Server/DownloadScript';
 import { SetupAccess } from 'teleport/Discover/Server/SetupAccess';
 import { TestConnection } from 'teleport/Discover/Server/TestConnection';
-import { ResourceKind, Finished } from 'teleport/Discover/Shared';
-import { DiscoverEvent } from 'teleport/services/userEvent';
+import { AwsAccount, Finished, ResourceKind } from 'teleport/Discover/Shared';
+import {
+  DiscoverDiscoveryConfigMethod,
+  DiscoverEvent,
+} from 'teleport/services/userEvent';
 
+import { ResourceSpec, ServerLocation } from '../SelectResource';
+import { ConfigureDiscoveryService } from '../Shared/ConfigureDiscoveryService';
+import { DiscoveryConfigSsm } from './DiscoveryConfigSsm/DiscoveryConfigSsm';
 import { ServerWrapper } from './ServerWrapper';
 
-export const ServerResource: Resource = {
+export const ServerResource: ResourceViewConfig<ResourceSpec> = {
   kind: ResourceKind.Server,
-  icon: <Server />,
   wrapper: (component: React.ReactNode) => (
     <ServerWrapper>{component}</ServerWrapper>
   ),
-  shouldPrompt(currentStep) {
-    // do not prompt on exit if they're selecting a resource
-    return currentStep !== 0;
+  shouldPrompt(currentStep, currentView, resourceSpec) {
+    if (resourceSpec?.nodeMeta?.location === ServerLocation.Aws) {
+      // Allow user to bypass prompting on this step (Connect AWS Connect)
+      // on exit because users might need to change route to setup an
+      // integration.
+      if (currentStep === 0) {
+        return false;
+      }
+    }
+    return currentView?.eventName !== DiscoverEvent.Completed;
   },
-  views: [
-    {
-      title: 'Select Resource Type',
-      eventName: DiscoverEvent.ResourceSelection,
-    },
-    {
-      title: 'Configure Resource',
-      component: DownloadScript,
-      eventName: DiscoverEvent.DeployService,
-    },
-    {
-      title: 'Set Up Access',
-      component: SetupAccess,
-      eventName: DiscoverEvent.PrincipalsConfigure,
-    },
-    {
-      title: 'Test Connection',
-      component: TestConnection,
-      eventName: DiscoverEvent.TestConnection,
-      manuallyEmitSuccessEvent: true,
-    },
-    {
-      title: 'Finished',
-      component: Finished,
-      hide: true,
-      eventName: DiscoverEvent.Completed,
-    },
-  ],
+
+  views(resource) {
+    let configureResourceViews;
+    const { nodeMeta } = resource;
+    if (
+      nodeMeta?.location === ServerLocation.Aws &&
+      nodeMeta.discoveryConfigMethod === DiscoverDiscoveryConfigMethod.AwsEc2Ssm
+    ) {
+      configureResourceViews = [
+        {
+          title: 'Connect AWS Account',
+          component: AwsAccount,
+          eventName: DiscoverEvent.IntegrationAWSOIDCConnectEvent,
+        },
+        // Self hosted requires user to manually install a discovery service.
+        // Cloud already has a discovery service running, so this step is not required.
+        ...(!cfg.isCloud
+          ? [
+              {
+                title: 'Configure Discovery Service',
+                component: ConfigureDiscoveryService,
+                eventName: DiscoverEvent.DeployService,
+              },
+            ]
+          : []),
+        {
+          title: cfg.isCloud
+            ? 'Configure Auto Discovery Service'
+            : 'Create Discovery Config',
+          component: DiscoveryConfigSsm,
+          eventName: DiscoverEvent.CreateDiscoveryConfig,
+        },
+      ];
+    } else {
+      configureResourceViews = [
+        {
+          title: 'Configure Resource',
+          component: DownloadScript,
+          eventName: DiscoverEvent.DeployService,
+        },
+      ];
+    }
+
+    return [
+      {
+        title: 'Configure Resource',
+        views: configureResourceViews,
+      },
+      {
+        title: 'Set Up Access',
+        component: SetupAccess,
+        eventName: DiscoverEvent.PrincipalsConfigure,
+      },
+      {
+        title: 'Test Connection',
+        component: TestConnection,
+        eventName: DiscoverEvent.TestConnection,
+        manuallyEmitSuccessEvent: true,
+      },
+      {
+        title: 'Finished',
+        component: Finished,
+        hide: true,
+        eventName: DiscoverEvent.Completed,
+      },
+    ];
+  },
 };

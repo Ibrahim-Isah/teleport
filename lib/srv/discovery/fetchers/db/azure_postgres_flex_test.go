@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
@@ -24,24 +28,24 @@ import (
 
 	"github.com/gravitational/teleport/api/types"
 	azureutils "github.com/gravitational/teleport/api/utils/azure"
-	"github.com/gravitational/teleport/lib/cloud"
 	"github.com/gravitational/teleport/lib/cloud/azure"
-	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/cloud/azure/azuretest"
+	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
 // TestAzurePostgresFlexFetchers tests Azure PostgreSQL Flexible server fetchers.
 func TestAzurePostgresFlexFetchers(t *testing.T) {
 	t.Parallel()
 
-	azureSub := makeAzureSubscription(t, "sub123")
+	azureSub := makeAzureSubscription("sub123")
 	azPostgresFlexServer, azPostgresFlexDB := makeAzurePostgresFlexServer(t, "postgres-flex", "sub123", "group 1", "East US", map[string]string{"env": "prod"})
-	azureMatchers := []services.AzureMatcher{{
-		Types:        []string{services.AzureMatcherPostgres},
+	azureMatchers := []types.AzureMatcher{{
+		Types:        []string{types.AzureMatcherPostgres},
 		ResourceTags: types.Labels{"env": []string{"prod"}},
 		Regions:      []string{"eastus"},
 	}}
 
-	clients := &cloud.TestCloudClients{
+	clients := &azuretest.Clients{
 		AzureSubscriptionClient: azure.NewSubscriptionClient(&azure.ARMSubscriptionsMock{
 			Subscriptions: []*armsubscription.Subscription{azureSub},
 		}),
@@ -84,7 +88,8 @@ func makeAzurePostgresFlexServer(t *testing.T, name, subscription, group, region
 	for _, opt := range opts {
 		opt(server)
 	}
-	database, err := services.NewDatabaseFromAzurePostgresFlexServer(server)
+	database, err := common.NewDatabaseFromAzurePostgresFlexServer(server)
 	require.NoError(t, err)
+	common.ApplyAzureDatabaseNameSuffix(database, types.AzureMatcherPostgres)
 	return server, database
 }

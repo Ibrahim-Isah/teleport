@@ -1,55 +1,52 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package tshwrap
 
 import (
-	"encoding/json"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 
-	"github.com/coreos/go-semver/semver"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/identityfile"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/client"
+	"github.com/gravitational/teleport/lib/tbot/bot/destination"
 	"github.com/gravitational/teleport/lib/tbot/config"
 	"github.com/gravitational/teleport/lib/tbot/identity"
+	"github.com/gravitational/teleport/lib/tbot/internal"
 	"github.com/gravitational/teleport/lib/tlsca"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 const (
 	// TSHVarName is the name of the environment variable that can override the
 	// tsh path that would otherwise be located on the $PATH.
 	TSHVarName = "TSH"
-
-	// TSHMinVersion is the minimum version of tsh that supports Machine ID
-	// proxies.
-	TSHMinVersion = "9.3.0"
 )
 
-var log = logrus.WithFields(logrus.Fields{
-	trace.Component: teleport.ComponentTBot,
-})
+var log = logutils.NewPackageLogger(teleport.ComponentKey, teleport.ComponentTBot)
 
 // capture runs a command (presumably tsh) with the given arguments and
 // returns it's captured stdout. Stderr is ignored. Errors are returned per
@@ -113,7 +110,13 @@ func (w *Wrapper) Exec(env map[string]string, args ...string) error {
 		environ = append(environ, k+"="+v)
 	}
 
-	log.Debugf("executing %s with env=%+v and args=%+v", w.path, env, args)
+	log.DebugContext(
+		context.TODO(),
+		"executing binary",
+		"path", w.path,
+		"env", env,
+		"args", args,
+	)
 
 	child := exec.Command(w.path, args...)
 	child.Env = environ
@@ -124,119 +127,44 @@ func (w *Wrapper) Exec(env map[string]string, args ...string) error {
 	return trace.Wrap(child.Run(), "unable to execute tsh")
 }
 
-// GetTSHVersion queries the system tsh for its version.
-func GetTSHVersion(w *Wrapper) (*semver.Version, error) {
-	rawVersion, err := w.capture(w.path, "version", "-f", "json")
-	if err != nil {
-		return nil, trace.Wrap(err, "querying tsh version")
-	}
-
-	versionInfo := struct {
-		Version string `json:"version"`
-	}{}
-	if err := json.Unmarshal(rawVersion, &versionInfo); err != nil {
-		return nil, trace.Wrap(err, "error deserializing tsh version from string: %s", rawVersion)
-	}
-
-	sv, err := semver.NewVersion(versionInfo.Version)
-	if err != nil {
-		return nil, trace.Wrap(err, "error parsing tsh version: %s", versionInfo.Version)
-	}
-
-	return sv, nil
+type destinationHolder interface {
+	GetDestination() destination.Destination
 }
 
-// CheckTSHSupported checks if the current tsh supports Machine ID.
-func CheckTSHSupported(w *Wrapper) error {
-	version, err := GetTSHVersion(w)
-	if err != nil {
-		return trace.Wrap(err, "unable to determine tsh version")
-	}
-
-	minVersion := semver.New(TSHMinVersion)
-	if version.LessThan(*minVersion) {
-		return trace.BadParameter(
-			"installed tsh version %s does not support Machine ID proxies, "+
-				"please upgrade to at least %s",
-			version, minVersion,
-		)
-	}
-
-	log.Debugf("tsh version %s is supported", version)
-
-	return nil
-}
-
-// GetDestination attempts to select an unambiguous destination, either from
-// CLI or YAML config. It returns an error if the selected destination is
-// invalid.
-func GetDestination(botConfig *config.BotConfig, cf *config.CLIConf) (*config.DestinationConfig, error) {
-	// Note: this only supports filesystem destinations.
-	if cf.DestinationDir != "" {
-		dest, err := botConfig.GetDestinationByPath(cf.DestinationDir)
-		if err != nil {
-			return nil, trace.Wrap(err, "unable to find destination %s in the "+
-				"configuration; has the configuration file been "+
-				"specified with `-c <path>`?", cf.DestinationDir)
+// GetDestinationDirectory attempts to select an unambiguous destination, either
+// from CLI or YAML config. It returns an error if the selected destination is
+// invalid. Note that CLI destinations will not be validated.
+func GetDestinationDirectory(cliDestinationPath string, botConfig *config.BotConfig) (*destination.Directory, error) {
+	if cliDestinationPath != "" {
+		d := &destination.Directory{
+			Path: cliDestinationPath,
+		}
+		if err := d.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
 		}
 
-		return dest, nil
+		return d, nil
 	}
 
-	if len(botConfig.Destinations) == 0 {
-		return nil, trace.BadParameter("either --destination-dir or a config file must be specified")
-	} else if len(botConfig.Destinations) > 1 {
-		return nil, trace.BadParameter("the config file contains multiple destinations; a --destination-dir must be specified")
+	var destinationHolders []destinationHolder
+	for _, svc := range botConfig.Services {
+		if v, ok := svc.(destinationHolder); ok {
+			destinationHolders = append(destinationHolders, v)
+		}
 	}
 
-	return botConfig.Destinations[0], nil
-}
-
-// GetDestinationPath returns a path to a filesystem destination.
-func GetDestinationPath(destination *config.DestinationConfig) (string, error) {
-	destinationImpl, err := destination.GetDestination()
-	if err != nil {
-		return "", trace.Wrap(err)
+	if len(destinationHolders) == 0 {
+		return nil, trace.BadParameter("either --destination-dir or a config file containing an output or service must be specified")
+	} else if len(destinationHolders) > 1 {
+		return nil, trace.BadParameter("the config file contains multiple outputs and services; a --destination-dir must be specified")
 	}
-
-	destinationDir, ok := destinationImpl.(*config.DestinationDirectory)
+	dest := destinationHolders[0].GetDestination()
+	destinationDir, ok := dest.(*destination.Directory)
 	if !ok {
-		return "", trace.BadParameter("destination %s must be a directory", destinationImpl)
+		return nil, trace.BadParameter("destination %s must be a directory", dest)
 	}
 
-	return destinationDir.Path, nil
-}
-
-// GetTLSCATemplate returns the TLS CA template for the given destination. It's
-// a required template so this should never fail.
-func GetTLSCATemplate(destination *config.DestinationConfig) (*config.TemplateTLSCAs, error) {
-	tpl := destination.GetConfigByName(config.TemplateTLSCAsName)
-	if tpl == nil {
-		return nil, trace.NotFound("no template with name %s found, this is a bug", config.TemplateTLSCAsName)
-	}
-
-	tlsCAs, ok := tpl.(*config.TemplateTLSCAs)
-	if !ok {
-		return nil, trace.BadParameter("invalid TLS CA template")
-	}
-
-	return tlsCAs, nil
-}
-
-// GetIdentityTemplate returns the identity template for the given destination.
-// This is a required template so it _should_ never fail.
-func GetIdentityTemplate(destination *config.DestinationConfig) (*config.TemplateIdentity, error) {
-	tpl := destination.GetConfigByName(config.TemplateIdentityName)
-	if tpl == nil {
-		return nil, trace.NotFound("no template with name %s found, this is a bug", config.TemplateIdentityName)
-	}
-
-	identity, ok := tpl.(*config.TemplateIdentity)
-	if !ok {
-		return nil, trace.BadParameter("invalid identity template")
-	}
-
-	return identity, nil
+	return destinationDir, nil
 }
 
 // mergeEnv applies the given value to each key inside the specified map.
@@ -248,17 +176,7 @@ func mergeEnv(m map[string]string, value string, keys []string) {
 
 // GetEnvForTSH returns a map of environment variables needed to properly wrap
 // tsh so that it uses our Machine ID certificates where necessary.
-func GetEnvForTSH(destination *config.DestinationConfig) (map[string]string, error) {
-	tlsCAs, err := GetTLSCATemplate(destination)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	destPath, err := GetDestinationPath(destination)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
+func GetEnvForTSH(destPath string) (map[string]string, error) {
 	// The env var interface does allow us to set specific resource names for
 	// everything but also has generic fallbacks. We'll use the fallbacks for
 	// now but could eventually communicate more info to tsh if desired.
@@ -270,16 +188,13 @@ func GetEnvForTSH(destination *config.DestinationConfig) (map[string]string, err
 	// automate later. (I don't think tsh handles this perfectly today anyway).
 	mergeEnv(env, filepath.Join(destPath, identity.TLSCertKey), client.VirtualPathEnvNames(client.VirtualPathDatabase, nil))
 
-	mergeEnv(env, filepath.Join(destPath, identity.TLSCertKey), client.VirtualPathEnvNames(client.VirtualPathApp, nil))
+	mergeEnv(env, filepath.Join(destPath, identity.TLSCertKey), client.VirtualPathEnvNames(client.VirtualPathAppCert, nil))
 
 	// We don't want to provide a fallback for CAs since it would be ambiguous,
 	// so we'll specify them exactly.
-	env[client.VirtualPathEnvName(client.VirtualPathCA, client.VirtualPathCAParams(types.UserCA))] = filepath.Join(destPath, tlsCAs.UserCAPath)
-	env[client.VirtualPathEnvName(client.VirtualPathCA, client.VirtualPathCAParams(types.HostCA))] = filepath.Join(destPath, tlsCAs.HostCAPath)
-	env[client.VirtualPathEnvName(client.VirtualPathCA, client.VirtualPathCAParams(types.DatabaseCA))] = filepath.Join(destPath, tlsCAs.DatabaseCAPath)
-
-	// TODO(timothyb89): Kubernetes support. We don't generate kubeconfigs yet, so we have
-	// nothing to give tsh for now.
+	env[client.VirtualPathEnvName(client.VirtualPathCA, client.VirtualPathCAParams(types.UserCA))] = filepath.Join(destPath, internal.UserCAPath)
+	env[client.VirtualPathEnvName(client.VirtualPathCA, client.VirtualPathCAParams(types.HostCA))] = filepath.Join(destPath, internal.HostCAPath)
+	env[client.VirtualPathEnvName(client.VirtualPathCA, client.VirtualPathCAParams(types.DatabaseCA))] = filepath.Join(destPath, internal.DatabaseCAPath)
 
 	return env, nil
 }

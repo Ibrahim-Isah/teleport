@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package config_test
 
@@ -25,6 +29,7 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	dtconfig "github.com/gravitational/teleport/lib/devicetrust/config"
 	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/modules/modulestest"
 )
 
 func TestValidateConfigAgainstModules(t *testing.T) {
@@ -92,17 +97,69 @@ func TestValidateConfigAgainstModules(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			modules.SetTestModules(t, &modules.TestModules{
+			testModules := &modulestest.Modules{
 				TestBuildType: test.buildType,
-			})
-
-			gotErr := dtconfig.ValidateConfigAgainstModules(test.deviceTrust)
+			}
+			gotErr := dtconfig.ValidateConfigAgainstModules(test.deviceTrust, testModules)
 			if test.wantErr {
 				assert.Error(t, gotErr, "ValidateConfigAgainstModules mismatch")
 				assert.True(t, trace.IsBadParameter(gotErr), "gotErr is not a trace.BadParameter error")
 			} else {
 				assert.NoError(t, gotErr, "ValidateConfigAgainstModules mismatch")
 			}
+		})
+	}
+}
+
+func TestGetEnforcementMode(t *testing.T) {
+	tests := []struct {
+		name      string
+		buildType string
+		dt        *types.DeviceTrust
+		want      string
+	}{
+		{
+			name:      "OSS default",
+			buildType: modules.BuildOSS,
+			want:      constants.DeviceTrustModeOff,
+		},
+		{
+			name:      "Enterprise default",
+			buildType: modules.BuildEnterprise,
+			want:      constants.DeviceTrustModeOptional,
+		},
+		{
+			name:      "dt.Mode empty",
+			buildType: modules.BuildEnterprise,
+			dt: &types.DeviceTrust{
+				Mode: "",
+			},
+			want: constants.DeviceTrustModeOptional,
+		},
+		{
+			name:      "dt.Mode set",
+			buildType: modules.BuildEnterprise,
+			dt: &types.DeviceTrust{
+				Mode: constants.DeviceTrustModeRequired,
+			},
+			want: constants.DeviceTrustModeRequired,
+		},
+		{
+			name:      "OSS node with Ent Auth",
+			buildType: modules.BuildOSS,
+			dt: &types.DeviceTrust{
+				Mode: constants.DeviceTrustModeRequired,
+			},
+			want: constants.DeviceTrustModeRequired,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testModules := &modulestest.Modules{
+				TestBuildType: test.buildType,
+			}
+			got := dtconfig.GetEnforcementMode(test.dt, testModules)
+			assert.Equal(t, test.want, got, "dtconfig.GetEnforcementMode mismatch")
 		})
 	}
 }

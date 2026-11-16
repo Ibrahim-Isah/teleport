@@ -1,22 +1,26 @@
 /*
-Copyright 2016 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package regular
 
 import (
+	"context"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -84,6 +88,12 @@ func TestParseProxyRequest(t *testing.T) {
 		},
 	}
 
+	server := &Server{
+		hostname:  "redhorse",
+		proxyMode: true,
+		logger:    slog.New(slog.DiscardHandler),
+	}
+
 	for i, tt := range testCases {
 		t.Run(tt.desc, func(t *testing.T) {
 			if tt.expected.namespace == "" {
@@ -92,7 +102,7 @@ func TestParseProxyRequest(t *testing.T) {
 				// never actually be empty.
 				tt.expected.namespace = apidefaults.Namespace
 			}
-			req, err := parseProxySubsysRequest(tt.req)
+			req, err := server.parseProxySubsysRequest(context.Background(), tt.req)
 			require.NoError(t, err, "Test case %d: req=%s, expected=%+v", i, tt.req, tt.expected)
 			require.Equal(t, tt.expected, req, "Test case %d: req=%s, expected=%+v", i, tt.req, tt.expected)
 		})
@@ -105,6 +115,7 @@ func TestParseBadRequests(t *testing.T) {
 	server := &Server{
 		hostname:  "redhorse",
 		proxyMode: true,
+		logger:    slog.New(slog.DiscardHandler),
 	}
 
 	ctx := &srv.ServerContext{}
@@ -120,7 +131,7 @@ func TestParseBadRequests(t *testing.T) {
 	}
 	for _, tt := range testCases {
 		t.Run(tt.desc, func(t *testing.T) {
-			subsystem, err := parseProxySubsys(tt.input, server, ctx)
+			subsystem, err := server.parseProxySubsys(context.Background(), tt.input, ctx)
 			require.Error(t, err, "test case: %q", tt.input)
 			require.Nil(t, subsystem, "test case: %q", tt.input)
 		})

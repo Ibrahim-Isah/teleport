@@ -1,55 +1,47 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
-	"context"
 	"net"
+	"strings"
 
 	"github.com/gravitational/trace"
 )
 
-type webContextKey string
-
-const (
-	// ClientSrcAddrContextKey is context key for client source address
-	ClientSrcAddrContextKey webContextKey = "teleport-clientSrcAddrContextKey"
-	// ClientDstAddrContextKey is context key for client destination address
-	ClientDstAddrContextKey webContextKey = "teleport-clientDstAddrContextKey"
-)
-
-// ClientAddrContext is used by server that accepts connections from clients to set incoming
-// client's connection source and destination addresses to the context, so it could be later used
-// for IP propagation purpose. It is used when we don't have other source for client source/destination
-// addresses (don't have direct access to net.Conn)
-func ClientAddrContext(ctx context.Context, src net.Addr, dst net.Addr) context.Context {
-	ctx = context.WithValue(ctx, ClientSrcAddrContextKey, src)
-	return context.WithValue(ctx, ClientDstAddrContextKey, dst)
-}
-
-// ClientAddrFromContext gets client source address and destination addresses from the context. If an address is
-// not present, nil will be returned
-func ClientAddrFromContext(ctx context.Context) (src net.Addr, dst net.Addr) {
-	if ctx == nil {
-		return nil, nil
+// ClientIPFromAddr extracts the client IP from a network address.
+// For bufconn test addresses it returns the literal string "bufconn".
+func ClientIPFromAddr(addr net.Addr) (string, error) {
+	if addr == nil {
+		return "", trace.BadParameter("missing client IP")
 	}
-	src, _ = ctx.Value(ClientSrcAddrContextKey).(net.Addr)
-	dst, _ = ctx.Value(ClientDstAddrContextKey).(net.Addr)
-	return
+	s := addr.String()
+	// bufconn peers don't include host:port, so use a stable synthetic
+	// key for request/connection limiting in tests.
+	if s == "bufconn" && addr.Network() == "bufconn" {
+		return "bufconn", nil
+	}
+	clientIP, _, err := net.SplitHostPort(s)
+	if err != nil {
+		return "", trace.BadParameter("missing client IP")
+	}
+	return clientIP, nil
 }
 
 // ClientIPFromConn extracts host from provided remote address.
@@ -62,4 +54,40 @@ func ClientIPFromConn(conn net.Conn) (string, error) {
 	}
 
 	return clientIP, nil
+}
+
+// FindMatchingProxyDNS checks if a given request host or app fqdn matches any of the specified proxy DNS names.
+// It compares the hostnames without considering the port numbers.
+// If a match is found, the method returns the original proxy DNS name (including its port if present).
+// If no match is found, it returns the first proxy DNS name from the list.
+//
+// Parameters:
+//   - requestHostnameOrFQDN: A string representing the host in the request, which may include a port.
+//   - proxyDNSNames: A slice of strings representing possible DNS names for a proxy, each of which may include a port.
+//
+// Returns:
+//   - A string representing the matching proxy DNS name with its port, or the first proxy DNS name if no matches are found.
+func FindMatchingProxyDNS(requestHostnameOrFQDN string, proxyDNSNames []string) string {
+	if requestHostnameOrFQDN == "" || len(proxyDNSNames) == 0 {
+		return ""
+	}
+
+	// Remove port from request host if present.
+	normalizedRequestHost := strings.Split(requestHostnameOrFQDN, ":")[0]
+	hostParts := strings.Split(normalizedRequestHost, ".")
+
+	// Iterate over each possible suffix of requestHostOrFQDN parts
+	for start := range hostParts {
+		possibleHost := strings.Join(hostParts[start:], ".")
+		for _, proxyDNSName := range proxyDNSNames {
+			// Normalize proxy DNS name by removing port if present
+			normalizedProxyDNSName := strings.Split(proxyDNSName, ":")[0]
+			if possibleHost == normalizedProxyDNSName {
+				return proxyDNSName
+			}
+		}
+	}
+
+	// If no match found, return the first proxyDNSName as fallback
+	return proxyDNSNames[0]
 }

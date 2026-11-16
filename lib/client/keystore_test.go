@@ -1,31 +1,38 @@
 /*
-Copyright 2016-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package client
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/api/utils/keys/hardwarekey"
 	"github.com/gravitational/teleport/lib/utils/cert"
 )
 
@@ -46,57 +53,166 @@ func testEachKeyStore(t *testing.T, testFunc func(t *testing.T, keyStore KeyStor
 
 func TestKeyStore(t *testing.T) {
 	t.Parallel()
+
+	ctx := context.Background()
 	s := newTestAuthority(t)
+	hwks := hardwarekey.NewMockHardwareKeyService(nil /*prompt*/)
+
+	// create a test software and hardware key.
+	idx := KeyRingIndex{"test.proxy.com", "test-user", "root"}
+	softKeyRing := s.makeSignedKeyRing(t, idx, false)
+	hwPriv, err := keys.NewHardwarePrivateKey(ctx, hwks, hardwarekey.PrivateKeyConfig{
+		ContextualKeyInfo: idx.contextualKeyInfo(),
+	})
+	require.NoError(t, err)
+	hardKeyRing := NewKeyRing(hwPriv, hwPriv)
+	hardKeyRing.KeyRingIndex = idx
+	s.signKeyRing(t, hardKeyRing, false)
+
+	for name, keyRing := range map[string]*KeyRing{
+		"software key": softKeyRing,
+		"hardware key": hardKeyRing,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			testEachKeyStore(t, func(t *testing.T, keyStore KeyStore) {
+
+				// add the test key to the memory store
+				err := keyStore.AddKeyRing(keyRing)
+				require.NoError(t, err)
+
+				// check that the key exists in the store and is the same,
+				// except the key's trusted certs should be empty, to be
+				// filled in by a trusted certs store.
+				retrievedKeyRing, err := keyStore.GetKeyRing(idx, hwks, WithAllCerts...)
+				require.NoError(t, err)
+				keyRing.TrustedCerts = nil
+				assertEqualKeyRings(t, keyRing, retrievedKeyRing)
+
+				// Delete just the db cred, reload & verify it's gone
+				err = keyStore.DeleteUserCerts(idx, WithDBCerts{})
+				require.NoError(t, err)
+				retrievedKeyRing, err = keyStore.GetKeyRing(idx, hwks, WithSSHCerts{}, WithDBCerts{})
+				require.NoError(t, err)
+				expectKeyRing := keyRing.Copy()
+				expectKeyRing.DBTLSCredentials = make(map[string]TLSCredential)
+				assertEqualKeyRings(t, expectKeyRing, retrievedKeyRing)
+
+				// Get the key, now without cluster name. It should retrieve the key without certs
+				// and without a cluster name in the KeyRingIndex or ContextualKeyInfo (hardware keys).
+				retrievedKeyRing, err = keyStore.GetKeyRing(KeyRingIndex{idx.ProxyHost, idx.Username, ""}, hwks)
+				require.NoError(t, err)
+				expectKeyRing.ClusterName = ""
+				expectKeyRing.Cert = nil
+				if hwPriv, ok := expectKeyRing.TLSPrivateKey.Signer.(*hardwarekey.Signer); ok {
+					hwPriv.KeyInfo.ClusterName = ""
+				}
+				if hwPriv, ok := expectKeyRing.SSHPrivateKey.Signer.(*hardwarekey.Signer); ok {
+					hwPriv.KeyInfo.ClusterName = ""
+				}
+				assertEqualKeyRings(t, expectKeyRing, retrievedKeyRing)
+
+				// delete the key
+				err = keyStore.DeleteKeyRing(idx)
+				require.NoError(t, err)
+
+				// check that the key doesn't exist in the store
+				retrievedKeyRing, err = keyStore.GetKeyRing(idx, hwks)
+				require.Error(t, err)
+				require.True(t, trace.IsNotFound(err))
+				require.Nil(t, retrievedKeyRing)
+
+				// Delete non-existing
+				err = keyStore.DeleteKeyRing(idx)
+				require.Error(t, err)
+				require.True(t, trace.IsNotFound(err))
+			})
+		})
+	}
+}
+
+// TestGetKeyRingIsolation verifies that key rings returned by GetKeyRing share no mutable state.
+// The multi-cluster kube local proxy issue certs concurrently.
+// A store that hands out key rings turns those issuances into
+// unsynchronized writes on a shared map, which is a fatal runtime error.
+func TestGetKeyRingIsolation(t *testing.T) {
+	t.Parallel()
+	s := newTestAuthority(t)
+	hwks := hardwarekey.NewMockHardwareKeyService(nil /*prompt*/)
+	idx := KeyRingIndex{"test.proxy.com", "test-user", "root"}
+	keyRing := s.makeSignedKeyRing(t, idx, false)
 
 	testEachKeyStore(t, func(t *testing.T, keyStore KeyStore) {
+		require.NoError(t, keyStore.AddKeyRing(keyRing))
+
+		first, err := keyStore.GetKeyRing(idx, hwks, WithAllCerts...)
+		require.NoError(t, err)
+		second, err := keyStore.GetKeyRing(idx, hwks, WithAllCerts...)
+		require.NoError(t, err)
+
+		first.KubeTLSCredentials["kube-a"] = TLSCredential{}
+		first.DBTLSCredentials["db-a"] = TLSCredential{}
+		first.AppTLSCredentials["app-a"] = TLSCredential{}
+
+		require.NotContains(t, second.KubeTLSCredentials, "kube-a",
+			"key rings retrieved from the store must not share their kube credential map")
+		require.NotContains(t, second.DBTLSCredentials, "db-a",
+			"key rings retrieved from the store must not share their db credential map")
+		require.NotContains(t, second.AppTLSCredentials, "app-a",
+			"key rings retrieved from the store must not share their app credential map")
+	})
+}
+
+func TestKeyStore_accessGraphCert(t *testing.T) {
+	t.Parallel()
+	a := newTestAuthority(t)
+
+	t.Run("round trip", func(t *testing.T) {
 		t.Parallel()
+		testEachKeyStore(t, func(t *testing.T, keyStore KeyStore) {
+			idx := KeyRingIndex{"host.a", "bob", "root"}
+			keyRing := a.makeSignedKeyRing(t, idx, false)
+			keyRing.AccessGraphTLSCert = a.signAccessGraphCert(t, keyRing, false)
+			require.NotEqual(t, keyRing.TLSCert, keyRing.AccessGraphTLSCert,
+				"AccessGraph cert must be distinct from the main TLS cert for this test to be meaningful")
 
-		// create a test key
-		idx := KeyIndex{"test.proxy.com", "test-user", "root"}
-		key := s.makeSignedKey(t, idx, false)
+			require.NoError(t, keyStore.AddKeyRing(keyRing))
 
-		// add the test key to the memory store
-		err := keyStore.AddKey(key)
-		require.NoError(t, err)
+			retrieved, err := keyStore.GetKeyRing(idx, nil /*hwks*/, WithAllCerts...)
+			require.NoError(t, err)
+			keyRing.TrustedCerts = nil
+			assertEqualKeyRings(t, keyRing, retrieved)
+		})
+	})
 
-		// check that the key exists in the store and is the same,
-		// except the key's trusted certs should be empty, to be
-		// filled in by a trusted certs store.
-		retrievedKey, err := keyStore.GetKey(idx, WithAllCerts...)
-		require.NoError(t, err)
-		key.TrustedCerts = nil
-		require.Equal(t, key, retrievedKey)
+	t.Run("fs delete removes cert file when present", func(t *testing.T) {
+		t.Parallel()
+		keyStore := newTestFSKeyStore(t)
+		idx := KeyRingIndex{"host.a", "bob", "root"}
+		keyRing := a.makeSignedKeyRing(t, idx, false)
+		keyRing.AccessGraphTLSCert = a.signAccessGraphCert(t, keyRing, false)
+		require.NoError(t, keyStore.AddKeyRing(keyRing))
 
-		// Delete just the db cert, reload & verify it's gone
-		err = keyStore.DeleteUserCerts(idx, WithDBCerts{})
-		require.NoError(t, err)
-		retrievedKey, err = keyStore.GetKey(idx, WithSSHCerts{}, WithDBCerts{})
-		require.NoError(t, err)
-		expectKey := key.Copy()
-		expectKey.DBTLSCerts = make(map[string][]byte)
-		require.Equal(t, expectKey, retrievedKey)
+		certPath := keyStore.accessGraphTLSCertPath(idx)
+		require.FileExists(t, certPath)
 
-		// check for the key, now without cluster name
-		retrievedKey, err = keyStore.GetKey(KeyIndex{idx.ProxyHost, idx.Username, ""})
-		require.NoError(t, err)
-		expectKey.ClusterName = ""
-		expectKey.Cert = nil
-		require.Equal(t, expectKey, retrievedKey)
+		require.NoError(t, keyStore.DeleteKeyRing(idx))
+		_, err := os.Stat(certPath)
+		require.ErrorIs(t, err, os.ErrNotExist)
+	})
 
-		// delete the key
-		err = keyStore.DeleteKey(idx)
-		require.NoError(t, err)
+	t.Run("fs delete succeeds when cert absent", func(t *testing.T) {
+		t.Parallel()
+		keyStore := newTestFSKeyStore(t)
+		idx := KeyRingIndex{"host.a", "bob", "root"}
+		// AddKeyRing without setting AccessGraphTLSCert → file is never created.
+		require.NoError(t, keyStore.AddKeyRing(a.makeSignedKeyRing(t, idx, false)))
 
-		// check that the key doesn't exist in the store
-		retrievedKey, err = keyStore.GetKey(idx)
-		require.Error(t, err)
-		require.True(t, trace.IsNotFound(err))
-		require.Nil(t, retrievedKey)
+		_, err := os.Stat(keyStore.accessGraphTLSCertPath(idx))
+		require.ErrorIs(t, err, os.ErrNotExist)
 
-		// Delete non-existing
-		err = keyStore.DeleteKey(idx)
-		require.Error(t, err)
-		require.True(t, trace.IsNotFound(err))
+		require.NoError(t, keyStore.DeleteKeyRing(idx))
 	})
 }
 
@@ -109,31 +225,33 @@ func TestListKeys(t *testing.T) {
 		const keyNum = 5
 
 		// add 5 keys for "bob"
-		keys := make([]Key, keyNum)
-		for i := 0; i < keyNum; i++ {
-			idx := KeyIndex{fmt.Sprintf("host-%v", i), "bob", "root"}
-			key := auth.makeSignedKey(t, idx, false)
-			require.NoError(t, keyStore.AddKey(key))
-			keys[i] = *key
+		keys := make([]KeyRing, keyNum)
+		for i := range keyNum {
+			idx := KeyRingIndex{fmt.Sprintf("host-%v", i), "bob", "root"}
+			keyRing := auth.makeSignedKeyRing(t, idx, false)
+			require.NoError(t, keyStore.AddKeyRing(keyRing))
+			keys[i] = *keyRing
 		}
 		// add 1 key for "sam"
-		samIdx := KeyIndex{"sam.host", "sam", "root"}
-		samKey := auth.makeSignedKey(t, samIdx, false)
-		require.NoError(t, keyStore.AddKey(samKey))
+		samIdx := KeyRingIndex{"sam.host", "sam", "root"}
+		samKeyRing := auth.makeSignedKeyRing(t, samIdx, false)
+		require.NoError(t, keyStore.AddKeyRing(samKeyRing))
 
 		// read all bob keys:
-		for i := 0; i < keyNum; i++ {
-			key, err := keyStore.GetKey(keys[i].KeyIndex, WithSSHCerts{}, WithDBCerts{})
+		for i := range keyNum {
+			keyRing, err := keyStore.GetKeyRing(keys[i].KeyRingIndex, nil /*hwks*/, WithSSHCerts{}, WithDBCerts{})
 			require.NoError(t, err)
-			key.TrustedCerts = keys[i].TrustedCerts
-			require.Equal(t, &keys[i], key)
+			keyRing.TrustedCerts = keys[i].TrustedCerts
+			assertEqualKeyRings(t, &keys[i], keyRing)
 		}
 
 		// read sam's key and make sure it's the same:
-		skey, err := keyStore.GetKey(samIdx, WithSSHCerts{})
+		skeyRing, err := keyStore.GetKeyRing(samIdx, nil /*hwks*/, WithSSHCerts{})
 		require.NoError(t, err)
-		require.Equal(t, samKey.Cert, skey.Cert)
-		require.Equal(t, samKey.MarshalSSHPublicKey(), skey.MarshalSSHPublicKey())
+		require.Equal(t, samKeyRing.Cert, skeyRing.Cert)
+		require.Equal(t, samKeyRing.TLSCert, skeyRing.TLSCert)
+		require.Equal(t, samKeyRing.SSHPrivateKey.MarshalSSHPublicKey(), skeyRing.SSHPrivateKey.MarshalSSHPublicKey())
+		require.Equal(t, samKeyRing.TLSPrivateKey.MarshalSSHPublicKey(), skeyRing.TLSPrivateKey.MarshalSSHPublicKey())
 	})
 }
 
@@ -145,17 +263,17 @@ func TestGetCertificates(t *testing.T) {
 		const keyNum = 3
 
 		// add keys for 3 different clusters with the same user and proxy.
-		keys := make([]Key, keyNum)
+		keys := make([]KeyRing, keyNum)
 		certs := make([]*ssh.Certificate, keyNum)
 		var proxy = "proxy.example.com"
 		var user = "bob"
-		for i := 0; i < keyNum; i++ {
-			idx := KeyIndex{proxy, user, fmt.Sprintf("cluster-%v", i)}
-			key := auth.makeSignedKey(t, idx, false)
-			err := keyStore.AddKey(key)
+		for i := range keyNum {
+			idx := KeyRingIndex{proxy, user, fmt.Sprintf("cluster-%v", i)}
+			keyRing := auth.makeSignedKeyRing(t, idx, false)
+			err := keyStore.AddKeyRing(keyRing)
 			require.NoError(t, err)
-			keys[i] = *key
-			certs[i], err = key.SSHCert()
+			keys[i] = *keyRing
+			certs[i], err = keyRing.SSHCert()
 			require.NoError(t, err)
 		}
 
@@ -171,21 +289,21 @@ func TestDeleteAll(t *testing.T) {
 
 	testEachKeyStore(t, func(t *testing.T, keyStore KeyStore) {
 		// generate keys
-		idxFoo := KeyIndex{"proxy.example.com", "foo", "root"}
-		keyFoo := auth.makeSignedKey(t, idxFoo, false)
-		idxBar := KeyIndex{"proxy.example.com", "bar", "root"}
-		keyBar := auth.makeSignedKey(t, idxBar, false)
+		idxFoo := KeyRingIndex{"proxy.example.com", "foo", "root"}
+		keyFoo := auth.makeSignedKeyRing(t, idxFoo, false)
+		idxBar := KeyRingIndex{"proxy.example.com", "bar", "root"}
+		keyBar := auth.makeSignedKeyRing(t, idxBar, false)
 
 		// add keys
-		err := keyStore.AddKey(keyFoo)
+		err := keyStore.AddKeyRing(keyFoo)
 		require.NoError(t, err)
-		err = keyStore.AddKey(keyBar)
+		err = keyStore.AddKeyRing(keyBar)
 		require.NoError(t, err)
 
 		// check keys exist
-		_, err = keyStore.GetKey(idxFoo)
+		_, err = keyStore.GetKeyRing(idxFoo, nil /*hwks*/)
 		require.NoError(t, err)
-		_, err = keyStore.GetKey(idxBar)
+		_, err = keyStore.GetKeyRing(idxBar, nil /*hwks*/)
 		require.NoError(t, err)
 
 		// delete all keys
@@ -193,9 +311,9 @@ func TestDeleteAll(t *testing.T) {
 		require.NoError(t, err)
 
 		// verify keys are gone
-		_, err = keyStore.GetKey(idxFoo)
+		_, err = keyStore.GetKeyRing(idxFoo, nil /*hwks*/)
 		require.True(t, trace.IsNotFound(err))
-		_, err = keyStore.GetKey(idxBar)
+		_, err = keyStore.GetKeyRing(idxBar, nil /*hwks*/)
 		require.Error(t, err)
 	})
 }
@@ -207,18 +325,18 @@ func TestCheckKey(t *testing.T) {
 	auth := newTestAuthority(t)
 
 	testEachKeyStore(t, func(t *testing.T, keyStore KeyStore) {
-		idx := KeyIndex{"host.a", "bob", "root"}
-		key := auth.makeSignedKey(t, idx, false)
+		idx := KeyRingIndex{"host.a", "bob", "root"}
+		keyRing := auth.makeSignedKeyRing(t, idx, false)
 
 		// Swap out the key with a ECDSA SSH key.
-		ellipticCertificate, _, err := cert.CreateEllipticCertificate("foo", ssh.UserCert)
+		ellipticCertificate, _, err := cert.CreateTestECDSACertificate("foo", ssh.UserCert)
 		require.NoError(t, err)
-		key.Cert = ssh.MarshalAuthorizedKey(ellipticCertificate)
+		keyRing.Cert = ssh.MarshalAuthorizedKey(ellipticCertificate)
 
-		err = keyStore.AddKey(key)
+		err = keyStore.AddKeyRing(keyRing)
 		require.NoError(t, err)
 
-		_, err = keyStore.GetKey(idx)
+		_, err = keyStore.GetKeyRing(idx, nil /*hwks*/)
 		require.NoError(t, err)
 	})
 }
@@ -235,19 +353,19 @@ func TestCheckKeyFIPS(t *testing.T) {
 	}
 
 	testEachKeyStore(t, func(t *testing.T, keyStore KeyStore) {
-		idx := KeyIndex{"host.a", "bob", "root"}
-		key := auth.makeSignedKey(t, idx, false)
+		idx := KeyRingIndex{"host.a", "bob", "root"}
+		keyRing := auth.makeSignedKeyRing(t, idx, false)
 
 		// Swap out the key with a ECDSA SSH key.
-		ellipticCertificate, _, err := cert.CreateEllipticCertificate("foo", ssh.UserCert)
+		ellipticCertificate, _, err := cert.CreateTestECDSACertificate("foo", ssh.UserCert)
 		require.NoError(t, err)
-		key.Cert = ssh.MarshalAuthorizedKey(ellipticCertificate)
+		keyRing.Cert = ssh.MarshalAuthorizedKey(ellipticCertificate)
 
-		err = keyStore.AddKey(key)
+		err = keyStore.AddKeyRing(keyRing)
 		require.NoError(t, err)
 
 		// Should return trace.BadParameter error because only RSA keys are supported.
-		_, err = keyStore.GetKey(idx)
+		_, err = keyStore.GetKeyRing(idx, nil /*hwks*/)
 		require.True(t, trace.IsBadParameter(err))
 	})
 }
@@ -258,33 +376,78 @@ func TestAddKey_withoutSSHCert(t *testing.T) {
 	keyStore := newTestFSKeyStore(t)
 
 	// without ssh cert, db certs only
-	idx := KeyIndex{"host.a", "bob", "root"}
-	key := auth.makeSignedKey(t, idx, false)
-	key.Cert = nil
-	require.NoError(t, keyStore.AddKey(key))
+	idx := KeyRingIndex{"host.a", "bob", "root"}
+	keyRing := auth.makeSignedKeyRing(t, idx, false)
+	keyRing.Cert = nil
+	require.NoError(t, keyStore.AddKeyRing(keyRing))
 
 	// ssh cert path should NOT exist
-	sshCertPath := keyStore.sshCertPath(key.KeyIndex)
+	sshCertPath := keyStore.sshCertPath(keyRing.KeyRingIndex)
 	_, err := os.Stat(sshCertPath)
 	require.ErrorIs(t, err, os.ErrNotExist)
 
-	// check db certs
-	keyCopy, err := keyStore.GetKey(idx, WithDBCerts{})
+	// check db creds
+	keyCopy, err := keyStore.GetKeyRing(idx, nil /*hwks*/, WithDBCerts{})
 	require.NoError(t, err)
-	require.Len(t, keyCopy.DBTLSCerts, 1)
+	require.Len(t, keyCopy.DBTLSCredentials, 1)
 }
 
-func TestConfigDirNotDeleted(t *testing.T) {
+func TestProtectedDirsNotDeleted(t *testing.T) {
 	t.Parallel()
 	auth := newTestAuthority(t)
 	keyStore := newTestFSKeyStore(t)
 
-	idx := KeyIndex{"host.a", "bob", "root"}
-	keyStore.AddKey(auth.makeSignedKey(t, idx, false))
+	idx := KeyRingIndex{"host.a", "bob", "root"}
+	keyStore.AddKeyRing(auth.makeSignedKeyRing(t, idx, false))
+
 	configPath := filepath.Join(keyStore.KeyDir, "config")
 	require.NoError(t, os.Mkdir(configPath, 0700))
+
+	azurePath := filepath.Join(keyStore.KeyDir, "azure")
+	require.NoError(t, os.Mkdir(azurePath, 0700))
+
+	binPath := filepath.Join(keyStore.KeyDir, "bin")
+	require.NoError(t, os.Mkdir(binPath, 0700))
+
+	testPath := filepath.Join(keyStore.KeyDir, "test")
+	require.NoError(t, os.Mkdir(testPath, 0700))
+
 	require.NoError(t, keyStore.DeleteKeys())
 	require.DirExists(t, configPath)
+	require.DirExists(t, azurePath)
+	require.DirExists(t, binPath)
+	require.NoDirExists(t, testPath)
 
 	require.NoDirExists(t, filepath.Join(keyStore.KeyDir, "keys"))
+}
+
+// TestDeleteKeyRingContinueOnError verifies that an issue deleting one file
+// does not prevent deleting the others.
+func TestDeleteKeyRingContinueOnError(t *testing.T) {
+	t.Parallel()
+	auth := newTestAuthority(t)
+	keyStore := newTestFSKeyStore(t)
+	idx := KeyRingIndex{"host.a", "bob", "root"}
+	require.NoError(t, keyStore.AddKeyRing(auth.makeSignedKeyRing(t, idx, false)))
+
+	require.NoError(t, os.Remove(keyStore.userSSHKeyPath(idx)))
+	require.Error(t, keyStore.DeleteKeyRing(idx))
+	for _, file := range []string{
+		keyStore.userSSHKeyPath(idx),
+		keyStore.userTLSKeyPath(idx),
+		keyStore.publicKeyPath(idx),
+		keyStore.tlsCertPath(idx),
+	} {
+		require.NoFileExists(t, file)
+	}
+}
+
+func assertEqualKeyRings(t *testing.T, expected, actual *KeyRing) {
+	t.Helper()
+	// Ignore differences in unexported private key fields, for example keyPEM
+	// may change after being serialized in OpenSSH format and then deserialized.
+	// cmp.Diff fails to compare [hardwarekey.PrivateKey], so we compare the signers below.
+	require.Empty(t, cmp.Diff(expected, actual, cmpopts.IgnoreUnexported(keys.PrivateKey{}), cmpopts.IgnoreUnexported(hardwarekey.Signer{})))
+	require.Equal(t, expected.TLSPrivateKey.Signer, actual.TLSPrivateKey.Signer)
+	require.Equal(t, expected.SSHPrivateKey.Signer, actual.SSHPrivateKey.Signer)
 }

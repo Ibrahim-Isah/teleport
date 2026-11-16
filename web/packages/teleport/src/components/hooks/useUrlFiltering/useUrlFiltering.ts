@@ -1,49 +1,113 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useLocation } from 'react-router';
-import { SortType } from 'design/DataTable/types';
 
+import { parseSortType } from 'design/DataTable/sort';
+import { SortType } from 'design/DataTable/types';
+import {
+  IncludedResourceMode,
+  isResourceHealthStatus,
+} from 'shared/components/UnifiedResources';
+import { makeAdvancedSearchQueryForLabel } from 'shared/utils/advancedSearchLabelQuery';
+
+import { ResourceFilter, ResourceLabel } from 'teleport/services/agents';
 import history from 'teleport/services/history';
-import { AgentFilter, AgentLabel } from 'teleport/services/agents';
 
 import { encodeUrlQueryParams } from './encodeUrlQueryParams';
 
-export function useUrlFiltering(initialSort: SortType) {
+export interface UrlFilteringState {
+  isSearchEmpty: boolean;
+  params: ResourceFilter;
+  setParams: (params: ResourceFilter) => void;
+  pathname: string;
+  setSort: (sort: SortType) => void;
+  onLabelClick: (label: ResourceLabel) => void;
+  replaceHistory: (path: string) => void;
+  search: string;
+}
+
+export type URLResourceFilter = Omit<ResourceFilter, 'includedResourceMode'>;
+
+export function useUrlFiltering(
+  initialParams: URLResourceFilter,
+  includedResourceMode?: IncludedResourceMode
+): UrlFilteringState {
   const { search, pathname } = useLocation();
-  const [params, setParams] = useState<AgentFilter>({
-    sort: initialSort,
-    ...getResourceUrlQueryParams(search),
-  });
 
   function replaceHistory(path: string) {
     history.replace(path);
   }
 
   function setSort(sort: SortType) {
-    setParams({ ...params, sort });
+    replaceHistory(
+      encodeUrlQueryParams({
+        pathname,
+        searchString: params.search || params.query,
+        sort: { ...params.sort, ...sort },
+        kinds: params.kinds,
+        isAdvancedSearch: !!params.query,
+        pinnedOnly: params.pinnedOnly,
+      })
+    );
   }
 
-  const onLabelClick = (label: AgentLabel) => {
-    const queryAfterLabelClick = labelClickQuery(label, params);
+  const [initialParamsState] = useState(initialParams);
+  const params = useMemo(() => {
+    const urlParams = getResourceUrlQueryParams(search);
+    return {
+      ...initialParamsState,
+      ...urlParams,
+      includedResourceMode,
+      pinnedOnly:
+        urlParams.pinnedOnly !== undefined
+          ? urlParams.pinnedOnly
+          : initialParamsState.pinnedOnly,
+    };
+  }, [search, includedResourceMode]);
 
-    setParams({ ...params, search: '', query: queryAfterLabelClick });
+  function setParams(newParams: URLResourceFilter) {
     replaceHistory(
-      encodeUrlQueryParams(pathname, queryAfterLabelClick, params.sort, true)
+      encodeUrlQueryParams({
+        pathname,
+        searchString: newParams.search || newParams.query,
+        sort: newParams.sort,
+        kinds: newParams.kinds,
+        isAdvancedSearch: !!newParams.query,
+        pinnedOnly: newParams.pinnedOnly,
+        statuses: newParams.statuses,
+      })
+    );
+  }
+
+  const onLabelClick = (label: ResourceLabel) => {
+    const queryAfterLabelClick = makeAdvancedSearchQueryForLabel(label, params);
+
+    replaceHistory(
+      encodeUrlQueryParams({
+        pathname,
+        searchString: queryAfterLabelClick,
+        sort: params.sort,
+        kinds: params.kinds,
+        isAdvancedSearch: true,
+        pinnedOnly: params.pinnedOnly,
+      })
     );
   };
 
@@ -61,49 +125,28 @@ export function useUrlFiltering(initialSort: SortType) {
   };
 }
 
-export default function getResourceUrlQueryParams(
-  searchPath: string
-): AgentFilter {
+function getResourceUrlQueryParams(searchPath: string): ResourceFilter {
   const searchParams = new URLSearchParams(searchPath);
   const query = searchParams.get('query');
   const search = searchParams.get('search');
+  const pinnedOnly = searchParams.get('pinnedOnly');
   const sort = searchParams.get('sort');
+  const kinds = searchParams.has('kinds') ? searchParams.getAll('kinds') : null;
+  const statuses = searchParams.has('status')
+    ? searchParams.getAll('status').filter(isResourceHealthStatus)
+    : undefined;
 
-  const sortParam = sort ? sort.split(':') : null;
-
-  // Converts the "fieldname:dir" format into {fieldName: "", dir: ""}
-  const processedSortParam = sortParam
-    ? ({
-        fieldName: sortParam[0],
-        dir: sortParam[1]?.toUpperCase() || 'ASC',
-      } as SortType)
-    : null;
+  const processedSortParam = parseSortType(sort);
 
   return {
     query,
     search,
+    kinds,
+    statuses,
     // Conditionally adds the sort field based on whether it exists or not
     ...(!!processedSortParam && { sort: processedSortParam }),
+    // Conditionally adds the pinnedResources field based on whether its true or not
+    pinnedOnly:
+      pinnedOnly === 'true' ? true : pinnedOnly === 'false' ? false : undefined,
   };
-}
-
-function labelClickQuery(label: AgentLabel, params: AgentFilter) {
-  const queryParts: string[] = [];
-
-  // Add existing query
-  if (params.query) {
-    queryParts.push(params.query);
-  }
-
-  // If there is an existing simple search, convert it to predicate language and add it
-  if (params.search) {
-    queryParts.push(`search("${params.search}")`);
-  }
-
-  const labelQuery = `labels["${label.name}"] == "${label.value}"`;
-  queryParts.push(labelQuery);
-
-  const finalQuery = queryParts.join(' && ');
-
-  return finalQuery;
 }

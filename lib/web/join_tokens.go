@@ -1,23 +1,24 @@
 /*
-Copyright 2015-2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package web
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -25,7 +26,6 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,24 +34,25 @@ import (
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/julienschmidt/httprouter"
-	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
 	apiutils "github.com/gravitational/teleport/api/utils"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/api/utils/clientutils"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/httplib"
-	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/itertools/stream"
+	"github.com/gravitational/teleport/lib/scopes/joining"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/gravitational/teleport/lib/ui"
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/web/scripts"
-	"github.com/gravitational/teleport/lib/web/ui"
+	webui "github.com/gravitational/teleport/lib/web/ui"
 )
 
 const (
-	teleportOSSPackageName = "teleport"
-	teleportEntPackageName = "teleport-ent"
+	HeaderTokenName = "X-Teleport-TokenName"
 )
 
 // nodeJoinToken contains node token fields for the UI.
@@ -59,7 +60,7 @@ type nodeJoinToken struct {
 	//  ID is token ID.
 	ID string `json:"id"`
 	// Expiry is token expiration time.
-	Expiry time.Time `json:"expiry,omitempty"`
+	Expiry time.Time `json:"expiry"`
 	// Method is the join method that the token supports
 	Method types.JoinMethod `json:"method"`
 	// SuggestedLabels contains the set of labels we expect the node to set when using this token
@@ -75,16 +76,262 @@ type scriptSettings struct {
 	appURI              string
 	joinMethod          string
 	databaseInstallMode bool
+
+	discoveryInstallMode bool
+	discoveryGroup       string
 }
 
-func (h *Handler) createTokenHandle(w http.ResponseWriter, r *http.Request, params httprouter.Params, ctx *SessionContext) (interface{}, error) {
-	var req types.ProvisionTokenSpecV2
-	if err := httplib.ReadJSON(r, &req); err != nil {
+// automaticUpgrades returns whether automaticUpgrades should be enabled.
+func automaticUpgrades(features proto.Features) bool {
+	return features.AutomaticUpgrades && features.Cloud
+}
+
+// Currently we aren't paginating this endpoint as we don't
+// expect many tokens to exist at a time. I'm leaving it in a "paginated" form
+// without a nextKey for now so implementing pagination won't change the response shape
+// TODO (avatus) implement pagination
+
+// GetTokensResponse returns a list of JoinTokens.
+type GetTokensResponse struct {
+	Items []webui.JoinToken `json:"items"`
+}
+
+func (h *Handler) getTokens(w http.ResponseWriter, r *http.Request, params httprouter.Params, ctx *SessionContext) (any, error) {
+	clt, err := ctx.GetClient()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// This endpoint returns provision, static, and user tokens together for
+	// compatibility with the legacy all-in-one "GetTokens" RPC.
+	staticTokens, err := clt.GetStaticTokens(r.Context())
+	if err != nil {
+		return nil, trace.Wrap(err, "getting static tokens")
+	}
+	tokens := staticTokens.GetStaticTokens()
+
+	provisionTokens, err := stream.Collect(clientutils.Resources(r.Context(),
+		func(ctx context.Context, pageSize int, pageKey string) ([]types.ProvisionToken, string, error) {
+			return clt.ListProvisionTokens(ctx, pageSize, pageKey, nil, "")
+		},
+	))
+	if err != nil {
+		return nil, trace.Wrap(err, "getting provision tokens")
+	}
+	tokens = append(tokens, provisionTokens...)
+
+	userTokens, err := stream.Collect(clientutils.Resources(r.Context(), clt.ListResetPasswordTokens))
+	if err != nil {
+		return nil, trace.Wrap(err, "getting user tokens")
+	}
+	// Converting the user tokens as provision tokens for presentation and
+	// backward compatibility.
+	for _, t := range userTokens {
+		roles := types.SystemRoles{types.RoleSignup}
+		tok, err := types.NewProvisionToken(t.GetName(), roles, t.Expiry())
+		if err != nil {
+			return nil, trace.Wrap(err, "converting user token as a provision token")
+		}
+		tokens = append(tokens, tok)
+	}
+
+	uiTokens, err := webui.MakeJoinTokens(tokens)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return GetTokensResponse{
+		Items: uiTokens,
+	}, nil
+}
+
+// ListProvisionTokensResponse contains a paginated list of provision tokens.
+type ListProvisionTokensResponse struct {
+	Items         []webui.JoinToken `json:"items"`
+	NextPageToken string            `json:"next_page_token,omitempty"`
+}
+
+// listProvisionTokens returns a paginated list of provision tokens. Items can
+// be filtered by role and bot name. Tokens with ANY of the provided roles are
+// returned. If a bot name is provided, only tokens having a role of Bot are
+// returned.
+func (h *Handler) listProvisionTokens(w http.ResponseWriter, r *http.Request, params httprouter.Params, ctx *SessionContext) (any, error) {
+	clt, err := ctx.GetClient()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	var pageSize int64 = 20
+	if r.URL.Query().Has("page_size") {
+		pageSize, err = strconv.ParseInt(r.URL.Query().Get("page_size"), 10, 32)
+		if err != nil {
+			return nil, trace.Wrap(err, "failed to parse page_size")
+		}
+	}
+
+	roles, err := types.NewTeleportRoles(r.URL.Query()["role"])
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	items, nextToken, err := clt.ListProvisionTokens(r.Context(), int(pageSize), r.URL.Query().Get("page_token"), roles, r.URL.Query().Get("bot_name"))
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	uiTokens, err := webui.MakeJoinTokens(items)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return ListProvisionTokensResponse{
+		Items:         uiTokens,
+		NextPageToken: nextToken,
+	}, nil
+}
+
+func (h *Handler) deleteToken(w http.ResponseWriter, r *http.Request, params httprouter.Params, ctx *SessionContext) (any, error) {
+	token := r.Header.Get(HeaderTokenName)
+	if token == "" {
+		return nil, trace.BadParameter("requires a token to delete")
+	}
+
+	clt, err := ctx.GetClient()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := clt.DeleteToken(r.Context(), token); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return OK(), nil
+}
+
+type CreateTokenRequest struct {
+	Content string `json:"content"`
+}
+
+func (h *Handler) updateTokenYAML(w http.ResponseWriter, r *http.Request, params httprouter.Params, sctx *SessionContext) (any, error) {
+	tokenId := r.Header.Get(HeaderTokenName)
+	if tokenId == "" {
+		return nil, trace.BadParameter("requires a token name to edit")
+	}
+
+	var yaml CreateTokenRequest
+	if err := httplib.ReadResourceJSON(r, &yaml); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	extractedRes, err := ExtractResourceAndValidate(yaml.Content)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if tokenId != extractedRes.Metadata.Name {
+		return nil, trace.BadParameter("renaming tokens is not supported")
+	}
+
+	token, err := services.UnmarshalProvisionToken(extractedRes.Raw)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	clt, err := sctx.GetClient()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	err = clt.UpsertToken(r.Context(), token)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	uiToken, err := webui.MakeJoinToken(token)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return uiToken, trace.Wrap(err)
+
+}
+
+type upsertTokenHandleRequest struct {
+	types.ProvisionTokenSpecV2
+	Name string `json:"name"`
+}
+
+func (h *Handler) upsertTokenHandle(w http.ResponseWriter, r *http.Request, params httprouter.Params, ctx *SessionContext) (any, error) {
+	var req upsertTokenHandleRequest
+	if err := httplib.ReadResourceJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	clt, err := ctx.GetClient()
 	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	var existingToken types.ProvisionToken
+	if req.Name != "" {
+		existingToken, err = clt.GetToken(r.Context(), req.Name)
+		if err != nil && !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	var expires time.Time
+	switch req.JoinMethod {
+	case types.JoinMethodGCP, types.JoinMethodIAM, types.JoinMethodOracle, types.JoinMethodGitHub, types.JoinMethodGitLab:
+		// IAM, GCP, Oracle, GitHub and GitLab tokens should never expire.
+		expires = time.Time{}
+	default:
+		// Set expires time to default node join token TTL.
+		expires = time.Now().UTC().Add(defaults.NodeJoinTokenTTL)
+	}
+
+	name := req.Name
+	if name == "" {
+		randName, err := utils.CryptoRandomHex(defaults.TokenLenBytes)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		name = randName
+	}
+
+	token, err := types.NewProvisionTokenFromSpec(name, expires, req.ProvisionTokenSpecV2)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// If this is an edit, then overwrite the metadata to retain the existing fields
+	if existingToken != nil {
+		token.SetMetadata(existingToken.GetMetadata())
+	}
+
+	err = clt.UpsertToken(r.Context(), token)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	uiToken, err := webui.MakeJoinToken(token)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return uiToken, nil
+}
+
+// createTokenForDiscoveryHandle creates tokens used during guided discover flows.
+// V2 endpoint processes "suggestedLabels" field.
+func (h *Handler) createTokenForDiscoveryHandle(w http.ResponseWriter, r *http.Request, params httprouter.Params, ctx *SessionContext) (any, error) {
+	clt, err := ctx.GetClient()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	var req types.ProvisionTokenSpecV2
+	if err := httplib.ReadResourceJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -107,13 +354,13 @@ func (h *Handler) createTokenHandle(w http.ResponseWriter, r *http.Request, para
 
 		if err == nil {
 			// check if the token found has the right rules
-			if t.GetJoinMethod() != types.JoinMethodIAM || !isSameRuleSet(req.Allow, t.GetAllowRules()) {
+			if t.GetJoinMethod() != types.JoinMethodIAM || !isSameRuleSet(req.Allow, t.GetAWSAllowRules()) {
 				return nil, trace.BadParameter("failed to create token: token with name %q already exists and does not have the expected allow rules", tokenName)
 			}
 
 			return &nodeJoinToken{
 				ID:     t.GetName(),
-				Expiry: *t.GetMetadata().Expires,
+				Expiry: t.Expiry(),
 				Method: t.GetJoinMethod(),
 			}, nil
 		}
@@ -143,12 +390,12 @@ func (h *Handler) createTokenHandle(w http.ResponseWriter, r *http.Request, para
 
 			return &nodeJoinToken{
 				ID:     t.GetName(),
-				Expiry: *t.GetMetadata().Expires,
+				Expiry: t.Expiry(),
 				Method: t.GetJoinMethod(),
 			}, nil
 		}
 	default:
-		tokenName, err = utils.CryptoRandomHex(auth.TokenLenBytes)
+		tokenName, err = utils.CryptoRandomHex(defaults.TokenLenBytes)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -165,9 +412,10 @@ func (h *Handler) createTokenHandle(w http.ResponseWriter, r *http.Request, para
 	// We create an ID and return it as part of the Token, so the UI can use this ID to query the Node that joined using this token
 	// WebUI can then query the resources by this id and answer the question:
 	//   - Which Node joined the cluster from this token Y?
-	req.SuggestedLabels = types.Labels{
-		types.InternalResourceIDLabel: apiutils.Strings{uuid.NewString()},
+	if req.SuggestedLabels == nil {
+		req.SuggestedLabels = make(types.Labels)
 	}
+	req.SuggestedLabels[types.InternalResourceIDLabel] = apiutils.Strings{uuid.NewString()}
 
 	provisionToken, err := types.NewProvisionTokenFromSpec(tokenName, expires, req)
 	if err != nil {
@@ -196,8 +444,8 @@ func (h *Handler) createTokenHandle(w http.ResponseWriter, r *http.Request, para
 	}, nil
 }
 
-func (h *Handler) getNodeJoinScriptHandle(w http.ResponseWriter, r *http.Request, params httprouter.Params) (interface{}, error) {
-	scripts.SetScriptHeaders(w.Header())
+func (h *Handler) getNodeJoinScriptHandle(w http.ResponseWriter, r *http.Request, params httprouter.Params) (any, error) {
+	httplib.SetScriptHeaders(w.Header())
 
 	settings := scriptSettings{
 		token:          params.ByName("token"),
@@ -205,36 +453,42 @@ func (h *Handler) getNodeJoinScriptHandle(w http.ResponseWriter, r *http.Request
 		joinMethod:     r.URL.Query().Get("method"),
 	}
 
-	script, err := getJoinScript(r.Context(), settings, h.GetProxyClient())
+	script, err := h.getJoinScript(r.Context(), settings)
 	if err != nil {
-		log.WithError(err).Info("Failed to return the node install script.")
+		h.logger.InfoContext(r.Context(), "Failed to return the node install script", "error", err)
 		w.Write(scripts.ErrorBashScript)
 		return nil, nil
 	}
 
 	w.WriteHeader(http.StatusOK)
 	if _, err := fmt.Fprintln(w, script); err != nil {
-		log.WithError(err).Info("Failed to return the node install script.")
+		h.logger.InfoContext(r.Context(), "Failed to return the node install script", "error", err)
 		w.Write(scripts.ErrorBashScript)
 	}
 
 	return nil, nil
 }
 
-func (h *Handler) getAppJoinScriptHandle(w http.ResponseWriter, r *http.Request, params httprouter.Params) (interface{}, error) {
-	scripts.SetScriptHeaders(w.Header())
+func (h *Handler) getAppJoinScriptHandle(w http.ResponseWriter, r *http.Request, params httprouter.Params) (any, error) {
+	httplib.SetScriptHeaders(w.Header())
 	queryValues := r.URL.Query()
 
 	name, err := url.QueryUnescape(queryValues.Get("name"))
 	if err != nil {
-		log.WithField("query-param", "name").WithError(err).Debug("Failed to return the app install script.")
+		h.logger.DebugContext(r.Context(), "Failed to return the app install script",
+			"query_param", "name",
+			"error", err,
+		)
 		w.Write(scripts.ErrorBashScript)
 		return nil, nil
 	}
 
 	uri, err := url.QueryUnescape(queryValues.Get("uri"))
 	if err != nil {
-		log.WithField("query-param", "uri").WithError(err).Debug("Failed to return the app install script.")
+		h.logger.DebugContext(r.Context(), "Failed to return the app install script",
+			"query_param", "uri",
+			"error", err,
+		)
 		w.Write(scripts.ErrorBashScript)
 		return nil, nil
 	}
@@ -246,165 +500,169 @@ func (h *Handler) getAppJoinScriptHandle(w http.ResponseWriter, r *http.Request,
 		appURI:         uri,
 	}
 
-	script, err := getJoinScript(r.Context(), settings, h.GetProxyClient())
+	script, err := h.getJoinScript(r.Context(), settings)
 	if err != nil {
-		log.WithError(err).Info("Failed to return the app install script.")
+		h.logger.InfoContext(r.Context(), "Failed to return the app install script", "error", err)
 		w.Write(scripts.ErrorBashScript)
 		return nil, nil
 	}
 
 	w.WriteHeader(http.StatusOK)
 	if _, err := fmt.Fprintln(w, script); err != nil {
-		log.WithError(err).Debug("Failed to return the app install script.")
+		h.logger.DebugContext(r.Context(), "Failed to return the app install script", "error", err)
 		w.Write(scripts.ErrorBashScript)
 	}
 
 	return nil, nil
 }
 
-func (h *Handler) getDatabaseJoinScriptHandle(w http.ResponseWriter, r *http.Request, params httprouter.Params) (interface{}, error) {
-	scripts.SetScriptHeaders(w.Header())
+func (h *Handler) getDatabaseJoinScriptHandle(w http.ResponseWriter, r *http.Request, params httprouter.Params) (any, error) {
+	httplib.SetScriptHeaders(w.Header())
 
 	settings := scriptSettings{
 		token:               params.ByName("token"),
 		databaseInstallMode: true,
 	}
 
-	script, err := getJoinScript(r.Context(), settings, h.GetProxyClient())
+	script, err := h.getJoinScript(r.Context(), settings)
 	if err != nil {
-		log.WithError(err).Info("Failed to return the database install script.")
+		h.logger.InfoContext(r.Context(), "Failed to return the database install script", "error", err)
 		w.Write(scripts.ErrorBashScript)
 		return nil, nil
 	}
 
 	w.WriteHeader(http.StatusOK)
 	if _, err := fmt.Fprintln(w, script); err != nil {
-		log.WithError(err).Debug("Failed to return the database install script.")
+		h.logger.DebugContext(r.Context(), "Failed to return the database install script", "error", err)
 		w.Write(scripts.ErrorBashScript)
 	}
 
 	return nil, nil
 }
 
-func getJoinScript(ctx context.Context, settings scriptSettings, m nodeAPIGetter) (string, error) {
-	switch types.JoinMethod(settings.joinMethod) {
+func (h *Handler) getDiscoveryJoinScriptHandle(w http.ResponseWriter, r *http.Request, params httprouter.Params) (any, error) {
+	httplib.SetScriptHeaders(w.Header())
+	queryValues := r.URL.Query()
+	const discoveryGroupQueryParam = "discoveryGroup"
+
+	discoveryGroup, err := url.QueryUnescape(queryValues.Get(discoveryGroupQueryParam))
+	if err != nil {
+		h.logger.DebugContext(r.Context(), "Failed to return the discovery install script",
+			"error", err,
+			"query_param", discoveryGroupQueryParam,
+		)
+		w.Write(scripts.ErrorBashScript)
+		return nil, nil
+	}
+	if discoveryGroup == "" {
+		h.logger.DebugContext(r.Context(), "Failed to return the discovery install script. Missing required fields",
+			"query_param", discoveryGroupQueryParam,
+		)
+		w.Write(scripts.ErrorBashScript)
+		return nil, nil
+	}
+
+	settings := scriptSettings{
+		token:                params.ByName("token"),
+		discoveryInstallMode: true,
+		discoveryGroup:       discoveryGroup,
+	}
+
+	script, err := h.getJoinScript(r.Context(), settings)
+	if err != nil {
+		h.logger.InfoContext(r.Context(), "Failed to return the discovery install script", "error", err)
+		w.Write(scripts.ErrorBashScript)
+		return nil, nil
+	}
+
+	w.WriteHeader(http.StatusOK)
+	if _, err := fmt.Fprintln(w, script); err != nil {
+		h.logger.DebugContext(r.Context(), "Failed to return the discovery install script", "error", err)
+		w.Write(scripts.ErrorBashScript)
+	}
+
+	return nil, nil
+}
+
+func (h *Handler) getJoinScript(ctx context.Context, settings scriptSettings) (string, error) {
+	joinMethod := types.JoinMethod(settings.joinMethod)
+	switch joinMethod {
 	case types.JoinMethodUnspecified, types.JoinMethodToken:
-		decodedToken, err := hex.DecodeString(settings.token)
-		if err != nil {
+		if err := validateJoinToken(settings.token); err != nil {
 			return "", trace.Wrap(err)
 		}
-		if len(decodedToken) != auth.TokenLenBytes {
-			return "", trace.BadParameter("invalid token %q", decodedToken)
-		}
-
 	case types.JoinMethodIAM:
 	default:
 		return "", trace.BadParameter("join method %q is not supported via script", settings.joinMethod)
 	}
 
+	clt := h.GetProxyClient()
+
 	// The provided token can be attacker controlled, so we must validate
 	// it with the backend before using it to generate the script.
-	token, err := m.GetToken(ctx, settings.token)
+	token, err := clt.GetToken(ctx, settings.token)
 	if err != nil {
 		return "", trace.BadParameter("invalid token")
 	}
 
-	// Get hostname and port from proxy server address.
-	proxyServers, err := m.GetProxies()
-	if err != nil {
-		return "", trace.Wrap(err)
-	}
-
-	if len(proxyServers) == 0 {
-		return "", trace.NotFound("no proxy servers found")
-	}
-
-	version := proxyServers[0].GetTeleportVersion()
-
-	publicAddr := proxyServers[0].GetPublicAddr()
-	if publicAddr == "" {
-		return "", trace.Errorf("proxy public_addr is not set, you must set proxy_service.public_addr to the publicly reachable address of the proxy before you can generate a node join script")
-	}
-
-	hostname, portStr, err := utils.SplitHostPort(publicAddr)
-	if err != nil {
-		return "", trace.Wrap(err)
-	}
+	// TODO(hugoShaka): hit the local accesspoint which has a cache instead of asking the auth every time.
 
 	// Get the CA pin hashes of the cluster to join.
-	localCAResponse, err := m.GetClusterCACert(ctx)
+	localCAResponse, err := clt.GetClusterCACert(ctx)
 	if err != nil {
 		return "", trace.Wrap(err)
 	}
+
 	caPins, err := tlsca.CalculatePins(localCAResponse.TLSCA)
 	if err != nil {
 		return "", trace.Wrap(err)
 	}
 
-	labelsList := []string{}
-	for labelKey, labelValues := range token.GetSuggestedLabels() {
-		labels := strings.Join(labelValues, " ")
-		labelsList = append(labelsList, fmt.Sprintf("%s=%s", labelKey, labels))
-	}
-
-	var dbServiceResourceLabels []string
-	if settings.databaseInstallMode {
-		suggestedAgentMatcherLabels := token.GetSuggestedAgentMatcherLabels()
-		dbServiceResourceLabels, err = scripts.MarshalLabelsYAML(suggestedAgentMatcherLabels, 6)
-		if err != nil {
-			return "", trace.Wrap(err)
-		}
-	}
-
-	var buf bytes.Buffer
-	// If app install mode is requested but parameters are blank for some reason,
-	// we need to return an error.
-	if settings.appInstallMode {
-		if errs := validation.IsDNS1035Label(settings.appName); len(errs) > 0 {
-			return "", trace.BadParameter("appName %q must be a valid DNS subdomain: https://goteleport.com/docs/application-access/guides/connecting-apps/#application-name", settings.appName)
-		}
-		if !appURIPattern.MatchString(settings.appURI) {
-			return "", trace.BadParameter("appURI %q contains invalid characters", settings.appURI)
-		}
-	}
-
-	packageName := teleportOSSPackageName
-	if modules.GetModules().BuildType() == modules.BuildEnterprise {
-		packageName = teleportEntPackageName
-	}
-
-	// TODO(marco): when cloud channel is ready and cluster is running in cloud, set this to `cloud`.
-	repoChannel := ""
-
-	// This section relies on Go's default zero values to make sure that the settings
-	// are correct when not installing an app.
-	err = scripts.InstallNodeBashScript.Execute(&buf, map[string]interface{}{
-		"token":    settings.token,
-		"hostname": hostname,
-		"port":     portStr,
-		// The install.sh script has some manually generated configs and some
-		// generated by the `teleport <service> config` commands. The old bash
-		// version used space delimited values whereas the teleport command uses
-		// a comma delimeter. The Old version can be removed when the install.sh
-		// file has been completely converted over.
-		"caPinsOld":                  strings.Join(caPins, " "),
-		"caPins":                     strings.Join(caPins, ","),
-		"packageName":                packageName,
-		"repoChannel":                repoChannel,
-		"version":                    version,
-		"appInstallMode":             strconv.FormatBool(settings.appInstallMode),
-		"appName":                    settings.appName,
-		"appURI":                     settings.appURI,
-		"joinMethod":                 settings.joinMethod,
-		"labels":                     strings.Join(labelsList, ","),
-		"databaseInstallMode":        strconv.FormatBool(settings.databaseInstallMode),
-		"db_service_resource_labels": dbServiceResourceLabels,
-	})
+	installOpts, err := h.installScriptOptions(ctx)
 	if err != nil {
-		return "", trace.Wrap(err)
+		return "", trace.Wrap(err, "Building install script options")
 	}
 
-	return buf.String(), nil
+	tokenName := token.GetName()
+	if secret, ok := token.GetSecret(); ok {
+		tokenName = joining.EncodeScopedToken(tokenName, secret)
+	}
+
+	nodeInstallOpts := scripts.InstallNodeScriptOptions{
+		InstallOptions: installOpts,
+		Token:          tokenName,
+		CAPins:         caPins,
+		// We are using the joinMethod from the script settings instead of the one from the token
+		// to reproduce the previous script behavior. I'm also afraid that using the
+		// join method from the token would provide an oracle for an attacker wanting to discover
+		// the join method.
+		// We might want to change this in the future to lookup the join method from the token
+		// to avoid potential mismatch and allow the caller to not care about the join method.
+		JoinMethod:              joinMethod,
+		Labels:                  token.GetSuggestedLabels(),
+		LabelMatchers:           token.GetSuggestedAgentMatcherLabels(),
+		AppServiceEnabled:       settings.appInstallMode,
+		AppName:                 settings.appName,
+		AppURI:                  settings.appURI,
+		DatabaseServiceEnabled:  settings.databaseInstallMode,
+		DiscoveryServiceEnabled: settings.discoveryInstallMode,
+		DiscoveryGroup:          settings.discoveryGroup,
+	}
+
+	return scripts.GetNodeInstallScript(ctx, nodeInstallOpts)
+}
+
+// validateJoinToken validate a join token.
+func validateJoinToken(token string) error {
+	decodedToken, err := hex.DecodeString(token)
+	if err != nil {
+		return trace.BadParameter("invalid token %q", token)
+	}
+	if len(decodedToken) != defaults.TokenLenBytes {
+		return trace.BadParameter("invalid token %q", decodedToken)
+	}
+
+	return nil
 }
 
 // generateIAMTokenName makes a deterministic name for a iam join token
@@ -438,7 +696,11 @@ func generateAzureTokenName(rules []*types.ProvisionTokenSpecV2Azure_Rule) (stri
 
 	h := fnv.New32a()
 	for _, r := range orderedRules {
-		_, err := h.Write([]byte(r.Subscription))
+		hashInput := r.Subscription
+		if r.Tenant != "" {
+			hashInput += "tenant:" + r.Tenant
+		}
+		_, err := h.Write([]byte(hashInput))
 		if err != nil {
 			return "", trace.Wrap(err)
 		}
@@ -461,9 +723,12 @@ func sortRules(rules []*types.TokenRule) {
 	})
 }
 
-// sortAzureRules sorts a slice of Azure rules based on their subscription.
+// sortAzureRules sorts a slice of Azure rules based on their subscription and tenant.
 func sortAzureRules(rules []*types.ProvisionTokenSpecV2Azure_Rule) {
 	sort.Slice(rules, func(i, j int) bool {
+		if rules[i].Tenant != rules[j].Tenant {
+			return rules[i].Tenant < rules[j].Tenant
+		}
 		return rules[i].Subscription < rules[j].Subscription
 	})
 }
@@ -481,17 +746,3 @@ func isSameAzureRuleSet(r1, r2 []*types.ProvisionTokenSpecV2Azure_Rule) bool {
 	sortAzureRules(r2)
 	return reflect.DeepEqual(r1, r2)
 }
-
-type nodeAPIGetter interface {
-	// GetToken looks up a provisioning token.
-	GetToken(ctx context.Context, token string) (types.ProvisionToken, error)
-
-	// GetClusterCACert returns the CAs for the local cluster without signing keys.
-	GetClusterCACert(ctx context.Context) (*proto.GetClusterCACertResponse, error)
-
-	// GetProxies returns a list of registered proxies.
-	GetProxies() ([]types.Server, error)
-}
-
-// appURIPattern is a regexp excluding invalid characters from application URIs.
-var appURIPattern = regexp.MustCompile(`^[-\w/:. ]+$`)

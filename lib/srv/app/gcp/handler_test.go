@@ -1,20 +1,25 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gcp
 
 import (
+	"cmp"
 	"context"
 	"testing"
 	"time"
@@ -50,12 +55,15 @@ func TestHandler_getToken(t *testing.T) {
 		}
 	}
 
+	testContext, testContextCancel := context.WithCancel(t.Context())
+
 	tests := []struct {
 		name string
 
 		initState func() any
 
-		config func(state any) HandlerConfig
+		getTokenContext context.Context
+		config          func(state any) HandlerConfig
 
 		wantToken  *credentialspb.GenerateAccessTokenResponse
 		checkErr   require.ErrorAssertionFunc
@@ -86,10 +94,10 @@ func TestHandler_getToken(t *testing.T) {
 			},
 			config: func(state any) HandlerConfig {
 				return HandlerConfig{
-					Clock: state.(clockwork.FakeClock).(clockwork.Clock),
+					Clock: state.(clockwork.Clock),
 					cloudClientGCP: makeTestCloudClient(&testIAMCredentialsClient{
 						generateAccessToken: func(ctx context.Context, req *credentialspb.GenerateAccessTokenRequest, opts ...gax.CallOption) (*credentialspb.GenerateAccessTokenResponse, error) {
-							clock := state.(clockwork.FakeClock)
+							clock := state.(*clockwork.FakeClock)
 
 							// advance time by getTokenTimeout
 							clock.Advance(getTokenTimeout)
@@ -107,8 +115,7 @@ func TestHandler_getToken(t *testing.T) {
 					}),
 				}
 			},
-			checkErr: func(t require.TestingT, err error, i ...interface{}) {
-				require.ErrorContains(t, err, "timeout waiting for access token for 5s")
+			checkErr: func(t require.TestingT, err error, i ...any) {
 				require.ErrorIs(t, err, context.DeadlineExceeded)
 			},
 		},
@@ -121,9 +128,24 @@ func TestHandler_getToken(t *testing.T) {
 					},
 				}),
 			}),
-			checkErr: func(t require.TestingT, err error, i ...interface{}) {
+			checkErr: func(t require.TestingT, err error, i ...any) {
 				require.ErrorContains(t, err, "bad param foo")
 				require.True(t, trace.IsBadParameter(err))
+			},
+		},
+		{
+			name:            "context cancel",
+			getTokenContext: testContext,
+			config: mkConstConfig(HandlerConfig{
+				cloudClientGCP: makeTestCloudClient(&testIAMCredentialsClient{
+					generateAccessToken: func(ctx context.Context, req *credentialspb.GenerateAccessTokenRequest, opts ...gax.CallOption) (*credentialspb.GenerateAccessTokenResponse, error) {
+						testContextCancel()
+						return nil, trace.BadParameter("bad param foo")
+					},
+				}),
+			}),
+			checkErr: func(t require.TestingT, err error, i ...any) {
+				require.ErrorIs(t, err, context.Canceled)
 			},
 		},
 	}
@@ -135,12 +157,10 @@ func TestHandler_getToken(t *testing.T) {
 				state = tt.initState()
 			}
 
-			ctx := context.Background()
-
-			fwd, err := newGCPHandler(ctx, tt.config(state))
+			fwd, err := newGCPHandler(t.Context(), tt.config(state))
 			require.NoError(t, err)
 
-			token, err := fwd.getToken(ctx, "MY_ACCOUNT")
+			token, err := fwd.getToken(cmp.Or(tt.getTokenContext, context.Background()), "MY_ACCOUNT")
 			require.Equal(t, tt.wantToken, token)
 			tt.checkErr(t, err)
 

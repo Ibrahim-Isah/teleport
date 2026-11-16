@@ -1,24 +1,84 @@
-/*
-Copyright 2019-2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import { privateKeyEnablingPolicies } from './consts';
+export type SSOType =
+  | 'microsoft'
+  | 'github'
+  | 'bitbucket'
+  | 'google'
+  | 'openid'
+  | 'okta'
+  | 'unknown';
 
 export type AuthProviderType = 'oidc' | 'saml' | 'github';
 
 export type Auth2faType = 'otp' | 'off' | 'optional' | 'on' | 'webauthn';
+
+export type SecondFactor = 'otp' | 'webauthn' | 'sso';
+
+// legacySecondFactorToSecondFactors converts the legacy second_factor field into the
+// equivalent list of second_factors.
+// TODO(Joerger): DELETE IN v20 - v19 server sets second_factors.
+export function legacySecondFactorToSecondFactors(
+  secondFactor: Auth2faType
+): SecondFactor[] {
+  switch (secondFactor) {
+    case 'otp':
+      return ['otp'];
+    case 'webauthn':
+      return ['webauthn'];
+    case 'on':
+    case 'optional':
+      return ['otp', 'webauthn'];
+    default:
+      return [];
+  }
+}
+
+// secondFactorsToLegacySecondFactor converts a list of second_factors into the
+// equivalent legacy second_factor field.
+//
+// The conversion is lossy:
+// - [sso] -> "off"
+// - [sso, x] -> "otp" | "webauthn" | "on"
+// - No combination of second_factors can result in "optional"
+//
+// TODO(Joerger): the 'optional' auth2faType is currently never sent by v17+ servers
+// due to a bug - https://github.com/gravitational/teleport/issues/67274. As a result,
+// we can accept the loss of "optional" in this conversion for the time being. If we decide
+// to fix "optional", this conversion can be updated to check an 'is_mfa_optional' field.
+export function secondFactorsToLegacySecondFactor(
+  secondFactors: SecondFactor[]
+): Auth2faType {
+  const otp = secondFactors.includes('otp');
+  const webauthn = secondFactors.includes('webauthn');
+
+  if (otp && webauthn) {
+    return 'on';
+  }
+  if (webauthn) {
+    return 'webauthn';
+  }
+  if (otp) {
+    return 'otp';
+  }
+  return 'off';
+}
 
 export type AuthType = 'local' | 'github' | 'oidc' | 'saml';
 
@@ -45,6 +105,17 @@ export type AuthProvider = {
   url: string;
 };
 
-export type PrivateKeyPolicy =
-  | 'none'
-  | typeof privateKeyEnablingPolicies[number];
+/** Values are taken from https://github.com/gravitational/teleport/blob/0460786b4c3afced1350dd9362ce761806e1c99d/api/types/constants.go#L140-L154 */
+export type NodeSubKind = 'teleport' | 'openssh' | 'openssh-ec2-ice';
+
+/** AppSubKind defines names of SubKind for App resource. */
+export enum AppSubKind {
+  AwsIcAccount = 'aws_ic_account',
+  MCP = 'mcp',
+  LLM = 'llm',
+}
+
+/**
+ * AppProtocol defines the protocol of an App resource.
+ */
+export type AppProtocol = 'TCP' | 'HTTP' | 'MCP' | 'LLM';

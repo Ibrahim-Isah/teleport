@@ -1,39 +1,54 @@
-/*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import Logger from 'shared/libs/logger';
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import { context, defaultTextMapSetter, trace } from '@opentelemetry/api';
 import { W3CTraceContextPropagator } from '@opentelemetry/core';
 
-import webSession from 'teleport/services/websession';
-import history from 'teleport/services/history';
-import cfg, { UrlResourcesParams, UrlSshParams } from 'teleport/config';
-import { getAccessToken, getHostName } from 'teleport/services/api';
+import Logger from 'shared/libs/logger';
+
+import cfg, {
+  UrlDbConnectParams,
+  UrlKubeExecParams,
+  UrlSshParams,
+} from 'teleport/config';
 import Tty from 'teleport/lib/term/tty';
 import TtyAddressResolver from 'teleport/lib/term/ttyAddressResolver';
+import { getHostName } from 'teleport/services/api';
+import ClustersService from 'teleport/services/clusters';
+import history from 'teleport/services/history';
+import ServiceNodes from 'teleport/services/nodes';
 import serviceSession, {
-  Session,
   ParticipantList,
   ParticipantMode,
+  Session,
 } from 'teleport/services/session';
-import ServiceNodes from 'teleport/services/nodes';
-import serviceClusters from 'teleport/services/clusters';
+import usersService from 'teleport/services/user';
+import webSession from 'teleport/services/websession';
+import { StoreUserContext } from 'teleport/stores';
 
-import { StoreParties, StoreDocs, DocumentSsh, Document } from './stores';
+import {
+  Document,
+  DocumentDb,
+  DocumentKubeExec,
+  DocumentSsh,
+  StoreDocs,
+  StoreParties,
+} from './stores';
 
 const logger = Logger.create('teleport/console');
 
@@ -47,6 +62,8 @@ export default class ConsoleContext {
   storeDocs = new StoreDocs();
   storeParties = new StoreParties();
   nodesService = new ServiceNodes();
+  clustersService = new ClustersService();
+  storeUser = new StoreUserContext();
 
   constructor() {
     // always initialize the console with 1 document
@@ -56,6 +73,15 @@ export default class ConsoleContext {
       clusterId: cfg.proxyCluster,
       created: new Date(),
     });
+  }
+
+  async initStoreUser() {
+    const user = await usersService.fetchUserContext();
+    this.storeUser.setState(user);
+  }
+
+  getStoreUser() {
+    return this.storeUser.state;
   }
 
   getActiveDocId(url: string) {
@@ -74,6 +100,14 @@ export default class ConsoleContext {
     this.storeDocs.update(id, partial);
   }
 
+  updateKubeExecDocument(id: number, partial: Partial<DocumentKubeExec>) {
+    this.storeDocs.update(id, partial);
+  }
+
+  updateDbDocument(id: number, partial: Partial<DocumentDb>) {
+    this.storeDocs.update(id, partial);
+  }
+
   addNodeDocument(clusterId = cfg.proxyCluster) {
     return this.storeDocs.add({
       clusterId,
@@ -81,6 +115,27 @@ export default class ConsoleContext {
       kind: 'nodes',
       url: cfg.getConsoleNodesRoute(clusterId),
       created: new Date(),
+    });
+  }
+
+  addKubeExecDocument(params: UrlKubeExecParams) {
+    const url = this.getKubeExecDocumentUrl(params);
+
+    return this.storeDocs.add({
+      kind: 'kubeExec',
+      status: 'disconnected',
+      clusterId: params.clusterId,
+      title: params.kubeId,
+      url,
+      created: new Date(),
+      mode: params.mode,
+      sid: params.sid,
+      kubeCluster: params.kubeId,
+      kubeNamespace: '',
+      pod: '',
+      container: '',
+      isInteractive: true,
+      command: '',
     });
   }
 
@@ -105,6 +160,20 @@ export default class ConsoleContext {
       url,
       mode,
       created: new Date(),
+      latency: undefined,
+    });
+  }
+
+  addDbDocument(params: UrlDbConnectParams) {
+    const url = this.getDbDocumentUrl(params);
+
+    return this.storeDocs.add({
+      kind: 'db',
+      clusterId: params.clusterId,
+      title: params.serviceName,
+      url,
+      created: new Date(),
+      name: params.serviceName,
     });
   }
 
@@ -120,6 +189,16 @@ export default class ConsoleContext {
     return sshParams.sid
       ? cfg.getSshSessionRoute(sshParams)
       : cfg.getSshConnectRoute(sshParams);
+  }
+
+  getKubeExecDocumentUrl(kubeExecParams: UrlKubeExecParams) {
+    return kubeExecParams.sid
+      ? cfg.getKubeExecSessionRoute(kubeExecParams)
+      : cfg.getKubeExecConnectRoute(kubeExecParams);
+  }
+
+  getDbDocumentUrl(dbConnectParams: UrlDbConnectParams) {
+    return cfg.getDbConnectRoute(dbConnectParams);
   }
 
   refreshParties() {
@@ -157,14 +236,6 @@ export default class ConsoleContext {
     });
   }
 
-  fetchNodes(clusterId: string, params?: UrlResourcesParams) {
-    return this.nodesService.fetchNodes(clusterId, params);
-  }
-
-  fetchClusters() {
-    return serviceClusters.fetchClusters();
-  }
-
   logout() {
     webSession.logout();
   }
@@ -178,21 +249,38 @@ export default class ConsoleContext {
     const ctx = context.active();
 
     propagator.inject(ctx, carrier, defaultTextMapSetter);
+    let baseUrl = '';
+    let ttyParams = {};
+    switch (session.kind) {
+      case 'ssh':
+        ttyParams = {
+          login,
+          sid,
+          server_id: serverId,
+          mode,
+        };
+        baseUrl = cfg.api.ttyWsAddr;
+        break;
+      case 'k8s':
+        ttyParams = {
+          sid,
+          mode,
+        };
 
-    const ttyUrl = cfg.api.ttyWsAddr
+        baseUrl = cfg.api.ttyKubeExecWsAddr;
+        break;
+      case 'db':
+        baseUrl = cfg.api.ttyDbWsAddr;
+    }
+
+    const ttyUrl = baseUrl
       .replace(':fqdn', getHostName())
-      .replace(':token', getAccessToken())
       .replace(':clusterId', clusterId)
       .replace(':traceparent', carrier['traceparent']);
 
     const addressResolver = new TtyAddressResolver({
       ttyUrl,
-      ttyParams: {
-        login,
-        sid,
-        server_id: serverId,
-        mode,
-      },
+      ttyParams,
     });
 
     return new Tty(addressResolver);

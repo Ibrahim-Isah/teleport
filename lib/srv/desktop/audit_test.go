@@ -1,95 +1,126 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package desktop
 
 import (
-	"bytes"
-	"context"
-	"fmt"
 	"io"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/testing/protocmp"
 
+	tdpbv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/desktop/v1"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/types/events"
 	libevents "github.com/gravitational/teleport/lib/events"
-	"github.com/gravitational/teleport/lib/events/eventstest"
-	"github.com/gravitational/teleport/lib/srv/desktop/tdp"
+	"github.com/gravitational/teleport/lib/reversetunnel"
+	"github.com/gravitational/teleport/lib/srv/desktop/tdp/protocol/legacy"
+	"github.com/gravitational/teleport/lib/srv/desktop/tdp/protocol/tdpb"
 	"github.com/gravitational/teleport/lib/tlsca"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
-func setup() (*WindowsService, *tlsca.Identity, *eventstest.MockEmitter) {
-	emitter := &eventstest.MockEmitter{}
-	log := logrus.New()
-	log.SetOutput(io.Discard)
+const (
+	testDirectoryID  directoryID  = 2
+	testCompletionID completionID = 999
+
+	testOffset uint64 = 500
+	testLength uint32 = 1000
+
+	testDirName  = "test-dir"
+	testFilePath = "test/path/test-file.txt"
+)
+
+// testDesktop is a dummy desktop used to populate
+// audit events for testing
+var testDesktop = &types.WindowsDesktopV3{
+	ResourceHeader: types.ResourceHeader{
+		Metadata: types.Metadata{
+			Name:   "test-desktop",
+			Labels: map[string]string{"env": "production"},
+		},
+	},
+	Spec: types.WindowsDesktopSpecV3{
+		Addr:   "192.168.100.12",
+		Domain: "test.example.com",
+	},
+}
+
+func setup(desktop types.WindowsDesktop) (*tlsca.Identity, *desktopSessionAuditor) {
+	startTime := time.Now()
 
 	s := &WindowsService{
 		clusterName: "test-cluster",
 		cfg: WindowsServiceConfig{
-			Log:     log,
-			Emitter: emitter,
+			Logger:  slog.New(logutils.NewSlogTextHandler(io.Discard, logutils.SlogTextHandlerConfig{})),
+			Emitter: libevents.NewDiscardEmitter(),
 			Heartbeat: HeartbeatConfig{
 				HostUUID: "test-host-id",
 			},
-			Clock: clockwork.NewFakeClockAt(time.Now()),
+			Clock:                clockwork.NewFakeClockAt(startTime),
+			ConnectedProxyGetter: reversetunnel.NewConnectedProxyGetter(),
 		},
 		auditCache: newSharedDirectoryAuditCache(),
 	}
 
 	id := &tlsca.Identity{
-		Username:     "foo",
-		Impersonator: "bar",
-		MFAVerified:  "mfa-id",
-		LoginIP:      "127.0.0.1",
+		Username:        "foo",
+		Impersonator:    "bar",
+		MFAVerified:     "mfa-id",
+		LoginIP:         "127.0.0.1",
+		TeleportCluster: s.clusterName,
 	}
 
-	return s, id, emitter
+	d := &desktopSessionAuditor{
+		clock: s.cfg.Clock,
+
+		sessionID:      "sessionID",
+		identity:       id,
+		targetUser:     "Administrator",
+		windowsDesktop: desktop,
+
+		startTime:          startTime,
+		clusterName:        s.clusterName,
+		desktopServiceUUID: s.cfg.Heartbeat.HostUUID,
+
+		auditCache: newSharedDirectoryAuditCache(),
+	}
+
+	return id, d
 }
 
 func TestSessionStartEvent(t *testing.T) {
-	s, id, emitter := setup()
-
-	desktop := &types.WindowsDesktopV3{
-		ResourceHeader: types.ResourceHeader{
-			Metadata: types.Metadata{
-				Name:   "test-desktop",
-				Labels: map[string]string{"env": "production"},
-			},
-		},
-		Spec: types.WindowsDesktopSpecV3{
-			Addr:   "192.168.100.12",
-			Domain: "test.example.com",
-		},
-	}
+	id, audit := setup(testDesktop)
 
 	userMeta := id.GetUserMetadata()
 	userMeta.Login = "Administrator"
 	expected := &events.WindowsDesktopSessionStart{
 		Metadata: events.Metadata{
-			ClusterName: s.clusterName,
+			ClusterName: audit.clusterName,
 			Type:        libevents.WindowsDesktopSessionStartEvent,
 			Code:        libevents.DesktopSessionStartCode,
-			Time:        s.cfg.Clock.Now().UTC().Round(time.Millisecond),
+			Time:        audit.startTime,
 		},
 		UserMetadata: userMeta,
 		SessionMetadata: events.SessionMetadata{
@@ -98,16 +129,17 @@ func TestSessionStartEvent(t *testing.T) {
 		},
 		ConnectionMetadata: events.ConnectionMetadata{
 			LocalAddr:  id.LoginIP,
-			RemoteAddr: desktop.GetAddr(),
+			RemoteAddr: testDesktop.GetAddr(),
 			Protocol:   libevents.EventProtocolTDP,
 		},
+		CertMetadata: new(events.WindowsCertificateMetadata),
 		Status: events.Status{
 			Success: true,
 		},
-		WindowsDesktopService: s.cfg.Heartbeat.HostUUID,
+		WindowsDesktopService: audit.desktopServiceUUID,
 		DesktopName:           "test-desktop",
-		DesktopAddr:           desktop.GetAddr(),
-		Domain:                desktop.GetDomain(),
+		DesktopAddr:           testDesktop.GetAddr(),
+		Domain:                testDesktop.GetDomain(),
 		WindowsUser:           "Administrator",
 		DesktopLabels:         map[string]string{"env": "production"},
 	}
@@ -136,70 +168,41 @@ func TestSessionStartEvent(t *testing.T) {
 		},
 	} {
 		t.Run(test.desc, func(t *testing.T) {
-			s.onSessionStart(
-				context.Background(),
-				s.cfg.Emitter,
-				id,
-				s.cfg.Clock.Now().UTC().Round(time.Millisecond),
-				"Administrator",
-				"sessionID",
-				desktop,
-				test.err,
-			)
-
-			event := emitter.LastEvent()
-			require.NotNil(t, event)
-
-			startEvent, ok := event.(*events.WindowsDesktopSessionStart)
-			require.True(t, ok)
-
+			startEvent := audit.makeWindowsSessionStart(test.err)
 			require.Empty(t, cmp.Diff(test.exp(), *startEvent))
 		})
 	}
+
+	t.Run("audit emits CAOverride details", func(t *testing.T) {
+		t.Parallel()
+
+		_, audit := setup(testDesktop)
+
+		const aPublicKeyHash = "6fbd7ba3f34c526f5d6d8ea2659f9fb5ca031712ee588ce35941d568742d44ed"
+		audit.caOverrideDetails = &events.CAOverrideCertificateDetails{
+			Active:        true,
+			PublicKeyHash: aPublicKeyHash,
+		}
+
+		got := audit.makeWindowsSessionStart(nil)
+		if diff := cmp.Diff(audit.caOverrideDetails, got.CAOverride, protocmp.Transform()); diff != "" {
+			t.Errorf("CAOverrideDetails mismatch (-want +got)\n%s", diff)
+		}
+	})
 }
 
 func TestSessionEndEvent(t *testing.T) {
-	s, id, emitter := setup()
+	id, audit := setup(testDesktop)
 
-	desktop := &types.WindowsDesktopV3{
-		ResourceHeader: types.ResourceHeader{
-			Metadata: types.Metadata{
-				Name:   "test-desktop",
-				Labels: map[string]string{"env": "production"},
-			},
-		},
-		Spec: types.WindowsDesktopSpecV3{
-			Addr:   "192.168.100.12",
-			Domain: "test.example.com",
-		},
-	}
+	audit.clock.(*clockwork.FakeClock).Advance(30 * time.Second)
 
-	c := clockwork.NewFakeClockAt(time.Now())
-	s.cfg.Clock = c
-	startTime := s.cfg.Clock.Now().UTC().Round(time.Millisecond)
-	c.Advance(30 * time.Second)
-
-	s.onSessionEnd(
-		context.Background(),
-		s.cfg.Emitter,
-		id,
-		startTime,
-		true,
-		"Administrator",
-		"sessionID",
-		desktop,
-	)
-
-	event := emitter.LastEvent()
-	require.NotNil(t, event)
-	endEvent, ok := event.(*events.WindowsDesktopSessionEnd)
-	require.True(t, ok)
+	endEvent := audit.makeWindowsSessionEnd(true)
 
 	userMeta := id.GetUserMetadata()
 	userMeta.Login = "Administrator"
 	expected := &events.WindowsDesktopSessionEnd{
 		Metadata: events.Metadata{
-			ClusterName: s.clusterName,
+			ClusterName: audit.clusterName,
 			Type:        libevents.WindowsDesktopSessionEndEvent,
 			Code:        libevents.DesktopSessionEndCode,
 		},
@@ -208,14 +211,19 @@ func TestSessionEndEvent(t *testing.T) {
 			SessionID: "sessionID",
 			WithMFA:   id.MFAVerified,
 		},
-		WindowsDesktopService: s.cfg.Heartbeat.HostUUID,
-		DesktopAddr:           desktop.GetAddr(),
-		Domain:                desktop.GetDomain(),
+		ConnectionMetadata: events.ConnectionMetadata{
+			LocalAddr:  id.LoginIP,
+			RemoteAddr: testDesktop.GetAddr(),
+			Protocol:   libevents.EventProtocolTDP,
+		},
+		WindowsDesktopService: audit.desktopServiceUUID,
+		DesktopName:           testDesktop.GetName(),
+		DesktopAddr:           testDesktop.GetAddr(),
+		Domain:                testDesktop.GetDomain(),
 		WindowsUser:           "Administrator",
 		DesktopLabels:         map[string]string{"env": "production"},
-		StartTime:             startTime,
-		EndTime:               c.Now().UTC().Round(time.Millisecond),
-		DesktopName:           desktop.GetName(),
+		StartTime:             audit.startTime,
+		EndTime:               audit.clock.Now().UTC(),
 		Recorded:              true,
 		Participants:          []string{"foo"},
 	}
@@ -223,15 +231,10 @@ func TestSessionEndEvent(t *testing.T) {
 }
 
 func TestDesktopSharedDirectoryStartEvent(t *testing.T) {
-	sid := "session-0"
-	desktopAddr := "windows.example.com"
-	testDirName := "test-dir"
-	var did uint32 = 2
-
 	for _, test := range []struct {
 		name string
-		// sendsSda determines whether a SharedDirectoryAnnounce is sent.
-		sendsSda bool
+		// sendsAnnounce determines whether a SharedDirectoryAnnounce is sent.
+		sendsAnnounce bool
 		// errCode is the error code in the simulated SharedDirectoryAcknowledge
 		errCode uint32
 		// expected returns the event we expect to be emitted by modifying baseEvent
@@ -240,18 +243,18 @@ func TestDesktopSharedDirectoryStartEvent(t *testing.T) {
 	}{
 		{
 			// when everything is working as expected
-			name:     "typical operation",
-			sendsSda: true,
-			errCode:  tdp.ErrCodeNil,
+			name:          "typical operation",
+			sendsAnnounce: true,
+			errCode:       legacy.ErrCodeNil,
 			expected: func(baseEvent *events.DesktopSharedDirectoryStart) *events.DesktopSharedDirectoryStart {
 				return baseEvent
 			},
 		},
 		{
 			// the announce operation failed
-			name:     "announce failed",
-			sendsSda: true,
-			errCode:  tdp.ErrCodeFailed,
+			name:          "announce failed",
+			sendsAnnounce: true,
+			errCode:       legacy.ErrCodeFailed,
 			expected: func(baseEvent *events.DesktopSharedDirectoryStart) *events.DesktopSharedDirectoryStart {
 				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryStartFailureCode
 				return baseEvent
@@ -259,9 +262,9 @@ func TestDesktopSharedDirectoryStartEvent(t *testing.T) {
 		},
 		{
 			// should never happen but just in case
-			name:     "directory name unknown",
-			sendsSda: false,
-			errCode:  tdp.ErrCodeNil,
+			name:          "directory name unknown",
+			sendsAnnounce: false,
+			errCode:       legacy.ErrCodeNil,
 			expected: func(baseEvent *events.DesktopSharedDirectoryStart) *events.DesktopSharedDirectoryStart {
 				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryStartFailureCode
 				baseEvent.DirectoryName = "unknown"
@@ -270,82 +273,57 @@ func TestDesktopSharedDirectoryStartEvent(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			s, id, emitter := setup()
-			recvHandler := s.makeTDPReceiveHandler(context.Background(),
-				emitter, func() int64 { return 0 },
-				id, sid, desktopAddr, &tdp.Conn{})
-			sendHandler := s.makeTDPSendHandler(context.Background(),
-				emitter, func() int64 { return 0 },
-				id, sid, desktopAddr, &tdp.Conn{})
+			id, audit := setup(testDesktop)
 
-			if test.sendsSda {
+			if test.sendsAnnounce {
 				// SharedDirectoryAnnounce initializes the nameCache.
-				sda := tdp.SharedDirectoryAnnounce{
-					DirectoryID: did,
+				audit.onSharedDirectoryAnnounce(&tdpb.SharedDirectoryAnnounce{
+					DirectoryId: uint32(testDirectoryID),
 					Name:        testDirName,
-				}
-				recvHandler(sda)
+				})
 			}
 
 			// SharedDirectoryAcknowledge causes the event to be emitted
-			// (or not, on failure).
-			ack := tdp.SharedDirectoryAcknowledge{
-				DirectoryID: did,
-				ErrCode:     test.errCode,
-			}
-			encoded, err := ack.Encode()
-			require.NoError(t, err)
-			sendHandler(ack, encoded)
+			startEvent := audit.makeSharedDirectoryStart(&tdpb.SharedDirectoryAcknowledge{
+				DirectoryId: uint32(testDirectoryID),
+				ErrorCode:   test.errCode,
+			})
 
 			baseEvent := &events.DesktopSharedDirectoryStart{
 				Metadata: events.Metadata{
 					Type:        libevents.DesktopSharedDirectoryStartEvent,
 					Code:        libevents.DesktopSharedDirectoryStartCode,
-					ClusterName: s.clusterName,
-					Time:        s.cfg.Clock.Now().UTC(),
+					ClusterName: audit.clusterName,
+					Time:        audit.clock.Now().UTC(),
 				},
 				UserMetadata: id.GetUserMetadata(),
 				SessionMetadata: events.SessionMetadata{
-					SessionID: sid,
+					SessionID: audit.sessionID,
 					WithMFA:   id.MFAVerified,
 				},
 				ConnectionMetadata: events.ConnectionMetadata{
 					LocalAddr:  id.LoginIP,
-					RemoteAddr: desktopAddr,
+					RemoteAddr: audit.windowsDesktop.GetAddr(),
 					Protocol:   libevents.EventProtocolTDP,
 				},
 				Status:        statusFromErrCode(test.errCode),
-				DesktopAddr:   desktopAddr,
+				DesktopAddr:   audit.windowsDesktop.GetAddr(),
 				DirectoryName: testDirName,
-				DirectoryID:   did,
+				DirectoryID:   uint32(testDirectoryID),
+				DesktopName:   audit.windowsDesktop.GetName(),
 			}
 
 			expected := test.expected(baseEvent)
-			event := emitter.LastEvent()
-
-			require.NotNil(t, event)
-			startEvent, ok := event.(*events.DesktopSharedDirectoryStart)
-			require.True(t, ok)
-
 			require.Empty(t, cmp.Diff(expected, startEvent))
 		})
 	}
 }
 
 func TestDesktopSharedDirectoryReadEvent(t *testing.T) {
-	sid := "session-0"
-	desktopAddr := "windows.example.com"
-	testDirName := "test-dir"
-	path := "test/path/test-file.txt"
-	var did uint32 = 2
-	var cid uint32 = 999
-	var offset uint64 = 500
-	var length uint32 = 1000
-
 	for _, test := range []struct {
 		name string
-		// sendsSda determines whether a SharedDirectoryAnnounce is sent.
-		sendsSda bool
+		// sendsAnnounce determines whether a SharedDirectoryAnnounce is sent.
+		sendsAnnounce bool
 		// sendsReq determines whether a SharedDirectoryReadRequest is sent.
 		sendsReq bool
 		// errCode is the error code in the simulated SharedDirectoryReadResponse
@@ -356,69 +334,74 @@ func TestDesktopSharedDirectoryReadEvent(t *testing.T) {
 	}{
 		{
 			// when everything is working as expected
-			name:     "typical operation",
-			sendsSda: true,
-			sendsReq: true,
-			errCode:  tdp.ErrCodeNil,
+			name:          "typical operation",
+			sendsAnnounce: true,
+			sendsReq:      true,
+			errCode:       legacy.ErrCodeNil,
 			expected: func(baseEvent *events.DesktopSharedDirectoryRead) *events.DesktopSharedDirectoryRead {
 				return baseEvent
 			},
 		},
 		{
 			// the read operation failed
-			name:     "read failed",
-			sendsSda: true,
-			sendsReq: true,
-			errCode:  tdp.ErrCodeFailed,
+			name:          "read failed",
+			sendsAnnounce: true,
+			sendsReq:      true,
+			errCode:       legacy.ErrCodeFailed,
 			expected: func(baseEvent *events.DesktopSharedDirectoryRead) *events.DesktopSharedDirectoryRead {
-				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryWriteFailureCode
+				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryReadFailureCode
 				return baseEvent
 			},
 		},
 		{
 			// should never happen but just in case
-			name:     "directory name unknown",
-			sendsSda: false,
-			sendsReq: true,
-			errCode:  tdp.ErrCodeNil,
+			name:          "directory name unknown",
+			sendsAnnounce: false,
+			sendsReq:      true,
+			errCode:       legacy.ErrCodeNil,
 			expected: func(baseEvent *events.DesktopSharedDirectoryRead) *events.DesktopSharedDirectoryRead {
 				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryReadFailureCode
-				baseEvent.DirectoryName = "unknown"
-				return baseEvent
-			},
-		},
-		{
-			// should never happen but just in case
-			name:     "request info unknown",
-			sendsSda: true,
-			sendsReq: false,
-			errCode:  tdp.ErrCodeNil,
-			expected: func(baseEvent *events.DesktopSharedDirectoryRead) *events.DesktopSharedDirectoryRead {
-				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryReadFailureCode
-
 				// resorts to default values for these
-				baseEvent.DirectoryID = 0
+				baseEvent.DirectoryID = uint32(testDirectoryID)
 				baseEvent.Offset = 0
 
 				// sets "unknown" for these
 				baseEvent.Path = "unknown"
-				// we can't retrieve the directory name because we don't have the directoryID
 				baseEvent.DirectoryName = "unknown"
+				return baseEvent
+			},
+		},
+		{
+			// should never happen but just in case
+			name:          "request info unknown",
+			sendsAnnounce: true,
+			sendsReq:      false,
+			errCode:       legacy.ErrCodeNil,
+			expected: func(baseEvent *events.DesktopSharedDirectoryRead) *events.DesktopSharedDirectoryRead {
+				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryReadFailureCode
+
+				// resorts to default values for these
+				baseEvent.DirectoryID = uint32(testDirectoryID)
+				baseEvent.Offset = 0
+
+				// sets "unknown" for these
+				baseEvent.Path = "unknown"
+				baseEvent.DirectoryName = testDirName
 
 				return baseEvent
 			},
 		},
 		{
 			// should never happen but just in case
-			name:     "directory name and request info unknown",
-			sendsSda: false,
-			sendsReq: false,
-			errCode:  tdp.ErrCodeNil,
+			name:          "directory name and request info unknown",
+			sendsAnnounce: false,
+			sendsReq:      false,
+			errCode:       legacy.ErrCodeNil,
 			expected: func(baseEvent *events.DesktopSharedDirectoryRead) *events.DesktopSharedDirectoryRead {
 				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryReadFailureCode
 
 				// resorts to default values for these
-				baseEvent.DirectoryID = 0
+				baseEvent.DirectoryID = uint32(testDirectoryID)
 				baseEvent.Offset = 0
 
 				// sets "unknown" for these
@@ -430,75 +413,55 @@ func TestDesktopSharedDirectoryReadEvent(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			s, id, emitter := setup()
-			recvHandler := s.makeTDPReceiveHandler(context.Background(),
-				emitter, func() int64 { return 0 },
-				id, sid, desktopAddr, &tdp.Conn{})
-			sendHandler := s.makeTDPSendHandler(context.Background(),
-				emitter, func() int64 { return 0 },
-				id, sid, desktopAddr, &tdp.Conn{})
-			if test.sendsSda {
-				// SharedDirectoryAnnounce initializes the nameCache.
-				sda := tdp.SharedDirectoryAnnounce{
-					DirectoryID: did,
+			id, audit := setup(testDesktop)
+
+			if test.sendsAnnounce {
+				// SharedDirectoryAnnounce initializes the name cache
+				audit.onSharedDirectoryAnnounce(&tdpb.SharedDirectoryAnnounce{
+					DirectoryId: uint32(testDirectoryID),
 					Name:        testDirName,
-				}
-				recvHandler(sda)
+				})
 			}
 
 			if test.sendsReq {
 				// SharedDirectoryReadRequest initializes the readRequestCache.
-				req := tdp.SharedDirectoryReadRequest{
-					CompletionID: cid,
-					DirectoryID:  did,
-					Path:         path,
-					Offset:       offset,
-					Length:       length,
-				}
-				encoded, err := req.Encode()
-				require.NoError(t, err)
-				sendHandler(req, encoded)
+				audit.onSharedDirectoryReadRequest(testCompletionID, testDirectoryID, tdpbv1.SharedDirectoryRequest_Read_builder{
+					Path:   testFilePath,
+					Offset: testOffset,
+					Length: testLength,
+				}.Build())
 			}
 
 			// SharedDirectoryReadResponse causes the event to be emitted.
-			res := tdp.SharedDirectoryReadResponse{
-				CompletionID:   cid,
-				ErrCode:        test.errCode,
-				ReadDataLength: length,
-				ReadData:       []byte{}, // irrelevant in this context
-			}
-			recvHandler(res)
-
-			event := emitter.LastEvent()
-			require.NotNil(t, event)
-
-			readEvent, ok := event.(*events.DesktopSharedDirectoryRead)
-			require.True(t, ok)
+			readEvent := audit.makeSharedDirectoryReadResponse(testDirectoryID, testCompletionID, test.errCode, tdpbv1.SharedDirectoryResponse_Read_builder{
+				Data: make([]byte, testLength), // slice contents are irrelevant in this context
+			}.Build())
 
 			baseEvent := &events.DesktopSharedDirectoryRead{
 				Metadata: events.Metadata{
 					Type:        libevents.DesktopSharedDirectoryReadEvent,
 					Code:        libevents.DesktopSharedDirectoryReadCode,
-					ClusterName: s.clusterName,
-					Time:        s.cfg.Clock.Now().UTC(),
+					ClusterName: audit.clusterName,
+					Time:        audit.clock.Now().UTC(),
 				},
 				UserMetadata: id.GetUserMetadata(),
 				SessionMetadata: events.SessionMetadata{
-					SessionID: sid,
+					SessionID: audit.sessionID,
 					WithMFA:   id.MFAVerified,
 				},
 				ConnectionMetadata: events.ConnectionMetadata{
 					LocalAddr:  id.LoginIP,
-					RemoteAddr: desktopAddr,
+					RemoteAddr: audit.windowsDesktop.GetAddr(),
 					Protocol:   libevents.EventProtocolTDP,
 				},
 				Status:        statusFromErrCode(test.errCode),
-				DesktopAddr:   desktopAddr,
+				DesktopAddr:   audit.windowsDesktop.GetAddr(),
 				DirectoryName: testDirName,
-				DirectoryID:   did,
-				Path:          path,
-				Length:        length,
-				Offset:        offset,
+				DirectoryID:   uint32(testDirectoryID),
+				Path:          testFilePath,
+				Length:        testLength,
+				Offset:        testOffset,
+				DesktopName:   audit.windowsDesktop.GetName(),
 			}
 
 			require.Empty(t, cmp.Diff(test.expected(baseEvent), readEvent))
@@ -507,19 +470,10 @@ func TestDesktopSharedDirectoryReadEvent(t *testing.T) {
 }
 
 func TestDesktopSharedDirectoryWriteEvent(t *testing.T) {
-	sid := "session-0"
-	desktopAddr := "windows.example.com"
-	testDirName := "test-dir"
-	path := "test/path/test-file.txt"
-	var did uint32 = 2
-	var cid uint32 = 999
-	var offset uint64 = 500
-	var length uint32 = 1000
-
 	for _, test := range []struct {
 		name string
-		// sendsSda determines whether a SharedDirectoryAnnounce is sent.
-		sendsSda bool
+		// sendsAnnounce determines whether a SharedDirectoryAnnounce is sent.
+		sendsAnnounce bool
 		// sendsReq determines whether a SharedDirectoryWriteRequest is sent.
 		sendsReq bool
 		// errCode is the error code in the simulated SharedDirectoryWriteResponse
@@ -530,20 +484,20 @@ func TestDesktopSharedDirectoryWriteEvent(t *testing.T) {
 	}{
 		{
 			// when everything is working as expected
-			name:     "typical operation",
-			sendsSda: true,
-			sendsReq: true,
-			errCode:  tdp.ErrCodeNil,
+			name:          "typical operation",
+			sendsAnnounce: true,
+			sendsReq:      true,
+			errCode:       legacy.ErrCodeNil,
 			expected: func(baseEvent *events.DesktopSharedDirectoryWrite) *events.DesktopSharedDirectoryWrite {
 				return baseEvent
 			},
 		},
 		{
 			// the Write operation failed
-			name:     "write failed",
-			sendsSda: true,
-			sendsReq: true,
-			errCode:  tdp.ErrCodeFailed,
+			name:          "write failed",
+			sendsAnnounce: true,
+			sendsReq:      true,
+			errCode:       legacy.ErrCodeFailed,
 			expected: func(baseEvent *events.DesktopSharedDirectoryWrite) *events.DesktopSharedDirectoryWrite {
 				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryWriteFailureCode
 				return baseEvent
@@ -551,48 +505,53 @@ func TestDesktopSharedDirectoryWriteEvent(t *testing.T) {
 		},
 		{
 			// should never happen but just in case
-			name:     "directory name unknown",
-			sendsSda: false,
-			sendsReq: true,
-			errCode:  tdp.ErrCodeNil,
+			name:          "directory name unknown",
+			sendsAnnounce: false,
+			sendsReq:      true,
+			errCode:       legacy.ErrCodeNil,
 			expected: func(baseEvent *events.DesktopSharedDirectoryWrite) *events.DesktopSharedDirectoryWrite {
 				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryWriteFailureCode
-				baseEvent.DirectoryName = "unknown"
-				return baseEvent
-			},
-		},
-		{
-			// should never happen but just in case
-			name:     "request info unknown",
-			sendsSda: true,
-			sendsReq: false,
-			errCode:  tdp.ErrCodeNil,
-			expected: func(baseEvent *events.DesktopSharedDirectoryWrite) *events.DesktopSharedDirectoryWrite {
-				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryWriteFailureCode
-
 				// resorts to default values for these
-				baseEvent.DirectoryID = 0
+				baseEvent.DirectoryID = uint32(testDirectoryID)
 				baseEvent.Offset = 0
 
 				// sets "unknown" for these
 				baseEvent.Path = "unknown"
-				// we can't retrieve the directory name because we don't have the directoryID
 				baseEvent.DirectoryName = "unknown"
+				return baseEvent
+			},
+		},
+		{
+			// should never happen but just in case
+			name:          "request info unknown",
+			sendsAnnounce: true,
+			sendsReq:      false,
+			errCode:       legacy.ErrCodeNil,
+			expected: func(baseEvent *events.DesktopSharedDirectoryWrite) *events.DesktopSharedDirectoryWrite {
+				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryWriteFailureCode
+
+				// resorts to default values for these
+				baseEvent.DirectoryID = uint32(testDirectoryID)
+				baseEvent.Offset = 0
+
+				// sets "unknown" for these
+				baseEvent.Path = "unknown"
+				baseEvent.DirectoryName = testDirName
 
 				return baseEvent
 			},
 		},
 		{
 			// should never happen but just in case
-			name:     "directory name and request info unknown",
-			sendsSda: false,
-			sendsReq: false,
-			errCode:  tdp.ErrCodeNil,
+			name:          "directory name and request info unknown",
+			sendsAnnounce: false,
+			sendsReq:      false,
+			errCode:       legacy.ErrCodeNil,
 			expected: func(baseEvent *events.DesktopSharedDirectoryWrite) *events.DesktopSharedDirectoryWrite {
 				baseEvent.Metadata.Code = libevents.DesktopSharedDirectoryWriteFailureCode
 
 				// resorts to default values for these
-				baseEvent.DirectoryID = 0
+				baseEvent.DirectoryID = uint32(testDirectoryID)
 				baseEvent.Offset = 0
 
 				// sets "unknown" for these
@@ -604,74 +563,55 @@ func TestDesktopSharedDirectoryWriteEvent(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			s, id, emitter := setup()
-			recvHandler := s.makeTDPReceiveHandler(context.Background(),
-				emitter, func() int64 { return 0 },
-				id, sid, desktopAddr, &tdp.Conn{})
-			sendHandler := s.makeTDPSendHandler(context.Background(),
-				emitter, func() int64 { return 0 },
-				id, sid, desktopAddr, &tdp.Conn{})
-			if test.sendsSda {
+			id, audit := setup(testDesktop)
+
+			if test.sendsAnnounce {
 				// SharedDirectoryAnnounce initializes the nameCache.
-				sda := tdp.SharedDirectoryAnnounce{
-					DirectoryID: did,
+				audit.onSharedDirectoryAnnounce(&tdpb.SharedDirectoryAnnounce{
+					DirectoryId: uint32(testDirectoryID),
 					Name:        testDirName,
-				}
-				recvHandler(sda)
+				})
 			}
 
 			if test.sendsReq {
 				// SharedDirectoryWriteRequest initializes the writeRequestCache.
-				req := tdp.SharedDirectoryWriteRequest{
-					CompletionID:    cid,
-					DirectoryID:     did,
-					Path:            path,
-					Offset:          offset,
-					WriteDataLength: length,
-				}
-				encoded, err := req.Encode()
-				require.NoError(t, err)
-				sendHandler(req, encoded)
+				audit.onSharedDirectoryWriteRequest(testCompletionID, testDirectoryID, tdpbv1.SharedDirectoryRequest_Write_builder{
+					Path:   testFilePath,
+					Offset: testOffset,
+					Data:   make([]byte, testLength),
+				}.Build())
 			}
 
 			// SharedDirectoryWriteResponse causes the event to be emitted.
-			res := tdp.SharedDirectoryWriteResponse{
-				CompletionID: cid,
-				ErrCode:      test.errCode,
-				BytesWritten: length,
-			}
-			recvHandler(res)
-
-			event := emitter.LastEvent()
-			require.NotNil(t, event)
-
-			writeEvent, ok := event.(*events.DesktopSharedDirectoryWrite)
-			require.True(t, ok)
+			writeEvent := audit.makeSharedDirectoryWriteResponse(testDirectoryID, testCompletionID, test.errCode, tdpbv1.SharedDirectoryResponse_Write_builder{
+				BytesWritten: testLength,
+			}.Build())
 
 			baseEvent := &events.DesktopSharedDirectoryWrite{
 				Metadata: events.Metadata{
 					Type:        libevents.DesktopSharedDirectoryWriteEvent,
 					Code:        libevents.DesktopSharedDirectoryWriteCode,
-					ClusterName: s.clusterName,
-					Time:        s.cfg.Clock.Now().UTC(),
+					ClusterName: audit.clusterName,
+					Time:        audit.clock.Now().UTC(),
 				},
 				UserMetadata: id.GetUserMetadata(),
 				SessionMetadata: events.SessionMetadata{
-					SessionID: sid,
+					SessionID: audit.sessionID,
 					WithMFA:   id.MFAVerified,
 				},
 				ConnectionMetadata: events.ConnectionMetadata{
 					LocalAddr:  id.LoginIP,
-					RemoteAddr: desktopAddr,
+					RemoteAddr: audit.windowsDesktop.GetAddr(),
 					Protocol:   libevents.EventProtocolTDP,
 				},
 				Status:        statusFromErrCode(test.errCode),
-				DesktopAddr:   desktopAddr,
+				DesktopAddr:   audit.windowsDesktop.GetAddr(),
 				DirectoryName: testDirName,
-				DirectoryID:   did,
-				Path:          path,
-				Length:        length,
-				Offset:        offset,
+				DirectoryID:   uint32(testDirectoryID),
+				Path:          testFilePath,
+				Length:        testLength,
+				Offset:        testOffset,
+				DesktopName:   audit.windowsDesktop.GetName(),
 			}
 
 			require.Empty(t, cmp.Diff(test.expected(baseEvent), writeEvent))
@@ -679,272 +619,234 @@ func TestDesktopSharedDirectoryWriteEvent(t *testing.T) {
 	}
 }
 
-// fillEntry is a helper function that fills an entry's readRequestCache up with entryMaxItems.
-func fillEntry(entry *sharedDirectoryAuditCacheEntry, did directoryID) {
-	for i := 0; i < entryMaxItems; i++ {
-		entry.readRequestCache[completionID(i)] = readRequestInfo{
-			directoryID: did,
-		}
+// fillReadRequestCache is a helper function that fills an entry's readRequestCache up with entryMaxItems.
+func fillReadRequestCache(cache *sharedDirectoryAuditCache, did directoryID) {
+	for i := range maxAuditCacheItems {
+		cache.SetReadRequestInfo(did, completionID(i), readRequestInfo{})
 	}
 }
 
 // TestDesktopSharedDirectoryStartEventAuditCacheMax tests that a
-// failed DesktopSharedDirectoryStart is emitted and the tdpConn is
-// closed when we receive a SharedDirectoryAnnounce whose corresponding
-// sharedDirectoryAuditCacheEntry is full.
+// failed DesktopSharedDirectoryStart is emitted when the shared
+// directory audit cache is full.
 func TestDesktopSharedDirectoryStartEventAuditCacheMax(t *testing.T) {
-	sid := "session-0"
-	desktopAddr := "windows.example.com"
-	testDirName := "test-dir"
-	var did uint32 = 2
+	id, audit := setup(testDesktop)
 
-	s, id, emitter := setup()
-	testConn := &testConn{}
-	tdpConn := tdp.NewConn(testConn)
-	recvHandler := s.makeTDPReceiveHandler(context.Background(),
-		emitter, func() int64 { return 0 },
-		id, sid, desktopAddr, tdpConn)
-
+	audit.auditCache.NewDirectory(testDirectoryID, testDirName)
 	// Set the audit cache entry to the maximum allowable size
-	entry := newSharedDirectoryAuditCacheEntry()
-	fillEntry(entry, directoryID(did))
-	s.auditCache.m[sessionID(sid)] = entry
+	fillReadRequestCache(&audit.auditCache, testDirectoryID)
 
 	// Send a SharedDirectoryAnnounce
-	sda := tdp.SharedDirectoryAnnounce{
-		DirectoryID: did,
+	startEvent := audit.onSharedDirectoryAnnounce(&tdpb.SharedDirectoryAnnounce{
+		DirectoryId: uint32(testDirectoryID),
 		Name:        testDirName,
-	}
-	recvHandler(sda)
+	})
+	require.NotNil(t, startEvent)
 
 	// Expect the audit cache to emit a failed DesktopSharedDirectoryStart
 	// with a status detailing the security problem.
-	event := emitter.LastEvent()
-	require.NotNil(t, event)
-	startEvent, ok := event.(*events.DesktopSharedDirectoryStart)
-	require.True(t, ok)
-
 	expected := &events.DesktopSharedDirectoryStart{
 		Metadata: events.Metadata{
 			Type:        libevents.DesktopSharedDirectoryStartEvent,
 			Code:        libevents.DesktopSharedDirectoryStartFailureCode,
-			ClusterName: s.clusterName,
-			Time:        s.cfg.Clock.Now().UTC(),
+			ClusterName: audit.clusterName,
+			Time:        audit.clock.Now().UTC(),
 		},
 		UserMetadata: id.GetUserMetadata(),
 		SessionMetadata: events.SessionMetadata{
-			SessionID: sid,
+			SessionID: audit.sessionID,
 			WithMFA:   id.MFAVerified,
 		},
 		ConnectionMetadata: events.ConnectionMetadata{
 			LocalAddr:  id.LoginIP,
-			RemoteAddr: desktopAddr,
+			RemoteAddr: audit.windowsDesktop.GetAddr(),
 			Protocol:   libevents.EventProtocolTDP,
 		},
 		Status: events.Status{
 			Success:     false,
-			Error:       fmt.Sprintf("audit cache for sessionID(%v) exceeded maximum size", sid),
+			Error:       "audit cache exceeded maximum size",
 			UserMessage: "Teleport failed the request and terminated the session as a security precaution",
 		},
-		DesktopAddr:   desktopAddr,
+		DesktopAddr:   audit.windowsDesktop.GetAddr(),
 		DirectoryName: testDirName,
-		DirectoryID:   did,
+		DirectoryID:   uint32(testDirectoryID),
+		DesktopName:   audit.windowsDesktop.GetName(),
 	}
 
 	require.Empty(t, cmp.Diff(expected, startEvent))
-
-	// Check that Close was called on the TDP connection
-	require.True(t, testConn.closeCalled)
 }
 
 // TestDesktopSharedDirectoryReadEventAuditCacheMax tests that a
-// failed DesktopSharedDirectoryRead is emitted and the tdpConn is
-// closed when we receive a SharedDirectoryReadRequest whose corresponding
-// sharedDirectoryAuditCacheEntry is full.
+// failed DesktopSharedDirectoryRead is generated when the shared
+// directory audit cache is full.
 func TestDesktopSharedDirectoryReadEventAuditCacheMax(t *testing.T) {
-	sid := "session-0"
-	desktopAddr := "windows.example.com"
-	testDirName := "test-dir"
-	path := "test/path/test-file.txt"
-	var did uint32 = 2
-	var cid uint32 = 999
-	var offset uint64 = 500
-	var length uint32 = 1000
-
-	s, id, emitter := setup()
-	testConn := &testConn{}
-	tdpConn := tdp.NewConn(testConn)
-	recvHandler := s.makeTDPReceiveHandler(context.Background(),
-		emitter, func() int64 { return 0 },
-		id, sid, desktopAddr, tdpConn)
-	sendHandler := s.makeTDPSendHandler(context.Background(),
-		emitter, func() int64 { return 0 },
-		id, sid, desktopAddr, tdpConn)
+	id, audit := setup(testDesktop)
 
 	// Send a SharedDirectoryAnnounce
-	sda := tdp.SharedDirectoryAnnounce{
-		DirectoryID: did,
+	audit.onSharedDirectoryAnnounce(&tdpb.SharedDirectoryAnnounce{
+		DirectoryId: uint32(testDirectoryID),
 		Name:        testDirName,
-	}
-	recvHandler(sda)
+	})
 
+	audit.auditCache.NewDirectory(testDirectoryID, testDirName)
 	// Set the audit cache entry to the maximum allowable size
-	entry, ok := s.auditCache.m[sessionID(sid)]
-	require.True(t, ok)
-	fillEntry(entry, directoryID(did))
+	fillReadRequestCache(&audit.auditCache, testDirectoryID)
 
 	// SharedDirectoryReadRequest should cause a failed audit event.
-	req := tdp.SharedDirectoryReadRequest{
-		CompletionID: cid,
-		DirectoryID:  did,
-		Path:         path,
-		Offset:       offset,
-		Length:       length,
-	}
-	encoded, err := req.Encode()
-	require.NoError(t, err)
-	sendHandler(req, encoded)
-
-	// Expect the audit cache to emit a failed DesktopSharedDirectoryRead
-	// with a status detailing the security problem.
-	event := emitter.LastEvent()
-	require.NotNil(t, event)
-	readEvent, ok := event.(*events.DesktopSharedDirectoryRead)
-	require.True(t, ok)
+	readEvent := audit.onSharedDirectoryReadRequest(testCompletionID, testDirectoryID, tdpbv1.SharedDirectoryRequest_Read_builder{
+		Path:   testFilePath,
+		Offset: testOffset,
+		Length: testLength,
+	}.Build())
+	require.NotNil(t, readEvent)
 
 	expected := &events.DesktopSharedDirectoryRead{
 		Metadata: events.Metadata{
 			Type:        libevents.DesktopSharedDirectoryReadEvent,
 			Code:        libevents.DesktopSharedDirectoryReadFailureCode,
-			ClusterName: s.clusterName,
-			Time:        s.cfg.Clock.Now().UTC(),
+			ClusterName: audit.clusterName,
+			Time:        audit.clock.Now().UTC(),
 		},
 		UserMetadata: id.GetUserMetadata(),
 		SessionMetadata: events.SessionMetadata{
-			SessionID: sid,
+			SessionID: audit.sessionID,
 			WithMFA:   id.MFAVerified,
 		},
 		ConnectionMetadata: events.ConnectionMetadata{
 			LocalAddr:  id.LoginIP,
-			RemoteAddr: desktopAddr,
+			RemoteAddr: audit.windowsDesktop.GetAddr(),
 			Protocol:   libevents.EventProtocolTDP,
 		},
 		Status: events.Status{
 			Success:     false,
-			Error:       fmt.Sprintf("audit cache for sessionID(%v) exceeded maximum size", sid),
+			Error:       "audit cache exceeded maximum size",
 			UserMessage: "Teleport failed the request and terminated the session as a security precaution",
 		},
-		DesktopAddr:   desktopAddr,
+		DesktopAddr:   audit.windowsDesktop.GetAddr(),
 		DirectoryName: testDirName,
-		DirectoryID:   did,
-		Path:          path,
-		Length:        length,
-		Offset:        offset,
+		DirectoryID:   uint32(testDirectoryID),
+		Path:          testFilePath,
+		Length:        testLength,
+		Offset:        testOffset,
+		DesktopName:   audit.windowsDesktop.GetName(),
 	}
 
 	require.Empty(t, cmp.Diff(expected, readEvent))
-
-	// Check that Close was called on the TDP connection
-	require.True(t, testConn.closeCalled)
 }
 
 // TestDesktopSharedDirectoryWriteEventAuditCacheMax tests that a
-// failed DesktopSharedDirectoryWrite is emitted and the tdpConn is
-// closed when we receive a SharedDirectoryWriteRequest whose corresponding
-// sharedDirectoryAuditCacheEntry is full.
+// failed DesktopSharedDirectoryWrite is generated when the shared
+// directory audit cache is full.
 func TestDesktopSharedDirectoryWriteEventAuditCacheMax(t *testing.T) {
-	sid := "session-0"
-	desktopAddr := "windows.example.com"
-	testDirName := "test-dir"
-	path := "test/path/test-file.txt"
-	var did uint32 = 2
-	var cid uint32 = 999
-	var offset uint64 = 500
-	var length uint32 = 1000
+	id, audit := setup(testDesktop)
 
-	s, id, emitter := setup()
-	testConn := &testConn{}
-	tdpConn := tdp.NewConn(testConn)
-	recvHandler := s.makeTDPReceiveHandler(context.Background(),
-		emitter, func() int64 { return 0 },
-		id, sid, desktopAddr, tdpConn)
-	sendHandler := s.makeTDPSendHandler(context.Background(),
-		emitter, func() int64 { return 0 },
-		id, sid, desktopAddr, tdpConn)
-
-	// Send a SharedDirectoryAnnounce
-	sda := tdp.SharedDirectoryAnnounce{
-		DirectoryID: did,
+	audit.onSharedDirectoryAnnounce(&tdpb.SharedDirectoryAnnounce{
+		DirectoryId: uint32(testDirectoryID),
 		Name:        testDirName,
-	}
-	recvHandler(sda)
+	})
 
-	// Set the audit cache entry to the maximum allowable size
-	entry, ok := s.auditCache.m[sessionID(sid)]
-	require.True(t, ok)
-	fillEntry(entry, directoryID(did))
+	audit.auditCache.NewDirectory(testDirectoryID, testDirName)
+	fillReadRequestCache(&audit.auditCache, testDirectoryID)
 
-	// SharedDirectoryWriteRequest should cause a failed audit event.
-	req := tdp.SharedDirectoryWriteRequest{
-		CompletionID:    cid,
-		DirectoryID:     did,
-		Path:            path,
-		Offset:          offset,
-		WriteDataLength: length,
-	}
-	encoded, err := req.Encode()
-	require.NoError(t, err)
-	sendHandler(req, encoded)
-
-	// Expect the audit cache to emit a failed DesktopSharedDirectoryWrite
-	// with a status detailing the security problem.
-	event := emitter.LastEvent()
-	require.NotNil(t, event)
-	writeEvent, ok := event.(*events.DesktopSharedDirectoryWrite)
-	require.True(t, ok)
+	writeEvent := audit.onSharedDirectoryWriteRequest(testCompletionID, testDirectoryID, tdpbv1.SharedDirectoryRequest_Write_builder{
+		Path:   testFilePath,
+		Offset: testOffset,
+		Data:   make([]byte, testLength),
+	}.Build())
+	require.NotNil(t, writeEvent, "audit event should have been generated")
 
 	expected := &events.DesktopSharedDirectoryWrite{
 		Metadata: events.Metadata{
 			Type:        libevents.DesktopSharedDirectoryWriteEvent,
 			Code:        libevents.DesktopSharedDirectoryWriteFailureCode,
-			ClusterName: s.clusterName,
-			Time:        s.cfg.Clock.Now().UTC(),
+			ClusterName: audit.clusterName,
+			Time:        audit.clock.Now().UTC(),
 		},
 		UserMetadata: id.GetUserMetadata(),
 		SessionMetadata: events.SessionMetadata{
-			SessionID: sid,
+			SessionID: audit.sessionID,
 			WithMFA:   id.MFAVerified,
 		},
 		ConnectionMetadata: events.ConnectionMetadata{
 			LocalAddr:  id.LoginIP,
-			RemoteAddr: desktopAddr,
+			RemoteAddr: audit.windowsDesktop.GetAddr(),
 			Protocol:   libevents.EventProtocolTDP,
 		},
 		Status: events.Status{
 			Success:     false,
-			Error:       fmt.Sprintf("audit cache for sessionID(%v) exceeded maximum size", sid),
+			Error:       "audit cache exceeded maximum size",
 			UserMessage: "Teleport failed the request and terminated the session as a security precaution",
 		},
-		DesktopAddr:   desktopAddr,
+		DesktopAddr:   audit.windowsDesktop.GetAddr(),
 		DirectoryName: testDirName,
-		DirectoryID:   did,
-		Path:          path,
-		Length:        length,
-		Offset:        offset,
+		DirectoryID:   uint32(testDirectoryID),
+		Path:          testFilePath,
+		Length:        testLength,
+		Offset:        testOffset,
+		DesktopName:   audit.windowsDesktop.GetName(),
 	}
 
 	require.Empty(t, cmp.Diff(expected, writeEvent))
-
-	// Check that Close was called on the TDP connection
-	require.True(t, testConn.closeCalled)
 }
 
-type testConn struct {
-	*bytes.Buffer
-	closeCalled bool
-}
+// TestAuditCacheLifecycle confirms that the audit cache operates correctly
+// in response to protocol events.
+func TestAuditCacheLifecycle(t *testing.T) {
+	_, audit := setup(testDesktop)
 
-func (t *testConn) Close() error {
-	t.closeCalled = true
-	return nil
+	// SharedDirectoryAnnounce initializes the nameCache.
+	audit.onSharedDirectoryAnnounce(&tdpb.SharedDirectoryAnnounce{
+		DirectoryId: uint32(testDirectoryID),
+		Name:        testDirName,
+	})
+
+	// Confirm that audit cache is in the expected state.
+	require.Equal(t, 1, audit.auditCache.totalItems())
+	name, ok := audit.auditCache.GetName(testDirectoryID)
+	require.True(t, ok)
+	require.Equal(t, directoryName(testDirName), name)
+	_, _, ok = audit.auditCache.TakeReadRequestInfo(testDirectoryID, testCompletionID)
+	require.False(t, ok)
+	_, _, ok = audit.auditCache.TakeWriteRequestInfo(testDirectoryID, testCompletionID)
+	require.False(t, ok)
+
+	// A SharedDirectoryReadRequest should add a corresponding entry in the readRequestCache.
+	audit.onSharedDirectoryReadRequest(testCompletionID, testDirectoryID, tdpbv1.SharedDirectoryRequest_Read_builder{
+		Path:   testFilePath,
+		Offset: testOffset,
+		Length: testLength,
+	}.Build())
+	require.Equal(t, 2, audit.auditCache.totalItems())
+
+	// A SharedDirectoryWriteRequest should add a corresponding entry in the writeRequestCache.
+	audit.onSharedDirectoryWriteRequest(testCompletionID, testDirectoryID, tdpbv1.SharedDirectoryRequest_Write_builder{
+		Path:   testFilePath,
+		Offset: testOffset,
+		Data:   make([]byte, testLength),
+	}.Build())
+	require.Equal(t, 3, audit.auditCache.totalItems())
+
+	// Check that the readRequestCache was properly filled out.
+	require.Contains(t, audit.auditCache.directories[testDirectoryID].readRequestCache, testCompletionID)
+
+	// Check that the writeRequestCache was properly filled out.
+	require.Contains(t, audit.auditCache.directories[testDirectoryID].writeRequestCache, testCompletionID)
+
+	// SharedDirectoryReadResponse should cause the entry in the readRequestCache to be cleaned up.
+	audit.makeSharedDirectoryReadResponse(testDirectoryID, testCompletionID, legacy.ErrCodeNil, tdpbv1.SharedDirectoryResponse_Read_builder{
+		Data: make([]byte, testLength), // slice contents are irrelevant in this context
+	}.Build())
+	require.Equal(t, 2, audit.auditCache.totalItems())
+
+	// SharedDirectoryWriteResponse should cause the entry in the writeRequestCache to be cleaned up.
+	audit.makeSharedDirectoryWriteResponse(testDirectoryID, testCompletionID, legacy.ErrCodeNil, tdpbv1.SharedDirectoryResponse_Write_builder{
+		BytesWritten: testLength,
+	}.Build())
+	require.Equal(t, 1, audit.auditCache.totalItems())
+
+	// Check that the readRequestCache was properly cleaned up.
+	require.NotContains(t, audit.auditCache.directories[testDirectoryID].readRequestCache, testCompletionID)
+
+	// Check that the writeRequestCache was properly cleaned up.
+	require.NotContains(t, audit.auditCache.directories[testDirectoryID].writeRequestCache, testCompletionID)
 }

@@ -1,249 +1,270 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import styled, { css } from 'styled-components';
+import { useRef, useState } from 'react';
+import styled, { useTheme } from 'styled-components';
 
-import { ChevronDownIcon } from 'design/SVGIcon/ChevronDown';
-import { Text } from 'design';
-import { LogoutIcon } from 'design/SVGIcon';
-import { NavLink } from 'react-router-dom';
+import { Box } from 'design';
+import { ChevronDown, Logout as LogoutIcon, Moon, Sun } from 'design/Icon';
+import { Theme } from 'gen-proto-ts/teleport/userpreferences/v1/theme_pb';
+import { UserDisplayName } from 'shared/components/UserDisplayName';
+import { useRefClickOutside } from 'shared/hooks/useRefClickOutside';
 
-import session from 'teleport/services/websession';
-import { useFeatures } from 'teleport/FeaturesContext';
 import { useTeleport } from 'teleport';
+import {
+  Dropdown,
+  DropdownDivider,
+  DropdownItem,
+  DropdownItemButton,
+  DropdownItemIcon,
+  DropdownItemLink,
+  INCREMENT_TRANSITION_DELAY,
+  STARTING_TRANSITION_DELAY,
+} from 'teleport/components/Dropdown';
+import { useFeatures } from 'teleport/FeaturesContext';
+import { focusOutsideTarget } from 'teleport/lib/util/eventTarget';
+import session from 'teleport/services/websession';
+import { getCurrentTheme, getNextTheme } from 'teleport/ThemeProvider';
+import { DeviceTrustStatus } from 'teleport/TopBar/DeviceTrustStatus';
+import { useUser } from 'teleport/User/UserContext';
 
-interface UserMenuNavProps {
-  username: string;
-}
+const USER_MENU_DROPDOWN_ID = 'tb-user-menu';
 
 const Container = styled.div`
   position: relative;
   align-self: center;
-  margin-right: 30px;
+  padding-left: ${props => props.theme.space[3]}px;
+  padding-right: ${props => props.theme.space[3]}px;
+  &:hover,
+  &:focus-within {
+    background: ${props => props.theme.colors.spotBackground[0]};
+  }
+  height: 100%;
 `;
 
 const UserInfo = styled.div`
+  height: 100%;
   display: flex;
   align-items: center;
-  padding: 8px;
   border-radius: 5px;
   cursor: pointer;
   user-select: none;
   position: relative;
-
-  &:hover {
-    background: rgba(255, 255, 255, 0.06);
-  }
+  outline: none;
 `;
 
-const Username = styled(Text)`
-  color: white;
-  font-size: 14px;
-  font-weight: 400;
-  padding-right: 40px;
+const CornerUserDisplay = styled(UserDisplayName)`
+  display: none;
+  @media screen and (min-width: ${p => p.theme.breakpoints.large}) {
+    display: inline-flex;
+  }
+  span {
+    line-height: 1.2;
+  }
 `;
 
 const StyledAvatar = styled.div`
   align-items: center;
-  background: #5130c9;
-  color: white;
+  background: ${props => props.theme.colors.brand};
+  color: ${props => props.theme.colors.text.primaryInverse};
   border-radius: 50%;
+  @media screen and (min-width: ${p => p.theme.breakpoints.medium}) {
+    margin-right: 16px;
+    height: 32px;
+    max-width: 32px;
+    min-width: 32px;
+  }
   display: flex;
   font-size: 14px;
   font-weight: bold;
   justify-content: center;
-  height: 32px;
-  margin-right: 16px;
   width: 100%;
-  max-width: 32px;
-  min-width: 32px;
+  height: 24px;
+  max-width: 24px;
+  min-width: 24px;
 `;
 
-const Arrow = styled.div`
-  position: absolute;
-  right: 10px;
-  top: 50%;
-  transform: translate(0, -50%);
+const Arrow = styled.div<{ open?: boolean }>`
   line-height: 0;
+  padding-left: ${p => p.theme.space[3]}px;
 
   svg {
     transform: ${p => (p.open ? 'rotate(-180deg)' : 'none')};
     transition: 0.1s linear transform;
   }
-`;
 
-interface OpenProps {
-  open: boolean;
-}
-
-const Dropdown = styled.div<OpenProps>`
-  position: absolute;
-  display: flex;
-  flex-direction: column;
-  padding: 10px 15px;
-  background: #222c59;
-  box-shadow: 0 2px 4px rgba(12, 12, 14, 0.9);
-  border-radius: 5px;
-  width: 265px;
-  right: 0;
-  top: 43px;
-  z-index: 999;
-  opacity: ${p => (p.open ? 1 : 0)};
-  visibility: ${p => (p.open ? 'visible' : 'hidden')};
-  transform-origin: top right;
-  transition: opacity 0.2s ease, visibility 0.2s ease,
-    transform 0.3s cubic-bezier(0.45, 0.6, 0.5, 1.25);
-  transform: ${p =>
-    p.open ? 'scale(1) translate(0, 12px)' : 'scale(.8) translate(0, 4px)'};
-`;
-
-const DropdownItem = styled.div`
-  line-height: 1;
-  font-size: 14px;
-  color: white;
-  cursor: pointer;
-  border-radius: 4px;
-  margin-bottom: 5px;
-  opacity: ${p => (p.open ? 1 : 0)};
-  transition: transform 0.3s ease, opacity 0.7s ease;
-  transform: translate3d(${p => (p.open ? 0 : '20px')}, 0, 0);
-
-  &:last-of-type {
-    margin-bottom: 0;
+  display: none;
+  @media screen and (min-width: ${p => p.theme.breakpoints.medium}) {
+    display: inline-flex;
   }
 `;
 
-const commonDropdownItemStyles = css`
-  opacity: 0.8;
-  align-items: center;
-  display: flex;
-  padding: 10px 10px;
-  color: white;
-  text-decoration: none;
-  transition: opacity 0.15s ease-in;
-
-  &:hover {
-    opacity: 1;
-  }
-`;
-
-const DropdownItemButton = styled.div`
-  ${commonDropdownItemStyles};
-`;
-
-const DropdownItemLink = styled(NavLink)`
-  ${commonDropdownItemStyles};
-`;
-
-const DropdownItemIcon = styled.div`
-  margin-right: 16px;
-  line-height: 0;
-`;
-
-const DropdownDivider = styled.div`
-  height: 1px;
-  background: rgba(255, 255, 255, 0.1);
-  margin: 0 5px 5px 5px;
-`;
-
-export function UserMenuNav({ username }: UserMenuNavProps) {
+export function UserMenuNav({ hideFeatures }: { hideFeatures?: boolean }) {
   const [open, setOpen] = useState(false);
+  const theme = useTheme();
 
-  const ref = useRef<HTMLDivElement>();
+  const { preferences, updatePreferences } = useUser();
+
+  const outsideClickRef = useRefClickOutside<HTMLDivElement>({ open, setOpen });
+  const dropdownRef = useRef<HTMLDivElement>(null);
 
   const ctx = useTeleport();
+  const { displayPrimary, displaySecondary, username } = ctx.storeUser.state;
   const clusterId = ctx.storeUser.getClusterId();
   const features = useFeatures();
+  const currentTheme = getCurrentTheme(preferences.theme);
+  const nextTheme = getNextTheme(preferences.theme);
 
-  const initial =
-    username && username.length ? username.trim().charAt(0).toUpperCase() : '';
+  const onThemeChange = () => {
+    updatePreferences({ theme: nextTheme });
+    setOpen(false);
+  };
 
-  const handleClickOutside = useCallback(
-    (event: MouseEvent) => {
-      if (ref.current && !ref.current.contains(event.target as HTMLElement)) {
-        setOpen(false);
-      }
-    },
-    [ref.current]
-  );
+  const initial = (displayPrimary?.trim() || username.trim())
+    .charAt(0)
+    .toUpperCase();
 
-  useEffect(() => {
-    if (open) {
-      document.addEventListener('mousedown', handleClickOutside);
-
-      return () => {
-        document.removeEventListener('mousedown', handleClickOutside);
-      };
-    }
-  }, [ref, open, handleClickOutside]);
-
-  const topMenuItems = features.filter(feature => Boolean(feature.topMenuItem));
+  const topMenuItems = hideFeatures
+    ? []
+    : features.filter(
+        feature =>
+          Boolean(feature.topMenuItem) && feature.category === undefined
+      );
 
   const items = [];
 
-  let transitionDelay = 80;
+  let transitionDelay = STARTING_TRANSITION_DELAY;
   for (const [index, item] of topMenuItems.entries()) {
     items.push(
       <DropdownItem
         open={open}
         key={index}
-        style={{
-          transitionDelay: `${transitionDelay}ms`,
-        }}
+        $transitionDelay={transitionDelay}
+        role="menuitem"
       >
         <DropdownItemLink
           to={item.topMenuItem.getLink(clusterId)}
           onClick={() => setOpen(false)}
+          onKeyUp={e => (e.key === 'Enter' || e.key === ' ') && setOpen(false)}
         >
-          <DropdownItemIcon>{item.topMenuItem.icon}</DropdownItemIcon>
+          <DropdownItemIcon>{<item.topMenuItem.icon />}</DropdownItemIcon>
           {item.topMenuItem.title}
         </DropdownItemLink>
       </DropdownItem>
     );
 
-    transitionDelay += 20;
+    transitionDelay += INCREMENT_TRANSITION_DELAY;
   }
 
   return (
-    <Container ref={ref}>
-      <UserInfo onClick={() => setOpen(!open)} open={open}>
+    <Container ref={outsideClickRef}>
+      <UserInfo
+        onClick={() => setOpen(!open)}
+        onKeyUp={e => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            setOpen(!open);
+            return;
+          }
+          if (e.key === 'Tab' && open) {
+            // move to first focusable item in dropdown
+            dropdownRef.current
+              ?.querySelector<HTMLElement>('a, div[role="button"]')
+              ?.focus();
+          }
+        }}
+        onBlur={e =>
+          focusOutsideTarget(e, dropdownRef.current) && setOpen(false)
+        }
+        tabIndex={0}
+        role="button"
+        aria-label="User Menu"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={USER_MENU_DROPDOWN_ID}
+      >
         <StyledAvatar>{initial}</StyledAvatar>
 
-        <Username>{username}</Username>
+        <CornerUserDisplay
+          username={username}
+          primaryText={displayPrimary}
+          // Suppress secondary text if primary is present to avoid cluttering the corner space.
+          secondaryText={displayPrimary ? undefined : displaySecondary}
+          layout="stacked"
+        />
+        <Box ml={3}>
+          <DeviceTrustStatus iconOnly />
+        </Box>
 
         <Arrow open={open}>
-          <ChevronDownIcon />
+          <ChevronDown size="medium" />
         </Arrow>
       </UserInfo>
 
-      <Dropdown open={open}>
+      <Dropdown
+        open={open}
+        ref={dropdownRef}
+        role="menu"
+        id={USER_MENU_DROPDOWN_ID}
+        onBlur={e =>
+          !e.currentTarget.contains(e.relatedTarget as Node) && setOpen(false)
+        }
+      >
+        <DeviceTrustStatus />
         {items}
 
-        <DropdownDivider />
+        {items.length > 0 && <DropdownDivider />}
+
+        {/* Hide ability to switch themes if the theme is a custom theme */}
+        {!theme.isCustomTheme && (
+          <DropdownItem
+            open={open}
+            $transitionDelay={transitionDelay}
+            role="menuitem"
+          >
+            <DropdownItemButton
+              onClick={onThemeChange}
+              onKeyUp={e =>
+                (e.key === 'Enter' || e.key === ' ') && onThemeChange()
+              }
+              tabIndex={0}
+            >
+              <DropdownItemIcon>
+                {currentTheme === Theme.DARK ? <Sun /> : <Moon />}
+              </DropdownItemIcon>
+              Switch to {currentTheme === Theme.DARK ? 'Light' : 'Dark'} Theme
+            </DropdownItemButton>
+          </DropdownItem>
+        )}
 
         <DropdownItem
           open={open}
-          style={{
-            transitionDelay: `${transitionDelay}ms`,
-          }}
+          $transitionDelay={transitionDelay}
+          role="menuitem"
         >
-          <DropdownItemButton onClick={() => session.logout()}>
+          <DropdownItemButton
+            onClick={() => session.logout()}
+            onKeyUp={e =>
+              (e.key === 'Enter' || e.key === ' ') && session.logout()
+            }
+            tabIndex={0}
+          >
             <DropdownItemIcon>
-              <LogoutIcon size={16} />
+              <LogoutIcon />
             </DropdownItemIcon>
             Logout
           </DropdownItemButton>

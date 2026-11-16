@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
@@ -25,7 +27,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -58,6 +59,25 @@ func TestInitCACert(t *testing.T) {
 		URI:      "localhost:5432",
 	})
 	require.NoError(t, err)
+
+	elastiCacheServerless, err := types.NewDatabaseV3(types.Metadata{
+		Name: "elasti-serverless",
+	}, types.DatabaseSpecV3{
+		Protocol: defaults.ProtocolRedis,
+		URI:      "localhost:6379",
+		AWS: types.AWS{
+			Region: "us-east-1",
+			ElastiCacheServerless: types.ElastiCacheServerless{
+				CacheName: "serverless-example",
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, elastiCacheServerless.IsElastiCacheServerless())
+
+	elastiCacheServerlessWithCert := elastiCacheServerless.Copy()
+	elastiCacheServerlessWithCert.SetName("elasti-serverless-with-cert")
+	elastiCacheServerlessWithCert.SetCA("elasticache-serverless-test-cert")
 
 	rds, err := types.NewDatabaseV3(types.Metadata{
 		Name: "rds",
@@ -111,6 +131,14 @@ func TestInitCACert(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	mongodbAtlas, err := types.NewDatabaseV3(types.Metadata{
+		Name: "mongodb-atlas",
+	}, types.DatabaseSpecV3{
+		Protocol: defaults.ProtocolMongoDB,
+		URI:      "mongodb+srv://test.xxxx.mongodb.net",
+	})
+	require.NoError(t, err)
+
 	cloudSQL, err := types.NewDatabaseV3(types.Metadata{
 		Name: "cloud-sql",
 	}, types.DatabaseSpecV3{
@@ -129,8 +157,33 @@ func TestInitCACert(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	docdb, err := types.NewDatabaseV3(types.Metadata{
+		Name: "docdb",
+	}, types.DatabaseSpecV3{
+		Protocol: defaults.ProtocolMongoDB,
+		URI:      "localhost:27017",
+		AWS: types.AWS{
+			Region: "us-east-1",
+			DocumentDB: types.DocumentDB{
+				ClusterID: "docdb",
+			},
+		},
+	})
+	require.NoError(t, err)
+
 	allDatabases := []types.Database{
-		selfHosted, rds, rdsWithCert, redshift, redshiftServerless, cloudSQL, azureMySQL, memoryDB,
+		selfHosted,
+		elastiCacheServerless,
+		elastiCacheServerlessWithCert,
+		rds,
+		rdsWithCert,
+		redshift,
+		redshiftServerless,
+		cloudSQL,
+		azureMySQL,
+		memoryDB,
+		mongodbAtlas,
+		docdb,
 	}
 
 	tests := []struct {
@@ -152,6 +205,16 @@ func TestInitCACert(t *testing.T) {
 			desc:     "shouldn't download RDS CA when it's set",
 			database: rdsWithCert.GetName(),
 			cert:     rdsWithCert.GetCA(),
+		},
+		{
+			desc:     "should download ElastiCache CA when it's not set",
+			database: elastiCacheServerless.GetName(),
+			cert:     fixtures.TLSCACertPEM,
+		},
+		{
+			desc:     "shouldn't download ElastiCache CA when it's set",
+			database: elastiCacheServerlessWithCert.GetName(),
+			cert:     elastiCacheServerlessWithCert.GetCA(),
 		},
 		{
 			desc:     "should download Redshift CA when it's not set",
@@ -176,7 +239,17 @@ func TestInitCACert(t *testing.T) {
 		{
 			desc:     "should download Azure CA when it's not set",
 			database: azureMySQL.GetName(),
-			cert:     fixtures.TLSCACertPEM + "\n" + fixtures.TLSCACertPEM, // Two CA files.
+			cert:     fixtures.TLSCACertPEM,
+		},
+		{
+			desc:     "should download MongoDB Atlas CA when it's not set",
+			database: mongodbAtlas.GetName(),
+			cert:     fixtures.TLSCACertPEM,
+		},
+		{
+			desc:     "should download DocumentDB CA when it's not set",
+			database: docdb.GetName(),
+			cert:     fixtures.TLSCACertPEM,
 		},
 	}
 
@@ -303,6 +376,7 @@ func TestCARenewer(t *testing.T) {
 	// Initialize the CA certs as normal.
 	require.NoError(t, databaseServer.initCACert(ctx, rds))
 	require.Equal(t, string(initialCA), rds.GetStatusCA())
+	require.Equal(t, int64(1), atomic.LoadInt64(&caDownloader.count))
 
 	// Start the database CA renewer.
 	renewerCtx, cancel := context.WithCancel(ctx)
@@ -318,16 +392,13 @@ func TestCARenewer(t *testing.T) {
 	caDownloader.cert = updatedCA
 	caDownloader.version = []byte("second-version")
 
-	// Trigger the CA renews by advancing in time.
-	testCtx.clock.Advance(caRenewInterval)
-
-	// Check if the database status CA is updated with new contents.
 	require.Eventually(t, func() bool {
-		return atomic.LoadInt64(&caDownloader.count) == 2
-	}, 5*time.Second, time.Second, "failed to wait the CA download")
-
-	// Advance another time to trigger another renew.
-	testCtx.clock.Advance(caRenewInterval)
+		// Advance the clock to ensure the renew loop is awakened, and start
+		// renewing the CAs. This can cause multiple renewals to occur, but for
+		// this test case, it is fine, given that the CA version won't change.
+		testCtx.clock.Advance(caRenewInterval)
+		return atomic.LoadInt64(&caDownloader.count) == int64(2)
+	}, 5*time.Second, 250*time.Millisecond, "failed to wait the CA download, expected 2 downloads but got %d", atomic.LoadInt64(&caDownloader.count))
 
 	// Wait until renewer is gone to check database CA contents. This avoids,
 	// test race condition.
@@ -363,7 +434,9 @@ func TestInitAzureCAs(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	supportedHints := []string{filepath.Base(azureCAURLBaltimore), filepath.Base(azureCAURLDigiCert)}
+	azureCAFilename, err := caFilenameFromURL(azureCAURLDigiCert)
+	require.NoError(t, err)
+	supportedHints := []string{azureCAFilename}
 	initialCA := generateDatabaseCA(t)
 	caDownloader := &fakeDownloader{
 		cert:    initialCA,
@@ -385,9 +458,74 @@ func TestInitAzureCAs(t *testing.T) {
 	})
 
 	require.NoError(t, databaseServer.initCACert(ctx, azureDB))
-	// It must have the contents of two CAs. Since we're returning the same
-	// content for both, it should have 2 instances of "initialCA".
-	require.Equal(t, string(bytes.Join([][]byte{initialCA, initialCA}, []byte("\n"))), azureDB.GetStatusCA())
+	require.Equal(t, string(initialCA), azureDB.GetStatusCA())
+}
+
+// TestInitAWSKeyspacesCAs given an AWS Keyspaces database, init its CAs
+// ensuring the downloaded bundle contains all AWS documented roots.
+func TestInitAWSKeyspacesCAs(t *testing.T) {
+	ctx := context.Background()
+	testCtx := setupTestContext(ctx, t)
+
+	keyspacesDB, err := types.NewDatabaseV3(types.Metadata{
+		Name: "keyspaces",
+	}, types.DatabaseSpecV3{
+		Protocol: defaults.ProtocolCassandra,
+		URI:      "localhost:9142",
+		AWS: types.AWS{
+			Region: "us-east-1",
+		},
+	})
+	require.NoError(t, err)
+
+	expectedHints := []string{
+		"AmazonRootCA1.pem",
+		"AmazonRootCA2.pem",
+		"AmazonRootCA3.pem",
+		"AmazonRootCA4.pem",
+		"sf-class2-root.crt",
+	}
+	receivedHints := make(map[string]struct{}, len(expectedHints))
+	casByHint := make(map[string][]byte, len(expectedHints))
+	expectedCAs := make([][]byte, 0, len(expectedHints))
+	for _, hint := range expectedHints {
+		ca := generateDatabaseCA(t)
+		casByHint[hint] = ca
+		expectedCAs = append(expectedCAs, ca)
+	}
+	caDownloader := &fakeDownloader{
+		version: []byte("v1"),
+		certFunc: func(hint string) []byte {
+			return casByHint[hint]
+		},
+		assertHintFunc: func(hint string) {
+			require.Contains(
+				t,
+				expectedHints,
+				hint,
+				"CA download hint must be one of: %s. But got %q", strings.Join(expectedHints, ","),
+				hint,
+			)
+			receivedHints[hint] = struct{}{}
+		},
+	}
+	databaseServer := testCtx.setupDatabaseServer(ctx, t, agentParams{
+		Databases:    []types.Database{keyspacesDB},
+		NoStart:      true,
+		CADownloader: caDownloader,
+	})
+
+	require.NoError(t, databaseServer.initCACert(ctx, keyspacesDB))
+
+	receivedUniqueHints := make([]string, 0, len(receivedHints))
+	for hint := range receivedHints {
+		receivedUniqueHints = append(receivedUniqueHints, hint)
+	}
+	require.ElementsMatch(t, expectedHints, receivedUniqueHints)
+	require.Equal(t, int64(len(expectedHints)), atomic.LoadInt64(&caDownloader.count))
+
+	expectedBundle := bytes.Join(expectedCAs, []byte("\n"))
+	require.Equal(t, string(expectedBundle), keyspacesDB.GetStatusCA())
 }
 
 func generateDatabaseCA(t *testing.T) []byte {
@@ -402,6 +540,9 @@ func generateDatabaseCA(t *testing.T) []byte {
 type fakeDownloader struct {
 	// cert is the cert to return as downloaded one.
 	cert []byte
+	// certFunc returns the cert to download for a given hint. If unset, cert is
+	// returned instead.
+	certFunc func(string) []byte
 	// count keeps track of how many times the downloader has been invoked.
 	count int64
 	// version is the CA version returned when GetVersion is called.
@@ -417,6 +558,9 @@ func (d *fakeDownloader) Download(_ context.Context, _ types.Database, hint stri
 	}
 
 	atomic.AddInt64(&d.count, 1)
+	if d.certFunc != nil {
+		return d.certFunc(hint), d.version, nil
+	}
 	return d.cert, d.version, nil
 }
 
@@ -478,7 +622,7 @@ func setupPostgres(ctx context.Context, t *testing.T, cfg *setupTLSTestCfg) *tes
 	})
 
 	go func() {
-		for conn := range testCtx.fakeRemoteSite.ProxyConn() {
+		for conn := range testCtx.fakeCluster.ProxyConn() {
 			go server1.HandleConnection(conn)
 		}
 	}()
@@ -523,7 +667,7 @@ func setupMySQL(ctx context.Context, t *testing.T, cfg *setupTLSTestCfg) *testCo
 	})
 
 	go func() {
-		for conn := range testCtx.fakeRemoteSite.ProxyConn() {
+		for conn := range testCtx.fakeCluster.ProxyConn() {
 			go server1.HandleConnection(conn)
 		}
 	}()
@@ -573,7 +717,7 @@ func setupMongo(ctx context.Context, t *testing.T, cfg *setupTLSTestCfg) *testCo
 	})
 
 	go func() {
-		for conn := range testCtx.fakeRemoteSite.ProxyConn() {
+		for conn := range testCtx.fakeCluster.ProxyConn() {
 			go server1.HandleConnection(conn)
 		}
 	}()
@@ -643,7 +787,6 @@ func TestTLSConfiguration(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -653,7 +796,6 @@ func TestTLSConfiguration(t *testing.T) {
 				defaults.ProtocolMySQL,
 				defaults.ProtocolMongoDB,
 			} {
-				dbType := dbType
 				t.Run(dbType, func(t *testing.T) {
 					ctx := context.Background()
 					cfg := &setupTLSTestCfg{
@@ -813,7 +955,7 @@ func TestCADownloaderGetVersion(t *testing.T) {
 				desc:        "without support to ETag returns error",
 				database:    rds,
 				supportEtag: false,
-				expectError: func(t require.TestingT, err error, _ ...interface{}) {
+				expectError: func(t require.TestingT, err error, _ ...any) {
 					require.Error(t, err)
 					require.True(t, trace.IsNotImplemented(err), "expected trace.NotImplementedError but received %T", err)
 				},

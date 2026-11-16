@@ -19,14 +19,21 @@ package webclient
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
+	"testing/iotest"
+	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/defaults"
+	apihelpers "github.com/gravitational/teleport/api/testhelpers"
 )
 
 func newPingHandler(path string) http.Handler {
@@ -103,6 +110,185 @@ func TestPlainHttpFallback(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestErrorFromUnsuccessfulResponse(t *testing.T) {
+	t.Parallel()
+
+	const (
+		endpoint  = "/webapi/ping"
+		proxyAddr = "proxy.example.com:443"
+	)
+
+	cases := []struct {
+		desc        string
+		statusCode  int
+		contentType string
+		body        string
+		bodyReadErr bool
+		errContains []string
+		errExcludes []string
+	}{
+		{
+			desc:        "structured error message",
+			statusCode:  http.StatusInternalServerError,
+			contentType: "application/json",
+			body:        `{"error":{"message":"something went wrong"}}`,
+			errContains: []string{"something went wrong", "returned HTTP 500"},
+		},
+		{
+			desc:        "control sequences in server message are escaped",
+			statusCode:  http.StatusBadGateway,
+			contentType: "application/json",
+			body:        "{\"error\":{\"message\":\"evil\\u001b[2Jspoof\"}}",
+			errContains: []string{"returned HTTP 502", `evil\x1b[2Jspoof`},
+			errExcludes: []string{"\x1b"},
+		},
+		{
+			desc:        "long server message is truncated",
+			statusCode:  http.StatusInternalServerError,
+			contentType: "application/json",
+			body:        `{"error":{"message":"` + strings.Repeat("a", 300) + `"}}`,
+			errContains: []string{"returned HTTP 500", strings.Repeat("a", 256) + "…"},
+			errExcludes: []string{strings.Repeat("a", 257)},
+		},
+		{
+			desc:        "structured error without message",
+			statusCode:  http.StatusInternalServerError,
+			contentType: "application/json",
+			body:        `{"error":{"message":""}}`,
+			errContains: []string{"HTTP 500 JSON response with no error message", "the proxy may be unhealthy"},
+		},
+		{
+			desc:        "unparseable JSON body",
+			statusCode:  http.StatusInternalServerError,
+			contentType: "application/json",
+			body:        "mangled",
+			errContains: []string{"unparseable HTTP 500 JSON response", `"mangled"`, "the proxy may be unhealthy"},
+		},
+		{
+			desc:        "oversized JSON body is bounded and unparseable",
+			statusCode:  http.StatusInternalServerError,
+			contentType: "application/json",
+			body:        `{"error":{"message":"` + strings.Repeat("a", maxErrorResponseBodyBytes) + `"}}`,
+			errContains: []string{"unparseable HTTP 500 JSON response"},
+			errExcludes: []string{strings.Repeat("a", maxErrorResponseBodyBytes)},
+		},
+		{
+			desc:        "non-JSON content type",
+			statusCode:  http.StatusBadGateway,
+			contentType: "text/html; charset=utf-8",
+			body:        "<html><body>error 502 from load balancer</body></html>",
+			errContains: []string{"returned HTTP 502", "the proxy may be unhealthy"},
+		},
+		{
+			desc:        "missing content type",
+			statusCode:  http.StatusBadGateway,
+			contentType: "",
+			body:        "bad gateway",
+			errContains: []string{"returned HTTP 502", "the proxy may be unhealthy"},
+		},
+		{
+			desc:        "non-JSON 404",
+			statusCode:  http.StatusNotFound,
+			contentType: "text/html; charset=utf-8",
+			body:        "<html><body>not found</body></html>",
+			errContains: []string{"returned HTTP 404", `is "https://` + proxyAddr + `" a Teleport proxy?`},
+		},
+		{
+			desc:        "unparseable JSON 404",
+			statusCode:  http.StatusNotFound,
+			contentType: "application/json",
+			body:        "mangled",
+			errContains: []string{"unparseable HTTP 404 JSON response", `a Teleport proxy?`},
+		},
+		{
+			desc:        "rate limited",
+			statusCode:  http.StatusTooManyRequests,
+			contentType: "text/html; charset=utf-8",
+			body:        "slow down",
+			errContains: []string{"returned HTTP 429", "rate-limiting"},
+		},
+		{
+			desc:        "body read error",
+			statusCode:  http.StatusInternalServerError,
+			contentType: "application/json",
+			bodyReadErr: true,
+			errContains: []string{"HTTP 500", "could not be fully read"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			header := http.Header{}
+			if tc.contentType != "" {
+				header.Set("Content-Type", tc.contentType)
+			}
+			var body io.Reader = strings.NewReader(tc.body)
+			if tc.bodyReadErr {
+				body = iotest.ErrReader(io.ErrUnexpectedEOF)
+			}
+			resp := &http.Response{
+				StatusCode: tc.statusCode,
+				Header:     header,
+				Body:       io.NopCloser(body),
+			}
+			err := errorFromUnsuccessfulResponse(context.Background(), endpoint, proxyAddr, resp)
+			for _, want := range tc.errContains {
+				require.ErrorContains(t, err, want)
+			}
+			for _, unwanted := range tc.errExcludes {
+				require.NotContains(t, err.Error(), unwanted)
+			}
+		})
+	}
+}
+
+func TestPingUnsuccessfulResponse(t *testing.T) {
+	t.Parallel()
+
+	t.Run("routes non-200 to helper", func(t *testing.T) {
+		proxyAddr := startProxy(t, "/webapi/ping", http.StatusInternalServerError, "application/json", "mangled")
+		_, err := Ping(&Config{Context: context.Background(), ProxyAddr: proxyAddr, Insecure: true})
+		require.ErrorContains(t, err, "/webapi/ping returned an unparseable HTTP 500 JSON response")
+	})
+
+	t.Run("unparseable 200 response", func(t *testing.T) {
+		proxyAddr := startProxy(t, "/webapi/ping", http.StatusOK, "application/json", "mangled")
+		_, err := Ping(&Config{Context: context.Background(), ProxyAddr: proxyAddr, Insecure: true})
+		require.ErrorContains(t, err, "cannot parse server ping response")
+	})
+}
+
+func TestFindUnsuccessfulResponse(t *testing.T) {
+	t.Parallel()
+
+	t.Run("routes non-200 to helper", func(t *testing.T) {
+		proxyAddr := startProxy(t, "/webapi/find", http.StatusInternalServerError, "application/json", "mangled")
+		_, err := Find(&Config{Context: context.Background(), ProxyAddr: proxyAddr, Insecure: true})
+		require.ErrorContains(t, err, "/webapi/find returned an unparseable HTTP 500 JSON response")
+	})
+
+	t.Run("unparseable 200 response", func(t *testing.T) {
+		proxyAddr := startProxy(t, "/webapi/find", http.StatusOK, "application/json", "mangled")
+		_, err := Find(&Config{Context: context.Background(), ProxyAddr: proxyAddr, Insecure: true})
+		require.ErrorContains(t, err, "cannot parse server find response")
+	})
+}
+
+func startProxy(t *testing.T, wantPath string, status int, contentType, body string) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != wantPath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.Listener.Addr().String()
 }
 
 func TestTunnelAddr(t *testing.T) {
@@ -320,36 +506,62 @@ func TestParse(t *testing.T) {
 	}
 }
 
-func TestNewWebClientRespectHTTPProxy(t *testing.T) {
-	t.Setenv("HTTPS_PROXY", "fakeproxy.example.com:9999")
-	client, err := newWebClient(&Config{
-		Context:   context.Background(),
-		ProxyAddr: "localhost:3080",
-	})
-	require.NoError(t, err)
-	//nolint:bodyclose // resp should be nil, so there will be no body to close.
-	resp, err := client.Get("https://fakedomain.example.com")
-	// Client should try to proxy through nonexistent server at localhost.
-	require.Error(t, err, "GET unexpectedly succeeded: %+v", resp)
-	require.Contains(t, err.Error(), "proxyconnect")
-	require.Contains(t, err.Error(), "lookup fakeproxy.example.com")
-	require.Contains(t, err.Error(), "no such host")
-}
+func TestNewWebClientHTTPProxy(t *testing.T) {
+	proxyHandler := &apihelpers.ProxyHandler{}
+	proxyServer := httptest.NewServer(proxyHandler)
+	t.Cleanup(proxyServer.Close)
 
-func TestNewWebClientNoProxy(t *testing.T) {
-	t.Setenv("HTTPS_PROXY", "fakeproxy.example.com:9999")
-	t.Setenv("NO_PROXY", "fakedomain.example.com")
-	client, err := newWebClient(&Config{
-		Context:   context.Background(),
-		ProxyAddr: "localhost:3080",
-	})
+	localIP, err := apihelpers.GetLocalIP()
 	require.NoError(t, err)
-	//nolint:bodyclose // resp should be nil, so there will be no body to close.
-	resp, err := client.Get("https://fakedomain.example.com")
-	require.Error(t, err, "GET unexpectedly succeeded: %+v", resp)
-	require.NotContains(t, err.Error(), "proxyconnect")
-	require.Contains(t, err.Error(), "lookup fakedomain.example.com")
-	require.Contains(t, err.Error(), "no such host")
+	server := apihelpers.MakeTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("hello"))
+	}), apihelpers.WithTestServerAddress(localIP))
+	_, serverPort, err := net.SplitHostPort(server.Listener.Addr().String())
+	require.NoError(t, err)
+	serverAddr := net.JoinHostPort(localIP, serverPort)
+	tests := []struct {
+		name               string
+		env                map[string]string
+		expectedProxyCount int
+	}{
+		{
+			name: "use http proxy",
+			env: map[string]string{
+				"HTTPS_PROXY": proxyServer.URL,
+			},
+			expectedProxyCount: 1,
+		},
+		{
+			name: "ignore proxy when no_proxy is set",
+			env: map[string]string{
+				"HTTPS_PROXY": proxyServer.URL,
+				"NO_PROXY":    "*",
+			},
+			expectedProxyCount: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(proxyHandler.Reset)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			client, err := newWebClient(&Config{
+				Context:   ctx,
+				ProxyAddr: "localhost:3080", // addr doesn't matter, it won't be used
+				Insecure:  true,
+			})
+			require.NoError(t, err)
+
+			resp, err := client.Get("https://" + serverAddr)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			require.Equal(t, tc.expectedProxyCount, proxyHandler.Count())
+		})
+	}
 }
 
 func TestSSHProxyHostPort(t *testing.T) {
@@ -441,4 +653,63 @@ func TestSSHProxyHostPort(t *testing.T) {
 			require.Equal(t, test.outPort, port)
 		})
 	}
+}
+
+// TestWebClientClosesIdleConnections verifies that all http connections
+// are closed when the http.Client created by newWebClient is no longer
+// being used.
+func TestWebClientClosesIdleConnections(t *testing.T) {
+	expectedResponse := &PingResponse{
+		Proxy: ProxySettings{
+			TLSRoutingEnabled: true,
+		},
+		ServerVersion:    "1.2.3",
+		MinClientVersion: "0.1.2",
+		ClusterName:      "test",
+	}
+
+	expectedStates := []string{
+		http.StateNew.String(), http.StateActive.String(), http.StateClosed.String(), // the https request will fail and cause us to fallback to http
+		http.StateNew.String(), http.StateActive.String(), http.StateIdle.String(), http.StateClosed.String(), // the http request should be processed and closed
+	}
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/webapi/find":
+			json.NewEncoder(w).Encode(expectedResponse)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+
+	stateChange := make(chan string, len(expectedStates))
+	srv.Config.ConnState = func(conn net.Conn, state http.ConnState) {
+		stateChange <- state.String()
+	}
+
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	resp, err := Find(&Config{
+		Context:   context.Background(),
+		ProxyAddr: strings.TrimPrefix(srv.URL, "http://"),
+		Insecure:  true,
+	})
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(expectedResponse, resp))
+
+	var got []string
+	for i := range expectedStates {
+		select {
+		case state := <-stateChange:
+			got = append(got, state)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timeout waiting for expected connection state %d", i)
+		}
+	}
+
+	slices.Sort(expectedStates)
+	slices.Sort(got)
+
+	require.Equal(t, expectedStates, got)
 }

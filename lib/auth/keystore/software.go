@@ -1,91 +1,190 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package keystore
 
 import (
 	"context"
 	"crypto"
+	"crypto/rsa"
+	"crypto/x509"
+	"io"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 )
+
+const softwareHash = crypto.SHA256
 
 type softwareKeyStore struct {
 	rsaKeyPairSource RSAKeyPairSource
 }
 
 // RSAKeyPairSource is a function type which returns new RSA keypairs.
-type RSAKeyPairSource func() (priv []byte, pub []byte, err error)
+type RSAKeyPairSource func(algo cryptosuites.Algorithm) (priv []byte, pub []byte, err error)
 
-type SoftwareConfig struct {
-	RSAKeyPairSource RSAKeyPairSource
+type softwareConfig struct {
+	rsaKeyPairSource RSAKeyPairSource
 }
 
-func (cfg *SoftwareConfig) CheckAndSetDefaults() error {
-	if cfg.RSAKeyPairSource == nil {
-		return trace.BadParameter("must provide RSAKeyPairSource")
-	}
-	return nil
-}
-
-func newSoftwareKeyStore(config *SoftwareConfig, logger logrus.FieldLogger) *softwareKeyStore {
+func newSoftwareKeyStore(config *softwareConfig) *softwareKeyStore {
 	return &softwareKeyStore{
-		rsaKeyPairSource: config.RSAKeyPairSource,
+		rsaKeyPairSource: config.rsaKeyPairSource,
 	}
 }
 
-// generateRSA creates a new RSA private key and returns its identifier and a
-// crypto.Signer. The returned identifier for softwareKeyStore is a pem-encoded
-// private key, and can be passed to getSigner later to get the same
-// crypto.Signer.
-func (s *softwareKeyStore) generateRSA(ctx context.Context, _ ...RSAKeyOption) ([]byte, crypto.Signer, error) {
-	priv, _, err := s.rsaKeyPairSource()
+func (p *softwareKeyStore) name() string {
+	return storeSoftware
+}
+
+// keyTypeDescription returns a human-readable description of the types of keys
+// this backend uses.
+func (s *softwareKeyStore) keyTypeDescription() string {
+	return "raw software keys"
+}
+
+// generateSigner creates a new private key and returns its identifier and a crypto.Signer. The returned
+// identifier for softwareKeyStore is a pem-encoded private key, and can be passed to getSigner later to get
+// an equivalent crypto.Signer.
+func (s *softwareKeyStore) generateSigner(ctx context.Context, alg cryptosuites.Algorithm) ([]byte, crypto.Signer, error) {
+	if alg == cryptosuites.RSA2048 && s.rsaKeyPairSource != nil {
+		privateKeyPEM, _, err := s.rsaKeyPairSource(alg)
+		if err != nil {
+			return nil, nil, err
+		}
+		privateKey, err := keys.ParsePrivateKey(privateKeyPEM)
+		return privateKeyPEM, privateKey, trace.Wrap(err)
+	}
+
+	signer, err := cryptosuites.GenerateKeyWithAlgorithm(alg)
 	if err != nil {
 		return nil, nil, err
 	}
-	signer, err := s.getSigner(ctx, priv)
-	if err != nil {
-		return nil, nil, err
+	privateKeyPEM, err := keys.MarshalPrivateKey(signer)
+	return privateKeyPEM, signer, trace.Wrap(err)
+}
+
+// oaepDecrypter captures and supplies the default opts that should be provided
+// at decryption time for convenience
+type oaepDecrypter struct {
+	crypto.Decrypter
+	hash crypto.Hash
+}
+
+func newOAEPDecrypter(hash crypto.Hash, decrypter crypto.Decrypter) oaepDecrypter {
+	return oaepDecrypter{
+		Decrypter: decrypter,
+		hash:      hash,
 	}
-	return priv, signer, trace.Wrap(err)
 }
 
-// GetSigner returns a crypto.Signer for the given pem-encoded private key.
-func (s *softwareKeyStore) getSigner(ctx context.Context, rawKey []byte) (crypto.Signer, error) {
-	signer, err := utils.ParsePrivateKeyPEM(rawKey)
-	return signer, trace.Wrap(err)
+func (d oaepDecrypter) Decrypt(rand io.Reader, ciphertext []byte, opts crypto.DecrypterOpts) ([]byte, error) {
+	if opts == nil {
+		opts = &rsa.OAEPOptions{
+			Hash: d.hash,
+		}
+	}
+
+	plaintext, err := d.Decrypter.Decrypt(rand, ciphertext, opts)
+	return plaintext, trace.Wrap(err)
 }
 
-// canSignWithKey returns true if the given key is a raw key.
-func (s *softwareKeyStore) canSignWithKey(ctx context.Context, _ []byte, keyType types.PrivateKeyType) (bool, error) {
+// generateDecrypter creates a new private key and returns its identifier and a [crypto.Decrypter]. The returned
+// identifier for softwareKeyStore is a pem-encoded private key, and can be passed to getDecrypter later to get
+// an equivalent crypto.Decrypter.
+func (s *softwareKeyStore) generateDecrypter(ctx context.Context, alg cryptosuites.Algorithm) ([]byte, crypto.Decrypter, crypto.Hash, error) {
+	if alg == cryptosuites.RSA4096 && s.rsaKeyPairSource != nil {
+		privateKeyPEM, _, err := s.rsaKeyPairSource(alg)
+		if err != nil {
+			return nil, nil, softwareHash, trace.Wrap(err)
+		}
+
+		privateKey, err := keys.ParsePrivateKey(privateKeyPEM)
+		if err != nil {
+			return nil, nil, softwareHash, trace.Wrap(err)
+		}
+
+		decrypter, ok := privateKey.Signer.(crypto.Decrypter)
+		if !ok {
+			return nil, nil, softwareHash, trace.Errorf("could not type assert crypto.Decrypter")
+		}
+
+		privateKeyDER, err := x509.MarshalPKCS8PrivateKey(privateKey.Signer)
+		if err != nil {
+			return nil, nil, softwareHash, trace.Wrap(err)
+		}
+
+		return privateKeyDER, newOAEPDecrypter(softwareHash, decrypter), softwareHash, trace.Wrap(err)
+	}
+
+	key, err := cryptosuites.GenerateDecrypterWithAlgorithm(alg)
+	if err != nil {
+		return nil, nil, softwareHash, trace.Wrap(err)
+	}
+
+	privateKey, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, nil, softwareHash, trace.Wrap(err)
+	}
+
+	return privateKey, newOAEPDecrypter(softwareHash, key), softwareHash, trace.Wrap(err)
+}
+
+// getSigner returns a crypto.Signer for the given pem-encoded private key.
+func (s *softwareKeyStore) getSigner(ctx context.Context, rawKey []byte, publicKey crypto.PublicKey) (crypto.Signer, error) {
+	return keys.ParsePrivateKey(rawKey)
+}
+
+// getDecrypter returns a crypto.Decrypter for the given pem-encoded private key.
+func (s *softwareKeyStore) getDecrypter(ctx context.Context, rawKey []byte, publicKey crypto.PublicKey, hash crypto.Hash) (crypto.Decrypter, error) {
+	privateKey, err := x509.ParsePKCS8PrivateKey(rawKey)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	decrypter, ok := privateKey.(crypto.Decrypter)
+	if !ok {
+		return nil, trace.Errorf("unsupported encryption key type %T", privateKey)
+	}
+
+	return newOAEPDecrypter(softwareHash, decrypter), nil
+}
+
+func (s *softwareKeyStore) findDecryptersByLabel(ctx context.Context, label *types.KeyLabel) ([]crypto.Decrypter, error) {
+	return nil, trace.NotImplemented("software decryption keys do not support lookup by label")
+}
+
+// canUseKey returns true if the given key is a raw key.
+func (s *softwareKeyStore) canUseKey(ctx context.Context, _ []byte, keyType types.PrivateKeyType) (bool, error) {
 	return keyType == types.PrivateKeyType_RAW, nil
 }
 
-// deleteKey deletes the given key from the KeyStore. This is a no-op for
-// softwareKeyStore.
+// deleteKey is a no-op for softwareKeyStore because the keys are not actually
+// stored in any external backend.
 func (s *softwareKeyStore) deleteKey(_ context.Context, _ []byte) error {
 	return nil
 }
 
-// DeleteUnusedKeys deletes all keys from the KeyStore if they are:
-// 1. Labeled by this KeyStore when they were created
-// 2. Not included in the argument usedKeys
-// This is a no-op for rawKeyStore.
-func (s *softwareKeyStore) DeleteUnusedKeys(ctx context.Context, usedKeys [][]byte) error {
+// deleteUnusedKeys is a no-op for softwareKeyStore because the keys are not
+// actually stored in any external backend.
+func (s *softwareKeyStore) deleteUnusedKeys(ctx context.Context, activeKeys [][]byte) error {
 	return nil
 }

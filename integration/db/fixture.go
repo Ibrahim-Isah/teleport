@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
@@ -24,6 +28,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 
@@ -31,20 +36,22 @@ import (
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/integration/helpers"
-	"github.com/gravitational/teleport/lib"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/auth/authtest"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/service"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/srv/db/cassandra"
+	cassandra "github.com/gravitational/teleport/lib/srv/db/cassandra/protocoltest"
 	"github.com/gravitational/teleport/lib/srv/db/common"
 	"github.com/gravitational/teleport/lib/srv/db/mongodb"
 	"github.com/gravitational/teleport/lib/srv/db/mysql"
 	"github.com/gravitational/teleport/lib/srv/db/postgres"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
 
 type DatabasePack struct {
@@ -58,18 +65,18 @@ type databaseClusterPack struct {
 	User             types.User
 	role             types.Role
 	dbProcess        *service.TeleportProcess
-	dbAuthClient     *auth.Client
-	PostgresService  service.Database
+	dbAuthClient     *authclient.Client
+	PostgresService  servicecfg.Database
 	postgresAddr     string
 	postgres         *postgres.TestServer
-	MysqlService     service.Database
+	MysqlService     servicecfg.Database
 	mysqlAddr        string
 	mysql            *mysql.TestServer
-	MongoService     service.Database
+	MongoService     servicecfg.Database
 	mongoAddr        string
 	mongo            *mongodb.TestServer
 	name             string
-	CassandraService service.Database
+	CassandraService servicecfg.Database
 	cassandra        *cassandra.TestServer
 	cassandraAddr    string
 }
@@ -89,38 +96,40 @@ func (pack *databaseClusterPack) StartDatabaseServices(t *testing.T, clock clock
 	var err error
 
 	var postgresListener, mysqlListener, mongoListener, cassandaListener net.Listener
+	var dbProcessUUID string
 
 	postgresListener, pack.postgresAddr = mustListen(t)
-	pack.PostgresService = service.Database{
+	pack.PostgresService = servicecfg.Database{
 		Name:     fmt.Sprintf("%s-postgres", pack.name),
 		Protocol: defaults.ProtocolPostgres,
 		URI:      pack.postgresAddr,
 	}
 
 	mysqlListener, pack.mysqlAddr = mustListen(t)
-	pack.MysqlService = service.Database{
+	pack.MysqlService = servicecfg.Database{
 		Name:     fmt.Sprintf("%s-mysql", pack.name),
 		Protocol: defaults.ProtocolMySQL,
 		URI:      pack.mysqlAddr,
 	}
 
 	mongoListener, pack.mongoAddr = mustListen(t)
-	pack.MongoService = service.Database{
+	pack.MongoService = servicecfg.Database{
 		Name:     fmt.Sprintf("%s-mongo", pack.name),
 		Protocol: defaults.ProtocolMongoDB,
-		URI:      pack.mongoAddr,
+		URI:      fmt.Sprintf("mongodb://%s/?heartbeatintervalms=500", pack.mongoAddr),
 	}
 
 	cassandaListener, pack.cassandraAddr = mustListen(t)
-	pack.CassandraService = service.Database{
+	pack.CassandraService = servicecfg.Database{
 		Name:     fmt.Sprintf("%s-cassandra", pack.name),
 		Protocol: defaults.ProtocolCassandra,
 		URI:      pack.cassandraAddr,
 	}
 
-	conf := service.MakeDefaultConfig()
+	conf := servicecfg.MakeDefaultConfig()
 	conf.DataDir = filepath.Join(t.TempDir(), pack.name)
 	conf.SetToken("static-token-value")
+	conf.InsecureMode = true
 
 	conf.SetAuthServerAddress(utils.NetAddr{
 		AddrNetwork: "tcp",
@@ -128,7 +137,7 @@ func (pack *databaseClusterPack) StartDatabaseServices(t *testing.T, clock clock
 	})
 
 	conf.Databases.Enabled = true
-	conf.Databases.Databases = []service.Database{
+	conf.Databases.Databases = []servicecfg.Database{
 		pack.PostgresService,
 		pack.MysqlService,
 		pack.MongoService,
@@ -136,7 +145,7 @@ func (pack *databaseClusterPack) StartDatabaseServices(t *testing.T, clock clock
 	}
 	conf.Clock = clock
 	conf.CircuitBreakerConfig = breaker.NoopBreakerConfig()
-	pack.dbProcess, pack.dbAuthClient, err = pack.Cluster.StartDatabase(conf)
+	pack.dbProcess, pack.dbAuthClient, dbProcessUUID, err = pack.Cluster.StartDatabase(conf)
 	require.NoError(t, err)
 
 	t.Cleanup(func() { require.NoError(t, pack.dbProcess.Close()) })
@@ -166,7 +175,7 @@ func (pack *databaseClusterPack) StartDatabaseServices(t *testing.T, clock clock
 		AuthClient: pack.dbAuthClient,
 		Name:       pack.MongoService.Name,
 		Listener:   mongoListener,
-	})
+	}, mongodb.TestServerSetFakeUserAuthError("nonexistent", trace.NotFound("user does not exist")))
 	require.NoError(t, err)
 	go pack.mongo.Serve()
 	t.Cleanup(func() { pack.mongo.Close() })
@@ -180,14 +189,15 @@ func (pack *databaseClusterPack) StartDatabaseServices(t *testing.T, clock clock
 	go pack.cassandra.Serve()
 	t.Cleanup(func() { pack.cassandra.Close() })
 
+	helpers.WaitForDatabaseService(t, pack.Cluster.Process.GetAuthServer(), dbProcessUUID)
 	helpers.WaitForDatabaseServers(t, pack.Cluster.Process.GetAuthServer(), conf.Databases.Databases)
 }
 
 type testOptions struct {
 	clock         clockwork.Clock
 	listenerSetup helpers.InstanceListenerSetupFunc
-	rootConfig    func(config *service.Config)
-	leafConfig    func(config *service.Config)
+	rootConfig    func(config *servicecfg.Config)
+	leafConfig    func(config *servicecfg.Config)
 	nodeName      string
 }
 
@@ -223,19 +233,20 @@ func WithListenerSetupDatabaseTest(fn helpers.InstanceListenerSetupFunc) TestOpt
 	}
 }
 
-func WithRootConfig(fn func(*service.Config)) TestOptionFunc {
+func WithRootConfig(fn func(*servicecfg.Config)) TestOptionFunc {
 	return func(o *testOptions) {
 		o.rootConfig = fn
 	}
 }
 
-func WithLeafConfig(fn func(*service.Config)) TestOptionFunc {
+func WithLeafConfig(fn func(*servicecfg.Config)) TestOptionFunc {
 	return func(o *testOptions) {
 		o.leafConfig = fn
 	}
 }
 
 func SetupDatabaseTest(t *testing.T, options ...TestOptionFunc) *DatabasePack {
+	ctx := context.Background()
 	var opts testOptions
 	for _, opt := range options {
 		opt(&opts)
@@ -245,11 +256,10 @@ func SetupDatabaseTest(t *testing.T, options ...TestOptionFunc) *DatabasePack {
 	// Some global setup.
 	tracer := utils.NewTracer(utils.ThisFunction()).Start()
 	t.Cleanup(func() { tracer.Stop() })
-	lib.SetInsecureDevMode(true)
-	log := utils.NewLoggerForTests()
+	log := logtest.NewLogger()
 
 	// Generate keypair.
-	privateKey, publicKey, err := testauthority.New().GenerateKeyPair()
+	privateKey, publicKey, err := testauthority.GenerateKeyPair()
 	require.NoError(t, err)
 
 	p := &DatabasePack{
@@ -265,7 +275,8 @@ func SetupDatabaseTest(t *testing.T, options ...TestOptionFunc) *DatabasePack {
 		NodeName:    opts.nodeName,
 		Priv:        privateKey,
 		Pub:         publicKey,
-		Log:         log,
+		Logger:      log,
+		Clock:       opts.clock,
 	}
 	rootCfg.Listeners = opts.listenerSetup(t, &rootCfg.Fds)
 	p.Root.Cluster = helpers.NewInstance(t, rootCfg)
@@ -277,32 +288,39 @@ func SetupDatabaseTest(t *testing.T, options ...TestOptionFunc) *DatabasePack {
 		NodeName:    opts.nodeName,
 		Priv:        privateKey,
 		Pub:         publicKey,
-		Log:         log,
+		Logger:      log,
+		Clock:       opts.clock,
 	}
 	leafCfg.Listeners = opts.listenerSetup(t, &leafCfg.Fds)
 	p.Leaf.Cluster = helpers.NewInstance(t, leafCfg)
 
 	// Make root cluster config.
-	rcConf := service.MakeDefaultConfig()
+	rcConf := servicecfg.MakeDefaultConfig()
+	rcConf.InsecureMode = true
 	rcConf.DataDir = t.TempDir()
 	rcConf.Auth.Enabled = true
+	rcConf.Auth.Clock = p.clock
 	rcConf.Auth.Preference.SetSecondFactor("off")
 	rcConf.Proxy.Enabled = true
 	rcConf.Proxy.DisableWebInterface = true
 	rcConf.Clock = p.clock
+	rcConf.InsecureMode = true
 	rcConf.CircuitBreakerConfig = breaker.NoopBreakerConfig()
 	if opts.rootConfig != nil {
 		opts.rootConfig(rcConf)
 	}
 
 	// Make leaf cluster config.
-	lcConf := service.MakeDefaultConfig()
+	lcConf := servicecfg.MakeDefaultConfig()
 	lcConf.DataDir = t.TempDir()
+	lcConf.InsecureMode = true
 	lcConf.Auth.Enabled = true
+	lcConf.Auth.Clock = p.clock
 	lcConf.Auth.Preference.SetSecondFactor("off")
 	lcConf.Proxy.Enabled = true
 	lcConf.Proxy.DisableWebInterface = true
 	lcConf.Clock = p.clock
+	lcConf.InsecureMode = true
 	lcConf.CircuitBreakerConfig = breaker.NoopBreakerConfig()
 	if opts.leafConfig != nil {
 		opts.leafConfig(lcConf)
@@ -329,8 +347,16 @@ func SetupDatabaseTest(t *testing.T, options ...TestOptionFunc) *DatabasePack {
 	// Setup users and roles on both clusters.
 	p.setupUsersAndRoles(t)
 
+	// disable health checks to reduce log noise during tests
+	defaultHCC := services.VirtualDefaultHealthCheckConfigDB()
+	defaultHCC.GetSpec().GetMatch().SetDisabled(true)
+	_, err = p.Root.Cluster.Process.GetAuthServer().UpsertHealthCheckConfig(ctx, defaultHCC)
+	require.NoError(t, err)
+	_, err = p.Leaf.Cluster.Process.GetAuthServer().UpsertHealthCheckConfig(ctx, defaultHCC)
+	require.NoError(t, err)
+
 	// Update root's certificate authority on leaf to configure role mapping.
-	ca, err := p.Leaf.Cluster.Process.GetAuthServer().GetCertAuthority(context.Background(), types.CertAuthID{
+	ca, err := p.Leaf.Cluster.Process.GetAuthServer().GetCertAuthority(ctx, types.CertAuthID{
 		Type:       types.UserCA,
 		DomainName: p.Root.Cluster.Secrets.SiteName,
 	}, false)
@@ -339,7 +365,7 @@ func SetupDatabaseTest(t *testing.T, options ...TestOptionFunc) *DatabasePack {
 	ca.SetRoleMap(types.RoleMap{
 		{Remote: p.Root.role.GetName(), Local: []string{p.Leaf.role.GetName()}},
 	})
-	err = p.Leaf.Cluster.Process.GetAuthServer().UpsertCertAuthority(ca)
+	err = p.Leaf.Cluster.Process.GetAuthServer().UpsertCertAuthority(ctx, ca)
 	require.NoError(t, err)
 
 	// Start database service and test servers in the clusters
@@ -351,29 +377,29 @@ func SetupDatabaseTest(t *testing.T, options ...TestOptionFunc) *DatabasePack {
 func (p *DatabasePack) setupUsersAndRoles(t *testing.T) {
 	var err error
 
-	p.Root.User, p.Root.role, err = auth.CreateUserAndRole(p.Root.Cluster.Process.GetAuthServer(), "root-user", nil, nil)
+	p.Root.User, p.Root.role, err = authtest.CreateUserAndRole(p.Root.Cluster.Process.GetAuthServer(), "root-user", nil, nil)
 	require.NoError(t, err)
 
 	p.Root.role.SetDatabaseUsers(types.Allow, []string{types.Wildcard})
 	p.Root.role.SetDatabaseNames(types.Allow, []string{types.Wildcard})
-	err = p.Root.Cluster.Process.GetAuthServer().UpsertRole(context.Background(), p.Root.role)
+	p.Root.role, err = p.Root.Cluster.Process.GetAuthServer().UpsertRole(context.Background(), p.Root.role)
 	require.NoError(t, err)
 
-	p.Leaf.User, p.Leaf.role, err = auth.CreateUserAndRole(p.Root.Cluster.Process.GetAuthServer(), "leaf-user", nil, nil)
+	p.Leaf.User, p.Leaf.role, err = authtest.CreateUserAndRole(p.Root.Cluster.Process.GetAuthServer(), "leaf-user", nil, nil)
 	require.NoError(t, err)
 
 	p.Leaf.role.SetDatabaseUsers(types.Allow, []string{types.Wildcard})
 	p.Leaf.role.SetDatabaseNames(types.Allow, []string{types.Wildcard})
-	err = p.Leaf.Cluster.Process.GetAuthServer().UpsertRole(context.Background(), p.Leaf.role)
+	p.Leaf.role, err = p.Leaf.Cluster.Process.GetAuthServer().UpsertRole(context.Background(), p.Leaf.role)
 	require.NoError(t, err)
 }
 
 func (p *DatabasePack) WaitForLeaf(t *testing.T) {
 	helpers.WaitForProxyCount(p.Leaf.Cluster, p.Root.Cluster.Secrets.SiteName, 1)
-	site, err := p.Root.Cluster.Tunnel.GetSite(p.Leaf.Cluster.Secrets.SiteName)
+	cluster, err := p.Root.Cluster.Tunnel.Cluster(t.Context(), p.Leaf.Cluster.Secrets.SiteName)
 	require.NoError(t, err)
 
-	accessPoint, err := site.CachingAccessPoint()
+	accessPoint, err := cluster.CachingAccessPoint()
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -388,15 +414,15 @@ func (p *DatabasePack) WaitForLeaf(t *testing.T) {
 			servers, err := accessPoint.GetDatabaseServers(ctx, apidefaults.Namespace)
 			if err != nil {
 				// Use root logger as we need a configured logger instance and the root cluster have one.
-				p.Root.Cluster.Log.WithError(err).Debugf("Leaf cluster access point is unavailable.")
+				p.Root.Cluster.Log.DebugContext(ctx, "Leaf cluster access point is unavailable", "error", err)
 				continue
 			}
 			if !containsDB(servers, p.Leaf.MysqlService.Name) {
-				p.Root.Cluster.Log.WithError(err).Debugf("Leaf db service %q is unavailable.", p.Leaf.MysqlService.Name)
+				p.Root.Cluster.Log.DebugContext(ctx, "Leaf db service is unavailable", "error", err, "db_service", p.Leaf.MysqlService.Name)
 				continue
 			}
 			if !containsDB(servers, p.Leaf.PostgresService.Name) {
-				p.Root.Cluster.Log.WithError(err).Debugf("Leaf db service %q is unavailable.", p.Leaf.PostgresService.Name)
+				p.Root.Cluster.Log.DebugContext(ctx, "Leaf db service is unavailable", "error", err, "db_service", p.Leaf.PostgresService.Name)
 				continue
 			}
 			return
@@ -413,14 +439,14 @@ func (p *DatabasePack) StartDatabases(t *testing.T) {
 
 // databaseAgentStartParams parameters used to configure a database agent.
 type databaseAgentStartParams struct {
-	databases        []service.Database
+	databases        []servicecfg.Database
 	resourceMatchers []services.ResourceMatcher
 }
 
 // startRootDatabaseAgent starts a database agent with the provided
 // configuration on the root cluster.
-func (p *DatabasePack) startRootDatabaseAgent(t *testing.T, params databaseAgentStartParams) (*service.TeleportProcess, *auth.Client) {
-	conf := service.MakeDefaultConfig()
+func (p *DatabasePack) startRootDatabaseAgent(t *testing.T, params databaseAgentStartParams) (*service.TeleportProcess, *authclient.Client) {
+	conf := servicecfg.MakeDefaultConfig()
 	conf.DataDir = t.TempDir()
 	conf.SetToken("static-token-value")
 	conf.DiagnosticAddr = *utils.MustParseAddr(helpers.NewListener(t, service.ListenerDiagnostic, &conf.FileDescriptors))
@@ -433,13 +459,15 @@ func (p *DatabasePack) startRootDatabaseAgent(t *testing.T, params databaseAgent
 	conf.Databases.Databases = params.databases
 	conf.Databases.ResourceMatchers = params.resourceMatchers
 	conf.CircuitBreakerConfig = breaker.NoopBreakerConfig()
+	conf.InsecureMode = true
 
-	server, authClient, err := p.Root.Cluster.StartDatabase(conf)
+	server, authClient, hostUUID, err := p.Root.Cluster.StartDatabase(conf)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		server.Close()
 	})
 
+	helpers.WaitForDatabaseService(t, p.Root.Cluster.Process.GetAuthServer(), hostUUID)
 	helpers.WaitForDatabaseServers(t, p.Root.Cluster.Process.GetAuthServer(), conf.Databases.Databases)
 	return server, authClient
 }

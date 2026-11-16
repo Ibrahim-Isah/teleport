@@ -1,18 +1,20 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
@@ -25,6 +27,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	apidefaults "github.com/gravitational/teleport/api/defaults"
@@ -35,6 +38,7 @@ import (
 
 // TestPluginsCRUD tests backend operations with plugin resources.
 func TestPluginsCRUD(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	mem, err := memory.New(memory.Config{
@@ -44,7 +48,7 @@ func TestPluginsCRUD(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { mem.Close() })
 
-	service := NewPluginsService(func() backend.Backend { return mem })
+	service := NewPluginsService(mem)
 
 	// Define two plugins
 	plugin1 := types.NewPluginV1(types.Metadata{Name: "p1"}, types.PluginSpecV1{
@@ -65,7 +69,7 @@ func TestPluginsCRUD(t *testing.T) {
 	// Initially we expect no items.
 	out, err := service.GetPlugins(ctx, false)
 	require.NoError(t, err)
-	require.Equal(t, 0, len(out))
+	require.Empty(t, out)
 
 	// Create both plugins.
 	err = service.CreatePlugin(ctx, plugin1)
@@ -77,26 +81,26 @@ func TestPluginsCRUD(t *testing.T) {
 	out, err = service.GetPlugins(ctx, true)
 	require.NoError(t, err)
 	require.Empty(t, cmp.Diff([]types.Plugin{plugin1, plugin2}, out,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 	))
 
 	// Fetch a specific plugin.
 	cluster, err := service.GetPlugin(ctx, plugin2.GetName(), true)
 	require.NoError(t, err)
 	require.Empty(t, cmp.Diff(plugin2, cluster,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 	))
 
 	// Try to fetch a plugin that doesn't exist.
 	_, err = service.GetPlugin(ctx, "doesnotexist", true)
-	require.IsType(t, trace.NotFound(""), err)
+	require.ErrorAs(t, err, new(*trace.NotFoundError))
 
 	// Try to create a duplicate plugin.
 	err = service.CreatePlugin(ctx, plugin1)
-	require.IsType(t, trace.AlreadyExists(""), err)
+	require.ErrorAs(t, err, new(*trace.AlreadyExistsError))
 
 	// Set plugin status.
-	status := types.PluginStatusV1{
+	status := &types.PluginStatusV1{
 		Code: types.PluginStatusCode_OTHER_ERROR,
 	}
 	err = service.SetPluginStatus(ctx, plugin1.GetName(), status)
@@ -105,10 +109,19 @@ func TestPluginsCRUD(t *testing.T) {
 	require.NoError(t, err)
 	// Fields other than Status should remain unchanged
 	require.Empty(t, cmp.Diff(plugin1, cluster,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 		cmpopts.IgnoreFields(types.PluginV1{}, "Status"),
 	))
 	require.Empty(t, cmp.Diff(status, cluster.GetStatus()))
+
+	// Test if plugin types exist.
+	exists, err := service.HasPluginType(ctx, types.PluginTypeOkta)
+	require.NoError(t, err)
+	require.False(t, exists)
+
+	exists, err = service.HasPluginType(ctx, types.PluginTypeSlack)
+	require.NoError(t, err)
+	require.True(t, exists)
 
 	// Delete a plugin.
 	err = service.DeletePlugin(ctx, plugin1.GetName())
@@ -116,22 +129,23 @@ func TestPluginsCRUD(t *testing.T) {
 	out, err = service.GetPlugins(ctx, true)
 	require.NoError(t, err)
 	require.Empty(t, cmp.Diff([]types.Plugin{plugin2}, out,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 	))
 
 	// Try to delete a plugin that doesn't exist.
 	err = service.DeletePlugin(ctx, "doesnotexist")
-	require.IsType(t, trace.NotFound(""), err)
+	require.ErrorAs(t, err, new(*trace.NotFoundError))
 
 	// Delete all plugin.
 	err = service.DeleteAllPlugins(ctx)
 	require.NoError(t, err)
 	out, err = service.GetPlugins(ctx, true)
 	require.NoError(t, err)
-	require.Len(t, out, 0)
+	require.Empty(t, out)
 }
 
 func TestListPlugins(t *testing.T) {
+	t.Parallel()
 	const pageSize = 5
 	const numPlugins = 2*pageSize + 1
 	ctx := context.Background()
@@ -143,10 +157,10 @@ func TestListPlugins(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { mem.Close() })
 
-	service := NewPluginsService(func() backend.Backend { return mem })
+	service := NewPluginsService(mem)
 
 	var insertedPlugins []types.Plugin
-	for i := 0; i < numPlugins; i++ {
+	for i := range numPlugins {
 		plugin := types.NewPluginV1(
 			types.Metadata{Name: fmt.Sprintf("p%02d", i+1)},
 			types.PluginSpecV1{
@@ -184,7 +198,7 @@ func TestListPlugins(t *testing.T) {
 		fetchedPlugins = append(fetchedPlugins, page3...)
 
 		require.Empty(t, cmp.Diff(insertedPlugins, fetchedPlugins,
-			cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 		))
 	})
 
@@ -194,7 +208,161 @@ func TestListPlugins(t *testing.T) {
 		require.Empty(t, nextKey)
 
 		require.Empty(t, cmp.Diff(insertedPlugins, fetchedPlugins,
-			cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 		))
 	})
+
+	t.Run("zero page size uses default value", func(t *testing.T) {
+		fetchedPlugins, nextKey, err := service.ListPlugins(ctx, 0, "", true)
+		require.NoError(t, err)
+		require.Empty(t, nextKey)
+
+		require.Empty(t, cmp.Diff(insertedPlugins, fetchedPlugins,
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+		))
+	})
+}
+
+func TestPlugins_invalid_create_and_update(t *testing.T) {
+	t.Parallel()
+
+	validSlackPlugin := func(name string) *types.PluginV1 {
+		return types.NewPluginV1(
+			types.Metadata{Name: name},
+			types.PluginSpecV1{
+				Settings: &types.PluginSpecV1_SlackAccessPlugin{
+					SlackAccessPlugin: &types.PluginSlackAccessSettings{
+						FallbackChannel: "#general",
+					},
+				},
+			},
+			nil,
+		)
+	}
+
+	for _, tt := range []struct {
+		desc         string
+		mutate       func(*types.PluginV1)
+		requireErrFn func(t require.TestingT, err error, msgAndArgs ...any)
+	}{
+		{
+			desc: "empty_fallback_channel",
+			mutate: func(p *types.PluginV1) {
+				p.Spec.GetSlackAccessPlugin().FallbackChannel = ""
+			},
+			requireErrFn: func(t require.TestingT, err error, msgAndArgs ...any) {
+				require.Error(t, err, msgAndArgs...)
+				require.True(t, trace.IsBadParameter(err), msgAndArgs...)
+				require.ErrorContains(t, err, "fallback_channel must be set", msgAndArgs...)
+			},
+		},
+	} {
+		t.Run(tt.desc, func(t *testing.T) {
+			ctx := t.Context()
+			mem, err := memory.New(memory.Config{
+				Context: ctx,
+				Clock:   clockwork.NewFakeClock(),
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { mem.Close() })
+			svc := NewPluginsService(mem)
+
+			plugin := validSlackPlugin("test_plugin")
+			tt.mutate(plugin)
+			err = svc.CreatePlugin(ctx, plugin)
+			tt.requireErrFn(t, err, "CreatePlugin")
+
+			if err != nil {
+				plugin = validSlackPlugin("test_plugin")
+				require.NoError(t, svc.CreatePlugin(ctx, plugin))
+			}
+			p, err := svc.GetPlugin(ctx, plugin.GetName(), true)
+			require.NoError(t, err)
+			require.IsType(t, &types.PluginV1{}, p)
+			plugin = p.(*types.PluginV1)
+
+			tt.mutate(plugin)
+			_, err = svc.UpdatePlugin(ctx, plugin)
+			tt.requireErrFn(t, err, "UpdatePlugin")
+		})
+	}
+}
+
+func TestPlugins_SkipsUnmarshalErrorsHittingPageBoundary(t *testing.T) {
+	ctx := t.Context()
+
+	const pageLimit = 64
+	const numberOfPages = 5
+
+	clock := clockwork.NewFakeClock()
+	mem, err := memory.New(memory.Config{
+		Context: t.Context(),
+		Clock:   clock,
+	})
+	require.NoError(t, err)
+	service := NewPluginsService(mem)
+
+	createApp := func(name string) {
+		dummyStaticCreds := &types.PluginCredentialsV1{
+			Credentials: &types.PluginCredentialsV1_StaticCredentialsRef{
+				StaticCredentialsRef: &types.PluginStaticCredentialsRef{
+					Labels: map[string]string{"test_cred_label_1": "test_cred_value_1"},
+				},
+			},
+		}
+
+		plugin := types.NewPluginV1(types.Metadata{Name: name}, types.PluginSpecV1{
+			Settings: &types.PluginSpecV1_Okta{
+				Okta: &types.PluginOktaSettings{
+					OrgUrl: "https://my.okta.org.example.com",
+				},
+			},
+		}, nil)
+		require.NoError(t, err)
+
+		plugin.Credentials = dummyStaticCreds
+
+		err = service.CreatePlugin(ctx, plugin)
+		require.NoError(t, err)
+	}
+
+	createMalformedApp := func(name string) {
+		_, err := mem.Put(ctx, backend.Item{
+			Key:   backend.NewKey(pluginsPrefix, name),
+			Value: []byte("not-valid-json"),
+		})
+		require.NoError(t, err)
+	}
+
+	for i := range pageLimit * numberOfPages {
+		key := fmt.Sprintf("r%d", i)
+		if i%2 == 0 {
+			createMalformedApp(key)
+		} else {
+			createApp(key)
+		}
+	}
+
+	page1, next, err := service.ListPlugins(ctx, pageLimit, "", false)
+	require.NoError(t, err)
+	require.Len(t, page1, pageLimit)
+	require.NotEmpty(t, next)
+
+	page2, next, err := service.ListPlugins(ctx, pageLimit, next, false)
+	require.NoError(t, err)
+	require.Len(t, page2, pageLimit)
+	require.NotEmpty(t, next)
+
+	page3, next, err := service.ListPlugins(ctx, pageLimit, next, false)
+	require.NoError(t, err)
+	require.Len(t, page3, pageLimit/2)
+	require.Empty(t, next)
+
+	slices := [][]types.Plugin{page1, page2, page3}
+	for i := range len(slices) {
+		for j := i + 1; j < len(slices); j++ {
+			assert.NotEqual(t, slices[i], slices[j], "slices %d and %d should differ", i, j)
+		}
+	}
+
 }

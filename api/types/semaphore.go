@@ -42,6 +42,19 @@ const SemaphoreKindKubernetesConnection = "kubernetes_connection"
 // the number of operations that can occur on a unix user to one at a time
 const SemaphoreKindHostUserModification = "host_user_modification"
 
+// SemaphoreKindAccessMonitoringLimiter is the semaphore kind used by
+// the Access Monitoring feature during handling user queries.
+const SemaphoreKindAccessMonitoringLimiter = "access_monitoring_limiter"
+
+// SemaphoreKindUploadCompleter is the semaphore kind used by the
+// auth server's upload completer to protect access to the shared
+// session recordings backend.
+const SemaphoreKindUploadCompleter = "upload_completer"
+
+// SemaphoreKindAccessListReminderLimiter is the semaphore kind used by
+// the periodic check which creates access list reminder notifications.
+const SemaphoreKindAccessListReminderLimiter = "access_list_reminder_limiter"
+
 // Semaphore represents distributed semaphore concept
 type Semaphore interface {
 	// Resource contains common resource values
@@ -236,14 +249,14 @@ func (c *SemaphoreV3) GetKind() string {
 	return c.Kind
 }
 
-// GetResourceID returns resource ID
-func (c *SemaphoreV3) GetResourceID() int64 {
-	return c.Metadata.ID
+// GetRevision returns the revision
+func (c *SemaphoreV3) GetRevision() string {
+	return c.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (c *SemaphoreV3) SetResourceID(id int64) {
-	c.Metadata.ID = id
+// SetRevision sets the revision
+func (c *SemaphoreV3) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // GetName returns the name of the cluster.
@@ -314,17 +327,37 @@ type Semaphores interface {
 	CancelSemaphoreLease(ctx context.Context, lease SemaphoreLease) error
 	// GetSemaphores returns a list of semaphores matching supplied filter.
 	GetSemaphores(ctx context.Context, filter SemaphoreFilter) ([]Semaphore, error)
+	// ListSemaphores returns a page of semaphores matching supplied filter.
+	ListSemaphores(ctx context.Context, limit int, start string, filter *SemaphoreFilter) ([]Semaphore, string, error)
 	// DeleteSemaphore deletes a semaphore matching supplied filter.
 	DeleteSemaphore(ctx context.Context, filter SemaphoreFilter) error
 }
 
 // Match checks if the supplied semaphore matches this filter.
 func (f *SemaphoreFilter) Match(sem Semaphore) bool {
-	if f.SemaphoreKind != "" && f.SemaphoreKind != sem.GetSubKind() {
+	if f.GetSemaphoreKind() != "" && f.GetSemaphoreKind() != sem.GetSubKind() {
 		return false
 	}
-	if f.SemaphoreName != "" && f.SemaphoreName != sem.GetName() {
+	if f.GetSemaphoreName() != "" && f.GetSemaphoreName() != sem.GetName() {
 		return false
 	}
 	return true
+}
+
+// GetSemaphoreKind returns the semaphore kind to filter by if filter is non-nil
+func (f *SemaphoreFilter) GetSemaphoreKind() string {
+	if f == nil {
+		return ""
+	}
+
+	return f.SemaphoreKind
+}
+
+// GetSemaphoreName returns the semaphore name to filter by if filter is non-nil
+func (f *SemaphoreFilter) GetSemaphoreName() string {
+	if f == nil {
+		return ""
+	}
+
+	return f.SemaphoreName
 }

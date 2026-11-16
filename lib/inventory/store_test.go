@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package inventory
 
@@ -34,6 +36,9 @@ cpu: Intel(R) Xeon(R) CPU @ 2.80GHz
 BenchmarkStore-4               3         480249642 ns/op
 */
 func BenchmarkStore(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping heavy benchmark")
+	}
 	const insertions = 100_000
 	const uniqueServers = 10_000
 	const readMod = 100
@@ -44,19 +49,19 @@ func BenchmarkStore(b *testing.B) {
 	var failOnce sync.Once
 	var failErr error
 
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		store := NewStore()
 		var wg sync.WaitGroup
 
-		for i := 0; i < insertions; i++ {
+		for i := range insertions {
 			wg.Add(1)
 			go func(sn int) {
 				defer wg.Done()
 				serverID := fmt.Sprintf("server-%d", sn%uniqueServers)
 				handle := &upstreamHandle{
-					hello: proto.UpstreamInventoryHello{
+					hello: proto.UpstreamInventoryHello_builder{
 						ServerID: serverID,
-					},
+					}.Build(),
 				}
 				store.Insert(handle)
 				_, ok := store.Get(serverID)
@@ -71,8 +76,8 @@ func BenchmarkStore(b *testing.B) {
 					go func() {
 						defer wg.Done()
 						var foundServer bool
-						store.Iter(func(h UpstreamHandle) {
-							if h.Hello().ServerID == serverID {
+						store.UniqueHandles(func(h UpstreamHandle) {
+							if h.Hello().GetServerID() == serverID {
 								foundServer = true
 							}
 						})
@@ -89,7 +94,7 @@ func BenchmarkStore(b *testing.B) {
 		wg.Wait()
 		failOnce.Do(func() {})
 		require.NoError(b, failErr)
-		require.True(b, store.Len() == uniqueServers)
+		require.Equal(b, uniqueServers, store.Len())
 	}
 }
 
@@ -97,6 +102,12 @@ func BenchmarkStore(b *testing.B) {
 // 1. Handles are loadable by ID.
 // 2. When multiple handles have the same ID, loads are distributed across them.
 func TestStoreAccess(t *testing.T) {
+	if testing.Short() {
+		t.Skip("TestStoreAccess is heavy")
+	}
+
+	t.Parallel()
+
 	store := NewStore()
 
 	// we keep a record of all handles inserted into the store
@@ -105,12 +116,12 @@ func TestStoreAccess(t *testing.T) {
 	handles := make(map[*upstreamHandle]int)
 
 	// create 1_000 handles across 100 unique server IDs.
-	for i := 0; i < 1_000; i++ {
+	for i := range 1_000 {
 		serverID := fmt.Sprintf("server-%d", i%100)
 		handle := &upstreamHandle{
-			hello: proto.UpstreamInventoryHello{
+			hello: proto.UpstreamInventoryHello_builder{
 				ServerID: serverID,
-			},
+			}.Build(),
 		}
 		store.Insert(handle)
 		handles[handle] = 0
@@ -118,13 +129,13 @@ func TestStoreAccess(t *testing.T) {
 
 	// ensure that all server IDs yield a handle
 	for h := range handles {
-		_, ok := store.Get(h.Hello().ServerID)
+		_, ok := store.Get(h.Hello().GetServerID())
 		require.True(t, ok)
 	}
 
 	// ensure that all handles are visited if we iterate many times
-	for i := 0; i < 1_000; i++ {
-		store.Iter(func(h UpstreamHandle) {
+	for range 1_000 {
+		store.UniqueHandles(func(h UpstreamHandle) {
 			ptr := h.(*upstreamHandle)
 			n, ok := handles[ptr]
 			require.True(t, ok)
@@ -140,7 +151,58 @@ func TestStoreAccess(t *testing.T) {
 
 	// verify that all handles were removed
 	var count int
-	store.Iter(func(h UpstreamHandle) {
+	store.UniqueHandles(func(h UpstreamHandle) {
+		count++
+	})
+	require.Zero(t, count)
+}
+
+// TestAllHandles verifies that AllHandles allows us to visit
+// every handle in the store, even when multiple handles are registered with
+// the same server ID.
+func TestAllHandles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("TestAllHandles is heavy")
+	}
+
+	t.Parallel()
+
+	store := NewStore()
+
+	// we keep a record of all handles inserted into the store
+	// so that we can ensure that we visit all of them during
+	// iteration.
+	handles := make(map[*upstreamHandle]int)
+
+	// create 1_000 handles across 100 unique server IDs.
+	for i := range 1_000 {
+		serverID := fmt.Sprintf("server-%d", i%100)
+		handle := &upstreamHandle{
+			hello: proto.UpstreamInventoryHello_builder{
+				ServerID: serverID,
+			}.Build(),
+		}
+		store.Insert(handle)
+		handles[handle] = 0
+	}
+
+	// ensure that all handles are visited
+	store.AllHandles(func(h UpstreamHandle) {
+		ptr := h.(*upstreamHandle)
+		n, ok := handles[ptr]
+		require.True(t, ok)
+		handles[ptr] = n + 1
+	})
+
+	// verify that each handle was seen, then remove it
+	for h, n := range handles {
+		require.NotZero(t, n)
+		store.Remove(h)
+	}
+
+	// verify that all handles were removed
+	var count int
+	store.UniqueHandles(func(h UpstreamHandle) {
 		count++
 	})
 	require.Zero(t, count)

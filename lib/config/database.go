@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package config
 
@@ -18,28 +22,30 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
-	"text/template"
+	"time"
 
+	template "github.com/DataDog/datadog-agent/pkg/template/text"
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/service"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/utils/parse"
 )
 
 // databaseConfigTemplateFunc list of template functions used on the database
 // config template.
 var databaseConfigTemplateFuncs = template.FuncMap{
-	"quote": quote,
-	"join":  strings.Join,
+	"quote":    quote,
+	"join":     strings.Join,
+	"duration": func(d types.Duration) time.Duration { return d.Duration() },
 }
 
 // databaseAgentConfigurationTemplate database configuration template.
 var databaseAgentConfigurationTemplate = template.Must(template.New("").Funcs(databaseConfigTemplateFuncs).Parse(`#
 # Teleport database agent configuration file.
-# Configuration reference: https://goteleport.com/docs/database-access/reference/configuration/
+# Configuration reference: https://goteleport.com/docs/reference/agent-services/database-access-reference/configuration/
 #
 version: v3
 teleport:
@@ -58,7 +64,7 @@ db_service:
   enabled: true
 
   # Matchers for database resources created with "tctl create" command or by the discovery service.
-  # For more information about dynamic registration: https://goteleport.com/docs/database-access/guides/dynamic-registration/
+  # For more information about dynamic registration: https://goteleport.com/docs/enroll-resources/database-access/guides/dynamic-registration/
   {{- if .DynamicResourcesLabels }}
   resources:
   {{- range $index, $resourceLabel := .DynamicResourcesLabels }}
@@ -66,24 +72,34 @@ db_service:
 	{{- range $name, $value := $resourceLabel }}
       "{{ $name }}": "{{ $value }}"
     {{- end }}
+    {{- if $.DatabaseAWSAssumeRoleARN }}
+    aws:
+      {{- if $.DatabaseAWSAssumeRoleARN }}
+      assume_role_arn: "{{ $.DatabaseAWSAssumeRoleARN }}"
+      {{- end }}
+      {{- if $.DatabaseAWSExternalID }}
+      external_id: "{{ $.DatabaseAWSExternalID }}"
+      {{- end }}
+    {{- end }}
   {{- end }}
   {{- else }}
   #
   # resources:
   # - labels:
   #     "env": "dev"
+  #   # Optional AWS role that the Database Service will assume to access the
+  #   # databases.
+  #   aws:
+  #     assume_role_arn: "arn:aws:iam::123456789012:role/example-role-name"
+  #     external_id: "example-external-id"
   {{- end }}
 
   # Matchers for registering AWS-hosted databases.
-  {{- if or .RDSDiscoveryRegions .RDSProxyDiscoveryRegions .RedshiftDiscoveryRegions .RedshiftServerlessDiscoveryRegions .ElastiCacheDiscoveryRegions .MemoryDBDiscoveryRegions}}
+  {{- if or .RDSDiscoveryRegions .RDSProxyDiscoveryRegions .RedshiftDiscoveryRegions .RedshiftServerlessDiscoveryRegions .ElastiCacheDiscoveryRegions .ElastiCacheServerlessDiscoveryRegions .MemoryDBDiscoveryRegions .OpenSearchDiscoveryRegions}}
   aws:
   {{- else }}
   # For more information about AWS auto-discovery:
-  # RDS/Aurora: https://goteleport.com/docs/database-access/guides/rds/
-  # RDS Proxy: https://goteleport.com/docs/database-access/guides/rdsproxy/
-  # Redshift: https://goteleport.com/docs/database-access/guides/postgres-redshift/
-  # Redshift Serverless: https://goteleport.com/docs/database-access/guides/postgres-redshift-serverless/
-  # ElastiCache/MemoryDB: https://goteleport.com/docs/database-access/guides/redis-aws/
+  # https://goteleport.com/docs/enroll-resources/auto-discovery/databases/aws/
   #
   # aws:
   #   # Database types. Valid options are:
@@ -92,8 +108,10 @@ db_service:
   #   # 'redshift' - discovers and registers AWS Redshift databases.
   #   # 'redshift-serverless' - discovers and registers AWS Redshift Serverless databases.
   #   # 'elasticache' - discovers and registers AWS ElastiCache Redis databases.
+  #   # 'elasticache-serverless' - Amazon ElastiCache Serverless Redis or Valkey databases.
   #   # 'memorydb' - discovers and registers AWS MemoryDB Redis databases.
-  # - types: ["rds", "rdsproxy","redshift", "redshift-serverless", "elasticache", "memorydb"]
+  #   # 'opensearch' - discovers and registers AWS OpenSearch domains.
+  # - types: ["rds", "rdsproxy", "redshift", "redshift-serverless", "elasticache", "elasticache-serverless", "memorydb", "opensearch"]
   #   # AWS regions to register databases from.
   #   regions: ["us-west-1", "us-east-2"]
   #   # AWS resource tags to match when registering databases.
@@ -102,7 +120,7 @@ db_service:
   {{- end }}
   {{- if .RDSDiscoveryRegions }}
   # RDS/Aurora databases auto-discovery.
-  # For more information about RDS/Aurora auto-discovery: https://goteleport.com/docs/database-access/guides/rds/
+  # For more information about RDS/Aurora auto-discovery: https://goteleport.com/docs/enroll-resources/auto-discovery/databases/aws/
   - types: ["rds"]
     # AWS regions to register databases from.
     regions:
@@ -117,7 +135,7 @@ db_service:
   {{- end }}
   {{- if .RDSProxyDiscoveryRegions }}
   # RDS Proxies auto-discovery.
-  # For more information about RDS Proxy auto-discovery: https://goteleport.com/docs/database-access/guides/rdsproxy/
+  # For more information about RDS Proxy auto-discovery: https://goteleport.com/docs/enroll-resources/auto-discovery/databases/aws/
   - types: ["rdsproxy"]
     # AWS regions to register databases from.
     regions:
@@ -132,7 +150,7 @@ db_service:
   {{- end }}
   {{- if .RedshiftDiscoveryRegions }}
   # Redshift databases auto-discovery.
-  # For more information about Redshift auto-discovery: https://goteleport.com/docs/database-access/guides/postgres-redshift/
+  # For more information about Redshift auto-discovery: https://goteleport.com/docs/enroll-resources/auto-discovery/databases/aws/
   - types: ["redshift"]
     # AWS regions to register databases from.
     regions:
@@ -147,7 +165,7 @@ db_service:
   {{- end }}
   {{- if .RedshiftServerlessDiscoveryRegions }}
   # Redshift Serverless databases auto-discovery.
-  # For more information about Redshift Serverless auto-discovery: https://goteleport.com/docs/database-access/guides/postgres-redshift-serverless/
+  # For more information about Redshift Serverless auto-discovery: https://goteleport.com/docs/enroll-resources/auto-discovery/databases/aws/
   - types: ["redshift-serverless"]
     # AWS regions to register databases from.
     regions:
@@ -162,7 +180,7 @@ db_service:
   {{- end }}
   {{- if .ElastiCacheDiscoveryRegions }}
   # ElastiCache databases auto-discovery.
-  # For more information about ElastiCache auto-discovery: https://goteleport.com/docs/database-access/guides/redis-aws/
+  # For more information about ElastiCache auto-discovery: https://goteleport.com/docs/enroll-resources/auto-discovery/databases/aws/
   - types: ["elasticache"]
     # AWS regions to register databases from.
     regions:
@@ -175,13 +193,43 @@ db_service:
       "{{ $name }}": "{{ $value }}"
     {{- end }}
   {{- end }}
+  {{- if .ElastiCacheServerlessDiscoveryRegions }}
+  # ElastiCacheServerless databases auto-discovery.
+  # For more information about ElastiCacheServerless auto-discovery: https://goteleport.com/docs/enroll-resources/auto-discovery/databases/aws/
+  - types: ["elasticache-serverless"]
+    # AWS regions to register databases from.
+    regions:
+    {{- range .ElastiCacheServerlessDiscoveryRegions }}
+    - "{{ . }}"
+    {{- end }}
+    # AWS resource tags to match when registering databases.
+    tags:
+    {{- range $name, $value := .AWSTags }}
+      "{{ $name }}": "{{ $value }}"
+    {{- end }}
+  {{- end }}
   {{- if .MemoryDBDiscoveryRegions }}
   # MemoryDB databases auto-discovery.
-  # For more information about MemoryDB auto-discovery: https://goteleport.com/docs/database-access/guides/redis-aws/
+  # For more information about MemoryDB auto-discovery: https://goteleport.com/docs/enroll-resources/auto-discovery/databases/aws/
   - types: ["memorydb"]
     # AWS regions to register databases from.
     regions:
     {{- range .MemoryDBDiscoveryRegions }}
+    - "{{ . }}"
+    {{- end }}
+    # AWS resource tags to match when registering databases.
+    tags:
+    {{- range $name, $value := .AWSTags }}
+      "{{ $name }}": "{{ $value }}"
+    {{- end }}
+  {{- end }}
+  {{- if .OpenSearchDiscoveryRegions }}
+  # OpenSearch databases auto-discovery.
+  # For more information about OpenSearch auto-discovery: https://goteleport.com/docs/enroll-resources/auto-discovery/databases/aws/
+  - types: ["opensearch"]
+    # AWS regions to register databases from.
+    regions:
+    {{- range .OpenSearchDiscoveryRegions }}
     - "{{ . }}"
     {{- end }}
     # AWS resource tags to match when registering databases.
@@ -196,9 +244,9 @@ db_service:
   azure:
   {{- else }}
   # For more information about Azure auto-discovery:
-  # MySQL/PostgreSQL: https://goteleport.com/docs/database-access/guides/azure-postgres-mysql/
-  # Redis: https://goteleport.com/docs/database-access/guides/azure-redis/
-  # SQL Server: https://goteleport.com/docs/database-access/guides/azure-sql-server-ad/
+  # MySQL/PostgreSQL: https://goteleport.com/docs/enroll-resources/database-access/enroll-azure-databases/azure-postgres-mysql/
+  # Redis: https://goteleport.com/docs/enroll-resources/database-access/enroll-azure-databases/azure-redis/
+  # SQL Server: https://goteleport.com/docs/enroll-resources/database-access/enroll-azure-databases/azure-sql-server-ad/
   #
   # azure:
   #   # Database types. Valid options are:
@@ -222,7 +270,7 @@ db_service:
   {{- end }}
   {{- if or .AzureMySQLDiscoveryRegions }}
   # Azure MySQL databases auto-discovery.
-  # For more information about Azure MySQL auto-discovery: https://goteleport.com/docs/database-access/guides/azure-postgres-mysql/
+  # For more information about Azure MySQL auto-discovery: https://goteleport.com/docs/enroll-resources/database-access/enroll-azure-databases/azure-postgres-mysql/
   - types: ["mysql"]
     # Azure subscription IDs to match.
     subscriptions:
@@ -247,7 +295,7 @@ db_service:
   {{- end }}
   {{- if or .AzurePostgresDiscoveryRegions }}
   # Azure Postgres databases auto-discovery.
-  # For more information about Azure Postgres auto-discovery: https://goteleport.com/docs/database-access/guides/azure-postgres-mysql/
+  # For more information about Azure Postgres auto-discovery: https://goteleport.com/docs/enroll-resources/database-access/enroll-azure-databases/azure-postgres-mysql/
   - types: ["postgres"]
     # Azure subscription IDs to match.
     subscriptions:
@@ -272,7 +320,7 @@ db_service:
   {{- end }}
   {{- if or .AzureRedisDiscoveryRegions }}
   # Azure Cache For Redis databases auto-discovery.
-  # For more information about Azure Cache for Redis auto-discovery: https://goteleport.com/docs/database-access/guides/azure-redis/
+  # For more information about Azure Cache for Redis auto-discovery: https://goteleport.com/docs/enroll-resources/database-access/enroll-azure-databases/azure-redis/
   - types: ["redis"]
     # Azure subscription IDs to match.
     subscriptions:
@@ -297,7 +345,7 @@ db_service:
   {{- end }}
   {{- if or .AzureSQLServerDiscoveryRegions }}
   # Azure SQL server and Managed instances auto-discovery.
-  # For more information about SQL server and Managed instances auto-discovery: https://goteleport.com/docs/database-access/guides/azure-sql-server-ad/
+  # For more information about SQL server and Managed instances auto-discovery: https://goteleport.com/docs/enroll-resources/database-access/enroll-azure-databases/azure-sql-server-ad/
   - types: ["sqlserver"]
     # Azure subscription IDs to match.
     subscriptions:
@@ -329,17 +377,25 @@ db_service:
     {{- if .StaticDatabaseURI }}
     uri: "{{ .StaticDatabaseURI }}"
     {{- end}}
-    {{- if .DatabaseCACertFile }}
+    {{- if or .DatabaseCACertFile .DatabaseTrustSystemCertPool}}
     tls:
+      {{- if .DatabaseCACertFile }}
       ca_cert_file: "{{ .DatabaseCACertFile }}"
+      {{- end }}
+      {{- if .DatabaseTrustSystemCertPool }}
+      trust_system_cert_pool: {{ .DatabaseTrustSystemCertPool }}
+      {{- end }}
     {{- end }}
-    {{- if or .DatabaseAWSRegion .DatabaseAWSAccountID .DatabaseAWSExternalID .DatabaseAWSRedshiftClusterID .DatabaseAWSRDSInstanceID .DatabaseAWSRDSClusterID .DatabaseAWSElastiCacheGroupID .DatabaseAWSMemoryDBClusterName }}
+    {{- if or .DatabaseAWSRegion .DatabaseAWSAccountID .DatabaseAWSAssumeRoleARN .DatabaseAWSExternalID .DatabaseAWSRedshiftClusterID .DatabaseAWSRDSInstanceID .DatabaseAWSRDSClusterID .DatabaseAWSElastiCacheGroupID .DatabaseAWSElastiCacheServerlessCacheName .DatabaseAWSMemoryDBClusterName }}
     aws:
       {{- if .DatabaseAWSRegion }}
       region: "{{ .DatabaseAWSRegion }}"
       {{- end }}
       {{- if .DatabaseAWSAccountID }}
       account_id: "{{ .DatabaseAWSAccountID }}"
+      {{- end }}
+      {{- if .DatabaseAWSAssumeRoleARN }}
+      assume_role_arn: "{{ .DatabaseAWSAssumeRoleARN }}"
       {{- end }}
       {{- if .DatabaseAWSExternalID }}
       external_id: "{{ .DatabaseAWSExternalID }}"
@@ -360,6 +416,10 @@ db_service:
       {{- if .DatabaseAWSElastiCacheGroupID }}
       elasticache:
         replication_group_id: "{{ .DatabaseAWSElastiCacheGroupID }}"
+      {{- end }}
+      {{- if .DatabaseAWSElastiCacheServerlessCacheName }}
+      elasticache_serverless:
+        cache_name: "{{ .DatabaseAWSElastiCacheServerlessCacheName }}"
       {{- end }}
       {{- if .DatabaseAWSMemoryDBClusterName }}
       memorydb:
@@ -399,7 +459,7 @@ db_service:
     dynamic_labels:
     {{- range $name, $label := .StaticDatabaseDynamicLabels }}
     - name: "{{ $name }}"
-      period: "{{ $label.Period.Duration }}"
+      period: "{{ duration $label.Period }}"
       command:
       {{- range $command := $label.Command }}
       - {{ $command | quote }}
@@ -410,7 +470,7 @@ db_service:
   #
   # databases:
   # # RDS database static configuration.
-  # # RDS/Aurora databases Auto-discovery reference: https://goteleport.com/docs/database-access/guides/rds/
+  # # RDS/Aurora databases Auto-discovery guide: https://goteleport.com/docs/enroll-resources/auto-discovery/databases/aws/
   # - name: rds
   #   description: AWS RDS/Aurora instance configuration example.
   #   # Supported protocols for RDS/Aurora: "postgres" or "mysql"
@@ -426,7 +486,7 @@ db_service:
   #       # RDS Instance ID. Only present on RDS databases.
   #       instance_id: rds-instance-1
   # # Aurora database static configuration.
-  # # RDS/Aurora databases Auto-discovery reference: https://goteleport.com/docs/database-access/guides/rds/
+  # # RDS/Aurora databases Auto-discovery guide: https://goteleport.com/docs/enroll-resources/auto-discovery/databases/aws/
   # - name: aurora
   #   description: AWS Aurora cluster configuration example.
   #   # Supported protocols for RDS/Aurora: "postgres" or "mysql"
@@ -442,7 +502,7 @@ db_service:
   #       # Aurora Cluster ID. Only present on Aurora databases.
   #       cluster_id: aurora-cluster-1
   # # Redshift database static configuration.
-  # # For more information: https://goteleport.com/docs/database-access/guides/postgres-redshift/
+  # # For more information: https://goteleport.com/docs/enroll-resources/auto-discovery/databases/aws/
   # - name: redshift
   #   description: AWS Redshift cluster configuration example.
   #   # Supported protocols for Redshift: "postgres".
@@ -485,6 +545,17 @@ db_service:
   #     memorydb:
   #       # MemoryDB cluster name.
   #       cluster_name: my-memorydb
+  # # OpenSearch database static configuration.
+  # - name: opensearch
+  #   description: AWS OpenSearch domain configuration example.
+  #   protocol: opensearch
+  #   # Database connection endpoint. Must be reachable from Database service.
+  #   uri: search-my-domain-xxxxxx.us-east-1.es.amazonaws.com:443
+  #   # AWS specific configuration.
+  #   aws:
+  #     # Region the database is deployed in.
+  #     region: us-east-1
+  #     account_id: "123456789000"
   # # Self-hosted static configuration.
   # - name: self-hosted
   #   description: Self-hosted database configuration.
@@ -567,9 +638,15 @@ type DatabaseSampleFlags struct {
 	// ElastiCacheDiscoveryRegions is a list of regions the ElastiCache
 	// auto-discovery is configured.
 	ElastiCacheDiscoveryRegions []string
+	// ElastiCacheServerlessDiscoveryRegions is a list of regions the ElastiCache
+	// Serverless auto-discovery is configured.
+	ElastiCacheServerlessDiscoveryRegions []string
 	// MemoryDBDiscoveryRegions is a list of regions the MemoryDB
 	// auto-discovery is configured.
 	MemoryDBDiscoveryRegions []string
+	// OpenSearchDiscoveryRegions is a list of regions the OpenSearch
+	// auto-discovery is configured.
+	OpenSearchDiscoveryRegions []string
 	// AWSTags is the list of the AWS resource tags used for AWS discoveries.
 	AWSTags map[string]string
 	// AWSRawTags is the "raw" list of AWS resource tags used for AWS discoveries.
@@ -580,6 +657,8 @@ type DatabaseSampleFlags struct {
 	DatabaseAWSRegion string
 	// DatabaseAWSAccountID is an optional AWS account ID e.g. when using Keyspaces or DynamoDB.
 	DatabaseAWSAccountID string
+	// DatabaseAWSAssumeRoleARN is an optional AWS IAM role ARN to assume when accessing the database.
+	DatabaseAWSAssumeRoleARN string
 	// DatabaseAWSExternalID is an optional AWS database external ID, used when assuming roles.
 	DatabaseAWSExternalID string
 	// DatabaseAWSRedshiftClusterID is Redshift cluster identifier.
@@ -590,6 +669,8 @@ type DatabaseSampleFlags struct {
 	DatabaseAWSRDSInstanceID string
 	// DatabaseAWSElastiCacheGroupID is the ElastiCache replication group identifier.
 	DatabaseAWSElastiCacheGroupID string
+	// DatabaseAWSElastiCacheServerlessCacheName is the ElastiCache Serverless cache name.
+	DatabaseAWSElastiCacheServerlessCacheName string
 	// DatabaseAWSMemoryDBClusterName is the MemoryDB cluster name.
 	DatabaseAWSMemoryDBClusterName string
 	// DatabaseADDomain is the Active Directory domain for authentication.
@@ -604,11 +685,14 @@ type DatabaseSampleFlags struct {
 	DatabaseGCPInstanceID string
 	// DatabaseCACertFile is the database CA cert path.
 	DatabaseCACertFile string
+	// DatabaseTrustSystemCertPool allows Teleport to trust certificate
+	// authorities available on the host system.
+	DatabaseTrustSystemCertPool bool
 }
 
 // CheckAndSetDefaults checks and sets default values for the flags.
 func (f *DatabaseSampleFlags) CheckAndSetDefaults() error {
-	conf := service.MakeDefaultConfig()
+	conf := servicecfg.MakeDefaultConfig()
 	f.DatabaseProtocols = defaults.DatabaseProtocols
 
 	if f.NodeName == "" {
@@ -619,10 +703,10 @@ func (f *DatabaseSampleFlags) CheckAndSetDefaults() error {
 	}
 
 	var err error
-	if f.AWSTags, err = client.ParseLabelSpec(f.AWSRawTags); err != nil {
+	if f.AWSTags, err = parse.LabelSelectorSpec(f.AWSRawTags); err != nil {
 		return trace.Wrap(err)
 	}
-	if f.AzureTags, err = client.ParseLabelSpec(f.AzureRawTags); err != nil {
+	if f.AzureTags, err = parse.LabelSelectorSpec(f.AzureRawTags); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -642,7 +726,7 @@ func (f *DatabaseSampleFlags) CheckAndSetDefaults() error {
 
 	// Labels for "resources" section.
 	for i := range f.DynamicResourcesRawLabels {
-		labels, err := client.ParseLabelSpec(f.DynamicResourcesRawLabels[i])
+		labels, err := parse.LabelSelectorSpec(f.DynamicResourcesRawLabels[i])
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -673,7 +757,7 @@ func MakeDatabaseAgentConfigString(flags DatabaseSampleFlags) (string, error) {
 	if err != nil {
 		return "", trace.Wrap(err)
 	}
-	cfg := service.MakeDefaultConfig()
+	cfg := servicecfg.MakeDefaultConfig()
 	if err = ApplyFileConfig(fc, cfg); err != nil {
 		return "", trace.Wrap(err)
 	}

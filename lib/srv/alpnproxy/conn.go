@@ -1,31 +1,28 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package alpnproxy
 
 import (
-	"crypto/tls"
-	"encoding/binary"
 	"io"
-	"math"
 	"net"
 	"sync"
 	"time"
-
-	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/lib/utils"
 )
@@ -70,7 +67,7 @@ func newBufferedConn(conn net.Conn, header io.Reader) *bufferedConn {
 //		 },
 //	})
 //
-// err := tlsConn.Handshake()
+// err := tlsConn.HandshakeContext(ctx)
 //
 //	if hello == nil {
 //	   return trace.Wrap(err)
@@ -104,108 +101,31 @@ func (conn readOnlyConn) SetDeadline(t time.Time) error      { return nil }
 func (conn readOnlyConn) SetReadDeadline(t time.Time) error  { return nil }
 func (conn readOnlyConn) SetWriteDeadline(t time.Time) error { return nil }
 
-// NewPingConn returns a ping connection wrapping the provided net.Conn.
-func NewPingConn(conn *tls.Conn) *PingConn {
-	return &PingConn{Conn: conn}
+type reportingConn struct {
+	net.Conn
+	closeOnce func() error
 }
 
-// PingConn wraps a *tls.Conn and add ping capabilities to it, including the
-// `WritePing` function and `Read` (which excludes ping packets).
-//
-// When using this connection, the packets written will contain an initial data:
-// the packet size. When reading, this information is taken into account, but it
-// is not returned to the caller.
-//
-// Ping messages have a packet size of zero and are produced only when
-// `WritePing` is called. On `Read`, any Ping packet is discarded.
-type PingConn struct {
-	//net.Conn
-	*tls.Conn
-
-	muRead  sync.Mutex
-	muWrite sync.Mutex
-
-	// currentSize size of bytes of the current packet.
-	currentSize uint32
+// newReportingConn returns a net.Conn that wraps the input conn, increments the
+// active connections gauge on creation, and decreases the active connections
+// gauge on close.
+func newReportingConn(conn net.Conn, clientALPN string, connSource string) net.Conn {
+	proxyActiveConnections.WithLabelValues(clientALPN, connSource).Inc()
+	return &reportingConn{
+		Conn: conn,
+		closeOnce: sync.OnceValue(func() error {
+			proxyActiveConnections.WithLabelValues(clientALPN, connSource).Dec()
+			// Do not wrap.
+			return conn.Close()
+		}),
+	}
 }
 
-// Read reads content from the underlaying connection, discarding any ping
-// messages it finds.
-func (c *PingConn) Read(p []byte) (int, error) {
-	c.muRead.Lock()
-	defer c.muRead.Unlock()
-
-	err := c.discardPingReads()
-	if err != nil {
-		return 0, err
-	}
-
-	// Check if the current size is larger than the provided buffer.
-	readSize := c.currentSize
-	if c.currentSize > uint32(len(p)) {
-		readSize = uint32(len(p))
-	}
-
-	n, err := c.Conn.Read(p[:readSize])
-	c.currentSize -= uint32(n)
-
-	return n, err
+// NetConn returns the underlying net.Conn.
+func (c *reportingConn) NetConn() net.Conn {
+	return c.Conn
 }
 
-// WritePing writes the ping packet to the connection.
-func (c *PingConn) WritePing() error {
-	c.muWrite.Lock()
-	defer c.muWrite.Unlock()
-
-	return binary.Write(c.Conn, binary.BigEndian, uint32(0))
-}
-
-// discardPingReads reads from the wrapped net.Conn until it encounters a
-// non-ping packet.
-func (c *PingConn) discardPingReads() error {
-	for c.currentSize == 0 {
-		err := binary.Read(c.Conn, binary.BigEndian, &c.currentSize)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// Write writes provided content to the underlying connection with proper
-// protocol fields.
-func (c *PingConn) Write(p []byte) (int, error) {
-	c.muWrite.Lock()
-	defer c.muWrite.Unlock()
-
-	// Avoid overflow when casting data length. It is only present to avoid
-	// panicking if the size cannot be cast. Callers should handle packet length
-	// limits, such as protocol implementations and audits.
-	if uint64(len(p)) > math.MaxUint32 {
-		return 0, trace.BadParameter("invalid content size, max size permitted is %d", uint64(math.MaxUint32))
-	}
-
-	size := uint32(len(p))
-	if size == 0 {
-		return 0, nil
-	}
-
-	// Write packet size.
-	if err := binary.Write(c.Conn, binary.BigEndian, size); err != nil {
-		return 0, trace.Wrap(err)
-	}
-
-	// Iterate until everything is written.
-	var written int
-	for written < len(p) {
-		n, err := c.Conn.Write(p)
-		written += n
-
-		if err != nil {
-			return written, trace.Wrap(err)
-		}
-	}
-
-	return written, nil
+func (c *reportingConn) Close() error {
+	return c.closeOnce()
 }

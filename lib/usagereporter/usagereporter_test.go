@@ -1,24 +1,25 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package usagereporter
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -37,7 +38,7 @@ const (
 )
 
 type TestEvent struct {
-	count string
+	count int
 }
 
 // newTestSubmitter creates a submitter that reports batches to a channel.
@@ -65,7 +66,7 @@ func newFailingSubmitter(size int) (SubmitFunc[TestEvent], chan []*SubmittedEven
 // newTestingUsageReporter creates a new usage reporter that can be used in
 // tests.
 func newTestingUsageReporter(
-	clock clockwork.FakeClock, submitClock clockwork.FakeClock,
+	clock *clockwork.FakeClock, submitClock *clockwork.FakeClock,
 	submitter SubmitFunc[TestEvent],
 ) (*UsageReporter[TestEvent], context.CancelFunc, chan struct{}) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -77,7 +78,7 @@ func newTestingUsageReporter(
 		receiveChan <- struct{}{}
 	}
 
-	reporter := NewUsageReporter[TestEvent](&Options[TestEvent]{
+	reporter := NewUsageReporter(&Options[TestEvent]{
 		Submit:        submitter,
 		Clock:         clock,
 		SubmitClock:   submitClock,
@@ -93,9 +94,6 @@ func newTestingUsageReporter(
 
 	go reporter.Run(ctx)
 
-	// Wait for timers to init.
-	clock.BlockUntil(1)
-
 	return reporter, cancel, receiveChan
 }
 
@@ -103,9 +101,9 @@ func newTestingUsageReporter(
 func createDummyEvents(start, count int) []*TestEvent {
 	var ret []*TestEvent
 
-	for i := 0; i < count; i++ {
+	for i := range count {
 		ret = append(ret, &TestEvent{
-			count: fmt.Sprintf("%d", start+i),
+			count: start + i,
 		})
 	}
 
@@ -115,7 +113,7 @@ func createDummyEvents(start, count int) []*TestEvent {
 func compareUsageEvents(t *testing.T, reporter *UsageReporter[TestEvent], inputs []*TestEvent, outputs []*SubmittedEvent[TestEvent]) {
 	require.Len(t, outputs, len(inputs))
 
-	for i := 0; i < len(inputs); i++ {
+	for i := range inputs {
 		input := inputs[i]
 		output := outputs[i]
 
@@ -124,7 +122,7 @@ func compareUsageEvents(t *testing.T, reporter *UsageReporter[TestEvent], inputs
 }
 
 // advanceClocks advances all the given clocks by the same duration
-func advanceClocks(dur time.Duration, clocks ...clockwork.FakeClock) {
+func advanceClocks(dur time.Duration, clocks ...*clockwork.FakeClock) {
 	for _, c := range clocks {
 		c.Advance(dur)
 	}
@@ -165,7 +163,6 @@ func TestUsageReporterTimeSubmit(t *testing.T) {
 	// clock.
 	fakeClock.BlockUntil(1)
 	advanceClocks(2*testMaxBatchAge, fakeClock, fakeSubmitClock)
-	fakeSubmitClock.BlockUntil(1)
 
 	select {
 	case e := <-batchChan:
@@ -189,7 +186,7 @@ func TestUsageReporterBatchSubmit(t *testing.T) {
 	defer cancel()
 
 	// Create enough events to fill a batch and then some.
-	events := createDummyEvents(0, 10)
+	events := createDummyEvents(0, testMaxBatchSize+testMinBatchSize)
 	reporter.AddEventsToQueue(events...)
 
 	// Block until events have been processed.
@@ -198,18 +195,11 @@ func TestUsageReporterBatchSubmit(t *testing.T) {
 	// Receive the first batch.
 	select {
 	case e := <-batchChan:
-		require.Len(t, e, testMaxBatchSize)
-		compareUsageEvents(t, reporter, events[:5], e)
+		compareUsageEvents(t, reporter, events[:testMaxBatchSize], e)
+		events = events[testMaxBatchSize:]
 	case <-time.After(time.Second):
 		t.Fatalf("Did not receive expected events.")
 	}
-
-	// Submit an extra event to trigger an early send
-	extra := createDummyEvents(9, 1)
-	reporter.AddEventsToQueue(extra...)
-	events = append(events, extra...)
-
-	<-rx
 
 	// Make sure the minimum delay is enforced for the subsequent batch.
 	select {
@@ -221,17 +211,23 @@ func TestUsageReporterBatchSubmit(t *testing.T) {
 
 	// Wait for submission to complete due to the submission delay.
 	fakeSubmitClock.BlockUntil(1)
-	fakeClock.BlockUntil(1)
 	advanceClocks(testSubmitDelay, fakeClock, fakeSubmitClock)
 
 	// Receive the 2nd batch.
 	select {
 	case e := <-batchChan:
-		require.Len(t, e, testMaxBatchSize)
-		compareUsageEvents(t, reporter, events[5:10], e)
+		compareUsageEvents(t, reporter, events[:testMinBatchSize], e)
+		events = events[testMinBatchSize:]
 	case <-time.After(time.Second):
 		t.Fatalf("Did not receive expected events.")
 	}
+
+	// Submit an extra event now
+	extra := createDummyEvents(100, 1)
+	reporter.AddEventsToQueue(extra...)
+	events = append(events, extra...)
+
+	<-rx
 
 	// Let the submission delay pass.
 	fakeSubmitClock.BlockUntil(1)
@@ -246,13 +242,12 @@ func TestUsageReporterBatchSubmit(t *testing.T) {
 		// Nothing to see yet.
 	}
 
-	fakeClock.BlockUntil(1)
 	advanceClocks(testMaxBatchAge, fakeClock, fakeSubmitClock)
 
 	select {
 	case e := <-batchChan:
 		require.Len(t, e, 1)
-		compareUsageEvents(t, reporter, events[10:], e)
+		compareUsageEvents(t, reporter, events, e)
 	case <-time.After(time.Second):
 		t.Fatalf("Did not receive expected events.")
 	}
@@ -284,11 +279,10 @@ func TestUsageReporterDiscard(t *testing.T) {
 		t.Fatalf("Did not receive expected events.")
 	}
 
-	// Wait the regular submit delay (to ensure submit finishes) _and_ the
-	// maxBatchAge (to allow the next submission).
-	fakeClock.BlockUntil(1)
+	// Wait the regular submit delay (to ensure submit finishes), as we have
+	// enough events to fill two batches.
 	fakeSubmitClock.BlockUntil(1)
-	advanceClocks(testSubmitDelay+testMaxBatchAge, fakeClock, fakeSubmitClock)
+	advanceClocks(testSubmitDelay, fakeClock, fakeSubmitClock)
 
 	// Receive the final batch.
 	select {
@@ -324,8 +318,9 @@ func TestUsageReporterErrorReenqueue(t *testing.T) {
 	defer cancel()
 
 	// Create enough events to fill the buffer.
-	events := createDummyEvents(0, 10)
+	events := createDummyEvents(0, testMaxBatchSize*2)
 	reporter.AddEventsToQueue(events...)
+	events, events2 := events[:testMaxBatchSize], events[testMaxBatchSize:]
 	<-rx
 
 	var prev []*SubmittedEvent[TestEvent]
@@ -333,9 +328,7 @@ func TestUsageReporterErrorReenqueue(t *testing.T) {
 	// Receive the first (failed) batch.
 	select {
 	case e := <-batchChan:
-		require.Len(t, e, testMaxBatchSize)
-		compareUsageEvents(t, reporter, events[:5], e)
-
+		compareUsageEvents(t, reporter, events, e)
 		prev = e
 	case <-time.After(time.Second):
 		t.Fatalf("Did not receive expected events.")
@@ -346,7 +339,6 @@ func TestUsageReporterErrorReenqueue(t *testing.T) {
 
 	// The submission fails, so events are reenqueued. This triggers an early
 	// send at the submit delay rather than the full batch send interval.
-	fakeClock.BlockUntil(1)
 	fakeSubmitClock.BlockUntil(1)
 
 	// Before continuing, check the last batch's retry counter. We need to check
@@ -360,8 +352,7 @@ func TestUsageReporterErrorReenqueue(t *testing.T) {
 	// Receive the second batch.
 	select {
 	case e := <-batchChan:
-		require.Len(t, e, testMaxBatchSize)
-		compareUsageEvents(t, reporter, events[5:10], e)
+		compareUsageEvents(t, reporter, events2, e)
 
 		prev = e
 	case <-time.After(time.Second):
@@ -371,9 +362,7 @@ func TestUsageReporterErrorReenqueue(t *testing.T) {
 	// Ack rx again.
 	<-rx
 
-	fakeClock.BlockUntil(1)
 	fakeSubmitClock.BlockUntil(1)
-
 	// As above, check the retry counter. These events still have only failed
 	// once.
 	for _, event := range prev {
@@ -385,19 +374,14 @@ func TestUsageReporterErrorReenqueue(t *testing.T) {
 	// Receive the first batch again, since it was reenqueued.
 	select {
 	case e := <-batchChan:
-		require.Len(t, e, testMaxBatchSize)
-		compareUsageEvents(t, reporter, events[:5], e)
+		compareUsageEvents(t, reporter, events, e)
 
 		prev = e
 	case <-time.After(time.Second):
 		t.Fatalf("Did not receive expected events.")
 	}
 
-	<-rx
-
-	fakeClock.BlockUntil(1)
 	fakeSubmitClock.BlockUntil(1)
-
 	// Now that it's been resubmitted once, retry attempts is lower.
 	for _, event := range prev {
 		require.Equal(t, 0, event.retriesRemaining)
@@ -408,22 +392,25 @@ func TestUsageReporterErrorReenqueue(t *testing.T) {
 	// Receive the second batch again, since it was reenqueued.
 	select {
 	case e := <-batchChan:
-		require.Len(t, e, testMaxBatchSize)
-		compareUsageEvents(t, reporter, events[5:10], e)
+		compareUsageEvents(t, reporter, events2, e)
 
 		prev = e
 	case <-time.After(time.Second):
 		t.Fatalf("Did not receive expected events.")
 	}
 
-	<-rx
-	fakeClock.BlockUntil(1)
 	fakeSubmitClock.BlockUntil(1)
-
 	// Now that it's been resubmitted once, retry attempts is lower.
 	for _, event := range prev {
 		require.Equal(t, 0, event.retriesRemaining)
 	}
+	// this will unblock the submission queue goroutine so that we can
+	// gracefully exit it
+	fakeSubmitClock.Advance(testSubmitDelay)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, reporter.GracefulStop(ctx))
 
 	// All events should have been dropped.
 	require.Empty(t, reporter.buf)

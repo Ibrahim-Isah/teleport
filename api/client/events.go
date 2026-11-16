@@ -18,7 +18,37 @@ import (
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/client/proto"
+	accessmonitoringrulesv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/accessmonitoringrules/v1"
+	"github.com/gravitational/teleport/api/gen/proto/go/teleport/autoupdate/v1"
+	beamsv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/beams/v1"
+	clusterconfigpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/clusterconfig/v1"
+	crownjewelv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/crownjewel/v1"
+	dbobjectv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/dbobject/v1"
+	healthcheckconfigv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/healthcheckconfig/v1"
+	identitycenterv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/identitycenter/v1"
+	kubewaitingcontainerpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/kubewaitingcontainer/v1"
+	linuxdesktopv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/linuxdesktop/v1"
+	machineidv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/machineid/v1"
+	mfav2 "github.com/gravitational/teleport/api/gen/proto/go/teleport/mfa/v2"
+	notificationsv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/notifications/v1"
+	presencev1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/presence/v1"
+	provisioningv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/provisioning/v1"
+	recordingencryptionv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/recordingencryption/v1"
+	scopedaccessv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/scopes/access/v1"
+	subcav1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/subca/v1"
+	summaryv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/summarizer/v1"
+	userprovisioningpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/userprovisioning/v2"
+	usertasksv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/usertasks/v1"
+	workloadidentityv1pb "github.com/gravitational/teleport/api/gen/proto/go/teleport/workloadidentity/v1"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/accesslist"
+	accesslistv1conv "github.com/gravitational/teleport/api/types/accesslist/convert/v1"
+	"github.com/gravitational/teleport/api/types/discoveryconfig"
+	discoveryconfigv1conv "github.com/gravitational/teleport/api/types/discoveryconfig/convert/v1"
+	"github.com/gravitational/teleport/api/types/secreports"
+	secreprotsv1conv "github.com/gravitational/teleport/api/types/secreports/convert/v1"
+	"github.com/gravitational/teleport/api/types/userloginstate"
+	userloginstatev1conv "github.com/gravitational/teleport/api/types/userloginstate/convert/v1"
 )
 
 // EventToGRPC converts types.Event to proto.Event.
@@ -31,9 +61,168 @@ func EventToGRPC(in types.Event) (*proto.Event, error) {
 		Type: eventType,
 	}
 	if in.Type == types.OpInit {
+		watchStatus, ok := in.Resource.(*types.WatchStatusV1)
+		if !ok {
+			return nil, trace.BadParameter("unexpected resource type %T for Init event", in.Resource)
+		}
+		out.Resource = &proto.Event_WatchStatus{
+			WatchStatus: watchStatus,
+		}
 		return &out, nil
 	}
 	switch r := in.Resource.(type) {
+	case types.Resource153UnwrapperT[*kubewaitingcontainerpb.KubernetesWaitingContainer]:
+		out.Resource = &proto.Event_KubernetesWaitingContainer{
+			KubernetesWaitingContainer: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*notificationsv1.Notification]:
+		out.Resource = &proto.Event_UserNotification{
+			UserNotification: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*notificationsv1.GlobalNotification]:
+		out.Resource = &proto.Event_GlobalNotification{
+			GlobalNotification: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*accessmonitoringrulesv1.AccessMonitoringRule]:
+		out.Resource = &proto.Event_AccessMonitoringRule{
+			AccessMonitoringRule: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*crownjewelv1.CrownJewel]:
+		out.Resource = &proto.Event_CrownJewel{
+			CrownJewel: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*dbobjectv1.DatabaseObject]:
+		out.Resource = &proto.Event_DatabaseObject{
+			DatabaseObject: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*beamsv1.Beam]:
+		out.Resource = &proto.Event_Beam{
+			Beam: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*beamsv1.BeamsConfig]:
+		out.Resource = &proto.Event_BeamsConfig{
+			BeamsConfig: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*machineidv1.BotInstance]:
+		out.Resource = &proto.Event_BotInstance{
+			BotInstance: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*clusterconfigpb.AccessGraphSettings]:
+		out.Resource = &proto.Event_AccessGraphSettings{
+			AccessGraphSettings: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*machineidv1.SPIFFEFederation]:
+		out.Resource = &proto.Event_SPIFFEFederation{
+			SPIFFEFederation: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*userprovisioningpb.StaticHostUser]:
+		out.Resource = &proto.Event_StaticHostUserV2{
+			StaticHostUserV2: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*autoupdate.AutoUpdateConfig]:
+		out.Resource = &proto.Event_AutoUpdateConfig{
+			AutoUpdateConfig: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*autoupdate.AutoUpdateVersion]:
+		out.Resource = &proto.Event_AutoUpdateVersion{
+			AutoUpdateVersion: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*usertasksv1.UserTask]:
+		out.Resource = &proto.Event_UserTask{
+			UserTask: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*provisioningv1.PrincipalState]:
+		out.Resource = &proto.Event_ProvisioningPrincipalState{
+			ProvisioningPrincipalState: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*autoupdate.AutoUpdateAgentRollout]:
+		out.Resource = &proto.Event_AutoUpdateAgentRollout{
+			AutoUpdateAgentRollout: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*autoupdate.AutoUpdateAgentReport]:
+		out.Resource = &proto.Event_AutoUpdateAgentReport{
+			AutoUpdateAgentReport: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*autoupdate.AutoUpdateBotInstanceReport]:
+		out.Resource = &proto.Event_AutoUpdateBotInstanceReport{
+			AutoUpdateBotInstanceReport: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*linuxdesktopv1.LinuxDesktop]:
+		out.Resource = &proto.Event_LinuxDesktop{
+			LinuxDesktop: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*scopedaccessv1.ScopedRole]:
+		out.Resource = &proto.Event_ScopedRole{
+			ScopedRole: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*scopedaccessv1.ScopedRoleAssignment]:
+		out.Resource = &proto.Event_ScopedRoleAssignment{
+			ScopedRoleAssignment: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*identitycenterv1.Account]:
+		out.Resource = &proto.Event_IdentityCenterAccount{
+			IdentityCenterAccount: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*identitycenterv1.PrincipalAssignment]:
+		out.Resource = &proto.Event_IdentityCenterPrincipalAssignment{
+			IdentityCenterPrincipalAssignment: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*identitycenterv1.AccountAssignment]:
+		out.Resource = &proto.Event_IdentityCenterAccountAssignment{
+			IdentityCenterAccountAssignment: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*workloadidentityv1pb.WorkloadIdentity]:
+		out.Resource = &proto.Event_WorkloadIdentity{
+			WorkloadIdentity: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*workloadidentityv1pb.WorkloadIdentityX509Revocation]:
+		out.Resource = &proto.Event_WorkloadIdentityX509Revocation{
+			WorkloadIdentityX509Revocation: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*recordingencryptionv1.RecordingEncryption]:
+		out.Resource = &proto.Event_RecordingEncryption{
+			RecordingEncryption: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*healthcheckconfigv1.HealthCheckConfig]:
+		out.Resource = &proto.Event_HealthCheckConfig{
+			HealthCheckConfig: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*presencev1.RelayServer]:
+		out.Resource = &proto.Event_RelayServer{
+			RelayServer: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*summaryv1.InferenceModel]:
+		out.Resource = &proto.Event_InferenceModel{
+			InferenceModel: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*summaryv1.InferenceSecret]:
+		out.Resource = &proto.Event_InferenceSecret{
+			InferenceSecret: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*summaryv1.InferencePolicy]:
+		out.Resource = &proto.Event_InferencePolicy{
+			InferencePolicy: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*summaryv1.Classifier]:
+		out.Resource = &proto.Event_Classifier{
+			Classifier: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*summaryv1.RetrievalModel]:
+		out.Resource = &proto.Event_RetrievalModel{
+			RetrievalModel: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*subcav1.CertAuthorityOverride]:
+		out.Resource = &proto.Event_CertAuthorityOverride{
+			CertAuthorityOverride: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*subcav1.PendingCSRRequest]:
+		out.Resource = &proto.Event_PendingCSRRequest{
+			PendingCSRRequest: r.UnwrapT(),
+		}
+	case types.Resource153UnwrapperT[*mfav2.ValidatedMFAChallenge]:
+		out.Resource = &proto.Event_ValidatedMFAChallengeV2{
+			ValidatedMFAChallengeV2: r.UnwrapT(),
+		}
 	case *types.ResourceHeader:
 		out.Resource = &proto.Event_ResourceHeader{
 			ResourceHeader: r,
@@ -95,10 +284,6 @@ func EventToGRPC(in types.Event) (*proto.Event, error) {
 		case types.KindSnowflakeSession:
 			out.Resource = &proto.Event_SnowflakeSession{
 				SnowflakeSession: r,
-			}
-		case types.KindSAMLIdPSession:
-			out.Resource = &proto.Event_SAMLIdPSession{
-				SAMLIdPSession: r,
 			}
 		default:
 			return nil, trace.BadParameter("only %q supported", types.WebSessionSubKinds)
@@ -167,6 +352,10 @@ func EventToGRPC(in types.Event) (*proto.Event, error) {
 		out.Resource = &proto.Event_WindowsDesktop{
 			WindowsDesktop: r,
 		}
+	case *types.DynamicWindowsDesktopV1:
+		out.Resource = &proto.Event_DynamicWindowsDesktop{
+			DynamicWindowsDesktop: r,
+		}
 	case *types.InstallerV1:
 		out.Resource = &proto.Event_Installer{
 			Installer: r,
@@ -187,6 +376,63 @@ func EventToGRPC(in types.Event) (*proto.Event, error) {
 		out.Resource = &proto.Event_UserGroup{
 			UserGroup: r,
 		}
+	case *types.OktaImportRuleV1:
+		out.Resource = &proto.Event_OktaImportRule{
+			OktaImportRule: r,
+		}
+	case *types.OktaAssignmentV1:
+		out.Resource = &proto.Event_OktaAssignment{
+			OktaAssignment: r,
+		}
+	case *types.IntegrationV1:
+		out.Resource = &proto.Event_Integration{
+			Integration: r,
+		}
+	case *types.HeadlessAuthentication:
+		out.Resource = &proto.Event_HeadlessAuthentication{
+			HeadlessAuthentication: r,
+		}
+	case *accesslist.AccessList:
+		out.Resource = &proto.Event_AccessList{
+			AccessList: accesslistv1conv.ToProto(r),
+		}
+	case *userloginstate.UserLoginState:
+		out.Resource = &proto.Event_UserLoginState{
+			UserLoginState: userloginstatev1conv.ToProto(r),
+		}
+	case *accesslist.AccessListMember:
+		out.Resource = &proto.Event_AccessListMember{
+			AccessListMember: accesslistv1conv.ToMemberProto(r),
+		}
+	case *discoveryconfig.DiscoveryConfig:
+		out.Resource = &proto.Event_DiscoveryConfig{
+			DiscoveryConfig: discoveryconfigv1conv.ToProto(r),
+		}
+	case *secreports.AuditQuery:
+		out.Resource = &proto.Event_AuditQuery{
+			AuditQuery: secreprotsv1conv.ToProtoAuditQuery(r),
+		}
+	case *secreports.Report:
+		out.Resource = &proto.Event_Report{
+			Report: secreprotsv1conv.ToProtoReport(r),
+		}
+	case *secreports.ReportState:
+		out.Resource = &proto.Event_ReportState{
+			ReportState: secreprotsv1conv.ToProtoReportState(r),
+		}
+	case *accesslist.Review:
+		out.Resource = &proto.Event_AccessListReview{
+			AccessListReview: accesslistv1conv.ToReviewProto(r),
+		}
+	case *types.PluginStaticCredentialsV1:
+		out.Resource = &proto.Event_PluginStaticCredentials{
+			PluginStaticCredentials: r,
+		}
+	case *types.PluginV1:
+		out.Resource = &proto.Event_Plugin{
+			Plugin: r,
+		}
+
 	default:
 		return nil, trace.BadParameter("resource type %T is not supported", in.Resource)
 	}
@@ -208,7 +454,7 @@ func EventTypeToGRPC(in types.OpType) (proto.Operation, error) {
 }
 
 // EventFromGRPC converts proto.Event to types.Event
-func EventFromGRPC(in proto.Event) (*types.Event, error) {
+func EventFromGRPC(in *proto.Event) (*types.Event, error) {
 	eventType, err := EventTypeFromGRPC(in.Type)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -217,6 +463,9 @@ func EventFromGRPC(in proto.Event) (*types.Event, error) {
 		Type: eventType,
 	}
 	if eventType == types.OpInit {
+		if r := in.GetWatchStatus(); r != nil {
+			out.Resource = r
+		}
 		return &out, nil
 	}
 	if r := in.GetResourceHeader(); r != nil {
@@ -306,6 +555,9 @@ func EventFromGRPC(in proto.Event) (*types.Event, error) {
 	} else if r := in.GetWindowsDesktop(); r != nil {
 		out.Resource = r
 		return &out, nil
+	} else if r := in.GetDynamicWindowsDesktop(); r != nil {
+		out.Resource = r
+		return &out, nil
 	} else if r := in.GetKubernetesServer(); r != nil {
 		out.Resource = r
 		return &out, nil
@@ -326,6 +578,192 @@ func EventFromGRPC(in proto.Event) (*types.Event, error) {
 		return &out, nil
 	} else if r := in.GetUserGroup(); r != nil {
 		out.Resource = r
+		return &out, nil
+	} else if r := in.GetOktaImportRule(); r != nil {
+		out.Resource = r
+		return &out, nil
+	} else if r := in.GetOktaAssignment(); r != nil {
+		out.Resource = r
+		return &out, nil
+	} else if r := in.GetIntegration(); r != nil {
+		out.Resource = r
+		return &out, nil
+	} else if r := in.GetHeadlessAuthentication(); r != nil {
+		out.Resource = r
+		return &out, nil
+	} else if r := in.GetAccessList(); r != nil {
+		out.Resource, err = accesslistv1conv.FromProto(
+			r,
+			accesslistv1conv.WithOwnersIneligibleStatusField(r.GetSpec().GetOwners()),
+		)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		return &out, nil
+	} else if r := in.GetUserLoginState(); r != nil {
+		out.Resource, err = userloginstatev1conv.FromProto(r)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		return &out, nil
+	} else if r := in.GetAccessListMember(); r != nil {
+		out.Resource, err = accesslistv1conv.FromMemberProto(
+			r,
+			accesslistv1conv.WithMemberIneligibleStatusField(r),
+		)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		return &out, nil
+	} else if r := in.GetDiscoveryConfig(); r != nil {
+		out.Resource, err = discoveryconfigv1conv.FromProto(r)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		return &out, nil
+	} else if r := in.GetAuditQuery(); r != nil {
+		out.Resource, err = secreprotsv1conv.FromProtoAuditQuery(r)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		return &out, nil
+	} else if r := in.GetReport(); r != nil {
+		out.Resource, err = secreprotsv1conv.FromProtoReport(r)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		return &out, nil
+	} else if r := in.GetReportState(); r != nil {
+		out.Resource, err = secreprotsv1conv.FromProtoReportState(r)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		return &out, nil
+	} else if r := in.GetAccessListReview(); r != nil {
+		out.Resource, err = accesslistv1conv.FromReviewProto(r)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		return &out, nil
+	} else if r := in.GetKubernetesWaitingContainer(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetUserNotification(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetGlobalNotification(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetAccessMonitoringRule(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetCrownJewel(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetDatabaseObject(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetBeam(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetBeamsConfig(); r != nil {
+		out.Resource = types.ProtoResource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetBotInstance(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetAccessGraphSettings(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetSPIFFEFederation(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetStaticHostUserV2(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetAutoUpdateConfig(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetAutoUpdateVersion(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetAutoUpdateAgentRollout(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetAutoUpdateAgentReport(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetAutoUpdateBotInstanceReport(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetScopedRole(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetScopedRoleAssignment(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetUserTask(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetProvisioningPrincipalState(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetIdentityCenterAccount(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetIdentityCenterPrincipalAssignment(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetIdentityCenterAccountAssignment(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetPluginStaticCredentials(); r != nil {
+		out.Resource = r
+		return &out, nil
+	} else if r := in.GetWorkloadIdentity(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetWorkloadIdentityX509Revocation(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetHealthCheckConfig(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetRelayServer(); r != nil {
+		out.Resource = types.ProtoResource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetRecordingEncryption(); r != nil {
+		out.Resource = types.ProtoResource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetPlugin(); r != nil {
+		out.Resource = r
+		return &out, nil
+	} else if r := in.GetLinuxDesktop(); r != nil {
+		out.Resource = types.ProtoResource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetInferenceModel(); r != nil {
+		out.Resource = types.ProtoResource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetInferenceSecret(); r != nil {
+		out.Resource = types.ProtoResource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetInferencePolicy(); r != nil {
+		out.Resource = types.ProtoResource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetClassifier(); r != nil {
+		out.Resource = types.ProtoResource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetRetrievalModel(); r != nil {
+		out.Resource = types.Resource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetCertAuthorityOverride(); r != nil {
+		out.Resource = types.ProtoResource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetPendingCSRRequest(); r != nil {
+		out.Resource = types.ProtoResource153ToLegacy(r)
+		return &out, nil
+	} else if r := in.GetValidatedMFAChallengeV2(); r != nil {
+		out.Resource = types.ProtoResource153ToLegacy(r)
 		return &out, nil
 	} else {
 		return nil, trace.BadParameter("received unsupported resource %T", in.Resource)

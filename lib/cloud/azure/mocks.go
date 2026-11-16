@@ -1,34 +1,40 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package azure
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v3"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v2"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/msi/armmsi"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/mysql/armmysql"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/mysql/armmysqlflexibleservers"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v7"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/postgresql/armpostgresql"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/postgresql/armpostgresqlflexibleservers"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/redis/armredis/v2"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/redis/armredis/v3"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/redisenterprise/armredisenterprise"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/sql/armsql"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/subscription/armsubscription"
@@ -508,10 +514,78 @@ func (m *ARMComputeMock) NewListPager(resourceGroup string, _ *armcompute.Virtua
 	})
 }
 
+func (m *ARMComputeMock) NewListAllPager(_ *armcompute.VirtualMachinesClientListAllOptions) *runtime.Pager[armcompute.VirtualMachinesClientListAllResponse] {
+	var vms []*armcompute.VirtualMachine
+	for _, resourceGroupVMs := range m.VirtualMachines {
+		vms = append(vms, resourceGroupVMs...)
+	}
+	return runtime.NewPager(runtime.PagingHandler[armcompute.VirtualMachinesClientListAllResponse]{
+		More: func(page armcompute.VirtualMachinesClientListAllResponse) bool {
+			return page.NextLink != nil && len(*page.NextLink) > 0
+		},
+		Fetcher: func(ctx context.Context, page *armcompute.VirtualMachinesClientListAllResponse) (armcompute.VirtualMachinesClientListAllResponse, error) {
+			return armcompute.VirtualMachinesClientListAllResponse{
+				VirtualMachineListResult: armcompute.VirtualMachineListResult{
+					Value: vms,
+				},
+			}, nil
+		},
+	})
+}
+
 func (m *ARMComputeMock) Get(_ context.Context, _ string, _ string, _ *armcompute.VirtualMachinesClientGetOptions) (armcompute.VirtualMachinesClientGetResponse, error) {
 	return armcompute.VirtualMachinesClientGetResponse{
 		VirtualMachine: m.GetResult,
 	}, m.GetErr
+}
+
+// ARMScaleSetVMsMock mocks armcompute.VirtualMachineScaleSetVMsClient.
+type ARMScaleSetVMsMock struct {
+	GetResult armcompute.VirtualMachineScaleSetVM
+	GetErr    error
+	ListErr   error
+}
+
+func (m *ARMScaleSetVMsMock) Get(ctx context.Context, resourceGroupName string, vmScaleSetName string, instanceID string, options *armcompute.VirtualMachineScaleSetVMsClientGetOptions) (armcompute.VirtualMachineScaleSetVMsClientGetResponse, error) {
+	return armcompute.VirtualMachineScaleSetVMsClientGetResponse{
+		VirtualMachineScaleSetVM: m.GetResult,
+	}, m.GetErr
+}
+
+func (m *ARMScaleSetVMsMock) NewListPager(resourceGroupName string, virtualMachineScaleSetName string, options *armcompute.VirtualMachineScaleSetVMsClientListOptions) *runtime.Pager[armcompute.VirtualMachineScaleSetVMsClientListResponse] {
+	return newPagerHelper(m.ListErr != nil, func() (armcompute.VirtualMachineScaleSetVMsClientListResponse, error) {
+		return armcompute.VirtualMachineScaleSetVMsClientListResponse{
+			VirtualMachineScaleSetVMListResult: armcompute.VirtualMachineScaleSetVMListResult{
+				Value: []*armcompute.VirtualMachineScaleSetVM{&m.GetResult},
+			},
+		}, m.ListErr
+	})
+}
+
+// ARMScaleSetsMock mocks armcompute.VirtualMachineScaleSetsClient.
+type ARMScaleSetsMock struct {
+	ScaleSetRecords []*armcompute.VirtualMachineScaleSet
+	ListErr         error
+}
+
+func (m *ARMScaleSetsMock) NewListPager(resourceGroupName string, options *armcompute.VirtualMachineScaleSetsClientListOptions) *runtime.Pager[armcompute.VirtualMachineScaleSetsClientListResponse] {
+	return newPagerHelper(m.ListErr != nil, func() (armcompute.VirtualMachineScaleSetsClientListResponse, error) {
+		return armcompute.VirtualMachineScaleSetsClientListResponse{
+			VirtualMachineScaleSetListResult: armcompute.VirtualMachineScaleSetListResult{
+				Value: m.ScaleSetRecords,
+			},
+		}, m.ListErr
+	})
+}
+
+func (m *ARMScaleSetsMock) NewListAllPager(options *armcompute.VirtualMachineScaleSetsClientListAllOptions) *runtime.Pager[armcompute.VirtualMachineScaleSetsClientListAllResponse] {
+	return newPagerHelper(m.ListErr != nil, func() (armcompute.VirtualMachineScaleSetsClientListAllResponse, error) {
+		return armcompute.VirtualMachineScaleSetsClientListAllResponse{
+			VirtualMachineScaleSetListWithLinkResult: armcompute.VirtualMachineScaleSetListWithLinkResult{
+				Value: m.ScaleSetRecords,
+			},
+		}, m.ListErr
+	})
 }
 
 // ARMSQLServerMock mocks armSQLServerClient
@@ -639,6 +713,108 @@ func (m *ARMPostgresFlexServerMock) NewListByResourceGroupPager(group string, _ 
 		return armpostgresqlflexibleservers.ServersClientListByResourceGroupResponse{
 			ServerListResult: armpostgresqlflexibleservers.ServerListResult{
 				Value: servers,
+			},
+		}, nil
+	})
+}
+
+// ARMUserAssignedIdentitiesMock implements ARMUserAssignedIdentities.
+type ARMUserAssignedIdentitiesMock struct {
+	identitiesMap map[string]armmsi.Identity
+}
+
+// NewARMUserAssignedIdentitiesMock creates a new ARMUserAssignedIdentitiesMock.
+func NewARMUserAssignedIdentitiesMock(identities ...armmsi.Identity) *ARMUserAssignedIdentitiesMock {
+	identitiesMap := make(map[string]armmsi.Identity)
+	for _, identity := range identities {
+		id, err := arm.ParseResourceID(*identity.ID)
+		if err == nil {
+			identitiesMap[id.ResourceGroupName+"+"+id.Name] = identity
+		} else {
+			slog.With("error", err).WarnContext(context.Background(), "Failed to add identity to mock.")
+		}
+	}
+	return &ARMUserAssignedIdentitiesMock{
+		identitiesMap: identitiesMap,
+	}
+}
+
+func (m *ARMUserAssignedIdentitiesMock) Get(ctx context.Context, resourceGroupName, resourceName string, options *armmsi.UserAssignedIdentitiesClientGetOptions) (armmsi.UserAssignedIdentitiesClientGetResponse, error) {
+	if m == nil || m.identitiesMap == nil {
+		return armmsi.UserAssignedIdentitiesClientGetResponse{}, trace.AccessDenied("access denied")
+	}
+
+	identity, found := m.identitiesMap[resourceGroupName+"+"+resourceName]
+	if !found {
+		return armmsi.UserAssignedIdentitiesClientGetResponse{}, trace.NotFound("%s of group %s not found", resourceName, resourceGroupName)
+	}
+	return armmsi.UserAssignedIdentitiesClientGetResponse{
+		Identity: identity,
+	}, nil
+}
+
+// NewUserAssignedIdentity creates an armmsi.Identity.
+func NewUserAssignedIdentity(subscription, resourceGroupName, resourceName, clientID string) armmsi.Identity {
+	id := fmt.Sprintf("/subscriptions/%s/resourcegroups/%s/providers/Microsoft.ManagedIdentity/userAssignedIdentities/%s", subscription, resourceGroupName, resourceName)
+	return armmsi.Identity{
+		ID:   &id,
+		Name: &resourceName,
+		Properties: &armmsi.UserAssignedIdentityProperties{
+			ClientID: &clientID,
+		},
+	}
+}
+
+// ARMNetworkMock mocks armnetwork.InterfacesClient.
+type ARMNetworkMock struct {
+	// NetworkInterfaces maps resource group name to the standalone NICs in it.
+	NetworkInterfaces map[string][]*armnetwork.Interface
+	// VMSSNetworkInterfaces maps "<resourceGroup>/<scaleSetName>" to the NICs
+	// of that uniform scale set.
+	VMSSNetworkInterfaces map[string][]*armnetwork.Interface
+	// VMSSListErrs maps scale set names to an error returned when listing
+	// that scale set's NICs.
+	VMSSListErrs map[string]error
+	// NoAuth indicates that the mock should return an access denied error
+	// for all requests.
+	NoAuth bool
+}
+
+// Fail if ARMNetworkMock does not implement networkInterfacesLister.
+var _ networkInterfacesLister = (*ARMNetworkMock)(nil)
+
+func (m *ARMNetworkMock) NewListPager(resourceGroup string, _ *armnetwork.InterfacesClientListOptions) *runtime.Pager[armnetwork.InterfacesClientListResponse] {
+	return newPagerHelper(m.NoAuth, func() (armnetwork.InterfacesClientListResponse, error) {
+		return armnetwork.InterfacesClientListResponse{
+			InterfaceListResult: armnetwork.InterfaceListResult{
+				Value: m.NetworkInterfaces[resourceGroup],
+			},
+		}, nil
+	})
+}
+
+func (m *ARMNetworkMock) NewListAllPager(_ *armnetwork.InterfacesClientListAllOptions) *runtime.Pager[armnetwork.InterfacesClientListAllResponse] {
+	return newPagerHelper(m.NoAuth, func() (armnetwork.InterfacesClientListAllResponse, error) {
+		var allNics []*armnetwork.Interface
+		for _, nics := range m.NetworkInterfaces {
+			allNics = append(allNics, nics...)
+		}
+		return armnetwork.InterfacesClientListAllResponse{
+			InterfaceListResult: armnetwork.InterfaceListResult{
+				Value: allNics,
+			},
+		}, nil
+	})
+}
+
+func (m *ARMNetworkMock) NewListVirtualMachineScaleSetNetworkInterfacesPager(resourceGroup, scaleSetName string, _ *armnetwork.InterfacesClientListVirtualMachineScaleSetNetworkInterfacesOptions) *runtime.Pager[armnetwork.InterfacesClientListVirtualMachineScaleSetNetworkInterfacesResponse] {
+	return newPagerHelper(m.NoAuth, func() (armnetwork.InterfacesClientListVirtualMachineScaleSetNetworkInterfacesResponse, error) {
+		if err := m.VMSSListErrs[scaleSetName]; err != nil {
+			return armnetwork.InterfacesClientListVirtualMachineScaleSetNetworkInterfacesResponse{}, err
+		}
+		return armnetwork.InterfacesClientListVirtualMachineScaleSetNetworkInterfacesResponse{
+			InterfaceListResult: armnetwork.InterfaceListResult{
+				Value: m.VMSSNetworkInterfaces[resourceGroup+"/"+scaleSetName],
 			},
 		}, nil
 	})

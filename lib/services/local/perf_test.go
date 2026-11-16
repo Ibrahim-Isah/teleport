@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
@@ -34,6 +36,9 @@ import (
 // BenchmarkGetNodes verifies the performance of the GetNodes operation
 // on local (sqlite) databases (as used by the cache system).
 func BenchmarkGetNodes(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping heavy benchmark")
+	}
 	ctx := context.Background()
 
 	type testCase struct {
@@ -58,9 +63,6 @@ func BenchmarkGetNodes(b *testing.B) {
 
 		// run the sub benchmark
 		b.Run(name, func(sb *testing.B) {
-
-			sb.StopTimer() // stop timer while running setup
-
 			// configure the backend instance
 			var bk backend.Backend
 			var err error
@@ -70,7 +72,7 @@ func BenchmarkGetNodes(b *testing.B) {
 			} else {
 				dir := b.TempDir()
 
-				bk, err = lite.NewWithConfig(context.TODO(), lite.Config{
+				bk, err = lite.NewWithConfig(b.Context(), lite.Config{
 					Path: dir,
 				})
 				require.NoError(b, err)
@@ -81,11 +83,7 @@ func BenchmarkGetNodes(b *testing.B) {
 			// seed the test nodes
 			insertNodes(ctx, b, svc, tt.nodes)
 
-			sb.StartTimer() // restart timer for benchmark operations
-
 			benchmarkGetNodes(ctx, sb, svc, tt.nodes)
-
-			sb.StopTimer() // stop timer to exclude deferred cleanup
 		})
 	}
 }
@@ -94,10 +92,10 @@ func BenchmarkGetNodes(b *testing.B) {
 func insertNodes(ctx context.Context, b *testing.B, svc services.Presence, nodeCount int) {
 	const labelCount = 10
 	labels := make(map[string]string, labelCount)
-	for i := 0; i < labelCount; i++ {
+	for i := range labelCount {
 		labels[fmt.Sprintf("label-key-%d", i)] = fmt.Sprintf("label-val-%d", i)
 	}
-	for i := 0; i < nodeCount; i++ {
+	for i := range nodeCount {
 		name, addr := fmt.Sprintf("node-%d", i), fmt.Sprintf("node%d.example.com", i)
 		node := &types.ServerV2{
 			Kind:    types.KindNode,
@@ -108,8 +106,7 @@ func insertNodes(ctx context.Context, b *testing.B, svc services.Presence, nodeC
 				Labels:    labels,
 			},
 			Spec: types.ServerSpecV2{
-				Addr:       addr,
-				PublicAddr: addr,
+				Addr: addr,
 			},
 		}
 		_, err := svc.UpsertNode(ctx, node)
@@ -121,12 +118,12 @@ func insertNodes(ctx context.Context, b *testing.B, svc services.Presence, nodeC
 func benchmarkGetNodes(ctx context.Context, b *testing.B, svc services.Presence, nodeCount int) {
 	var nodes []types.Server
 	var err error
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		nodes, err = svc.GetNodes(ctx, apidefaults.Namespace)
 		require.NoError(b, err)
 	}
 	// do *something* with the loop result.  probably unnecessary since the loop
 	// contains I/O, but I don't know enough about the optimizer to be 100% certain
 	// about that.
-	require.Equal(b, nodeCount, len(nodes))
+	require.Len(b, nodes, nodeCount)
 }

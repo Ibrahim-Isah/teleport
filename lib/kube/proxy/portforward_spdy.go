@@ -20,19 +20,20 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
-	"k8s.io/apimachinery/pkg/util/httpstream"
-	spdystream "k8s.io/apimachinery/pkg/util/httpstream/spdy"
+	"k8s.io/streaming/pkg/httpstream"
+	spdystream "k8s.io/streaming/pkg/httpstream/spdy"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 // portForwardRequest is a request that specifies port forwarding
@@ -46,6 +47,7 @@ type portForwardRequest struct {
 	context            context.Context
 	targetDialer       httpstream.Dialer
 	pingPeriod         time.Duration
+	idleTimeout        time.Duration
 }
 
 func (p portForwardRequest) String() string {
@@ -70,17 +72,16 @@ func parsePortString(pString string) (uint16, error) {
 // runPortForwardingHTTPStreams upgrades the clients using SPDY protocol.
 // It supports multiplexing and HTTP streams and can be used per-request.
 func runPortForwardingHTTPStreams(req portForwardRequest) error {
-	_, err := httpstream.Handshake(req.httpRequest, req.httpResponseWriter, []string{PortForwardProtocolV1Name})
+	targetConn, _, err := req.targetDialer.Dial(PortForwardProtocolV1Name)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-
-	targetConn, _, err := req.targetDialer.Dial(PortForwardProtocolV1Name)
-	if err != nil {
-		return trace.ConnectionProblem(err, "error upgrading connection")
-	}
 	defer targetConn.Close()
 
+	_, err = httpstream.Handshake(req.httpRequest, req.httpResponseWriter, []string{PortForwardProtocolV1Name})
+	if err != nil {
+		return trace.Wrap(err)
+	}
 	streamChan := make(chan httpstream.Stream, 1)
 
 	upgrader := spdystream.NewResponseUpgraderWithPings(req.pingPeriod)
@@ -91,10 +92,10 @@ func runPortForwardingHTTPStreams(req portForwardRequest) error {
 	defer conn.Close()
 
 	h := &portForwardProxy{
-		Entry: log.WithFields(log.Fields{
-			trace.Component:   teleport.Component(teleport.ComponentProxyKube),
-			events.RemoteAddr: req.httpRequest.RemoteAddr,
-		}),
+		logger: slog.With(
+			teleport.ComponentKey, teleport.Component(teleport.ComponentProxyKube),
+			events.RemoteAddr, req.httpRequest.RemoteAddr,
+		),
 		portForwardRequest:    req,
 		sourceConn:            conn,
 		streamChan:            streamChan,
@@ -103,8 +104,10 @@ func runPortForwardingHTTPStreams(req portForwardRequest) error {
 		targetConn:            targetConn,
 	}
 	defer h.Close()
-	h.Debugf("Setting port forwarding streaming connection idle timeout to %v", IdleTimeout)
-	conn.SetIdleTimeout(IdleTimeout)
+
+	h.logger.DebugContext(req.context, "Setting port forwarding streaming connection idle timeout", "idle_timeout", req.idleTimeout)
+	conn.SetIdleTimeout(adjustIdleTimeoutForConn(req.idleTimeout))
+
 	h.run()
 	return nil
 }
@@ -147,7 +150,7 @@ func httpStreamReceived(ctx context.Context, streams chan httpstream.Stream) fun
 // portForwardProxy is capable of processing multiple port forward
 // requests over a single httpstream.Connection.
 type portForwardProxy struct {
-	*log.Entry
+	logger *slog.Logger
 	portForwardRequest
 	sourceConn            httpstream.Connection
 	streamChan            chan httpstream.Stream
@@ -165,87 +168,74 @@ func (h *portForwardProxy) Close() error {
 	return nil
 }
 
+// forwardStreamPair creates a new data and error streams using the same requestID
+// received from the client and copies the data between target's data and error and
+// client's data and error streams. It blocks until all copy operations complete.
+// It does not close the client's data and error streams as they are closed by
+// the caller.
 func (h *portForwardProxy) forwardStreamPair(p *httpStreamPair, remotePort int64) error {
 	// create error stream
 	headers := http.Header{}
+	port := fmt.Sprintf("%d", remotePort)
 	headers.Set(StreamType, StreamTypeError)
-	headers.Set(PortHeader, fmt.Sprintf("%d", remotePort))
+	headers.Set(PortHeader, port)
 	headers.Set(PortForwardRequestIDHeader, p.requestID)
 
 	// read and write from the error stream
 	targetErrorStream, err := h.targetConn.CreateStream(headers)
+	h.onPortForward(net.JoinHostPort(h.podName, port), err == nil /* success */)
 	if err != nil {
-		h.onPortForward(fmt.Sprintf("%v:%v", h.podName, remotePort), false)
-		return trace.ConnectionProblem(err, "error creating error stream for port %d", remotePort)
+		err := trace.ConnectionProblem(err, "error creating error stream for port %d", remotePort)
+		p.sendErr(err)
+		return err
 	}
-	h.onPortForward(fmt.Sprintf("%v:%v", h.podName, remotePort), true)
-	defer targetErrorStream.Close()
-
-	go func() {
-		_, err := io.Copy(targetErrorStream, p.errorStream)
-		if err != nil && err != io.EOF {
-			h.Debugf("Copy stream error: %v.", err)
-		}
+	defer func() {
+		// on stream close, remove the stream from the connection and close it.
+		h.targetConn.RemoveStreams(targetErrorStream)
+		targetErrorStream.Close()
 	}()
 
-	errClose := make(chan struct{})
+	wg := &sync.WaitGroup{}
+
+	wg.Add(1)
 	go func() {
-		defer close(errClose)
-		_, err := io.Copy(p.errorStream, targetErrorStream)
-		if err != nil && err != io.EOF {
-			h.Debugf("Copy stream error: %v.", err)
+		defer wg.Done()
+		// Close the target error stream to indicate no more writes.
+		if err := targetErrorStream.Close(); err != nil {
+			h.logger.DebugContext(h.context, "Unable to close target error stream", "error", err)
+		}
+		// Enables error propagation from Kube API server to kubectl client.
+		if _, err := io.Copy(p.errorStream, targetErrorStream); err != nil {
+			h.logger.DebugContext(h.context, "Unable to proxy portforward error-stream", "error", err)
 		}
 	}()
 
 	// create data stream
 	headers.Set(StreamType, StreamTypeData)
-	dataStream, err := h.targetConn.CreateStream(headers)
+	targetDataStream, err := h.targetConn.CreateStream(headers)
 	if err != nil {
-		return trace.ConnectionProblem(err, "error creating forwarding stream for port -> %d: %v", remotePort, err)
+		err := trace.ConnectionProblem(err, "error creating forwarding stream for port -> %d: %v", remotePort, err)
+		p.sendErr(err)
+		return err
 	}
-	defer dataStream.Close()
+	defer func() {
+		// on stream close, remove the stream from the connection and close it.
+		h.targetConn.RemoveStreams(targetDataStream)
+		targetDataStream.Close()
+	}()
 
-	localError := make(chan struct{})
-	remoteDone := make(chan struct{})
-
+	wg.Add(1)
 	go func() {
-		// inform the select below that the remote copy is done
-		defer close(remoteDone)
-		// Copy from the remote side to the local port.
-		if _, err := io.Copy(p.dataStream, dataStream); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-			log.Error(fmt.Errorf("error copying from remote stream to local connection: %v", err))
+		defer wg.Done()
+		if err := utils.ProxyConn(h.context, p.dataStream, targetDataStream); err != nil {
+			h.logger.DebugContext(h.context, "Unable to proxy portforward data-stream", "error", err)
 		}
 	}()
 
-	go func() {
-		// inform server we're not sending any more data after copy unblocks
-		defer dataStream.Close()
-
-		// Copy from the local port to the target side.
-		if _, err := io.Copy(dataStream, p.dataStream); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-			h.Warningf("Error copying from local connection to remote stream: %v.", err)
-			// break out of the select below without waiting for the other copy to finish
-			close(localError)
-		}
-	}()
-
-	h.Debugf("Streams have been created, Waiting for copy to complete.")
-
-	// wait for either a local->remote error or for copying from remote->local to finish
-	select {
-	case <-remoteDone:
-	case <-localError:
-	case <-h.context.Done():
-		h.Debugf("Context is closing, cleaning up.")
-	}
-
-	// always expect something on errorChan (it may be nil)
-	select {
-	case <-errClose:
-	case <-h.context.Done():
-		h.Debugf("Context is closing, cleaning up.")
-	}
-	h.Infof("Port forwarding pair completed.")
+	h.logger.DebugContext(h.context, "Streams have been created, Waiting for copy to complete")
+	// wait for the copies to complete before returning.
+	wg.Wait()
+	h.logger.DebugContext(h.context, "Port forwarding pair completed")
 	return nil
 }
 
@@ -257,11 +247,11 @@ func (h *portForwardProxy) getStreamPair(requestID string) (*httpStreamPair, boo
 	defer h.streamPairsLock.Unlock()
 
 	if p, ok := h.streamPairs[requestID]; ok {
-		log.Debugf("Request %s, found existing stream pair", requestID)
+		h.logger.DebugContext(h.context, "Found existing stream pair for request", "request_id", requestID)
 		return p, false
 	}
 
-	h.Debugf("Request %s, creating new stream pair.", requestID)
+	h.logger.DebugContext(h.context, "Creating new stream pair for request", "request_id", requestID)
 
 	p := newPortForwardPair(requestID)
 	h.streamPairs[requestID] = p
@@ -272,12 +262,14 @@ func (h *portForwardProxy) getStreamPair(requestID string) (*httpStreamPair, boo
 // monitorStreamPair waits for the pair to receive both its error and data
 // streams, or for the timeout to expire (whichever happens first), and then
 // removes the pair.
-func (h *portForwardProxy) monitorStreamPair(p *httpStreamPair, timeout <-chan time.Time) {
+func (h *portForwardProxy) monitorStreamPair(p *httpStreamPair) {
+	timeC := time.NewTimer(h.streamCreationTimeout)
+	defer timeC.Stop()
 	select {
-	case <-timeout:
-		h.Errorf("Request %s, timed out waiting for streams.", p.requestID)
+	case <-timeC.C:
+		h.logger.ErrorContext(h.context, "Request timed out waiting for streams", "request_id", p.requestID)
 	case <-p.complete:
-		h.Debugf("Request %s, successfully received error and data streams.", p.requestID)
+		h.logger.DebugContext(h.context, "Request successfully received error and data streams", "request_id", p.requestID)
 	}
 	h.removeStreamPair(p.requestID)
 }
@@ -286,7 +278,14 @@ func (h *portForwardProxy) monitorStreamPair(p *httpStreamPair, timeout <-chan t
 func (h *portForwardProxy) removeStreamPair(requestID string) {
 	h.streamPairsLock.Lock()
 	defer h.streamPairsLock.Unlock()
-
+	pair, ok := h.streamPairs[requestID]
+	if !ok {
+		return
+	}
+	if h.sourceConn != nil {
+		// remove the streams from the connection and close them.
+		h.sourceConn.RemoveStreams(pair.dataStream, pair.errorStream)
+	}
 	delete(h.streamPairs, requestID)
 }
 
@@ -303,61 +302,71 @@ func (h *portForwardProxy) requestID(stream httpstream.Stream) (string, error) {
 // streams, invoking portForward for each complete stream pair. The loop exits
 // when the httpstream.Connection is closed.
 func (h *portForwardProxy) run() {
-	h.Debugf("Waiting for port forward streams.")
+	h.logger.DebugContext(h.context, "Waiting for port forward streams")
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	for {
 		select {
 		case <-h.context.Done():
-			h.Debugf("Context is closing, returning.")
+			h.logger.DebugContext(h.context, "Context is closing, returning")
 			return
 		case <-h.sourceConn.CloseChan():
-			h.Debugf("Upgraded connection closed.")
+			h.logger.DebugContext(h.context, "Upgraded connection closed")
+			return
+		case <-h.targetConn.CloseChan():
+			h.logger.DebugContext(h.context, "Target connection closed")
 			return
 		case stream := <-h.streamChan:
 			requestID, err := h.requestID(stream)
 			if err != nil {
-				h.Warningf("Failed to parse request id: %v.", err)
+				h.logger.WarnContext(h.context, "Failed to parse request id", "error", err)
 				return
 			}
+
 			streamType := stream.Headers().Get(StreamType)
-			h.Debugf("Received new stream %v of type %v.", requestID, streamType)
+			h.logger.DebugContext(h.context, "Received new stream", "request_id", requestID, "stream_type", streamType)
 
 			p, created := h.getStreamPair(requestID)
 			if created {
-				go h.monitorStreamPair(p, time.After(h.streamCreationTimeout))
+				go h.monitorStreamPair(p)
 			}
 			if complete, err := p.add(stream); err != nil {
-				msg := fmt.Sprintf("error processing stream for request %s: %v", requestID, err)
-				p.printError(msg)
+				err := trace.BadParameter("error processing stream for request %s: %v", requestID, err)
+				p.sendErr(err)
 			} else if complete {
-				go h.portForward(p)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					h.portForward(p)
+				}()
 			}
 		}
 	}
 }
 
-// portForward invokes the portForwardProxy's forwarder.PortForward
-// function for the given stream pair.
+// portForward handles the port-forwarding for the given stream pair.
+// It closes the pair when it is done.
 func (h *portForwardProxy) portForward(p *httpStreamPair) {
-	defer p.dataStream.Close()
-	defer p.errorStream.Close()
+	defer p.close()
 
 	portString := p.dataStream.Headers().Get(PortHeader)
 	port, _ := strconv.ParseInt(portString, 10, 32)
 
-	h.Debugf("Forwarding port %v -> %v.", p.requestID, portString)
-	err := h.forwardStreamPair(p, port)
-	h.Debugf("Completed forwarding port %v -> %v.", p.requestID, portString)
+	logger := h.logger.With("request_id", p.requestID, "port", portString)
 
-	if err != nil {
-		msg := fmt.Errorf("error forwarding port %d to pod %s: %v", port, h.podName, err)
-		fmt.Fprint(p.errorStream, msg.Error())
+	logger.DebugContext(h.context, "Forwarding port")
+
+	if err := h.forwardStreamPair(p, port); err != nil {
+		logger.DebugContext(h.context, "Error forwarding port", "error", err)
+		return
 	}
+	h.logger.DebugContext(h.context, "Completed forwarding port")
 }
 
 // httpStreamPair represents the error and data streams for a port
 // forwarding request.
 type httpStreamPair struct {
-	lock        sync.RWMutex
+	lock        sync.Mutex
 	requestID   string
 	dataStream  httpstream.Stream
 	errorStream httpstream.Stream
@@ -400,11 +409,26 @@ func (p *httpStreamPair) add(stream httpstream.Stream) (bool, error) {
 	return complete, nil
 }
 
-// printError writes s to p.errorStream if p.errorStream has been set.
-func (p *httpStreamPair) printError(s string) {
-	p.lock.RLock()
-	defer p.lock.RUnlock()
+// sendErr writes s to p.errorStream if p.errorStream has been set.
+func (p *httpStreamPair) sendErr(err error) {
+	if err == nil {
+		return
+	}
+	p.lock.Lock()
+	defer p.lock.Unlock()
 	if p.errorStream != nil {
-		fmt.Fprint(p.errorStream, s)
+		fmt.Fprint(p.errorStream, err.Error())
+	}
+}
+
+// close closes the data and error streams for this pair.
+func (p *httpStreamPair) close() {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.dataStream != nil {
+		p.dataStream.Close()
+	}
+	if p.errorStream != nil {
+		p.errorStream.Close()
 	}
 }

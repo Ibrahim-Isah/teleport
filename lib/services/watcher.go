@@ -1,48 +1,75 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or collectoried.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"context"
+	"log/slog"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/constants"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
+	healthcheckconfigv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/healthcheckconfig/v1"
+	presencev1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/presence/v1"
+	scopesv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/scopes/v1"
 	"github.com/gravitational/teleport/api/types"
+	apiutils "github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/api/utils/clientutils"
 	"github.com/gravitational/teleport/api/utils/retryutils"
 	"github.com/gravitational/teleport/lib/defaults"
+	iterstream "github.com/gravitational/teleport/lib/itertools/stream"
+	"github.com/gravitational/teleport/lib/scopes"
+	"github.com/gravitational/teleport/lib/services/readonly"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
+)
+
+const (
+	// smallFanoutCapacity is the default capacity used for the circular event buffer allocated by
+	// resource watchers that implement event fanout.
+	smallFanoutCapacity = 128
+
+	// eventBufferMaxSize is the maximum size of the event buffer used by resource watchers to
+	// batch events that arrive in quick succession. In practice the event buffer should never
+	// grow this large unless we're dealing with a truly massive teleport cluster.
+	eventBufferMaxSize = 2048
 )
 
 // resourceCollector is a generic interface for maintaining an up-to-date view
 // of a resource set being monitored. Used in conjunction with resourceWatcher.
 type resourceCollector interface {
-	// resourceKind specifies the resource kind to watch.
-	resourceKind() string
+	// resourceKinds specifies the resource kind to watch.
+	resourceKinds() []types.WatchKind
 	// getResourcesAndUpdateCurrent is called when the resources should be
 	// (re-)fetched directly.
 	getResourcesAndUpdateCurrent(context.Context) error
-	// processEventAndUpdateCurrent is called when a watcher event is received.
-	processEventAndUpdateCurrent(context.Context, types.Event)
+	// processEventsAndUpdateCurrent is called when a watcher events are received. The event buffer
+	// may be reused so implementers must not retain it, but implementers may mutate the buffer
+	// in place during the call, e.g. in order to filter out undesired events before passing them
+	// to a subsideary bulk-processor such as a fanout.
+	processEventsAndUpdateCurrent(context.Context, []types.Event)
 	// notifyStale is called when the maximum acceptable staleness (if specified)
 	// is exceeded.
 	notifyStale()
@@ -51,23 +78,40 @@ type resourceCollector interface {
 	initializationChan() <-chan struct{}
 }
 
+func watchKindsString(kinds []types.WatchKind) string {
+	var sb strings.Builder
+	for i, k := range kinds {
+		if i != 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(k.Kind)
+		if k.SubKind != "" {
+			sb.WriteString("/")
+			sb.WriteString(k.SubKind)
+		}
+	}
+	return sb.String()
+}
+
 // ResourceWatcherConfig configures resource watcher.
 type ResourceWatcherConfig struct {
-	// Component is a component used in logs.
-	Component string
-	// Log is a logger.
-	Log logrus.FieldLogger
-	// MaxRetryPeriod is the maximum retry period on failed watchers.
-	MaxRetryPeriod time.Duration
 	// Clock is used to control time.
 	Clock clockwork.Clock
-	// Client is used to create new watchers.
+	// Client is used to create new watchers
 	Client types.Events
+	// Logger emits log messages.
+	Logger *slog.Logger
+	// ResetC is a channel to notify of internal watcher reset (used in tests).
+	ResetC chan time.Duration
+	// Component is a component used in logs.
+	Component string
+	// MaxRetryPeriod is the maximum retry period on failed watchers.
+	MaxRetryPeriod time.Duration
 	// MaxStaleness is a maximum acceptable staleness for the locally maintained
 	// resources, zero implies no staleness detection.
 	MaxStaleness time.Duration
-	// ResetC is a channel to notify of internal watcher reset (used in tests).
-	ResetC chan time.Duration
+	// QueueSize is an optional queue size
+	QueueSize int
 }
 
 // CheckAndSetDefaults checks parameters and sets default values.
@@ -75,8 +119,8 @@ func (cfg *ResourceWatcherConfig) CheckAndSetDefaults() error {
 	if cfg.Component == "" {
 		return trace.BadParameter("missing parameter Component")
 	}
-	if cfg.Log == nil {
-		cfg.Log = logrus.StandardLogger()
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
 	}
 	if cfg.MaxRetryPeriod == 0 {
 		cfg.MaxRetryPeriod = defaults.MaxWatcherBackoff
@@ -97,17 +141,21 @@ func (cfg *ResourceWatcherConfig) CheckAndSetDefaults() error {
 // It is the caller's responsibility to verify the inputs' validity
 // incl. cfg.CheckAndSetDefaults.
 func newResourceWatcher(ctx context.Context, collector resourceCollector, cfg ResourceWatcherConfig) (*resourceWatcher, error) {
+	if err := cfg.CheckAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err)
+	}
 	retry, err := retryutils.NewLinear(retryutils.LinearConfig{
-		First:  utils.HalfJitter(cfg.MaxRetryPeriod / 10),
+		First:  retryutils.FullJitter(cfg.MaxRetryPeriod / 10),
 		Step:   cfg.MaxRetryPeriod / 5,
 		Max:    cfg.MaxRetryPeriod,
-		Jitter: retryutils.NewHalfJitter(),
+		Jitter: retryutils.HalfJitter,
 		Clock:  cfg.Clock,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	cfg.Log = cfg.Log.WithField("resource-kind", collector.resourceKind())
+
+	cfg.Logger = cfg.Logger.With("resource_kinds", watchKindsString(collector.resourceKinds()))
 	ctx, cancel := context.WithCancel(ctx)
 	p := &resourceWatcher{
 		ResourceWatcherConfig: cfg,
@@ -116,7 +164,7 @@ func newResourceWatcher(ctx context.Context, collector resourceCollector, cfg Re
 		cancel:                cancel,
 		retry:                 retry,
 		LoopC:                 make(chan struct{}),
-		StaleC:                make(chan struct{}, 1),
+		StaleC:                make(chan struct{}),
 	}
 	go p.runWatchLoop()
 	return p, nil
@@ -125,28 +173,23 @@ func newResourceWatcher(ctx context.Context, collector resourceCollector, cfg Re
 // resourceWatcher monitors additions, updates and deletions
 // to a set of resources.
 type resourceWatcher struct {
-	ResourceWatcherConfig
-	collector resourceCollector
-
-	// ctx is a context controlling the lifetime of this resourceWatcher
-	// instance.
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	// retry is used to manage backoff logic for watchers.
-	retry retryutils.Retry
-
 	// failureStartedAt records when the current sync failures were first
 	// detected, zero if there are no failures present.
 	failureStartedAt time.Time
-
+	collector        resourceCollector
+	// ctx is a context controlling the lifetime of this resourceWatcher
+	// instance.
+	ctx context.Context
+	// retry is used to manage backoff logic for watchers.
+	retry  retryutils.Retry
+	cancel context.CancelFunc
 	// LoopC is a channel to check whether the watch loop is running
 	// (used in tests).
 	LoopC chan struct{}
-
 	// StaleC is a channel that can trigger the condition of resource staleness
 	// (used in tests).
 	StaleC chan struct{}
+	ResourceWatcherConfig
 }
 
 // Done returns a channel that signals resource watcher closure.
@@ -181,9 +224,9 @@ func (p *resourceWatcher) WaitInitialization() error {
 		case <-p.collector.initializationChan():
 			return nil
 		case <-t.C:
-			p.Log.Debugf("ResourceWatcher %s is not yet initialized.", p.collector.resourceKind())
+			p.Logger.DebugContext(p.ctx, "ResourceWatcher is not yet initialized.")
 		case <-p.ctx.Done():
-			return trace.BadParameter("ResourceWatcher %s failed to initialize.", p.collector.resourceKind())
+			return trace.BadParameter("ResourceWatcher %s failed to initialize.", watchKindsString(p.collector.resourceKinds()))
 		}
 	}
 }
@@ -207,7 +250,7 @@ func (p *resourceWatcher) hasStaleView() bool {
 // runWatchLoop runs a watch loop.
 func (p *resourceWatcher) runWatchLoop() {
 	for {
-		p.Log.Debug("Starting watch.")
+		p.Logger.Log(p.ctx, logutils.TraceLevel, "Starting watch.")
 		err := p.watch()
 
 		select {
@@ -222,7 +265,7 @@ func (p *resourceWatcher) runWatchLoop() {
 			p.failureStartedAt = p.Clock.Now()
 		}
 		if p.hasStaleView() {
-			p.Log.Warningf("Maximum staleness of %v exceeded, failure started at %v.", p.MaxStaleness, p.failureStartedAt)
+			p.Logger.WarnContext(p.ctx, "Maximum staleness of period exceeded.", "max_staleness", p.MaxStaleness, "failure_started", p.failureStartedAt)
 			p.collector.notifyStale()
 		}
 
@@ -236,14 +279,19 @@ func (p *resourceWatcher) runWatchLoop() {
 		startedWaiting := p.Clock.Now()
 		select {
 		case t := <-p.retry.After():
-			p.Log.Debugf("Attempting to restart watch after waiting %v.", t.Sub(startedWaiting))
+			p.Logger.DebugContext(p.ctx, "Attempting to restart watch after waiting", "waited", t.Sub(startedWaiting))
 			p.retry.Inc()
 		case <-p.ctx.Done():
-			p.Log.Debug("Closed, returning from watch loop.")
+			p.Logger.DebugContext(p.ctx, "Closed, returning from watch loop.")
 			return
+		case <-p.StaleC:
+			// Used for testing that the watch routine is waiting for the
+			// next restart attempt. We don't want to wait for the full
+			// retry period in tests so we trigger the restart immediately.
+			p.Logger.DebugContext(p.ctx, "Stale view, continue watch loop.")
 		}
 		if err != nil {
-			p.Log.Warningf("Restart watch on error: %v.", err)
+			p.Logger.WarnContext(p.ctx, "Restart watch on error", "error", err)
 		}
 	}
 }
@@ -251,11 +299,16 @@ func (p *resourceWatcher) runWatchLoop() {
 // watch monitors new resource updates, maintains a local view and broadcasts
 // notifications to connected agents.
 func (p *resourceWatcher) watch() error {
-	watcher, err := p.Client.NewWatcher(p.ctx, types.Watch{
+	watch := types.Watch{
 		Name:            p.Component,
 		MetricComponent: p.Component,
-		Kinds:           []types.WatchKind{{Kind: p.collector.resourceKind()}},
-	})
+		Kinds:           p.collector.resourceKinds(),
+	}
+
+	if p.QueueSize > 0 {
+		watch.QueueSize = p.QueueSize
+	}
+	watcher, err := p.Client.NewWatcher(p.ctx, watch)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -280,6 +333,8 @@ func (p *resourceWatcher) watch() error {
 		return trace.ConnectionProblem(watcher.Error(), "watcher is closed: %v", watcher.Error())
 	case <-p.ctx.Done():
 		return trace.ConnectionProblem(p.ctx.Err(), "context is closing")
+	case <-p.StaleC:
+		return trace.ConnectionProblem(nil, "stale view")
 	case event := <-watcher.Events():
 		if event.Type != types.OpInit {
 			return trace.BadParameter("expected init event, got %v instead", event.Type)
@@ -292,6 +347,8 @@ func (p *resourceWatcher) watch() error {
 	p.retry.Reset()
 	p.failureStartedAt = time.Time{}
 
+	// start out with a modestly sized event buffer
+	eventBuf := make([]types.Event, 0, 16)
 	for {
 		select {
 		case <-watcher.Done():
@@ -299,196 +356,737 @@ func (p *resourceWatcher) watch() error {
 		case <-p.ctx.Done():
 			return trace.ConnectionProblem(p.ctx.Err(), "context is closing")
 		case event := <-watcher.Events():
-			p.collector.processEventAndUpdateCurrent(p.ctx, event)
+			// resource collectors want to process events in batches
+			// when possible in order to reduce contention on their locks.
+			// we therefore optimistically try to gather a large number of
+			// events without blocking.
+			eventBuf = append(eventBuf, event)
+		CollectEvents:
+			for len(eventBuf) < eventBufferMaxSize {
+				select {
+				case additionalEvent := <-watcher.Events():
+					eventBuf = append(eventBuf, additionalEvent)
+				default:
+					break CollectEvents
+				}
+			}
+			p.collector.processEventsAndUpdateCurrent(p.ctx, eventBuf)
+			clear(eventBuf)
+			eventBuf = eventBuf[:0]
 		case p.LoopC <- struct{}{}:
 			// Used in tests to detect the watch loop is running.
+		case <-p.StaleC:
+			return trace.ConnectionProblem(nil, "stale view")
 		}
 	}
 }
 
 // ProxyWatcherConfig is a ProxyWatcher configuration.
 type ProxyWatcherConfig struct {
-	ResourceWatcherConfig
 	// ProxyGetter is used to directly fetch the list of active proxies.
 	ProxyGetter
 	// ProxyDiffer is used to decide whether a put operation on an existing proxy should
 	// trigger a event.
 	ProxyDiffer func(old, new types.Server) bool
 	// ProxiesC is a channel used to report the current proxy set. It receives
-	// a fresh list at startup and subsequently a list of all known proxies
+	// a fresh list at startup and subsequently a list of all known proxy
 	// whenever an addition or deletion is detected.
 	ProxiesC chan []types.Server
+	ResourceWatcherConfig
+}
+
+// NewProxyWatcher returns a new instance of GenericWatcher that is configured
+// to watch for changes.
+func NewProxyWatcher(ctx context.Context, cfg ProxyWatcherConfig) (*GenericWatcher[types.Server, readonly.Server], error) {
+	if cfg.ProxyGetter == nil {
+		return nil, trace.BadParameter("ProxyGetter must be provided")
+	}
+
+	if cfg.ProxyDiffer == nil {
+		cfg.ProxyDiffer = func(old, new types.Server) bool { return true }
+	}
+
+	proxyGetter := cfg.ProxyGetter
+	w, err := NewGenericResourceWatcher(ctx, GenericWatcherConfig[types.Server, readonly.Server]{
+		ResourceWatcherConfig: cfg.ResourceWatcherConfig,
+		ResourceKind:          types.KindProxy,
+		ResourceKey:           types.Server.GetName,
+		ResourceGetter: func(ctx context.Context) ([]types.Server, error) {
+			return clientutils.CollectWithFallback(ctx, proxyGetter.ListProxyServers, func(context.Context) ([]types.Server, error) {
+				//nolint:staticcheck // TODO(kiosion) DELETE IN 21.0.0
+				return proxyGetter.GetProxies()
+			})
+		},
+		ResourcesC:                          cfg.ProxiesC,
+		ResourceDiffer:                      cfg.ProxyDiffer,
+		RequireResourcesForInitialBroadcast: true,
+		CloneFunc:                           types.Server.DeepCopy,
+		ReadOnlyFunc: func(resource types.Server) readonly.Server {
+			return resource
+		},
+	})
+	return w, trace.Wrap(err)
+}
+
+// DatabaseWatcherConfig is a DatabaseWatcher configuration.
+type DatabaseWatcherConfig struct {
+	// DatabaseGetter is responsible for fetching database resources.
+	DatabaseGetter
+	// DatabasesC receives up-to-date list of all database resources.
+	DatabasesC chan []types.Database
+	// ResourceWatcherConfig is the resource watcher configuration.
+	ResourceWatcherConfig
+}
+
+// NewDatabaseWatcher returns a new instance of DatabaseWatcher.
+func NewDatabaseWatcher(ctx context.Context, cfg DatabaseWatcherConfig) (*GenericWatcher[types.Database, readonly.Database], error) {
+	if cfg.DatabaseGetter == nil {
+		return nil, trace.BadParameter("DatabaseGetter must be provided")
+	}
+
+	w, err := NewGenericResourceWatcher(ctx, GenericWatcherConfig[types.Database, readonly.Database]{
+		ResourceWatcherConfig: cfg.ResourceWatcherConfig,
+		ResourceKind:          types.KindDatabase,
+		ResourceKey:           types.Database.GetName,
+		ResourceGetter:        cfg.DatabaseGetter.GetDatabases,
+		ResourcesC:            cfg.DatabasesC,
+		CloneFunc: func(resource types.Database) types.Database {
+			return resource.Copy()
+		},
+		ReadOnlyFunc: func(resource types.Database) readonly.Database {
+			return resource
+		},
+	})
+	return w, trace.Wrap(err)
+}
+
+// AppWatcherConfig is an AppWatcher configuration.
+type AppWatcherConfig struct {
+	// AppGetter is responsible for fetching application resources.
+	AppGetter
+	// AppsC receives up-to-date list of all application resources.
+	AppsC chan []types.Application
+	// ResourceWatcherConfig is the resource watcher configuration.
+	ResourceWatcherConfig
+}
+
+// NewAppWatcher returns a new instance of AppWatcher.
+func NewAppWatcher(ctx context.Context, cfg AppWatcherConfig) (*GenericWatcher[types.Application, readonly.Application], error) {
+	if cfg.AppGetter == nil {
+		return nil, trace.BadParameter("AppGetter must be provided")
+	}
+
+	w, err := NewGenericResourceWatcher(ctx, GenericWatcherConfig[types.Application, readonly.Application]{
+		ResourceWatcherConfig: cfg.ResourceWatcherConfig,
+		ResourceKind:          types.KindApp,
+		ResourceKey:           types.Application.GetName,
+		ResourceGetter:        cfg.AppGetter.GetApps,
+		ResourcesC:            cfg.AppsC,
+		CloneFunc: func(resource types.Application) types.Application {
+			return resource.Copy()
+		},
+		ReadOnlyFunc: func(resource types.Application) readonly.Application {
+			return resource
+		},
+	})
+
+	return w, trace.Wrap(err)
+}
+
+type AppServersWatcherConfig struct {
+	AppServersGetter
+	ResourceWatcherConfig
 }
 
 // CheckAndSetDefaults checks parameters and sets default values.
-func (cfg *ProxyWatcherConfig) CheckAndSetDefaults() error {
+func (cfg *AppServersWatcherConfig) CheckAndSetDefaults() error {
 	if err := cfg.ResourceWatcherConfig.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}
-	if cfg.ProxyGetter == nil {
-		getter, ok := cfg.Client.(ProxyGetter)
-		if !ok {
-			return trace.BadParameter("missing parameter ProxyGetter and Client not usable as ProxyGetter")
-		}
-		cfg.ProxyGetter = getter
+
+	if cfg.MaxStaleness == 0 {
+		const appServerMaxStaleness = time.Minute
+		cfg.MaxStaleness = appServerMaxStaleness
 	}
-	if cfg.ProxiesC == nil {
-		cfg.ProxiesC = make(chan []types.Server)
+
+	if cfg.AppServersGetter == nil {
+		getter, ok := cfg.Client.(AppServersGetter)
+		if !ok {
+			return trace.BadParameter("missing parameter AppServersGetter and Client not usable as AppServersGetter")
+		}
+		cfg.AppServersGetter = getter
+	}
+
+	return nil
+}
+
+func NewAppServersWatcher(ctx context.Context, cfg AppServersWatcherConfig) (*GenericWatcher[types.AppServer, readonly.AppServer], error) {
+	if err := cfg.CheckAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	w, err := NewGenericResourceWatcher(ctx, GenericWatcherConfig[types.AppServer, readonly.AppServer]{
+		ResourceWatcherConfig: cfg.ResourceWatcherConfig,
+		ResourceKind:          types.KindAppServer,
+		// The app server watcher is a proxy only routing construct (see the
+		// reversetunnel server and initProxyEndpoint call sites); it must observe app
+		// servers in every scope, not just unscoped ones, so it watches with MODE_ALL.
+		ScopeFilter: types.ScopeFilterFromProto(scopesv1.Filter_builder{Mode: scopesv1.Mode_MODE_ALL}.Build()),
+		ResourceKey: func(resource types.AppServer) string {
+			// host IDs are guaranteed to not contain "/"
+			return resource.GetHostID() + "/" + resource.GetName()
+		},
+		DeleteKey: func(r types.Resource) string {
+			// the host ID is stored in metadata.description in app server delete events
+			return r.GetMetadata().Description + "/" + r.GetName()
+		},
+		ResourceGetter: func(ctx context.Context) ([]types.AppServer, error) {
+			// TODO(fspmarshall/scopes): this list does not yet honor scope filters, so it
+			// currently returns app servers in every scope and happens to match the MODE_ALL watch
+			// above. Once the list API supports scope filters (and defaults unscoped callers to
+			// unscoped-only, like the watch API), this call must explicitly request MODE_ALL as well.
+			return cfg.AppServersGetter.GetApplicationServers(ctx, apidefaults.Namespace)
+		},
+		DisableUpdateBroadcast: true,
+		CloneFunc:              types.AppServer.Copy,
+		ReadOnlyFunc: func(resource types.AppServer) readonly.AppServer {
+			return resource
+		},
+	})
+
+	return w, trace.Wrap(err)
+}
+
+type DatabaseServerWatcherConfig struct {
+	DatabaseServersGetter
+	ResourceWatcherConfig
+}
+
+// CheckAndSetDefaults checks parameters and sets default values.
+func (cfg *DatabaseServerWatcherConfig) CheckAndSetDefaults() error {
+	if err := cfg.ResourceWatcherConfig.CheckAndSetDefaults(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if cfg.MaxStaleness == 0 {
+		const databaseServerMaxStaleness = time.Minute
+		cfg.MaxStaleness = databaseServerMaxStaleness
+	}
+
+	if cfg.DatabaseServersGetter == nil {
+		getter, ok := cfg.Client.(DatabaseServersGetter)
+		if !ok {
+			return trace.BadParameter("missing parameter DatabaseServersGetter and Client not usable as DatabaseServersGetter")
+		}
+		cfg.DatabaseServersGetter = getter
+	}
+
+	return nil
+}
+
+func NewDatabaseServerWatcher(ctx context.Context, cfg DatabaseServerWatcherConfig) (*GenericWatcher[types.DatabaseServer, readonly.DatabaseServer], error) {
+	if err := cfg.CheckAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	w, err := NewGenericResourceWatcher(ctx, GenericWatcherConfig[types.DatabaseServer, readonly.DatabaseServer]{
+		ResourceWatcherConfig: cfg.ResourceWatcherConfig,
+		ResourceKind:          types.KindDatabaseServer,
+		ResourceKey: func(r types.DatabaseServer) string {
+			// the host ID is guaranteed not to contain "/"
+			return r.GetHostID() + "/" + r.GetName()
+		},
+		DeleteKey: func(r types.Resource) string {
+			// database servers put the host ID in the description in delete events
+			return r.GetMetadata().Description + "/" + r.GetName()
+		},
+		ResourceGetter: func(ctx context.Context) ([]types.DatabaseServer, error) {
+			return cfg.DatabaseServersGetter.GetDatabaseServers(ctx, apidefaults.Namespace)
+		},
+		DisableUpdateBroadcast: true,
+		CloneFunc:              types.DatabaseServer.Copy,
+		ReadOnlyFunc:           readonly.NewDatabaseServer,
+	})
+
+	return w, trace.Wrap(err)
+}
+
+// KubeServerWatcherConfig is an KubeServerWatcher configuration.
+type KubeServerWatcherConfig struct {
+	// KubernetesServerGetter is responsible for fetching kube_server resources.
+	KubernetesServerGetter
+	// ResourceWatcherConfig is the resource watcher configuration.
+	ResourceWatcherConfig
+}
+
+// NewKubeServerWatcher returns a new instance of KubeServerWatcher.
+func NewKubeServerWatcher(ctx context.Context, cfg KubeServerWatcherConfig) (*GenericWatcher[types.KubeServer, readonly.KubeServer], error) {
+	if cfg.KubernetesServerGetter == nil {
+		return nil, trace.BadParameter("KubernetesServerGetter must be provided")
+	}
+
+	w, err := NewGenericResourceWatcher(ctx, GenericWatcherConfig[types.KubeServer, readonly.KubeServer]{
+		ResourceWatcherConfig: cfg.ResourceWatcherConfig,
+		ResourceKind:          types.KindKubeServer,
+		ResourceGetter:        cfg.KubernetesServerGetter.GetKubernetesServers,
+		ResourceKey: func(resource types.KubeServer) string {
+			return resource.GetHostID() + resource.GetName()
+		},
+		DisableUpdateBroadcast: true,
+		CloneFunc:              types.KubeServer.Copy,
+		ReadOnlyFunc: func(resource types.KubeServer) readonly.KubeServer {
+			return resource
+		},
+	})
+	return w, trace.Wrap(err)
+}
+
+// KubeClusterWatcherConfig is an KubeClusterWatcher configuration.
+type KubeClusterWatcherConfig struct {
+	// KubernetesGetter is responsible for fetching kube_cluster resources.
+	KubernetesClusterGetter
+	// KubeClustersC receives up-to-date list of all kube_cluster resources.
+	KubeClustersC chan []types.KubeCluster
+	// ResourceWatcherConfig is the resource watcher configuration.
+	ResourceWatcherConfig
+	// LoadSecrets specifies whether the watched kube clusters include their kubeconfig. Only the
+	// kube agent needs this, to connect to dynamically-registered clusters, and it requires
+	// secret-inclusive read permission on kubernetes_cluster.
+	LoadSecrets bool
+}
+
+// NewKubeClusterWatcher returns a new instance of KubeClusterWatcher.
+func NewKubeClusterWatcher(ctx context.Context, cfg KubeClusterWatcherConfig) (*GenericWatcher[types.KubeCluster, readonly.KubeCluster], error) {
+	if cfg.KubernetesClusterGetter == nil {
+		return nil, trace.BadParameter("KubernetesClusterGetter must be provided")
+	}
+
+	getter := cfg.KubernetesClusterGetter
+	w, err := NewGenericResourceWatcher(ctx, GenericWatcherConfig[types.KubeCluster, readonly.KubeCluster]{
+		ResourceWatcherConfig: cfg.ResourceWatcherConfig,
+		ResourceKind:          types.KindKubernetesCluster,
+		LoadSecrets:           cfg.LoadSecrets,
+		ResourceGetter: func(ctx context.Context) ([]types.KubeCluster, error) {
+			return iterstream.Collect(getter.RangeKubeClusters(ctx, presencev1.ListKubeClustersRequest_builder{
+				WithSecrets: cfg.LoadSecrets,
+			}.Build()))
+		},
+		ResourceKey: GetCursorForKubeCluster,
+		DeleteKey: func(res types.Resource) string {
+			cluster, ok := res.(types.KubeCluster)
+			if !ok {
+				return ""
+			}
+			return GetCursorForKubeCluster(cluster)
+		},
+		ResourcesC: cfg.KubeClustersC,
+		CloneFunc: func(resource types.KubeCluster) types.KubeCluster {
+			return resource.Copy()
+		},
+		ReadOnlyFunc: func(resource types.KubeCluster) readonly.KubeCluster {
+			return resource
+		},
+	})
+	return w, trace.Wrap(err)
+}
+
+type DynamicWindowsDesktopGetter interface {
+	ListDynamicWindowsDesktops(ctx context.Context, pageSize int, pageToken string) ([]types.DynamicWindowsDesktop, string, error)
+}
+
+// DynamicWindowsDesktopWatcherConfig is a DynamicWindowsDesktopWatcher configuration.
+type DynamicWindowsDesktopWatcherConfig struct {
+	// DynamicWindowsDesktopGetter is responsible for fetching DynamicWindowsDesktop resources.
+	DynamicWindowsDesktopGetter
+	// DynamicWindowsDesktopsC receives up-to-date list of all DynamicWindowsDesktop resources.
+	DynamicWindowsDesktopsC chan []types.DynamicWindowsDesktop
+	// ResourceWatcherConfig is the resource watcher configuration.
+	ResourceWatcherConfig
+}
+
+// NewDynamicWindowsDesktopWatcher returns a new instance of DynamicWindowsDesktopWatcher.
+func NewDynamicWindowsDesktopWatcher(ctx context.Context, cfg DynamicWindowsDesktopWatcherConfig) (*GenericWatcher[types.DynamicWindowsDesktop, readonly.DynamicWindowsDesktop], error) {
+	if cfg.DynamicWindowsDesktopGetter == nil {
+		return nil, trace.BadParameter("DynamicWindowsDesktopGetter must be provided")
+	}
+	getter := cfg.DynamicWindowsDesktopGetter
+	w, err := NewGenericResourceWatcher(ctx, GenericWatcherConfig[types.DynamicWindowsDesktop, readonly.DynamicWindowsDesktop]{
+		ResourceWatcherConfig: cfg.ResourceWatcherConfig,
+		ResourceKind:          types.KindDynamicWindowsDesktop,
+		ResourceGetter: pagerFn[types.DynamicWindowsDesktop](
+			getter.ListDynamicWindowsDesktops,
+		).getAll,
+		ResourceKey: types.DynamicWindowsDesktop.GetName,
+		ResourcesC:  cfg.DynamicWindowsDesktopsC,
+		CloneFunc:   types.DynamicWindowsDesktop.Copy,
+		ReadOnlyFunc: func(resource types.DynamicWindowsDesktop) readonly.DynamicWindowsDesktop {
+			return resource
+		},
+	})
+	return w, trace.Wrap(err)
+}
+
+// GenericWatcherConfig is a generic resource watcher configuration.
+type GenericWatcherConfig[T any, R any] struct {
+	// ResourceGetter is used to directly fetch the current set of resources.
+	ResourceGetter func(context.Context) ([]T, error)
+	// ResourceDiffer is used to decide whether a put operation on an existing ResourceGetter should
+	// trigger an event.
+	ResourceDiffer func(old, new T) bool
+	// ResourceKey defines how the resources should be keyed.
+	ResourceKey func(resource T) string
+	// DeleteKey defines how a deleted resource key is derived. A delete event
+	// typically sends a stripped down resource representation with an underlying
+	// type of [types.ResourceHeader].
+	// If unspecified the key will be derived from the resource.Description + resource.GetName
+	DeleteKey func(types.Resource) string
+	// ResourcesC is a channel used to report the current resource set. It receives
+	// a fresh list at startup and subsequently a list of all known resources
+	// whenever an addition or deletion is detected.
+	ResourcesC chan []T
+	// CloneFunc defines how a resource is cloned. All resources provided via
+	// the broadcast mechanism, or retrieved via [GenericWatcer.CurrentResources]
+	// or [GenericWatcher.CurrentResourcesWithFilter] will be cloned by this
+	// mechanism before being provided to callers.
+	CloneFunc func(resource T) T
+	// ReadOnlyFunc returns the read-only view of a resource. Ideally this will
+	// be a type conversion (but we can't statically express that as constraints
+	// on T and R) but it's also possible to wrapper the original resource.
+	// Making the read-only view should be much cheaper than CloneFunc.
+	ReadOnlyFunc func(resource T) R
+	ResourceWatcherConfig
+	// ResourceKind specifies the kind of resource the watcher is monitoring.
+	ResourceKind string
+	// ResourceFilter is an optional filter that is applied on the backend when
+	// watching for resources. Only resources matching the filter will be sent
+	// to the watcher.
+	ResourceFilter map[string]string
+	// ScopeFilter is an optional scope filter applied to the watch. A nil filter
+	// yields the caller's default scope behavior (unscoped-only for unscoped
+	// callers, current-scope-only for scoped callers). Watchers that run on the
+	// teleport proxy and must observe every instance of an optionally-scoped kind
+	// (regardless of scope) should set this to MODE_ALL. Note that the paired
+	// ResourceGetter (the list seed) does not yet honor scope filters; see the
+	// TODO at each MODE_ALL call site.
+	ScopeFilter *types.ScopeFilter
+	// RequireResourcesForInitialBroadcast indicates whether an update should be
+	// performed if the initial set of resources is empty.
+	RequireResourcesForInitialBroadcast bool
+	// DisableUpdateBroadcast turns off emitting updates on changes. When this
+	// mode is opted into, users must invoke [GenericWatcher.CurrentResources] or
+	// [GenericWatcher.CurrentResourcesWithFilter] manually to retrieve the active
+	// resource set.
+	DisableUpdateBroadcast bool
+	// LoadSecrets specifies whether sensitive data will be loaded into memory.
+	// This is only applicable to certain types like [types.CertAuthority].
+	LoadSecrets bool
+}
+
+// CheckAndSetDefaults checks parameters and sets default values.
+func (cfg *GenericWatcherConfig[T, R]) CheckAndSetDefaults() error {
+	if err := cfg.ResourceWatcherConfig.CheckAndSetDefaults(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if cfg.ResourceGetter == nil {
+		return trace.BadParameter("ResourceGetter not provided to generic resource watcher")
+	}
+
+	if cfg.ResourceKind == "" {
+		return trace.BadParameter("ResourceKind not provided to generic resource watcher")
+	}
+
+	if cfg.ResourceKey == nil {
+		return trace.BadParameter("ResourceKey not provided to generic resource watcher")
+	}
+
+	if cfg.CloneFunc == nil {
+		return trace.BadParameter("CloneFunc not provided to generic resource watcher")
+	}
+	if cfg.ReadOnlyFunc == nil {
+		return trace.BadParameter("ReadOnlyFunc not provided to generic resource watcher")
+	}
+
+	if cfg.ResourceDiffer == nil {
+		cfg.ResourceDiffer = func(T, T) bool { return true }
+	}
+
+	if cfg.ResourcesC == nil {
+		cfg.ResourcesC = make(chan []T)
 	}
 	return nil
 }
 
-// NewProxyWatcher returns a new instance of ProxyWatcher.
-func NewProxyWatcher(ctx context.Context, cfg ProxyWatcherConfig) (*ProxyWatcher, error) {
+// NewGenericResourceWatcher returns a new instance of resource watcher.
+func NewGenericResourceWatcher[T any, R any](ctx context.Context, cfg GenericWatcherConfig[T, R]) (*GenericWatcher[T, R], error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	collector := &proxyCollector{
-		ProxyWatcherConfig: cfg,
-		initializationC:    make(chan struct{}),
+
+	cache, err := utils.NewFnCache(utils.FnCacheConfig{
+		Context: ctx,
+		TTL:     3 * time.Second,
+		Clock:   cfg.Clock,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
+
+	collector := &genericCollector[T, R]{
+		GenericWatcherConfig: cfg,
+		initializationC:      make(chan struct{}),
+		cache:                cache,
+	}
+	collector.stale.Store(true)
 	watcher, err := newResourceWatcher(ctx, collector, cfg.ResourceWatcherConfig)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return &ProxyWatcher{watcher, collector}, nil
+	return &GenericWatcher[T, R]{watcher, collector}, nil
 }
 
-// ProxyWatcher is built on top of resourceWatcher to monitor additions
-// and deletions to the set of proxies.
-type ProxyWatcher struct {
+// GenericWatcher is built on top of resourceWatcher to monitor additions
+// and deletions to the set of resources.
+type GenericWatcher[T any, R any] struct {
 	*resourceWatcher
-	*proxyCollector
+	*genericCollector[T, R]
 }
 
-// proxyCollector accompanies resourceWatcher when monitoring proxies.
-type proxyCollector struct {
-	ProxyWatcherConfig
-	// current holds a map of the currently known proxies (keyed by server name,
+// ResourceCount returns the current number of resources known to the watcher.
+func (g *GenericWatcher[T, R]) ResourceCount() int {
+	g.rw.RLock()
+	defer g.rw.RUnlock()
+	return len(g.current)
+}
+
+// CurrentResources returns a copy of the resources known to the watcher.
+func (g *GenericWatcher[T, R]) CurrentResources(ctx context.Context) ([]T, error) {
+	if err := g.refreshStaleResources(ctx); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	g.rw.RLock()
+	defer g.rw.RUnlock()
+
+	return resourcesToSlice(g.current, g.CloneFunc), nil
+}
+
+// CurrentResourcesWithFilter returns a copy of the resources known to the watcher
+// that match the provided filter.
+func (g *GenericWatcher[T, R]) CurrentResourcesWithFilter(ctx context.Context, filter func(R) bool) ([]T, error) {
+	if err := g.refreshStaleResources(ctx); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	g.rw.RLock()
+	defer g.rw.RUnlock()
+
+	var out []T
+	for _, resource := range g.current {
+		if filter(g.ReadOnlyFunc(resource)) {
+			out = append(out, g.CloneFunc(resource))
+		}
+	}
+
+	return out, nil
+}
+
+// genericCollector accompanies resourceWatcher when monitoring proxies. T is
+// the resource type, R is a read-only view over T.
+type genericCollector[T any, R any] struct {
+	GenericWatcherConfig[T, R]
+	// current holds a map of the currently known resources (keyed by server name,
 	// RWMutex protected).
-	current         map[string]types.Server
-	rw              sync.RWMutex
+	current         map[string]T
 	initializationC chan struct{}
-	once            sync.Once
+	// cache is a helper for temporarily storing the results of CurrentResources.
+	// It's used to limit the number of calls to the backend.
+	cache *utils.FnCache
+	rw    sync.RWMutex
+	once  sync.Once
+	// stale is used to indicate that the watcher is stale and needs to be
+	// refreshed.
+	stale atomic.Bool
 }
 
-// GetCurrent returns the currently stored proxies.
-func (p *proxyCollector) GetCurrent() []types.Server {
-	p.rw.RLock()
-	defer p.rw.RUnlock()
-	return serverMapValues(p.current)
+// resourceKinds specifies the resource kind to watch.
+func (g *genericCollector[T, R]) resourceKinds() []types.WatchKind {
+	return []types.WatchKind{{
+		Kind:        g.ResourceKind,
+		LoadSecrets: g.LoadSecrets,
+		Filter:      g.ResourceFilter,
+		ScopeFilter: g.ScopeFilter,
+	}}
 }
 
-// resourceKind specifies the resource kind to watch.
-func (p *proxyCollector) resourceKind() string {
-	return types.KindProxy
+// getResources gets the list of current resources.
+func (g *genericCollector[T, R]) getResources(ctx context.Context) (map[string]T, error) {
+	resources, err := g.GenericWatcherConfig.ResourceGetter(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	current := make(map[string]T, len(resources))
+	for _, resource := range resources {
+		current[g.GenericWatcherConfig.ResourceKey(resource)] = resource
+	}
+	return current, nil
+}
+
+func (g *genericCollector[T, R]) refreshStaleResources(ctx context.Context) error {
+	if !g.stale.Load() {
+		return nil
+	}
+
+	_, err := utils.FnCacheGet(ctx, g.cache, g.GenericWatcherConfig.ResourceKind, func(ctx context.Context) (any, error) {
+		newCurrent, err := g.getResources(ctx)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		// as an optimization, we can check if the collector is still stale
+		// before grabbing the write lock
+		if !g.stale.Load() {
+			// the view is no longer stale, discard newCurrent and proceed with
+			// the data in g.current
+			return nil, nil
+		}
+
+		g.rw.Lock()
+		defer g.rw.Unlock()
+
+		// check the staleness again since it might've changed since we were not
+		// holding the lock
+		if !g.stale.Load() {
+			return nil, nil
+		}
+
+		g.current = newCurrent
+		g.stale.Store(false)
+
+		return nil, nil
+	})
+
+	return trace.Wrap(err)
 }
 
 // getResourcesAndUpdateCurrent is called when the resources should be
 // (re-)fetched directly.
-func (p *proxyCollector) getResourcesAndUpdateCurrent(ctx context.Context) error {
-	proxies, err := p.ProxyGetter.GetProxies()
+func (g *genericCollector[T, R]) getResourcesAndUpdateCurrent(ctx context.Context) error {
+	newCurrent, err := g.getResources(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	newCurrent := make(map[string]types.Server, len(proxies))
-	for _, proxy := range proxies {
-		newCurrent[proxy.GetName()] = proxy
+	g.rw.Lock()
+	defer g.rw.Unlock()
+	g.current = newCurrent
+	g.stale.Store(false)
+	// Only emit an empty set of resources if the watcher is already initialized,
+	// or if explicitly opted into by for the watcher.
+	if len(newCurrent) > 0 || g.isInitialized() ||
+		(!g.RequireResourcesForInitialBroadcast && len(newCurrent) == 0) {
+		g.broadcastUpdate(ctx)
 	}
-	p.rw.Lock()
-	defer p.rw.Unlock()
-	p.current = newCurrent
-	// only emit an empty proxy list if the collector has already been initialized
-	// to prevent an empty slice being sent out on creation of the watcher
-	if len(proxies) > 0 || (len(proxies) == 0 && p.isInitialized()) {
-		p.broadcastUpdate(ctx)
-	}
-	p.defineCollectorAsInitialized()
+	g.defineCollectorAsInitialized()
 	return nil
 }
 
-func (p *proxyCollector) defineCollectorAsInitialized() {
-	p.once.Do(func() {
+func (g *genericCollector[T, R]) defineCollectorAsInitialized() {
+	g.once.Do(func() {
 		// mark watcher as initialized.
-		close(p.initializationC)
+		close(g.initializationC)
 	})
 }
 
-// processEventAndUpdateCurrent is called when a watcher event is received.
-func (p *proxyCollector) processEventAndUpdateCurrent(ctx context.Context, event types.Event) {
-	if event.Resource == nil || event.Resource.GetKind() != types.KindProxy {
-		p.Log.Warningf("Unexpected event: %v.", event)
-		return
+// processEventsAndUpdateCurrent is called when a watcher event is received.
+func (g *genericCollector[T, R]) processEventsAndUpdateCurrent(ctx context.Context, events []types.Event) {
+	g.rw.Lock()
+	defer g.rw.Unlock()
+
+	var updated bool
+
+	for _, event := range events {
+		if event.Resource == nil || event.Resource.GetKind() != g.ResourceKind {
+			g.Logger.WarnContext(ctx, "Received unexpected event", "event", logutils.StringerAttr(event))
+			continue
+		}
+
+		switch event.Type {
+		case types.OpDelete:
+			// On delete events, the server description is populated with the host ID.
+			key := event.Resource.GetMetadata().Description + event.Resource.GetName()
+			if g.DeleteKey != nil {
+				key = g.DeleteKey(event.Resource)
+			}
+			delete(g.current, key)
+			// Always broadcast when a resource is deleted.
+			updated = true
+		case types.OpPut:
+			resource, err := types.ConvertResource[T](event.Resource)
+			if err != nil {
+				g.Logger.WarnContext(ctx, "Failed to convert event resource",
+					"resource", event.Resource.GetKind(),
+					"error", err,
+				)
+				continue
+			}
+
+			key := g.ResourceKey(resource)
+			current, exists := g.current[key]
+			g.current[key] = resource
+			updated = !exists || g.ResourceDiffer(current, resource)
+		default:
+			g.Logger.WarnContext(ctx, "Skipping unsupported event type", "event_type", event.Type)
+		}
 	}
 
-	p.rw.Lock()
-	defer p.rw.Unlock()
-
-	switch event.Type {
-	case types.OpDelete:
-		delete(p.current, event.Resource.GetName())
-		// Always broadcast when a proxy is deleted.
-		p.broadcastUpdate(ctx)
-	case types.OpPut:
-		server, ok := event.Resource.(types.Server)
-		if !ok {
-			p.Log.Warningf("Unexpected type %T.", event.Resource)
-			return
-		}
-		current, exists := p.current[server.GetName()]
-		p.current[server.GetName()] = server
-		if !exists || (p.ProxyDiffer != nil && p.ProxyDiffer(current, server)) {
-			p.broadcastUpdate(ctx)
-		}
-	default:
-		p.Log.Warningf("Skipping unsupported event type %s.", event.Type)
+	if updated {
+		g.broadcastUpdate(ctx)
 	}
 }
 
-// broadcastUpdate broadcasts information about updating the proxy set.
-func (p *proxyCollector) broadcastUpdate(ctx context.Context) {
-	names := make([]string, 0, len(p.current))
-	for k := range p.current {
+// broadcastUpdate broadcasts information about updating the resource set.
+func (g *genericCollector[T, R]) broadcastUpdate(ctx context.Context) {
+	if g.DisableUpdateBroadcast {
+		return
+	}
+
+	names := make([]string, 0, len(g.current))
+	for k := range g.current {
 		names = append(names, k)
 	}
-	p.Log.Debugf("List of known proxies updated: %q.", names)
+	g.Logger.DebugContext(ctx, "List of known resources updated", "resources", names)
 
 	select {
-	case p.ProxiesC <- serverMapValues(p.current):
+	case g.ResourcesC <- resourcesToSlice(g.current, g.CloneFunc):
 	case <-ctx.Done():
 	}
 }
 
 // isInitialized is used to check that the cache has done its initial
 // sync
-func (p *proxyCollector) initializationChan() <-chan struct{} {
-	return p.initializationC
+func (g *genericCollector[T, R]) initializationChan() <-chan struct{} {
+	return g.initializationC
 }
 
-func (p *proxyCollector) isInitialized() bool {
+func (g *genericCollector[T, R]) isInitialized() bool {
 	select {
-	case <-p.initializationC:
+	case <-g.initializationC:
 		return true
 	default:
 		return false
 	}
 }
 
-func (p *proxyCollector) notifyStale() {}
-
-func serverMapValues(serverMap map[string]types.Server) []types.Server {
-	servers := make([]types.Server, 0, len(serverMap))
-	for _, server := range serverMap {
-		servers = append(servers, server)
-	}
-	return servers
+func (g *genericCollector[T, R]) notifyStale() {
+	g.stale.Store(true)
 }
 
 // LockWatcherConfig is a LockWatcher configuration.
 type LockWatcherConfig struct {
-	ResourceWatcherConfig
 	LockGetter
+	ResourceWatcherConfig
 }
 
 // CheckAndSetDefaults checks parameters and sets default values.
@@ -516,12 +1114,14 @@ func NewLockWatcher(ctx context.Context, cfg LockWatcherConfig) (*LockWatcher, e
 	}
 	collector := &lockCollector{
 		LockWatcherConfig: cfg,
-		fanout:            NewFanout(),
-		initializationC:   make(chan struct{}),
+		fanout: NewFanoutV2(FanoutV2Config{
+			Capacity: smallFanoutCapacity,
+		}),
+		initializationC: make(chan struct{}),
 	}
 	// Resource watcher require the fanout to be initialized before passing in.
 	// Otherwise, Emit() may fail due to a race condition mentioned in https://github.com/gravitational/teleport/issues/19289
-	collector.fanout.SetInit()
+	collector.fanout.SetInit(collector.resourceKinds())
 	watcher, err := newResourceWatcher(ctx, collector, cfg.ResourceWatcherConfig)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -540,15 +1140,23 @@ type lockCollector struct {
 	LockWatcherConfig
 	// current holds a map of the currently known locks (keyed by lock name).
 	current map[string]types.Lock
-	// isStale indicates whether the local lock view (current) is stale.
-	isStale bool
-	// currentRW is a mutex protecting both current and isStale.
-	currentRW sync.RWMutex
 	// fanout provides support for multiple subscribers to the lock updates.
-	fanout *Fanout
+	fanout *FanoutV2
 	// initializationC is used to check whether the initial sync has completed
 	initializationC chan struct{}
-	once            sync.Once
+	// currentRW is a mutex protecting both current and isStale.
+	currentRW sync.RWMutex
+	once      sync.Once
+	// isStale indicates whether the local lock view (current) is stale.
+	isStale bool
+}
+
+// IsStale is used to check whether the lock watcher is stale.
+// Used in tests.
+func (p *lockCollector) IsStale() bool {
+	p.currentRW.RLock()
+	defer p.currentRW.RUnlock()
+	return p.isStale
 }
 
 // Subscribe is used to subscribe to the lock updates.
@@ -575,6 +1183,11 @@ func (p *lockCollector) Subscribe(ctx context.Context, targets ...types.LockTarg
 // CheckLockInForce returns an AccessDenied error if there is a lock in force
 // matching at least one of the targets.
 func (p *lockCollector) CheckLockInForce(mode constants.LockingMode, targets ...types.LockTarget) error {
+	if len(targets) == 0 {
+		// A lock can't match any targets if there are no targets.
+		return nil
+	}
+
 	p.currentRW.RLock()
 	defer p.currentRW.RUnlock()
 	if p.isStale && mode == constants.LockingModeStrict {
@@ -590,9 +1203,6 @@ func (p *lockCollector) findLockInForceUnderMutex(targets []types.LockTarget) ty
 	for _, lock := range p.current {
 		if !lock.IsInForce(p.Clock.Now()) {
 			continue
-		}
-		if len(targets) == 0 {
-			return lock
 		}
 		for _, target := range targets {
 			if target.Match(lock) {
@@ -610,9 +1220,9 @@ func (p *lockCollector) GetCurrent() []types.Lock {
 	return lockMapValues(p.current)
 }
 
-// resourceKind specifies the resource kind to watch.
-func (p *lockCollector) resourceKind() string {
-	return types.KindLock
+// resourceKinds specifies the resource kind to watch.
+func (p *lockCollector) resourceKinds() []types.WatchKind {
+	return []types.WatchKind{{Kind: types.KindLock}}
 }
 
 // initializationChan is used to check that the cache has done its initial
@@ -624,10 +1234,21 @@ func (p *lockCollector) initializationChan() <-chan struct{} {
 // getResourcesAndUpdateCurrent is called when the resources should be
 // (re-)fetched directly.
 func (p *lockCollector) getResourcesAndUpdateCurrent(ctx context.Context) error {
-	locks, err := p.LockGetter.GetLocks(ctx, true)
+	locks, err := clientutils.CollectWithFallback(
+		ctx,
+		func(ctx context.Context, limit int, start string) ([]types.Lock, string, error) {
+			return p.LockGetter.ListLocks(ctx, limit, start, &types.LockFilter{InForceOnly: true})
+		},
+		func(ctx context.Context) ([]types.Lock, error) {
+			// TODO(okraport): DELETE IN v21
+			const inForceOnlyTrue = true
+			return p.LockGetter.GetLocks(ctx, inForceOnlyTrue)
+		},
+	)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
 	newCurrent := map[string]types.Lock{}
 	for _, lock := range locks {
 		newCurrent[lock.GetName()] = lock
@@ -651,34 +1272,38 @@ func (p *lockCollector) defineCollectorAsInitialized() {
 	})
 }
 
-// processEventAndUpdateCurrent is called when a watcher event is received.
-func (p *lockCollector) processEventAndUpdateCurrent(ctx context.Context, event types.Event) {
-	if event.Resource == nil || event.Resource.GetKind() != types.KindLock {
-		p.Log.Warningf("Unexpected event: %v.", event)
-		return
-	}
-
+// processEventsAndUpdateCurrent is called when a watcher event is received.
+func (p *lockCollector) processEventsAndUpdateCurrent(ctx context.Context, events []types.Event) {
 	p.currentRW.Lock()
 	defer p.currentRW.Unlock()
-	switch event.Type {
-	case types.OpDelete:
-		delete(p.current, event.Resource.GetName())
-		p.fanout.Emit(event)
-	case types.OpPut:
-		lock, ok := event.Resource.(types.Lock)
-		if !ok {
-			p.Log.Warningf("Unexpected resource type %T.", event.Resource)
-			return
+	eventsToEmit := events[:0]
+	for _, event := range events {
+		if event.Resource == nil || event.Resource.GetKind() != types.KindLock {
+			p.Logger.WarnContext(ctx, "Received unexpected event", "event", logutils.StringerAttr(event))
+			continue
 		}
-		if lock.IsInForce(p.Clock.Now()) {
-			p.current[lock.GetName()] = lock
-			p.fanout.Emit(event)
-		} else {
-			delete(p.current, lock.GetName())
+
+		switch event.Type {
+		case types.OpDelete:
+			delete(p.current, event.Resource.GetName())
+			eventsToEmit = append(eventsToEmit, event)
+		case types.OpPut:
+			lock, ok := event.Resource.(types.Lock)
+			if !ok {
+				p.Logger.WarnContext(ctx, "Unexpected resource type", "resource", event.Resource.GetKind())
+				continue
+			}
+			if lock.IsInForce(p.Clock.Now()) {
+				p.current[lock.GetName()] = lock
+				eventsToEmit = append(eventsToEmit, event)
+			} else {
+				delete(p.current, lock.GetName())
+			}
+		default:
+			p.Logger.WarnContext(ctx, "Skipping unsupported event type", "event_type", event.Type)
 		}
-	default:
-		p.Log.Warningf("Skipping unsupported event type %s.", event.Type)
 	}
+	p.fanout.Emit(eventsToEmit...)
 }
 
 // notifyStale is called when the maximum acceptable staleness (if specified)
@@ -697,7 +1322,7 @@ func (p *lockCollector) notifyStale() {
 func lockTargetsToWatchKinds(targets []types.LockTarget) ([]types.WatchKind, error) {
 	watchKinds := make([]types.WatchKind, 0, len(targets))
 	for _, target := range targets {
-		if target.IsEmpty() {
+		if target == (types.LockTarget{}) {
 			continue
 		}
 		filter, err := target.IntoMap()
@@ -723,437 +1348,12 @@ func lockMapValues(lockMap map[string]types.Lock) []types.Lock {
 	return locks
 }
 
-// DatabaseWatcherConfig is a DatabaseWatcher configuration.
-type DatabaseWatcherConfig struct {
-	// ResourceWatcherConfig is the resource watcher configuration.
-	ResourceWatcherConfig
-	// DatabaseGetter is responsible for fetching database resources.
-	DatabaseGetter
-	// DatabasesC receives up-to-date list of all database resources.
-	DatabasesC chan types.Databases
-}
-
-// CheckAndSetDefaults checks parameters and sets default values.
-func (cfg *DatabaseWatcherConfig) CheckAndSetDefaults() error {
-	if err := cfg.ResourceWatcherConfig.CheckAndSetDefaults(); err != nil {
-		return trace.Wrap(err)
-	}
-	if cfg.DatabaseGetter == nil {
-		getter, ok := cfg.Client.(DatabaseGetter)
-		if !ok {
-			return trace.BadParameter("missing parameter DatabaseGetter and Client not usable as DatabaseGetter")
-		}
-		cfg.DatabaseGetter = getter
-	}
-	if cfg.DatabasesC == nil {
-		cfg.DatabasesC = make(chan types.Databases)
-	}
-	return nil
-}
-
-// NewDatabaseWatcher returns a new instance of DatabaseWatcher.
-func NewDatabaseWatcher(ctx context.Context, cfg DatabaseWatcherConfig) (*DatabaseWatcher, error) {
-	if err := cfg.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	collector := &databaseCollector{
-		DatabaseWatcherConfig: cfg,
-		initializationC:       make(chan struct{}),
-	}
-	watcher, err := newResourceWatcher(ctx, collector, cfg.ResourceWatcherConfig)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &DatabaseWatcher{watcher, collector}, nil
-}
-
-// DatabaseWatcher is built on top of resourceWatcher to monitor database resources.
-type DatabaseWatcher struct {
-	*resourceWatcher
-	*databaseCollector
-}
-
-// databaseCollector accompanies resourceWatcher when monitoring database resources.
-type databaseCollector struct {
-	// DatabaseWatcherConfig is the watcher configuration.
-	DatabaseWatcherConfig
-	// current holds a map of the currently known database resources.
-	current map[string]types.Database
-	// lock protects the "current" map.
-	lock sync.RWMutex
-	// initializationC is used to check that the
-	initializationC chan struct{}
-	once            sync.Once
-}
-
-// resourceKind specifies the resource kind to watch.
-func (p *databaseCollector) resourceKind() string {
-	return types.KindDatabase
-}
-
-// isInitialized is used to check that the cache has done its initial
-// sync
-func (p *databaseCollector) initializationChan() <-chan struct{} {
-	return p.initializationC
-}
-
-// getResourcesAndUpdateCurrent refreshes the list of current resources.
-func (p *databaseCollector) getResourcesAndUpdateCurrent(ctx context.Context) error {
-	databases, err := p.DatabaseGetter.GetDatabases(ctx)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	newCurrent := make(map[string]types.Database, len(databases))
-	for _, database := range databases {
-		newCurrent[database.GetName()] = database
-	}
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	p.current = newCurrent
-	p.defineCollectorAsInitialized()
-
-	select {
-	case <-ctx.Done():
-		return trace.Wrap(ctx.Err())
-	case p.DatabasesC <- databases:
-	}
-
-	return nil
-}
-
-func (p *databaseCollector) defineCollectorAsInitialized() {
-	p.once.Do(func() {
-		// mark watcher as initialized.
-		close(p.initializationC)
-	})
-}
-
-// processEventAndUpdateCurrent is called when a watcher event is received.
-func (p *databaseCollector) processEventAndUpdateCurrent(ctx context.Context, event types.Event) {
-	if event.Resource == nil || event.Resource.GetKind() != types.KindDatabase {
-		p.Log.Warnf("Unexpected event: %v.", event)
-		return
-	}
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	switch event.Type {
-	case types.OpDelete:
-		delete(p.current, event.Resource.GetName())
-		select {
-		case <-ctx.Done():
-		case p.DatabasesC <- resourcesToSlice(p.current):
-		}
-	case types.OpPut:
-		database, ok := event.Resource.(types.Database)
-		if !ok {
-			p.Log.Warnf("Unexpected resource type %T.", event.Resource)
-			return
-		}
-		p.current[database.GetName()] = database
-		select {
-		case <-ctx.Done():
-		case p.DatabasesC <- resourcesToSlice(p.current):
-		}
-
-	default:
-		p.Log.Warnf("Unsupported event type %s.", event.Type)
-		return
-	}
-}
-
-func (*databaseCollector) notifyStale() {}
-
-// AppWatcherConfig is an AppWatcher configuration.
-type AppWatcherConfig struct {
-	// ResourceWatcherConfig is the resource watcher configuration.
-	ResourceWatcherConfig
-	// AppGetter is responsible for fetching application resources.
-	AppGetter
-	// AppsC receives up-to-date list of all application resources.
-	AppsC chan types.Apps
-}
-
-// CheckAndSetDefaults checks parameters and sets default values.
-func (cfg *AppWatcherConfig) CheckAndSetDefaults() error {
-	if err := cfg.ResourceWatcherConfig.CheckAndSetDefaults(); err != nil {
-		return trace.Wrap(err)
-	}
-	if cfg.AppGetter == nil {
-		getter, ok := cfg.Client.(AppGetter)
-		if !ok {
-			return trace.BadParameter("missing parameter AppGetter and Client not usable as AppGetter")
-		}
-		cfg.AppGetter = getter
-	}
-	if cfg.AppsC == nil {
-		cfg.AppsC = make(chan types.Apps)
-	}
-	return nil
-}
-
-// NewAppWatcher returns a new instance of AppWatcher.
-func NewAppWatcher(ctx context.Context, cfg AppWatcherConfig) (*AppWatcher, error) {
-	if err := cfg.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	collector := &appCollector{
-		AppWatcherConfig: cfg,
-		initializationC:  make(chan struct{}),
-	}
-	watcher, err := newResourceWatcher(ctx, collector, cfg.ResourceWatcherConfig)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &AppWatcher{watcher, collector}, nil
-}
-
-// AppWatcher is built on top of resourceWatcher to monitor application resources.
-type AppWatcher struct {
-	*resourceWatcher
-	*appCollector
-}
-
-// appCollector accompanies resourceWatcher when monitoring application resources.
-type appCollector struct {
-	// AppWatcherConfig is the watcher configuration.
-	AppWatcherConfig
-	// current holds a map of the currently known application resources.
-	current map[string]types.Application
-	// lock protects the "current" map.
-	lock sync.RWMutex
-	// initializationC is used to check whether the initial sync has completed
-	initializationC chan struct{}
-	once            sync.Once
-}
-
-// resourceKind specifies the resource kind to watch.
-func (p *appCollector) resourceKind() string {
-	return types.KindApp
-}
-
-// isInitialized is used to check that the cache has done its initial
-// sync
-func (p *appCollector) initializationChan() <-chan struct{} {
-	return p.initializationC
-}
-
-// getResourcesAndUpdateCurrent refreshes the list of current resources.
-func (p *appCollector) getResourcesAndUpdateCurrent(ctx context.Context) error {
-	apps, err := p.AppGetter.GetApps(ctx)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	newCurrent := make(map[string]types.Application, len(apps))
-	for _, app := range apps {
-		newCurrent[app.GetName()] = app
-	}
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	p.current = newCurrent
-	p.defineCollectorAsInitialized()
-	select {
-	case <-ctx.Done():
-		return trace.Wrap(ctx.Err())
-	case p.AppsC <- apps:
-	}
-	return nil
-}
-
-func (p *appCollector) defineCollectorAsInitialized() {
-	p.once.Do(func() {
-		// mark watcher as initialized.
-		close(p.initializationC)
-	})
-}
-
-// processEventAndUpdateCurrent is called when a watcher event is received.
-func (p *appCollector) processEventAndUpdateCurrent(ctx context.Context, event types.Event) {
-	if event.Resource == nil || event.Resource.GetKind() != types.KindApp {
-		p.Log.Warnf("Unexpected event: %v.", event)
-		return
-	}
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	switch event.Type {
-	case types.OpDelete:
-		delete(p.current, event.Resource.GetName())
-		p.AppsC <- resourcesToSlice(p.current)
-
-		select {
-		case <-ctx.Done():
-		case p.AppsC <- resourcesToSlice(p.current):
-		}
-
-	case types.OpPut:
-		app, ok := event.Resource.(types.Application)
-		if !ok {
-			p.Log.Warnf("Unexpected resource type %T.", event.Resource)
-			return
-		}
-		p.current[app.GetName()] = app
-
-		select {
-		case <-ctx.Done():
-		case p.AppsC <- resourcesToSlice(p.current):
-		}
-	default:
-		p.Log.Warnf("Unsupported event type %s.", event.Type)
-		return
-	}
-}
-
-func (*appCollector) notifyStale() {}
-
-func resourcesToSlice[T any](resources map[string]T) (slice []T) {
+func resourcesToSlice[T any](resources map[string]T, cloneFunc func(T) T) (slice []T) {
 	for _, resource := range resources {
-		slice = append(slice, resource)
+		slice = append(slice, cloneFunc(resource))
 	}
 	return slice
 }
-
-// KubeClusterWatcherConfig is an KubeClusterWatcher configuration.
-type KubeClusterWatcherConfig struct {
-	// ResourceWatcherConfig is the resource watcher configuration.
-	ResourceWatcherConfig
-	// KubernetesGetter is responsible for fetching kube_cluster resources.
-	KubernetesGetter
-	// KubeClustersC receives up-to-date list of all kube_cluster resources.
-	KubeClustersC chan types.KubeClusters
-}
-
-// CheckAndSetDefaults checks parameters and sets default values.
-func (cfg *KubeClusterWatcherConfig) CheckAndSetDefaults() error {
-	if err := cfg.ResourceWatcherConfig.CheckAndSetDefaults(); err != nil {
-		return trace.Wrap(err)
-	}
-	if cfg.KubernetesGetter == nil {
-		getter, ok := cfg.Client.(KubernetesGetter)
-		if !ok {
-			return trace.BadParameter("missing parameter KubernetesGetter and Client not usable as KubernetesGetter")
-		}
-		cfg.KubernetesGetter = getter
-	}
-	if cfg.KubeClustersC == nil {
-		cfg.KubeClustersC = make(chan types.KubeClusters)
-	}
-	return nil
-}
-
-// NewKubeClusterWatcher returns a new instance of KubeClusterWatcher.
-func NewKubeClusterWatcher(ctx context.Context, cfg KubeClusterWatcherConfig) (*KubeClusterWatcher, error) {
-	if err := cfg.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	collector := &kubeCollector{
-		KubeClusterWatcherConfig: cfg,
-		initializationC:          make(chan struct{}),
-	}
-	watcher, err := newResourceWatcher(ctx, collector, cfg.ResourceWatcherConfig)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &KubeClusterWatcher{watcher, collector}, nil
-}
-
-// KubeClusterWatcher is built on top of resourceWatcher to monitor kube_cluster resources.
-type KubeClusterWatcher struct {
-	*resourceWatcher
-	*kubeCollector
-}
-
-// kubeCollector accompanies resourceWatcher when monitoring kube_cluster resources.
-type kubeCollector struct {
-	// KubeClusterWatcherConfig is the watcher configuration.
-	KubeClusterWatcherConfig
-	// current holds a map of the currently known kube_cluster resources.
-	current map[string]types.KubeCluster
-	// lock protects the "current" map.
-	lock sync.RWMutex
-	// initializationC is used to check whether the initial sync has completed
-	initializationC chan struct{}
-	once            sync.Once
-}
-
-// isInitialized is used to check that the cache has done its initial
-// sync
-func (k *kubeCollector) initializationChan() <-chan struct{} {
-	return k.initializationC
-}
-
-// resourceKind specifies the resource kind to watch.
-func (k *kubeCollector) resourceKind() string {
-	return types.KindKubernetesCluster
-}
-
-// getResourcesAndUpdateCurrent refreshes the list of current resources.
-func (k *kubeCollector) getResourcesAndUpdateCurrent(ctx context.Context) error {
-	clusters, err := k.KubernetesGetter.GetKubernetesClusters(ctx)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	newCurrent := make(map[string]types.KubeCluster, len(clusters))
-	for _, cluster := range clusters {
-		newCurrent[cluster.GetName()] = cluster
-	}
-	k.lock.Lock()
-	defer k.lock.Unlock()
-	k.current = newCurrent
-
-	select {
-	case <-ctx.Done():
-		return trace.Wrap(ctx.Err())
-	case k.KubeClustersC <- clusters:
-	}
-
-	k.defineCollectorAsInitialized()
-
-	return nil
-}
-
-func (k *kubeCollector) defineCollectorAsInitialized() {
-	k.once.Do(func() {
-		// mark watcher as initialized.
-		close(k.initializationC)
-	})
-}
-
-// processEventAndUpdateCurrent is called when a watcher event is received.
-func (k *kubeCollector) processEventAndUpdateCurrent(ctx context.Context, event types.Event) {
-	if event.Resource == nil || event.Resource.GetKind() != types.KindKubernetesCluster {
-		k.Log.Warnf("Unexpected event: %v.", event)
-		return
-	}
-	k.lock.Lock()
-	defer k.lock.Unlock()
-	switch event.Type {
-	case types.OpDelete:
-		delete(k.current, event.Resource.GetName())
-		k.KubeClustersC <- resourcesToSlice(k.current)
-
-		select {
-		case <-ctx.Done():
-		case k.KubeClustersC <- resourcesToSlice(k.current):
-		}
-
-	case types.OpPut:
-		cluster, ok := event.Resource.(types.KubeCluster)
-		if !ok {
-			k.Log.Warnf("Unexpected resource type %T.", event.Resource)
-			return
-		}
-		k.current[cluster.GetName()] = cluster
-
-		select {
-		case <-ctx.Done():
-		case k.KubeClustersC <- resourcesToSlice(k.current):
-		}
-	default:
-		k.Log.Warnf("Unsupported event type %s.", event.Type)
-		return
-	}
-}
-
-func (*kubeCollector) notifyStale() {}
 
 // CertAuthorityWatcherConfig is a CertAuthorityWatcher configuration.
 type CertAuthorityWatcherConfig struct {
@@ -1163,6 +1363,10 @@ type CertAuthorityWatcherConfig struct {
 	AuthorityGetter
 	// Types restricts which cert authority types are retrieved via the AuthorityGetter.
 	Types []types.CertAuthType
+	// LoadKeys determines whether private keys will be included.
+	LoadKeys bool
+	// ResourceC receives an up-to-date list of all cert authority resources.
+	ResourceC chan []types.CertAuthority
 }
 
 // CheckAndSetDefaults checks parameters and sets default values.
@@ -1177,28 +1381,74 @@ func (cfg *CertAuthorityWatcherConfig) CheckAndSetDefaults() error {
 		}
 		cfg.AuthorityGetter = getter
 	}
+	if len(cfg.Types) == 0 {
+		return trace.BadParameter("missing parameter Types")
+	}
 	return nil
 }
 
-// NewCertAuthorityWatcher returns a new instance of CertAuthorityWatcher.
-func NewCertAuthorityWatcher(ctx context.Context, cfg CertAuthorityWatcherConfig) (*CertAuthorityWatcher, error) {
+// NewCertAuthorityWatcher returns a new cert authority watcher instance.
+func NewCertAuthorityWatcher(ctx context.Context, cfg CertAuthorityWatcherConfig) (*GenericWatcher[types.CertAuthority, readonly.CertAuthority], error) {
+	if err := cfg.CheckAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	getter := cfg.AuthorityGetter
+	w, err := NewGenericResourceWatcher(ctx, GenericWatcherConfig[types.CertAuthority, readonly.CertAuthority]{
+		ResourceKind:          types.KindCertAuthority,
+		ResourceWatcherConfig: cfg.ResourceWatcherConfig,
+		ResourceGetter: func(ctx context.Context) ([]types.CertAuthority, error) {
+			var cas []types.CertAuthority
+			for _, t := range cfg.Types {
+				innerCAs, err := getter.GetCertAuthorities(ctx, t, cfg.LoadKeys)
+				if err != nil {
+					return nil, trace.Wrap(err)
+				}
+				cas = append(cas, innerCAs...)
+			}
+			return cas, nil
+		},
+		ResourceKey: func(resource types.CertAuthority) string {
+			return resource.GetSubKind() + "/" + resource.GetName()
+		},
+		DeleteKey: func(resource types.Resource) string {
+			return resource.GetSubKind() + "/" + resource.GetName()
+		},
+		ResourcesC: cfg.ResourceC,
+		CloneFunc:  types.CertAuthority.Clone,
+		ReadOnlyFunc: func(resource types.CertAuthority) readonly.CertAuthority {
+			return resource
+		},
+		LoadSecrets: cfg.LoadKeys,
+	})
+	return w, trace.Wrap(err)
+}
+
+// DeprecatedNewCertAuthorityWatcher returns a new instance of CertAuthorityWatcher.
+//
+// Deprecated: This has been replaced by NewCertAuthorityWatcher which uses the
+// newer generic watcher under the hood.
+func DeprecatedNewCertAuthorityWatcher(ctx context.Context, cfg CertAuthorityWatcherConfig) (*CertAuthorityWatcher, error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	collector := &caCollector{
 		CertAuthorityWatcherConfig: cfg,
-		fanout:                     NewFanout(),
-		cas:                        make(map[types.CertAuthType]map[string]types.CertAuthority, len(cfg.Types)),
-		initializationC:            make(chan struct{}),
+		fanout: NewFanoutV2(FanoutV2Config{
+			Capacity: smallFanoutCapacity,
+		}),
+		cas:             make(map[types.CertAuthType]map[string]types.CertAuthority, len(cfg.Types)),
+		filter:          make(types.CertAuthorityFilter, len(cfg.Types)),
+		initializationC: make(chan struct{}),
 	}
 
 	for _, t := range cfg.Types {
 		collector.cas[t] = make(map[string]types.CertAuthority)
+		collector.filter[t] = types.Wildcard
 	}
 	// Resource watcher require the fanout to be initialized before passing in.
 	// Otherwise, Emit() may fail due to a race condition mentioned in https://github.com/gravitational/teleport/issues/19289
-	collector.fanout.SetInit()
+	collector.fanout.SetInit(collector.resourceKinds())
 	watcher, err := newResourceWatcher(ctx, collector, cfg.ResourceWatcherConfig)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -1215,24 +1465,26 @@ type CertAuthorityWatcher struct {
 
 // caCollector accompanies resourceWatcher when monitoring cert authority resources.
 type caCollector struct {
-	CertAuthorityWatcherConfig
-	fanout *Fanout
-
-	// lock protects concurrent access to cas
-	lock sync.RWMutex
-	// cas maps ca type -> cluster -> ca
-	cas map[types.CertAuthType]map[string]types.CertAuthority
+	fanout *FanoutV2
+	cas    map[types.CertAuthType]map[string]types.CertAuthority
 	// initializationC is used to check whether the initial sync has completed
 	initializationC chan struct{}
-	once            sync.Once
+	filter          types.CertAuthorityFilter
+	CertAuthorityWatcherConfig
+	// lock protects concurrent access to cas
+	lock sync.RWMutex
+	once sync.Once
 }
 
 // Subscribe is used to subscribe to the lock updates.
 func (c *caCollector) Subscribe(ctx context.Context, filter types.CertAuthorityFilter) (types.Watcher, error) {
+	if len(filter) == 0 {
+		filter = c.filter
+	}
 	watch := types.Watch{
 		Kinds: []types.WatchKind{
 			{
-				Kind:   c.resourceKind(),
+				Kind:   types.KindCertAuthority,
 				Filter: filter.IntoMap(),
 			},
 		},
@@ -1252,9 +1504,9 @@ func (c *caCollector) Subscribe(ctx context.Context, filter types.CertAuthorityF
 	return sub, nil
 }
 
-// resourceKind specifies the resource kind to watch.
-func (c *caCollector) resourceKind() string {
-	return types.KindCertAuthority
+// resourceKinds specifies the resource kind to watch.
+func (c *caCollector) resourceKinds() []types.WatchKind {
+	return []types.WatchKind{{Kind: types.KindCertAuthority, Filter: c.filter.IntoMap()}}
 }
 
 // isInitialized is used to check that the cache has done its initial
@@ -1300,54 +1552,57 @@ func (c *caCollector) defineCollectorAsInitialized() {
 	})
 }
 
-// processEventAndUpdateCurrent is called when a watcher event is received.
-func (c *caCollector) processEventAndUpdateCurrent(ctx context.Context, event types.Event) {
-	if event.Resource == nil || event.Resource.GetKind() != types.KindCertAuthority {
-		c.Log.Warnf("Unexpected event: %v.", event)
-		return
-	}
+// processEventsAndUpdateCurrent is called when a watcher event is received.
+func (c *caCollector) processEventsAndUpdateCurrent(ctx context.Context, events []types.Event) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	switch event.Type {
-	case types.OpDelete:
-		caType := types.CertAuthType(event.Resource.GetSubKind())
-		if !c.watchingType(caType) {
-			return
-		}
 
-		delete(c.cas[caType], event.Resource.GetName())
-		c.fanout.Emit(event)
-	case types.OpPut:
-		ca, ok := event.Resource.(types.CertAuthority)
-		if !ok {
-			c.Log.Warnf("Unexpected resource type %T.", event.Resource)
-			return
-		}
+	eventsToEmit := events[:0]
 
-		if !c.watchingType(ca.GetType()) {
-			return
+	for _, event := range events {
+		if event.Resource == nil || event.Resource.GetKind() != types.KindCertAuthority {
+			c.Logger.WarnContext(ctx, "Received unexpected event", "event", logutils.StringerAttr(event))
+			continue
 		}
+		switch event.Type {
+		case types.OpDelete:
+			caType := types.CertAuthType(event.Resource.GetSubKind())
+			if !c.watchingType(caType) {
+				continue
+			}
 
-		authority, ok := c.cas[ca.GetType()][ca.GetName()]
-		if ok && CertAuthoritiesEquivalent(authority, ca) {
-			return
+			delete(c.cas[caType], event.Resource.GetName())
+			eventsToEmit = append(eventsToEmit, event)
+		case types.OpPut:
+			ca, ok := event.Resource.(types.CertAuthority)
+			if !ok {
+				c.Logger.WarnContext(ctx, "Received unexpected resource type", "resource", event.Resource.GetKind())
+				continue
+			}
+
+			if !c.watchingType(ca.GetType()) {
+				continue
+			}
+
+			authority, ok := c.cas[ca.GetType()][ca.GetName()]
+			if ok && authority.IsEqual(ca) {
+				continue
+			}
+
+			c.cas[ca.GetType()][ca.GetName()] = ca
+			eventsToEmit = append(eventsToEmit, event)
+		default:
+			c.Logger.WarnContext(ctx, "Received unsupported event type", "event_type", event.Type)
 		}
-
-		c.cas[ca.GetType()][ca.GetName()] = ca
-		c.fanout.Emit(event)
-	default:
-		c.Log.Warnf("Unsupported event type %s.", event.Type)
-		return
 	}
+
+	c.fanout.Emit(eventsToEmit...)
 }
 
 func (c *caCollector) watchingType(t types.CertAuthType) bool {
-	for _, caType := range c.Types {
-		if caType == t {
-			return true
-		}
+	if _, ok := c.cas[t]; ok {
+		return true
 	}
-
 	return false
 }
 
@@ -1355,186 +1610,60 @@ func (c *caCollector) notifyStale() {}
 
 // NodeWatcherConfig is a NodeWatcher configuration.
 type NodeWatcherConfig struct {
-	ResourceWatcherConfig
 	// NodesGetter is used to directly fetch the list of active nodes.
 	NodesGetter
-}
-
-// CheckAndSetDefaults checks parameters and sets default values.
-func (cfg *NodeWatcherConfig) CheckAndSetDefaults() error {
-	if err := cfg.ResourceWatcherConfig.CheckAndSetDefaults(); err != nil {
-		return trace.Wrap(err)
-	}
-	if cfg.NodesGetter == nil {
-		getter, ok := cfg.Client.(NodesGetter)
-		if !ok {
-			return trace.BadParameter("missing parameter NodesGetter and Client not usable as NodesGetter")
-		}
-		cfg.NodesGetter = getter
-	}
-	return nil
+	ResourceWatcherConfig
+	// ScopeFilter is an optional scope filter applied to the node watch. See
+	// GenericWatcherConfig.ScopeFilter for discussion of function. Node watchers
+	// that run on the teleport proxy need to see nodes in every scope for routing
+	// and should set this to MODE_ALL.
+	ScopeFilter *types.ScopeFilter
 }
 
 // NewNodeWatcher returns a new instance of NodeWatcher.
-func NewNodeWatcher(ctx context.Context, cfg NodeWatcherConfig) (*NodeWatcher, error) {
-	if err := cfg.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	collector := &nodeCollector{
-		NodeWatcherConfig: cfg,
-		current:           map[string]types.Server{},
-		initializationC:   make(chan struct{}),
-	}
-	watcher, err := newResourceWatcher(ctx, collector, cfg.ResourceWatcherConfig)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &NodeWatcher{watcher, collector}, nil
-}
-
-// NodeWatcher is built on top of resourceWatcher to monitor additions
-// and deletions to the set of nodes.
-type NodeWatcher struct {
-	*resourceWatcher
-	*nodeCollector
-}
-
-// nodeCollector accompanies resourceWatcher when monitoring nodes.
-type nodeCollector struct {
-	NodeWatcherConfig
-	// current holds a map of the currently known nodes (keyed by server name,
-	// RWMutex protected).
-	current map[string]types.Server
-	rw      sync.RWMutex
-	// initializationC is used to check whether the initial sync has completed
-	initializationC chan struct{}
-	once            sync.Once
-}
-
-// Node is a readonly subset of the types.Server interface which
-// users may filter by in GetNodes.
-type Node interface {
-	// ResourceWithLabels provides common resource headers
-	types.ResourceWithLabels
-	// GetTeleportVersion returns the teleport version the server is running on
-	GetTeleportVersion() string
-	// GetAddr return server address
-	GetAddr() string
-	// GetHostname returns server hostname
-	GetHostname() string
-	// GetNamespace returns server namespace
-	GetNamespace() string
-	// GetCmdLabels gets command labels
-	GetCmdLabels() map[string]types.CommandLabel
-	// GetPublicAddr is an optional field that returns the public address this cluster can be reached at.
-	GetPublicAddr() string
-	// GetRotation gets the state of certificate authority rotation.
-	GetRotation() types.Rotation
-	// GetUseTunnel gets if a reverse tunnel should be used to connect to this node.
-	GetUseTunnel() bool
-	// GetProxyID returns a list of proxy ids this server is connected to.
-	GetProxyIDs() []string
-}
-
-// GetNodes allows callers to retrieve a subset of nodes that match the filter provided. The
-// returned servers are a copy and can be safely modified. It is intentionally hard to retrieve
-// the full set of nodes to reduce the number of copies needed since the number of nodes can get
-// quite large and doing so can be expensive.
-func (n *nodeCollector) GetNodes(fn func(n Node) bool) []types.Server {
-	n.rw.RLock()
-	defer n.rw.RUnlock()
-
-	var matched []types.Server
-	for _, server := range n.current {
-		if fn(server) {
-			matched = append(matched, server.DeepCopy())
-		}
+func NewNodeWatcher(ctx context.Context, cfg NodeWatcherConfig) (*GenericWatcher[types.Server, readonly.Server], error) {
+	if cfg.NodesGetter == nil {
+		return nil, trace.BadParameter("NodesGetter must be provided")
 	}
 
-	return matched
-}
-
-func (n *nodeCollector) NodeCount() int {
-	n.rw.RLock()
-	defer n.rw.RUnlock()
-	return len(n.current)
-}
-
-// resourceKind specifies the resource kind to watch.
-func (n *nodeCollector) resourceKind() string {
-	return types.KindNode
-}
-
-// getResourcesAndUpdateCurrent is called when the resources should be
-// (re-)fetched directly.
-func (n *nodeCollector) getResourcesAndUpdateCurrent(ctx context.Context) error {
-	nodes, err := n.NodesGetter.GetNodes(ctx, apidefaults.Namespace)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	defer n.defineCollectorAsInitialized()
-
-	if len(nodes) == 0 {
-		return nil
-	}
-	newCurrent := make(map[string]types.Server, len(nodes))
-	for _, node := range nodes {
-		newCurrent[node.GetName()] = node
-	}
-	n.rw.Lock()
-	defer n.rw.Unlock()
-	n.current = newCurrent
-	return nil
-}
-
-func (n *nodeCollector) defineCollectorAsInitialized() {
-	n.once.Do(func() {
-		// mark watcher as initialized.
-		close(n.initializationC)
+	w, err := NewGenericResourceWatcher(ctx, GenericWatcherConfig[types.Server, readonly.Server]{
+		ResourceWatcherConfig: cfg.ResourceWatcherConfig,
+		ResourceKind:          types.KindNode,
+		ScopeFilter:           cfg.ScopeFilter,
+		ResourceGetter: func(ctx context.Context) ([]types.Server, error) {
+			return iterstream.Collect(cfg.NodesGetter.RangeSSHServers(ctx, presencev1.ListSSHServersRequest_builder{
+				ScopeFilter: cfg.ScopeFilter.ToProto(),
+			}.Build()))
+		},
+		ResourceKey: GetCursorForNode,
+		DeleteKey: func(res types.Resource) string {
+			// Delete events for scoped nodes carry a partially populated
+			// server so that the scope can be recovered from the key, while
+			// unscoped nodes only emit a resource header.
+			if node, ok := res.(types.Server); ok {
+				return GetCursorForNode(node)
+			}
+			return scopes.MakeResourceCursor("", res.GetName())
+		},
+		DisableUpdateBroadcast: true,
+		CloneFunc:              types.Server.DeepCopy,
+		ReadOnlyFunc: func(resource types.Server) readonly.Server {
+			return resource
+		},
 	})
+	return w, trace.Wrap(err)
 }
-
-// processEventAndUpdateCurrent is called when a watcher event is received.
-func (n *nodeCollector) processEventAndUpdateCurrent(ctx context.Context, event types.Event) {
-	if event.Resource == nil || event.Resource.GetKind() != types.KindNode {
-		n.Log.Warningf("Unexpected event: %v.", event)
-		return
-	}
-
-	n.rw.Lock()
-	defer n.rw.Unlock()
-
-	switch event.Type {
-	case types.OpDelete:
-		delete(n.current, event.Resource.GetName())
-	case types.OpPut:
-		server, ok := event.Resource.(types.Server)
-		if !ok {
-			n.Log.Warningf("Unexpected type %T.", event.Resource)
-			return
-		}
-		n.current[server.GetName()] = server
-	default:
-		n.Log.Warningf("Skipping unsupported event type %s.", event.Type)
-	}
-}
-
-func (n *nodeCollector) initializationChan() <-chan struct{} {
-	return n.initializationC
-}
-
-func (n *nodeCollector) notifyStale() {}
 
 // AccessRequestWatcherConfig is a AccessRequestWatcher configuration.
 type AccessRequestWatcherConfig struct {
-	// ResourceWatcherConfig is the resource watcher configuration.
-	ResourceWatcherConfig
 	// AccessRequestGetter is responsible for fetching access request resources.
 	AccessRequestGetter
-	// Filter is the filter to use to monitor access requests.
-	Filter types.AccessRequestFilter
 	// AccessRequestsC receives up-to-date list of all access request resources.
 	AccessRequestsC chan types.AccessRequests
+	// ResourceWatcherConfig is the resource watcher configuration.
+	ResourceWatcherConfig
+	// Filter is the filter to use to monitor access requests.
+	Filter types.AccessRequestFilter
 }
 
 // CheckAndSetDefaults checks parameters and sets default values.
@@ -1583,16 +1712,16 @@ type accessRequestCollector struct {
 	AccessRequestWatcherConfig
 	// current holds a map of the currently known access request resources.
 	current map[string]types.AccessRequest
-	// lock protects the "current" map.
-	lock sync.RWMutex
 	// initializationC is used to check that the watcher has been initialized properly.
 	initializationC chan struct{}
-	once            sync.Once
+	// lock protects the "current" map.
+	lock sync.RWMutex
+	once sync.Once
 }
 
-// resourceKind specifies the resource kind to watch.
-func (p *accessRequestCollector) resourceKind() string {
-	return types.KindAccessRequest
+// resourceKinds specifies the resource kind to watch.
+func (p *accessRequestCollector) resourceKinds() []types.WatchKind {
+	return []types.WatchKind{{Kind: types.KindAccessRequest}}
 }
 
 // isInitialized is used to check that the cache has done its initial
@@ -1609,7 +1738,7 @@ func (p *accessRequestCollector) getResourcesAndUpdateCurrent(ctx context.Contex
 	}
 	newCurrent := make(map[string]types.AccessRequest, len(accessRequests))
 	for _, accessRequest := range accessRequests {
-		newCurrent[accessRequest.GetName()] = accessRequest
+		newCurrent[accessRequest.GetName()] = accessRequest.Copy()
 	}
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -1632,37 +1761,137 @@ func (p *accessRequestCollector) defineCollectorAsInitialized() {
 	})
 }
 
-// processEventAndUpdateCurrent is called when a watcher event is received.
-func (p *accessRequestCollector) processEventAndUpdateCurrent(ctx context.Context, event types.Event) {
-	if event.Resource == nil || event.Resource.GetKind() != types.KindAccessRequest {
-		p.Log.Warnf("Unexpected event: %v.", event)
-		return
-	}
+// processEventsAndUpdateCurrent is called when a watcher event is received.
+func (p *accessRequestCollector) processEventsAndUpdateCurrent(ctx context.Context, events []types.Event) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	switch event.Type {
-	case types.OpDelete:
-		delete(p.current, event.Resource.GetName())
-		select {
-		case <-ctx.Done():
-		case p.AccessRequestsC <- resourcesToSlice(p.current):
-		}
-	case types.OpPut:
-		accessRequest, ok := event.Resource.(types.AccessRequest)
-		if !ok {
-			p.Log.Warnf("Unexpected resource type %T.", event.Resource)
-			return
-		}
-		p.current[accessRequest.GetName()] = accessRequest
-		select {
-		case <-ctx.Done():
-		case p.AccessRequestsC <- resourcesToSlice(p.current):
-		}
 
-	default:
-		p.Log.Warnf("Unsupported event type %s.", event.Type)
-		return
+	for _, event := range events {
+		if event.Resource == nil || event.Resource.GetKind() != types.KindAccessRequest {
+			p.Logger.WarnContext(ctx, "Received unexpected event", "event", logutils.StringerAttr(event))
+			continue
+		}
+		switch event.Type {
+		case types.OpDelete:
+			delete(p.current, event.Resource.GetName())
+			select {
+			case <-ctx.Done():
+			case p.AccessRequestsC <- resourcesToSlice(p.current, types.AccessRequest.Copy):
+			}
+		case types.OpPut:
+			accessRequest, ok := event.Resource.(types.AccessRequest)
+			if !ok {
+				p.Logger.WarnContext(ctx, "Received unexpected resource type", "resource", event.Resource.GetKind())
+				continue
+			}
+			p.current[accessRequest.GetName()] = accessRequest
+			select {
+			case <-ctx.Done():
+			case p.AccessRequestsC <- resourcesToSlice(p.current, types.AccessRequest.Copy):
+			}
+
+		default:
+			p.Logger.WarnContext(ctx, "Received unsupported event type", "event_type", event.Type)
+		}
 	}
 }
 
 func (*accessRequestCollector) notifyStale() {}
+
+// GitServerWatcherConfig is the config for Git server watcher.
+type GitServerWatcherConfig struct {
+	GitServerGetter
+	ResourceWatcherConfig
+
+	// EnableUpdateBroadcast turns on emitting updates on changes. Broadcast is
+	// opt-in for Git Server watcher.
+	EnableUpdateBroadcast bool
+}
+
+// NewGitServerWatcher returns a new instance of Git server watcher.
+func NewGitServerWatcher(ctx context.Context, cfg GitServerWatcherConfig) (*GenericWatcher[types.Server, readonly.Server], error) {
+	if cfg.GitServerGetter == nil {
+		return nil, trace.BadParameter("GitServerGetter must be provided")
+	}
+
+	w, err := NewGenericResourceWatcher(ctx, GenericWatcherConfig[types.Server, readonly.Server]{
+		ResourceWatcherConfig: cfg.ResourceWatcherConfig,
+		ResourceKind:          types.KindGitServer,
+		ResourceGetter: pagerFn[types.Server](
+			cfg.GitServerGetter.ListGitServers,
+		).getAll,
+		ResourceKey:            types.Server.GetName,
+		DisableUpdateBroadcast: !cfg.EnableUpdateBroadcast,
+		CloneFunc:              types.Server.DeepCopy,
+		ReadOnlyFunc: func(resource types.Server) readonly.Server {
+			return resource
+		},
+	})
+	return w, trace.Wrap(err)
+}
+
+// HealthCheckConfigWatcherConfig is the config for the health_check_config
+// watcher.
+type HealthCheckConfigWatcherConfig struct {
+	// Reader is used to fetch health check config resources.
+	Reader HealthCheckConfigReader
+	// ResourcesC receives up-to-date list of all health check config resources.
+	ResourcesC chan []*healthcheckconfigv1.HealthCheckConfig
+	// ResourceWatcherConfig is the resource watcher configuration.
+	ResourceWatcherConfig ResourceWatcherConfig
+}
+
+// HealthCheckConfigWatcher monitors health_check_config resources.
+type HealthCheckConfigWatcher = GenericWatcher[
+	*healthcheckconfigv1.HealthCheckConfig,
+	*healthcheckconfigv1.HealthCheckConfig,
+]
+
+// NewHealthCheckConfigWatcher returns a new instance of health check config
+// watcher.
+func NewHealthCheckConfigWatcher(
+	ctx context.Context,
+	cfg HealthCheckConfigWatcherConfig,
+) (*HealthCheckConfigWatcher, error) {
+	if cfg.Reader == nil {
+		return nil, trace.BadParameter("Reader must be provided")
+	}
+
+	w, err := NewGenericResourceWatcher(ctx, GenericWatcherConfig[
+		*healthcheckconfigv1.HealthCheckConfig,
+		*healthcheckconfigv1.HealthCheckConfig,
+	]{
+		ResourceWatcherConfig: cfg.ResourceWatcherConfig,
+		ResourceKind:          types.KindHealthCheckConfig,
+		ResourceGetter: pagerFn[*healthcheckconfigv1.HealthCheckConfig](
+			cfg.Reader.ListHealthCheckConfigs,
+		).getAll,
+		ResourceKey: func(resource *healthcheckconfigv1.HealthCheckConfig) string {
+			return resource.GetMetadata().GetName()
+		},
+		ResourcesC: cfg.ResourcesC,
+		CloneFunc:  apiutils.CloneProtoMsg[*healthcheckconfigv1.HealthCheckConfig],
+		ReadOnlyFunc: func(resource *healthcheckconfigv1.HealthCheckConfig) *healthcheckconfigv1.HealthCheckConfig {
+			return resource
+		},
+	})
+	return w, trace.Wrap(err)
+}
+
+type pagerFn[T any] func(ctx context.Context, limit int, startKey string) ([]T, string, error)
+
+func (fn pagerFn[T]) getAll(ctx context.Context) ([]T, error) {
+	var out []T
+	var token string
+	for {
+		page, nextToken, err := fn(ctx, apidefaults.DefaultChunkSize, token)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		out = append(out, page...)
+		if nextToken == "" {
+			return out, nil
+		}
+		token = nextToken
+	}
+}

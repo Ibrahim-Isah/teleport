@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package webauthncli
 
@@ -24,8 +28,8 @@ import (
 
 	"github.com/gravitational/trace"
 
+	"github.com/gravitational/teleport/api/utils/prompt"
 	"github.com/gravitational/teleport/lib/auth/touchid"
-	"github.com/gravitational/teleport/lib/utils/prompt"
 )
 
 // DefaultPrompt is a default implementation for LoginPrompt and
@@ -35,6 +39,10 @@ type DefaultPrompt struct {
 	FirstTouchMessage, SecondTouchMessage string
 	AcknowledgeTouchMessage               string
 	PromptCredentialMessage               string
+
+	// StdinFunc allows tests to override prompt.Stdin().
+	// If nil prompt.Stdin() is used.
+	StdinFunc func() prompt.StdinReader
 
 	ctx context.Context
 	out io.Writer
@@ -57,9 +65,16 @@ func NewDefaultPrompt(ctx context.Context, out io.Writer) *DefaultPrompt {
 	}
 }
 
+func (p *DefaultPrompt) stdin() prompt.StdinReader {
+	if p.StdinFunc == nil {
+		return prompt.Stdin()
+	}
+	return p.StdinFunc()
+}
+
 // PromptPIN prompts the user for a PIN.
 func (p *DefaultPrompt) PromptPIN() (string, error) {
-	return prompt.Password(p.ctx, p.out, prompt.Stdin(), p.PINMessage)
+	return prompt.Password(p.ctx, p.out, p.stdin(), p.PINMessage)
 }
 
 // PromptTouch prompts the user for a security key touch, using different
@@ -101,7 +116,7 @@ func (p *DefaultPrompt) PromptCredential(creds []*CredentialInfo) (*CredentialIn
 	}
 
 	for {
-		numOrName, err := prompt.Input(p.ctx, p.out, prompt.Stdin(), p.PromptCredentialMessage)
+		numOrName, err := prompt.Input(p.ctx, p.out, p.stdin(), p.PromptCredentialMessage)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}

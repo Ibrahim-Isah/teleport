@@ -18,16 +18,18 @@ package types
 
 import (
 	"fmt"
-	"regexp"
+	"net"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
+	"github.com/charlievieth/strcase"
+	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 
-	"github.com/gravitational/teleport/api/constants"
+	componentfeaturesv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/componentfeatures/v1"
 	"github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/api/utils/aws"
 )
 
 // Server represents a Node, Proxy or Auth server in a Teleport cluster
@@ -48,8 +50,10 @@ type Server interface {
 	GetCmdLabels() map[string]CommandLabel
 	// SetCmdLabels sets command labels.
 	SetCmdLabels(cmdLabels map[string]CommandLabel)
-	// GetPublicAddr is an optional field that returns the public address this cluster can be reached at.
+	// GetPublicAddr returns a public address where this server can be reached.
 	GetPublicAddr() string
+	// GetPublicAddrs returns a list of public addresses where this server can be reached.
+	GetPublicAddrs() []string
 	// GetRotation gets the state of certificate authority rotation.
 	GetRotation() Rotation
 	// SetRotation sets the state of certificate authority rotation.
@@ -62,39 +66,62 @@ type Server interface {
 	String() string
 	// SetAddr sets server address
 	SetAddr(addr string)
-	// SetPublicAddr sets the public address this cluster can be reached at.
-	SetPublicAddr(string)
+	// SetPublicAddrs sets the public addresses where this server can be reached.
+	SetPublicAddrs([]string)
 	// SetNamespace sets server namespace
 	SetNamespace(namespace string)
-	// GetApps gets the list of applications this server is proxying.
-	// DELETE IN 9.0.
-	GetApps() []*App
-	// GetApps gets the list of applications this server is proxying.
-	// DELETE IN 9.0.
-	SetApps([]*App)
-	// GetKubeClusters returns the kubernetes clusters directly handled by this
-	// server.
-	// DELETE IN 13.0.0
-	GetKubernetesClusters() []*KubernetesCluster
-	// SetKubeClusters sets the kubernetes clusters handled by this server.
-	// DELETE IN 13.0.0
-	SetKubernetesClusters([]*KubernetesCluster)
 	// GetPeerAddr returns the peer address of the server.
 	GetPeerAddr() string
 	// SetPeerAddr sets the peer address of the server.
 	SetPeerAddr(string)
 	// ProxiedService provides common methods for a proxied service.
 	ProxiedService
-	// MatchAgainst takes a map of labels and returns True if this server
-	// has ALL of them
-	//
-	// Any server matches against an empty label set
-	MatchAgainst(labels map[string]string) bool
-	// LabelsString returns a comma separated string with all node's labels
-	LabelsString() string
+
+	// GetRelayGroup returns the name of the Relay group that the server is
+	// connected to.
+	GetRelayGroup() string
+	// GetRelayIDs returns the list of Relay host IDs that the server is
+	// connected to.
+	GetRelayIDs() []string
 
 	// DeepCopy creates a clone of this server value
 	DeepCopy() Server
+
+	// CloneResource is used to return a clone of the Server and match the CloneAny interface
+	// This is helpful when interfacing with multiple types at the same time in unified resources
+	CloneResource() ResourceWithLabels
+
+	// GetCloudMetadata gets the cloud metadata for the server.
+	GetCloudMetadata() *CloudMetadata
+	// GetAWSInfo returns the AWSInfo for the server.
+	GetAWSInfo() *AWSInfo
+	// SetCloudMetadata sets the server's cloud metadata.
+	SetCloudMetadata(meta *CloudMetadata)
+
+	// IsOpenSSHNode returns whether the connection to this Server must use OpenSSH.
+	// This returns true for SubKindOpenSSHNode and SubKindOpenSSHEICENode.
+	IsOpenSSHNode() bool
+
+	// IsEICE returns whether the Node is an EICE instance.
+	// Must be `openssh-ec2-ice` subkind and have the AccountID and InstanceID information (AWS Metadata or Labels).
+	IsEICE() bool
+
+	// GetAWSInstanceID returns the AWS Instance ID if this node comes from an EC2 instance.
+	GetAWSInstanceID() string
+	// GetAWSAccountID returns the AWS Account ID if this node comes from an EC2 instance.
+	GetAWSAccountID() string
+
+	// GetGitHub returns the GitHub server spec.
+	GetGitHub() *GitHubServerMetadata
+	// GetScope returns the scope this server belongs to.
+	GetScope() string
+
+	// GetComponentFeatures returns the supported features for the server.
+	GetComponentFeatures() *componentfeaturesv1.ComponentFeatures
+	// SetComponentFeatures sets the supported features for the server.
+	SetComponentFeatures(*componentfeaturesv1.ComponentFeatures)
+	// GetImmutableLabels returns the immutable labels for the server.
+	GetImmutableLabels() map[string]string
 }
 
 // NewServer creates an instance of Server.
@@ -119,6 +146,73 @@ func NewServerWithLabels(name, kind string, spec ServerSpecV2, labels map[string
 	return server, nil
 }
 
+// NewNode is a convenience method to create a Server of Kind Node.
+func NewNode(name, subKind string, spec ServerSpecV2, labels map[string]string) (Server, error) {
+	server := &ServerV2{
+		Kind:    KindNode,
+		SubKind: subKind,
+		Metadata: Metadata{
+			Name:   name,
+			Labels: labels,
+		},
+		Spec: spec,
+	}
+	if err := server.CheckAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return server, nil
+}
+
+// NewNode is a convenience method to create an EICE Node.
+func NewEICENode(spec ServerSpecV2, labels map[string]string) (Server, error) {
+	server := &ServerV2{
+		Kind:    KindNode,
+		SubKind: SubKindOpenSSHEICENode,
+		Metadata: Metadata{
+			Labels: labels,
+		},
+		Spec: spec,
+	}
+	if err := server.CheckAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return server, nil
+}
+
+// NewGitHubServer creates a new Git server for GitHub.
+func NewGitHubServer(githubSpec GitHubServerMetadata) (Server, error) {
+	return NewGitHubServerWithName(uuid.NewString(), githubSpec)
+}
+
+// NewGitHubServerWithName creates a new Git server for GitHub with provided
+// name.
+func NewGitHubServerWithName(name string, githubSpec GitHubServerMetadata) (Server, error) {
+	server := &ServerV2{
+		Kind:    KindGitServer,
+		SubKind: SubKindGitHub,
+		Metadata: Metadata{
+			Name: name,
+		},
+		Spec: ServerSpecV2{
+			GitHub: &githubSpec,
+		},
+	}
+	if err := server.CheckAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return server, nil
+}
+
+// GetComponentFeatures returns the supported features for the server.
+func (s *ServerV2) GetComponentFeatures() *componentfeaturesv1.ComponentFeatures {
+	return s.Spec.ComponentFeatures
+}
+
+// SetComponentFeatures sets the supported features for the server.
+func (s *ServerV2) SetComponentFeatures(features *componentfeaturesv1.ComponentFeatures) {
+	s.Spec.ComponentFeatures = features
+}
+
 // GetVersion returns resource version
 func (s *ServerV2) GetVersion() string {
 	return s.Version
@@ -136,6 +230,11 @@ func (s *ServerV2) GetKind() string {
 
 // GetSubKind returns resource sub kind
 func (s *ServerV2) GetSubKind() string {
+	// if the server is a node subkind isn't set, this is a teleport node.
+	if s.Kind == KindNode && s.SubKind == "" {
+		return SubKindTeleportNode
+	}
+
 	return s.SubKind
 }
 
@@ -144,14 +243,14 @@ func (s *ServerV2) SetSubKind(sk string) {
 	s.SubKind = sk
 }
 
-// GetResourceID returns resource ID
-func (s *ServerV2) GetResourceID() int64 {
-	return s.Metadata.ID
+// GetRevision returns the revision
+func (s *ServerV2) GetRevision() string {
+	return s.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (s *ServerV2) SetResourceID(id int64) {
-	s.Metadata.ID = id
+// SetRevision sets the revision
+func (s *ServerV2) SetRevision(rev string) {
+	s.Metadata.SetRevision(rev)
 }
 
 // GetMetadata returns metadata
@@ -179,9 +278,9 @@ func (s *ServerV2) Expiry() time.Time {
 	return s.Metadata.Expiry()
 }
 
-// SetPublicAddr sets the public address this cluster can be reached at.
-func (s *ServerV2) SetPublicAddr(addr string) {
-	s.Spec.PublicAddr = addr
+// SetPublicAddrs sets the public proxy addresses where this server can be reached.
+func (s *ServerV2) SetPublicAddrs(addrs []string) {
+	s.Spec.PublicAddrs = addrs
 }
 
 // GetName returns server name
@@ -199,9 +298,18 @@ func (s *ServerV2) GetAddr() string {
 	return s.Spec.Addr
 }
 
-// GetPublicAddr is an optional field that returns the public address this cluster can be reached at.
+// GetPublicAddr returns a public address where this server can be reached.
 func (s *ServerV2) GetPublicAddr() string {
-	return s.Spec.PublicAddr
+	addrs := s.GetPublicAddrs()
+	if len(addrs) != 0 {
+		return addrs[0]
+	}
+	return ""
+}
+
+// GetPublicAddrs returns a list of public addresses where this server can be reached.
+func (s *ServerV2) GetPublicAddrs() []string {
+	return s.Spec.PublicAddrs
 }
 
 // GetRotation gets the state of certificate authority rotation.
@@ -229,18 +337,35 @@ func (s *ServerV2) GetHostname() string {
 	return s.Spec.Hostname
 }
 
+// GetLabel retrieves the label with the provided key. If not found
+// value will be empty and ok will be false.
+func (s *ServerV2) GetLabel(key string) (value string, ok bool) {
+	if v, ok := s.Spec.ImmutableLabels[key]; ok {
+		return v, ok
+	}
+
+	if cmd, ok := s.Spec.CmdLabels[key]; ok {
+		return cmd.Result, ok
+	}
+
+	v, ok := s.Metadata.Labels[key]
+	return v, ok
+}
+
+// GetLabels returns server's static label key pairs.
 // GetLabels and GetStaticLabels are the same, and that is intentional. GetLabels
 // exists to preserve backwards compatibility, while GetStaticLabels exists to
 // implement ResourcesWithLabels.
-
-// GetLabels returns server's static label key pairs
 func (s *ServerV2) GetLabels() map[string]string {
-	return s.Metadata.Labels
+	return s.GetStaticLabels()
 }
 
 // GetStaticLabels returns the server static labels.
+// GetLabels and GetStaticLabels are the same, and that is intentional. GetLabels
+// exists to preserve backwards compatibility, while GetStaticLabels exists to
+// implement ResourcesWithLabels.
 func (s *ServerV2) GetStaticLabels() map[string]string {
-	return s.Metadata.Labels
+	return CombineLabels(s.Spec.ImmutableLabels, s.Metadata.Labels, nil)
 }
 
 // SetStaticLabels sets the server static labels.
@@ -271,16 +396,6 @@ func (s *ServerV2) SetCmdLabels(cmdLabels map[string]CommandLabel) {
 	s.Spec.CmdLabels = LabelsToV2(cmdLabels)
 }
 
-// GetApps gets the list of applications this server is proxying.
-func (s *ServerV2) GetApps() []*App {
-	return s.Spec.Apps
-}
-
-// SetApps sets the list of applications this server is proxying.
-func (s *ServerV2) SetApps(apps []*App) {
-	s.Spec.Apps = apps
-}
-
 func (s *ServerV2) String() string {
 	return fmt.Sprintf("Server(name=%v, namespace=%v, addr=%v, labels=%v)", s.Metadata.Name, s.Metadata.Namespace, s.Spec.Addr, s.Metadata.Labels)
 }
@@ -300,48 +415,47 @@ func (s *ServerV2) SetProxyIDs(proxyIDs []string) {
 	s.Spec.ProxyIDs = proxyIDs
 }
 
+// GetRelayGroup implements [Server].
+func (s *ServerV2) GetRelayGroup() string {
+	if s == nil {
+		return ""
+	}
+	return s.Spec.RelayGroup
+}
+
+// GetRelayIDs implements [Server].
+func (s *ServerV2) GetRelayIDs() []string {
+	if s == nil {
+		return nil
+	}
+	return s.Spec.RelayIds
+}
+
 // GetAllLabels returns the full key:value map of both static labels and
 // "command labels"
 func (s *ServerV2) GetAllLabels() map[string]string {
 	// server labels (static and dynamic)
-	labels := CombineLabels(s.Metadata.Labels, s.Spec.CmdLabels)
-
-	// server-specific labels
-	switch s.Kind {
-	case KindKubeService:
-		for _, cluster := range s.Spec.KubernetesClusters {
-			// Combine cluster static and dynamic labels, and merge into
-			// `labels`.
-			for name, value := range CombineLabels(cluster.StaticLabels, cluster.DynamicLabels) {
-				labels[name] = value
-			}
-		}
-	}
-
+	labels := CombineLabels(s.Spec.ImmutableLabels, s.Metadata.Labels, s.Spec.CmdLabels)
 	return labels
 }
 
 // CombineLabels combines the passed in static and dynamic labels.
-func CombineLabels(static map[string]string, dynamic map[string]CommandLabelV2) map[string]string {
-	lmap := make(map[string]string)
+func CombineLabels(immutable, static map[string]string, dynamic map[string]CommandLabelV2) map[string]string {
+	if len(dynamic) == 0 && len(immutable) == 0 {
+		return static
+	}
+	lmap := make(map[string]string, len(static)+len(dynamic)+len(immutable))
 	for key, value := range static {
 		lmap[key] = value
 	}
 	for key, cmd := range dynamic {
 		lmap[key] = cmd.Result
 	}
+	// immutable labels must always override static and dynamic labels
+	for key, value := range immutable {
+		lmap[key] = value
+	}
 	return lmap
-}
-
-// GetKubernetesClusters returns the kubernetes clusters directly handled by this
-// server.
-// DEPRECATED, remove in 12.0.0
-func (s *ServerV2) GetKubernetesClusters() []*KubernetesCluster { return s.Spec.KubernetesClusters }
-
-// SetKubernetesClusters sets the kubernetes clusters handled by this server.
-// DEPRECATED, remove in 12.0.0
-func (s *ServerV2) SetKubernetesClusters(clusters []*KubernetesCluster) {
-	s.Spec.KubernetesClusters = clusters
 }
 
 // GetPeerAddr returns the peer address of the server.
@@ -354,36 +468,129 @@ func (s *ServerV2) SetPeerAddr(addr string) {
 	s.Spec.PeerAddr = addr
 }
 
-// MatchAgainst takes a map of labels and returns True if this server
-// has ALL of them
-//
-// Any server matches against an empty label set
-func (s *ServerV2) MatchAgainst(labels map[string]string) bool {
-	return MatchLabels(s, labels)
-}
-
-// LabelsString returns a comma separated string of all labels.
-func (s *ServerV2) LabelsString() string {
-	return LabelsAsString(s.Metadata.Labels, s.Spec.CmdLabels)
-}
-
-// LabelsAsString combines static and dynamic labels and returns a comma
-// separated string.
-func LabelsAsString(static map[string]string, dynamic map[string]CommandLabelV2) string {
-	labels := []string{}
-	for key, val := range static {
-		labels = append(labels, fmt.Sprintf("%s=%s", key, val))
-	}
-	for key, val := range dynamic {
-		labels = append(labels, fmt.Sprintf("%s=%s", key, val.Result))
-	}
-	sort.Strings(labels)
-	return strings.Join(labels, ",")
-}
-
 // setStaticFields sets static resource header and metadata fields.
 func (s *ServerV2) setStaticFields() {
 	s.Version = V2
+}
+
+// IsOpenSSHNode returns whether the connection to this Server must use OpenSSH.
+// This returns true for SubKindOpenSSHNode and SubKindOpenSSHEICENode.
+func (s *ServerV2) IsOpenSSHNode() bool {
+	return IsOpenSSHNodeSubKind(s.SubKind)
+}
+
+// IsOpenSSHNodeSubKind returns whether the Node SubKind is from a server which accepts connections over the
+// OpenSSH daemon (instead of a Teleport Node).
+func IsOpenSSHNodeSubKind(subkind string) bool {
+	return subkind == SubKindOpenSSHNode || subkind == SubKindOpenSSHEICENode
+}
+
+// GetAWSAccountID returns the AWS Account ID if this node comes from an EC2 instance.
+func (s *ServerV2) GetAWSAccountID() string {
+	awsAccountID, _ := s.GetLabel(AWSAccountIDLabel)
+
+	awsMetadata := s.GetAWSInfo()
+	if awsMetadata != nil && awsMetadata.AccountID != "" {
+		awsAccountID = awsMetadata.AccountID
+	}
+	return awsAccountID
+}
+
+// GetAWSInstanceID returns the AWS Instance ID if this node comes from an EC2 instance.
+func (s *ServerV2) GetAWSInstanceID() string {
+	awsInstanceID, _ := s.GetLabel(AWSInstanceIDLabel)
+
+	awsMetadata := s.GetAWSInfo()
+	if awsMetadata != nil && awsMetadata.InstanceID != "" {
+		awsInstanceID = awsMetadata.InstanceID
+	}
+	return awsInstanceID
+}
+
+// IsEICE returns whether the Node is an EICE instance.
+// Must be `openssh-ec2-ice` subkind and have the AccountID and InstanceID information (AWS Metadata or Labels).
+func (s *ServerV2) IsEICE() bool {
+	if s.SubKind != SubKindOpenSSHEICENode {
+		return false
+	}
+
+	return s.GetAWSAccountID() != "" && s.GetAWSInstanceID() != ""
+}
+
+// GetGitHub returns the GitHub server spec.
+func (s *ServerV2) GetGitHub() *GitHubServerMetadata {
+	return s.Spec.GitHub
+}
+
+// openSSHNodeCheckAndSetDefaults are common validations for OpenSSH nodes.
+// They include SubKindOpenSSHNode and SubKindOpenSSHEICENode.
+func (s *ServerV2) openSSHNodeCheckAndSetDefaults() error {
+	if s.Spec.Addr == "" {
+		return trace.BadParameter("addr must be set when server SubKind is %q", s.GetSubKind())
+	}
+	if len(s.GetPublicAddrs()) != 0 {
+		return trace.BadParameter("publicAddrs must not be set when server SubKind is %q", s.GetSubKind())
+	}
+	if s.Spec.Hostname == "" {
+		return trace.BadParameter("hostname must be set when server SubKind is %q", s.GetSubKind())
+	}
+
+	_, _, err := net.SplitHostPort(s.Spec.Addr)
+	if err != nil {
+		return trace.BadParameter("invalid Addr %q: %v", s.Spec.Addr, err)
+	}
+	return nil
+}
+
+// openSSHEC2InstanceConnectEndpointNodeCheckAndSetDefaults are validations for SubKindOpenSSHEICENode.
+func (s *ServerV2) openSSHEC2InstanceConnectEndpointNodeCheckAndSetDefaults() error {
+	if err := s.openSSHNodeCheckAndSetDefaults(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	// AWS fields are required for SubKindOpenSSHEICENode.
+	switch {
+	case s.Spec.CloudMetadata == nil || s.Spec.CloudMetadata.AWS == nil:
+		return trace.BadParameter("missing AWS CloudMetadata (required for %q SubKind)", s.SubKind)
+
+	case s.Spec.CloudMetadata.AWS.AccountID == "":
+		return trace.BadParameter("missing AWS Account ID (required for %q SubKind)", s.SubKind)
+
+	case s.Spec.CloudMetadata.AWS.Region == "":
+		return trace.BadParameter("missing AWS Region (required for %q SubKind)", s.SubKind)
+
+	case s.Spec.CloudMetadata.AWS.Integration == "":
+		return trace.BadParameter("missing AWS OIDC Integration (required for %q SubKind)", s.SubKind)
+
+	case s.Spec.CloudMetadata.AWS.InstanceID == "":
+		return trace.BadParameter("missing AWS InstanceID (required for %q SubKind)", s.SubKind)
+
+	case s.Spec.CloudMetadata.AWS.VPCID == "":
+		return trace.BadParameter("missing AWS VPC ID (required for %q SubKind)", s.SubKind)
+
+	case s.Spec.CloudMetadata.AWS.SubnetID == "":
+		return trace.BadParameter("missing AWS Subnet ID (required for %q SubKind)", s.SubKind)
+	}
+
+	return nil
+}
+
+// serverNameForEICE returns the deterministic Server's name for an EICE instance.
+// This name must comply with the expected format for EC2 Nodes as defined here: api/utils/aws.IsEC2NodeID
+// Returns an error if AccountID or InstanceID is not present.
+func serverNameForEICE(s *ServerV2) (string, error) {
+	awsAccountID := s.GetAWSAccountID()
+	awsInstanceID := s.GetAWSInstanceID()
+
+	if awsAccountID != "" && awsInstanceID != "" {
+		eiceNodeName := fmt.Sprintf("%s-%s", awsAccountID, awsInstanceID)
+		if !aws.IsEC2NodeID(eiceNodeName) {
+			return "", trace.BadParameter("invalid account %q or instance id %q", awsAccountID, awsInstanceID)
+		}
+		return eiceNodeName, nil
+	}
+
+	return "", trace.BadParameter("missing account id or instance id in %s node", SubKindOpenSSHEICENode)
 }
 
 // CheckAndSetDefaults checks and set default values for any missing fields.
@@ -391,12 +598,44 @@ func (s *ServerV2) CheckAndSetDefaults() error {
 	// TODO(awly): default s.Metadata.Expiry if not set (use
 	// defaults.ServerAnnounceTTL).
 	s.setStaticFields()
+
+	if s.Metadata.Name == "" {
+		switch s.SubKind {
+		case SubKindOpenSSHEICENode:
+			// For EICE nodes, use a deterministic name.
+			eiceNodeName, err := serverNameForEICE(s)
+			if err != nil {
+				return trace.Wrap(err)
+			}
+			s.Metadata.Name = eiceNodeName
+		case SubKindOpenSSHNode:
+			// if the server is a registered OpenSSH node, allow the name to be
+			// randomly generated
+			s.Metadata.Name = uuid.NewString()
+		case SubKindGitHub:
+			s.Metadata.Name = uuid.NewString()
+		}
+	}
+
 	if err := s.Metadata.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}
 
-	if s.Kind == "" {
+	switch s.Kind {
+	case "":
 		return trace.BadParameter("server Kind is empty")
+	case KindNode:
+		if err := s.nodeCheckAndSetDefaults(); err != nil {
+			return trace.Wrap(err)
+		}
+	case KindGitServer:
+		if err := s.gitServerCheckAndSetDefaults(); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		if s.SubKind != "" {
+			return trace.BadParameter(`server SubKind must only be set when Kind is "node" or "git_server"`)
+		}
 	}
 
 	for key := range s.Spec.CmdLabels {
@@ -404,47 +643,171 @@ func (s *ServerV2) CheckAndSetDefaults() error {
 			return trace.BadParameter("invalid label key: %q", key)
 		}
 	}
-	for _, kc := range s.Spec.KubernetesClusters {
-		if !validKubeClusterName.MatchString(kc.Name) {
-			return trace.BadParameter("invalid kubernetes cluster name: %q", kc.Name)
+	return nil
+}
+
+func (s *ServerV2) nodeCheckAndSetDefaults() error {
+	switch s.SubKind {
+	case "", SubKindTeleportNode:
+		// allow but do nothing
+	case SubKindOpenSSHNode:
+		if err := s.openSSHNodeCheckAndSetDefaults(); err != nil {
+			return trace.Wrap(err)
 		}
+
+	case SubKindOpenSSHEICENode:
+		if err := s.openSSHEC2InstanceConnectEndpointNodeCheckAndSetDefaults(); err != nil {
+			return trace.Wrap(err)
+		}
+
+	default:
+		return trace.BadParameter("invalid SubKind %q of Kind %q", s.SubKind, s.Kind)
+	}
+	return nil
+}
+
+func (s *ServerV2) gitServerCheckAndSetDefaults() error {
+	switch s.SubKind {
+	case SubKindGitHub:
+		return trace.Wrap(s.githubCheckAndSetDefaults())
+	default:
+		return trace.BadParameter("invalid SubKind %q of Kind %q", s.SubKind, s.Kind)
+	}
+}
+
+func (s *ServerV2) githubCheckAndSetDefaults() error {
+	if s.Spec.GitHub == nil {
+		return trace.BadParameter("github must be set for Subkind %q", s.SubKind)
+	}
+	if s.Spec.GitHub.Integration == "" {
+		return trace.BadParameter("integration must be set for Subkind %q", s.SubKind)
+	}
+	if err := ValidateGitHubOrganizationName(s.Spec.GitHub.Organization); err != nil {
+		return trace.Wrap(err, "invalid GitHub organization name")
 	}
 
+	// Set SSH host port for connection and "fake" hostname for routing. These
+	// values are hard-coded and cannot be customized.
+	s.Spec.Addr = "github.com:22"
+	s.Spec.Hostname = MakeGitHubOrgServerDomain(s.Spec.GitHub.Organization)
+	if s.Metadata.Labels == nil {
+		s.Metadata.Labels = make(map[string]string)
+	}
+	s.Metadata.Labels[GitHubOrgLabel] = s.Spec.GitHub.Organization
 	return nil
 }
 
 // MatchSearch goes through select field values and tries to
 // match against the list of search values.
 func (s *ServerV2) MatchSearch(values []string) bool {
-	var fieldVals []string
-	var custom func(val string) bool
-
-	if s.GetKind() == KindNode {
-		fieldVals = append(utils.MapToStrings(s.GetAllLabels()), s.GetName(), s.GetHostname(), s.GetAddr())
-
-		if s.GetUseTunnel() {
-			custom = func(val string) bool {
-				return strings.EqualFold(val, "tunnel")
+	switch s.Kind {
+	case KindNode, KindGitServer:
+	default:
+		return false
+	}
+Outer:
+	for _, searchV := range values {
+		for key, value := range s.Metadata.Labels {
+			if strcase.Contains(key, searchV) || strcase.Contains(value, searchV) {
+				continue Outer
 			}
 		}
+		for key, cmd := range s.Spec.CmdLabels {
+			if strcase.Contains(key, searchV) || strcase.Contains(cmd.Result, searchV) {
+				continue Outer
+			}
+		}
+
+		if strcase.Contains(s.Metadata.Name, searchV) {
+			continue
+		}
+
+		if strcase.Contains(s.Spec.Hostname, searchV) {
+			continue
+		}
+
+		if strcase.Contains(s.Spec.Addr, searchV) {
+			continue
+		}
+
+		for _, addr := range s.Spec.PublicAddrs {
+			if strcase.Contains(addr, searchV) {
+				continue Outer
+			}
+		}
+
+		if s.GetUseTunnel() && strings.EqualFold(searchV, "tunnel") {
+			continue
+		}
+
+		// When no fields matched a value, prematurely end if we can.
+		return false
 	}
 
-	return MatchSearch(fieldVals, values, custom)
+	return true
 }
 
 // DeepCopy creates a clone of this server value
 func (s *ServerV2) DeepCopy() Server {
-	return proto.Clone(s).(*ServerV2)
+	return utils.CloneProtoMsg(s)
 }
 
-// IsAWSConsole returns true if this app is AWS management console.
-func (a *App) IsAWSConsole() bool {
-	return strings.HasPrefix(a.URI, constants.AWSConsoleURL)
+// CloneResource creates a clone of this server value
+func (s *ServerV2) CloneResource() ResourceWithLabels {
+	return s.DeepCopy()
 }
 
-// GetAWSAccountID returns value of label containing AWS account ID on this app.
-func (a *App) GetAWSAccountID() string {
-	return a.StaticLabels[constants.AWSAccountIDLabel]
+// GetCloudMetadata gets the cloud metadata for the server.
+func (s *ServerV2) GetCloudMetadata() *CloudMetadata {
+	return s.Spec.CloudMetadata
+}
+
+// GetAWSInfo gets the AWS Cloud metadata for the server.
+func (s *ServerV2) GetAWSInfo() *AWSInfo {
+	if s.Spec.CloudMetadata == nil {
+		return nil
+	}
+
+	return s.Spec.CloudMetadata.AWS
+}
+
+// SetCloudMetadata sets the server's cloud metadata.
+func (s *ServerV2) SetCloudMetadata(meta *CloudMetadata) {
+	s.Spec.CloudMetadata = meta
+}
+
+// GetScope returns the scope this server belongs to.
+func (s *ServerV2) GetScope() string {
+	return s.Scope
+}
+
+// GetImmutableLabels returns the immutable labels for the server.
+func (s *ServerV2) GetImmutableLabels() map[string]string {
+	return s.Spec.ImmutableLabels
+}
+
+// GetAzureVMID returns the Azure VM ID, if this node comes from Azure.
+func GetAzureVMID(s Server) string {
+	val, _ := s.GetLabel(VMIDLabelInternal)
+	return val
+}
+
+// GetAzureSubscriptionID returns the Azure subscription ID, if this node comes from Azure.
+func GetAzureSubscriptionID(s Server) string {
+	val, _ := s.GetLabel(SubscriptionIDLabelInternal)
+	return val
+}
+
+// GetAzureRegion returns the Azure region, if this node comes from Azure.
+func GetAzureRegion(s Server) string {
+	val, _ := s.GetLabel(RegionLabelInternal)
+	return val
+}
+
+// GetAzureResourceGroup returns the Azure resource group, if this node comes from Azure.
+func GetAzureResourceGroup(s Server) string {
+	val, _ := s.GetLabel(ResourceGroupLabelInternal)
+	return val
 }
 
 // CommandLabel is a label that has a value as a result of the
@@ -523,12 +886,6 @@ func LabelsToV2(labels map[string]CommandLabel) map[string]CommandLabelV2 {
 	return out
 }
 
-// validKubeClusterName filters the allowed characters in kubernetes cluster
-// names. We need this because cluster names are used for cert filenames on the
-// client side, in the ~/.tsh directory. Restricting characters helps with
-// sneaky cluster names being used for client directory traversal and exploits.
-var validKubeClusterName = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
-
 // Servers represents a list of servers.
 type Servers []Server
 
@@ -600,4 +957,30 @@ func (s Servers) GetFieldVals(field string) ([]string, error) {
 	}
 
 	return vals, nil
+}
+
+// MakeGitHubOrgServerDomain creates a special domain name used in server's
+// host address to identify the GitHub organization.
+func MakeGitHubOrgServerDomain(org string) string {
+	return fmt.Sprintf("%s.%s", org, GitHubOrgServerDomain)
+}
+
+// GetGitHubOrgFromNodeAddr parses the organization from the node address.
+func GetGitHubOrgFromNodeAddr(addr string) (string, bool) {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		addr = host
+	}
+	if strings.HasSuffix(addr, "."+GitHubOrgServerDomain) {
+		return strings.TrimSuffix(addr, "."+GitHubOrgServerDomain), true
+	}
+	return "", false
+}
+
+// GetOrganizationURL returns the URL to the GitHub organization.
+func (m *GitHubServerMetadata) GetOrganizationURL() string {
+	if m == nil {
+		return ""
+	}
+	// Public github.com for now.
+	return fmt.Sprintf("%s/%s", GithubURL, m.Organization)
 }

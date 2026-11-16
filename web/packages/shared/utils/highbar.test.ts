@@ -1,20 +1,22 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { arrayObjectIsEqual, mergeDeep } from './highbar';
+import { arrayObjectIsEqual, equalsDeep, mergeDeep, runOnce } from './highbar';
 
 describe('mergeDeep can merge two', () => {
   it('objects together', () => {
@@ -218,4 +220,177 @@ describe('arrayObjectIsEqual correctly compares', () => {
 
     expect(arrayObjectIsEqual(a, b)).toBe(true);
   });
+});
+
+describe('equalsDeep', () => {
+  describe.each([false, true])('with ignoreUndefined=%s', ignoreUndefined => {
+    it('compares primitive values', () => {
+      expect(equalsDeep(1, 2, { ignoreUndefined })).toBe(false);
+      expect(equalsDeep(2, 2, { ignoreUndefined })).toBe(true);
+    });
+
+    it('compares simple objects', () => {
+      expect(equalsDeep({}, {}, { ignoreUndefined })).toBe(true);
+      expect(
+        equalsDeep({ a: 'b', c: 4 }, { c: 5, a: 'b' }, { ignoreUndefined })
+      ).toBe(false);
+      expect(
+        equalsDeep({ a: 'b', c: 4 }, { c: 4, a: 'b' }, { ignoreUndefined })
+      ).toBe(true);
+
+      // Corner case: falsy values
+      expect(
+        equalsDeep({}, { a: 0, b: false, c: '' }, { ignoreUndefined })
+      ).toBe(false);
+    });
+
+    it('compares complex objects', () => {
+      expect(
+        equalsDeep(
+          { a: 'b', c: 1, d: [2, { e: 'f' }] },
+          { a: 'b', c: 5, d: [2, { e: 'f' }] },
+          { ignoreUndefined }
+        )
+      ).toBe(false);
+      expect(
+        equalsDeep(
+          { a: 'b', c: 1, d: [2, { e: 'f' }] },
+          { a: 'b', c: 1, d: [5, { e: 'f' }] },
+          { ignoreUndefined }
+        )
+      ).toBe(false);
+      expect(
+        equalsDeep(
+          { a: 'b', c: 1, d: [2, { e: 'f' }] },
+          { a: 'b', c: 1, d: [2, { e: 'f' }, 3] },
+          { ignoreUndefined }
+        )
+      ).toBe(false);
+      expect(
+        equalsDeep(
+          { a: 'b', c: 1, d: [2, { e: 'f' }] },
+          { a: 'b', c: 1, d: [2, { e: 'z' }] },
+          { ignoreUndefined }
+        )
+      ).toBe(false);
+      expect(
+        equalsDeep(
+          { a: 'b', c: 1, d: [2, { e: 'f' }] },
+          { a: 'b', c: 1, d: [2, { e: 'f' }], g: 'h' },
+          { ignoreUndefined }
+        )
+      ).toBe(false);
+      expect(
+        equalsDeep(
+          { a: 'b', c: 1, d: [{ e: 'f' }, 2] },
+          { a: 'b', c: 1, d: [2, { e: 'f' }] },
+          { ignoreUndefined }
+        )
+      ).toBe(false);
+      expect(
+        equalsDeep(
+          { a: 'b', c: 1, d: [2, { e: 'f' }] },
+          { a: 'b', z: 1, d: [2, { e: 'f' }] },
+          { ignoreUndefined }
+        )
+      ).toBe(false);
+
+      expect(
+        equalsDeep(
+          { a: 'b', c: 1, d: [2, { e: 'f' }] },
+          { a: 'b', c: 1, d: [2, { e: 'f' }] },
+          { ignoreUndefined }
+        )
+      ).toBe(true);
+    });
+  });
+
+  it.each`
+    options                       | result
+    ${undefined}                  | ${false}
+    ${{ ignoreUndefined: false }} | ${false}
+    ${{ ignoreUndefined: true }}  | ${true}
+  `('returns $result for options set to $options', ({ options, result }) => {
+    expect(equalsDeep({ a: undefined, b: 1 }, { b: 1 }, options)).toBe(result);
+    expect(equalsDeep({ b: 1 }, { a: undefined, b: 1 }, options)).toBe(result);
+    expect(equalsDeep({}, { a: undefined }, options)).toBe(result);
+
+    // Corner case: The same number of fields.
+    expect(
+      equalsDeep({ a: undefined, b: 1 }, { b: 1, c: undefined }, options)
+    ).toBe(result);
+
+    // And the same thing, but in the deep.
+    expect(
+      equalsDeep(
+        { a: { b: undefined, c: 1 } },
+        { a: { c: 1, d: undefined } },
+        options
+      )
+    ).toBe(result);
+
+    // Crossing an array.
+    expect(
+      equalsDeep(
+        { a: [{ b: undefined, c: 1 }] },
+        { a: [{ c: 1, d: undefined }] },
+        options
+      )
+    ).toBe(result);
+  });
+
+  // A "real-world" example.
+  it('compares role options', () => {
+    const makeOptions = () => ({
+      cert_format: 'standard',
+      create_db_user: false,
+      create_desktop_user: false,
+      desktop_clipboard: true,
+      desktop_directory_sharing: true,
+      enhanced_recording: ['command', 'network'],
+      forward_agent: false,
+      max_session_ttl: '30h0m0s',
+      pin_source_ip: false,
+      port_forwarding: true,
+      record_session: {
+        default: 'best_effort',
+        desktop: true,
+      },
+      ssh_file_copy: true,
+    });
+
+    expect(equalsDeep(makeOptions(), makeOptions())).toBe(true);
+    expect(
+      equalsDeep(makeOptions(), {
+        ...makeOptions(),
+        unknown_option: 'foo',
+      })
+    ).toBe(false);
+  });
+});
+
+test('runOnce only runs once and preserves "this"', () => {
+  class Class {
+    private value: symbol;
+
+    update = runOnce(function (this: Class) {
+      const value = Symbol();
+      // Store the value to make sure 'this' is passed correctly through runOnce,
+      // even when used in that complex way.
+      this.value = value;
+      return value;
+    });
+  }
+
+  const c = new Class();
+
+  // First call updates the value (and doesn't throw because of 'this' being undefined).
+  let firstReturnValue: symbol;
+  expect(() => {
+    firstReturnValue = c.update();
+  }).not.toThrow();
+
+  // Subsequent calls return the same value.
+  const secondReturnValue = c.update();
+  expect(secondReturnValue).toBe(firstReturnValue);
 });

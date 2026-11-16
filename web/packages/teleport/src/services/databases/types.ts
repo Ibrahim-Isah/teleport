@@ -1,39 +1,73 @@
-/*
-Copyright 2021-2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
+import { ResourceTargetHealth } from 'shared/components/UnifiedResources';
 import { DbProtocol } from 'shared/services/databases';
 
-import { AgentLabel } from 'teleport/services/agents';
+import { ResourceLabel } from 'teleport/services/agents';
+
+import { AwsRdsDatabase, RdsEngine, Regions } from '../integrations';
+
+export enum IamPolicyStatus {
+  // Unspecified flag is most likely a result
+  // from an older service that do not set this state
+  Unspecified = 'IAM_POLICY_STATUS_UNSPECIFIED',
+  Pending = 'IAM_POLICY_STATUS_PENDING',
+  Failed = 'IAM_POLICY_STATUS_FAILED',
+  Success = 'IAM_POLICY_STATUS_SUCCESS',
+}
+
+export type Aws = {
+  rds: Pick<
+    AwsRdsDatabase,
+    'resourceId' | 'region' | 'subnets' | 'vpcId' | 'securityGroups'
+  >;
+  iamPolicyStatus: IamPolicyStatus;
+};
 
 export interface Database {
+  kind: 'db';
   name: string;
   description: string;
   type: string;
   protocol: DbProtocol;
-  labels: AgentLabel[];
+  labels: ResourceLabel[];
   names?: string[];
   users?: string[];
+  roles?: string[];
   hostname: string;
+  aws?: Aws;
+  requiresRequest?: boolean;
+  supportsInteractive?: boolean;
+  autoUsersEnabled?: boolean;
+  /**
+   * targetHealth describes the health status of network connectivity
+   * reported from an agent (db_service) that is proxying this database.
+   *
+   * This field will be empty if the database was not extracted from
+   * a db_server resource. The following endpoints will set this field
+   * since these endpoints query for db_server under the hood and then
+   * extract db from it:
+   * - webapi/sites/:site/databases/:database (singular)
+   * - webapi/sites/:site/resources (unified resources)
+   */
+  targetHealth?: ResourceTargetHealth;
 }
-
-export type DatabasesResponse = {
-  databases: Database[];
-  startKey?: string;
-  totalCount?: number;
-};
 
 export type UpdateDatabaseRequest = Omit<
   Partial<CreateDatabaseRequest>,
@@ -44,15 +78,13 @@ export type UpdateDatabaseRequest = Omit<
 
 export type CreateDatabaseRequest = {
   name: string;
-  protocol: DbProtocol;
+  protocol: DbProtocol | RdsEngine;
   uri: string;
-  labels?: AgentLabel[];
-  awsRds?: AwsRds;
-};
-
-export type AwsRds = {
-  accountId: string;
-  resourceId: string;
+  labels?: ResourceLabel[];
+  awsRds?: AwsRdsDatabase;
+  awsRegion?: Regions;
+  awsVpcId?: string;
+  overwrite?: boolean;
 };
 
 export type DatabaseIamPolicyResponse = {
@@ -60,7 +92,7 @@ export type DatabaseIamPolicyResponse = {
   aws: DatabaseIamPolicyAws;
 };
 
-export type DatabaseIamPolicyAws = {
+type DatabaseIamPolicyAws = {
   policy_document: string;
   placeholders: string;
 };
@@ -77,4 +109,10 @@ export type DatabaseServicesResponse = {
   services: DatabaseService[];
   startKey?: string;
   totalCount?: number;
+};
+
+export type DatabaseServer = {
+  hostname: string;
+  hostId: string;
+  targetHealth?: ResourceTargetHealth;
 };

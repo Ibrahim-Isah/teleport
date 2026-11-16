@@ -19,12 +19,13 @@ package retryutils
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 )
 
 // Retry is an interface that provides retry logic
@@ -185,15 +186,24 @@ func (r *Linear) For(ctx context.Context, retryFn func() error) error {
 		if err == nil {
 			return nil
 		}
-		if _, ok := trace.Unwrap(err).(*permanentRetryError); ok {
+		var permanentRetryError *permanentRetryError
+		if errors.As(trace.Unwrap(err), &permanentRetryError) {
 			return trace.Wrap(err)
 		}
-		log.Debugf("Will retry in %v: %v.", r.Duration(), err)
+		slog.DebugContext(ctx,
+			"Waiting to retry operation again",
+			"wait", r.Duration().String(),
+
+			// Unwrap the error so we do not log the stack trace, which can make
+			// a totally benign/expected error (e.g. failing to acquire a leader
+			// lock) appear more serious.
+			"error", trace.Unwrap(err),
+		)
 		select {
 		case <-r.After():
 			r.Inc()
 		case <-ctx.Done():
-			return trace.LimitExceeded(ctx.Err().Error())
+			return trace.LimitExceeded("%s", ctx.Err())
 		}
 	}
 }
@@ -213,7 +223,20 @@ func (e *permanentRetryError) Error() string {
 	return e.err.Error()
 }
 
-// RetryFastFor retries a function repeatedly for a set amount of
+// Unwrap returns the original error.
+func (e *permanentRetryError) Unwrap() error {
+	return e.err
+}
+
+// IsPermanent returns true if the error is a permanent retry error.
+// Useful when testing functions used in the retry loop.
+func IsPermanent(err error) bool {
+	var permanentRetryError *permanentRetryError
+	ok := errors.As(err, &permanentRetryError)
+	return ok
+}
+
+// RetryStaticFor retries a function repeatedly for a set amount of
 // time before returning an error.
 //
 // Intended mostly for tests.

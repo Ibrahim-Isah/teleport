@@ -1,31 +1,38 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
 	"context"
+	"errors"
 	"io"
-	"math/rand"
+	"log/slog"
+	"math/rand/v2"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
+
+	"github.com/gravitational/teleport"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // NewLoadBalancer returns new load balancer listening on frontend
@@ -45,20 +52,16 @@ func newLoadBalancer(ctx context.Context, frontend NetAddr, policy loadBalancerP
 	if ctx == nil {
 		return nil, trace.BadParameter("missing parameter context")
 	}
-	waitCtx, waitCancel := context.WithCancel(ctx)
+
 	return &LoadBalancer{
-		frontend:   frontend,
-		ctx:        ctx,
-		backends:   backends,
-		policy:     policy,
-		waitCtx:    waitCtx,
-		waitCancel: waitCancel,
-		Entry: log.WithFields(log.Fields{
-			trace.Component: "loadbalancer",
-			trace.ComponentFields: log.Fields{
-				"listen": frontend.String(),
-			},
-		}),
+		frontend: frontend,
+		ctx:      ctx,
+		backends: backends,
+		policy:   policy,
+		logger: slog.With(
+			teleport.ComponentKey, "loadbalancer",
+			"frontend_addr", frontend.FullAddress(),
+		),
 		connections: make(map[NetAddr]map[int64]net.Conn),
 	}, nil
 }
@@ -89,25 +92,25 @@ func randomPolicy() loadBalancerPolicy {
 		if len(backends) == 0 {
 			return NetAddr{}, trace.ConnectionProblem(nil, "no backends")
 		}
-		i := rand.Intn(len(backends))
+		i := rand.N(len(backends))
 		return backends[i], nil
 	}
 }
 
-// LoadBalancer implements naive round robin TCP load
-// balancer used in tests.
+// LoadBalancer is a simple load balancer implementation.
+// It does not do any health checking of backends and is not suitable for production usage.
 type LoadBalancer struct {
 	sync.RWMutex
-	connID int64
-	*log.Entry
+	connID      int64
+	logger      *slog.Logger
 	frontend    NetAddr
 	backends    []NetAddr
 	ctx         context.Context
 	policy      loadBalancerPolicy
 	listener    net.Listener
 	connections map[NetAddr]map[int64]net.Conn
-	waitCtx     context.Context
-	waitCancel  context.CancelFunc
+
+	PROXYHeader []byte // optional PROXY header that load balancer will send to the backend on every new connection.
 }
 
 // trackeConnection adds connection to the connection tracker
@@ -149,7 +152,7 @@ func (l *LoadBalancer) AddBackend(b NetAddr) {
 	l.Lock()
 	defer l.Unlock()
 	l.backends = append(l.backends, b)
-	l.Debugf("Backends %v.", l.backends)
+	l.logger.DebugContext(l.ctx, "Backends updated", "backends", l.backends)
 }
 
 // RemoveBackend removes backend
@@ -158,7 +161,7 @@ func (l *LoadBalancer) RemoveBackend(b NetAddr) error {
 	defer l.Unlock()
 	for i := range l.backends {
 		if l.backends[i] == b {
-			l.backends = append(l.backends[:i], l.backends[i+1:]...)
+			l.backends = slices.Delete(l.backends, i, i+1)
 			l.dropConnections(b)
 			return nil
 		}
@@ -198,7 +201,9 @@ func (l *LoadBalancer) Listen() error {
 	if err != nil {
 		return trace.ConvertSystemError(err)
 	}
-	l.Debugf("created listening socket")
+	l.logger.DebugContext(l.ctx, "created listening socket",
+		"listen_addr", logutils.StringerAttr(l.listener.Addr()),
+	)
 	return nil
 }
 
@@ -213,7 +218,6 @@ func (l *LoadBalancer) Addr() net.Addr {
 
 // Serve starts accepting connections
 func (l *LoadBalancer) Serve() error {
-	defer l.waitCancel()
 	for {
 		conn, err := l.listener.Accept()
 		if err != nil {
@@ -224,7 +228,7 @@ func (l *LoadBalancer) Serve() error {
 			case <-l.ctx.Done():
 				return trace.Wrap(net.ErrClosed, "context is closing")
 			case <-time.After(5. * time.Second):
-				l.Debugf("Backoff on network error.")
+				l.logger.DebugContext(l.ctx, "Backoff on network error")
 			}
 		} else {
 			go l.forwardConnection(conn)
@@ -235,14 +239,8 @@ func (l *LoadBalancer) Serve() error {
 func (l *LoadBalancer) forwardConnection(conn net.Conn) {
 	err := l.forward(conn)
 	if err != nil {
-		l.Warningf("Failed to forward connection: %v.", err)
+		l.logger.WarnContext(l.ctx, "Failed to forward connection", "error", err)
 	}
-}
-
-// Wait is here to workaround issue https://github.com/golang/go/issues/10527
-// in tests
-func (l *LoadBalancer) Wait() {
-	<-l.waitCtx.Done()
 }
 
 func (l *LoadBalancer) forward(conn net.Conn) error {
@@ -262,14 +260,20 @@ func (l *LoadBalancer) forward(conn net.Conn) error {
 	}
 	defer backendConn.Close()
 
+	if len(l.PROXYHeader) > 0 {
+		if _, err := backendConn.Write(l.PROXYHeader); err != nil {
+			return trace.Wrap(err)
+		}
+	}
+
 	backendConnID := l.trackConnection(backend, backendConn)
 	defer l.untrackConnection(backend, backendConnID)
 
-	logger := l.WithFields(log.Fields{
-		"source": conn.RemoteAddr(),
-		"dest":   backendConn.RemoteAddr(),
-	})
-	logger.Debugf("forward")
+	logger := l.logger.With(
+		"source_addr", logutils.StringerAttr(conn.RemoteAddr()),
+		"dest_addr", logutils.StringerAttr(backendConn.RemoteAddr()),
+	)
+	logger.DebugContext(l.ctx, "forwarding data")
 
 	messagesC := make(chan error, 2)
 
@@ -288,11 +292,11 @@ func (l *LoadBalancer) forward(conn net.Conn) error {
 	}()
 
 	var lastErr error
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case err := <-messagesC:
-			if err != nil && err != io.EOF {
-				logger.Warningf("connection problem: %v %T", trace.DebugReport(err), err)
+			if err != nil && !errors.Is(err, io.EOF) {
+				logger.WarnContext(l.ctx, "connection problem", "error", err)
 				lastErr = err
 			}
 		case <-l.ctx.Done():

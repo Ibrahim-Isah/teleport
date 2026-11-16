@@ -55,7 +55,7 @@ From the start, we will support the following scenarios:
 
 - Teleport agents installed via a dedicated `apt` or `yum` package that sets up the installer.
 
-Agents deployed in one of the above manners will automically be "enrolled" in the cloud upgrade system as part of the
+Agents deployed in one of the above manners will automatically be "enrolled" in the cloud upgrade system as part of the
 installation process. Enrollment will not be coordinated at the cluster-level (i.e. agents will not check with the
 cluster to determine if upgrades should occur). It will be assumed that the latest available cloud-stable package is
 always the "correct" package to be running. This is an important divergence from how teleport versioning is typically
@@ -72,7 +72,7 @@ their control planes are always compatible with the current version targeted by 
 The current `cloud-stable` target version will be served via an `s3` bucket backed by CloudFront. Ex:
 
 ```
-$ VERSION="$(curl --proto '=https' --tlsv1.2 -sSf https://update.gravitational.io/v1/cloud-stable/version)"
+$ VERSION="$(curl --proto '=https' --tlsv1.2 -sSf https://updates.releases.teleport.dev/v1/cloud/stable/version)"
 ```
 
 Formally, this will be the only definition of what the current "cloud-stable" target is. An agent "downgrade" will
@@ -86,11 +86,11 @@ Rollout of a new version to cloud-stable will generally follow the following ste
 
 3. The target version of the cloud-stable endpoint is updated to point to the new target client version.
 
-4. A grace period is observed, during which the control plane is not updated s.t. it breaks comatibility with
+4. A grace period is observed, during which the control plane is not updated s.t. it breaks compatibility with
 agents that have yet to be upgraded. I.e. if cloud-stable targets `v1` at `T1`, then the control plane must maintain
 compatibility with `v1` until at least `T1 + grace_period`.
 
-Note that in practice, wether or not the ordering/timing of the above steps matters depends entirely on what changes
+Note that in practice, whether or not the ordering/timing of the above steps matters depends entirely on what changes
 were made between versions. Most minor/patch releases don't actually require this kind of procedure, tho its best to
 assume that the procedure is required unless we are rolling out a critical bug fix that was specifically designed to
 be self-contained.
@@ -123,8 +123,8 @@ is treated as non-critical.
 Example usage:
 
 ```bash
-VERSION="$(curl --proto '=https' --tlsv1.2 -sSf https://update.gravitational.io/v1/cloud-stable/version)"
-CRITICAL="$(curl --proto '=https' --tlsv1.2 -sSf https://update.gravitational.io/v1/cloud-stable/critical)"
+VERSION="$(curl --proto '=https' --tlsv1.2 -sSf https://updates.releases.teleport.dev/v1/cloud/stable/version)"
+CRITICAL="$(curl --proto '=https' --tlsv1.2 -sSf https://updates.releases.teleport.dev/v1/cloud/stable/critical)"
 
 if [[ "$CRITICAL" == "yes" || "$UPGRADE_WINDOW" == "yes" ]]
 then
@@ -245,14 +245,14 @@ Kubernetes based agents will be managed by a separate cloud-stable upgrade contr
 be responsible for all teleport agents installed by the helm chart, and will perform rolling
 updates, applying the latest immutable image tag to all agents.
 
-Agents running in kuberentes mode will periodically export their schedules to a kubernetes config object to be
+Agents running in kubernetes mode will periodically export their schedules to a kubernetes config object to be
 consumed by the controller.
 
 The k8s controller's specific loop will end up looking like this:
 
 ![Upgrade Controller](https://user-images.githubusercontent.com/16366487/219150279-9255d4b3-74fb-48f7-b966-04cb79520e66.png)
 
-The kuberenetes controller will leverage cosign based image signing for an added layer of security.
+The kubernetes controller will leverage cosign based image signing for an added layer of security.
 
 Our kube agent helm chart will be updated to support enabling all necessary cloud-stable behaviors
 (added controller and any necessary command/env changes) via a single flag. Ex:
@@ -291,13 +291,13 @@ to firing approximately every 30min. When healthy, teleport agents will export a
 the default monotonic fire rate and setting an `OnCalendar` directive matching the current agent maintenance schedule,
 thereby limiting the upgrade timer to firing only during maintenance windows.
 
-The `teleport-upgrade-check.timer` unit will peridoically check `cloud-stable/critical`. If it detects a critical update
+The `teleport-upgrade-check.timer` unit will periodically check `cloud-stable/critical`. If it detects a critical update
 *and* that the currently installed teleport version differs from the cloud-stable target, it will revert the primary
 timer back to monotonic/high-frequency mode. Note that we *could* invoke the upgrade script directly instead and the
 system would be simpler overall, however this would lead to duplicate sources of truth for what a "firing" upgrade
 was, and potentially lead to confusing interactions between conflicting check rates. After some back and forth,
 I'm opting to commit to the concept of a single upgrade timer whose modes are switched by external actors, but
-which utimately retains sole control over the upgrade process.
+which ultimately retains sole control over the upgrade process.
 
 
 ### Automatic/Guided Install Changes
@@ -327,12 +327,58 @@ to be changed to follow the same pattern of registering a release channel and in
 by ec2 discovery.
 
 
+### AWS OIDC - Deploy Service Agents (Amazon ECS with Fargate)
+
+When Teleport Discover flow is used to connect an RDS, a Teleport agent is automatically provisioned using ECS Fargate. The automatic update
+functionality for regular agents depends on systemd or Kubernetes. Fargate agents run in containers, so that means the existing automatic
+update functionality is not compatible with these agents. We need a separate method of keeping these Fargate agents updated.
+
+To keep Fargate agents updated, Teleport will run a separate task on the Proxy service. We're choosing to run the task on the Proxy over the
+Auth service because this task is not a critical service for Teleport. The task checks every 30 minutes for an available update and uses the
+ECS Fargate API to update Teleport agents. This task does not need to be run on all Teleport clusters. It will only be needed if the
+`TELEPORT_AUTOMATIC_UPGRADES` environment variable is enabled. The window when Fargate agents are updated should also coincide with the
+maintenance window. If there is a simple way to identify unhealthy agents, they can be updated outside of the maintenance window, but
+otherwise, the agent will just be updated during the next maintenance window.
+
+The logic flow will look like the same as the core update model:
+
+- If there is a critical update, attempt update
+- If an agent is unhealthy, attempt update
+- If within maintenance window, attempt update
+
+For getting the region, let's iterate over all Databases, filter for RDS ones and extract the AWS.Region.
+For each unique Region, we will call the APIs (DescribeCluster/DescribeServices)
+
+To query for available ECS clusters Teleport will iterate over all databases filtering for RDS, and then extract the AWS.Region. For each
+unique region, we can use [ListClusters](https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/ecs#Client.ListClusters) and
+[ListServices](https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/ecs#Client.ListServices) to list available ECS clusters and services.
+
+[DescribeClusters](https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/ecs#Client.DescribeClusters) and
+[DescribeServices](https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/ecs#Client.DescribeServices) provide information about the
+clusters and services. The cluster and service names are deterministic and the information returned from the API also include tags which can
+help identify if the cluster was created by Teleport using the DeployService.
+
+[DescribeTaskDefinition](https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/ecs#Client.DescribeTaskDefinition) and
+[RegisterTaskDefinition](https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/ecs#Client.RegisterTaskDefinition) can be used to pull the
+latest definition and recreate a new task with an updated container image version. Everything else must stay the same.
+
+To carry out the actual update of a Fargate agent, a new ECS service will be created with the desired version, then the old ECS service will
+be shutdown. The workflow will require the [CreateService](https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/ecs#Client.CreateService),
+and [DeleteService](https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/ecs#Client.DeleteService) ECS API calls.
+
+We may be able to utilize the [ServicesStableWaiter](https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/ecs#ServicesStableWaiter) and
+[ServicesInactiveWaiter](https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/ecs#ServicesInactiveWaiter) to handle failover and graceful
+shutdown. ServicesActiveWaiter waits on a condition to be met before returning. This can be used to wait for a new agent to be healthy, and
+either rollback the update or retry the update if the new agent fails to become healthy. ServicesInactiveWaiter does the same thing and
+waits for a condition to be met before returning. This can be used to wait for the existing agent to shutdown before being deleted.
+
+
 ### Documentation Changes
 
 After initial trials, we would like tracking cloud-stable to become the default for new cloud clusters. Because of this, we will
 need to make some updates to existing documentation to guide new cloud users to invoke the necessary install variants.
 
-Mostly, this will consist of adding appropiate `ScopedBlock`s to docs that display cloud variants of install
+Mostly, this will consist of adding appropriate `ScopedBlock`s to docs that display cloud variants of install
 commands. A number of the pages under `deploy-a-cluster/helm-deployments/` will need this treatment. Most cloud guides prompt
 users to use a join script, so the majority of those will be able to be left untouched, as clusters will automatically serve
 the correct script variant.

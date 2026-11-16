@@ -1,22 +1,22 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package bpf
-
-import "C"
 
 import (
 	"context"
@@ -24,9 +24,8 @@ import (
 	"github.com/coreos/go-semver/semver"
 	"github.com/gravitational/trace"
 
-	"github.com/gravitational/teleport/api/constants"
 	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/api/types/wrappers"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
@@ -34,13 +33,20 @@ import (
 type BPF interface {
 	// OpenSession will start monitoring all events within a session and
 	// emitting them to the Audit Log.
-	OpenSession(ctx *SessionContext) (uint64, error)
+	OpenSession(ctx *SessionContext) error
 
 	// CloseSession will stop monitoring events for a particular session.
 	CloseSession(ctx *SessionContext) error
 
 	// Close will stop any running BPF programs.
-	Close() error
+	Close(restarting bool) error
+
+	// Enabled returns whether enhanced recording is active.
+	Enabled() bool
+
+	// LostEvents returns the total number of lost events for command, disk,
+	// and network events since the service was started.
+	LostEvents() EventCount
 }
 
 // SessionContext contains all the information needed to track and emit
@@ -69,89 +75,77 @@ type SessionContext struct {
 	// User is the Teleport user.
 	User string
 
-	// PID is the process ID of Teleport when it re-executes itself. This is
-	// used by Teleport to find itself by cgroup.
-	PID int
+	// UserOriginClusterName is the name of the cluster where the user is
+	// originally from.
+	UserOriginClusterName string
 
 	// Emitter is used to record events for a particular session
 	Emitter apievents.Emitter
 
 	// Events is the set of events (command, disk, or network) to record for
 	// this session.
-	Events map[string]bool
+	Events map[string]struct{}
+
+	// UserRoles are the roles assigned to the user.
+	UserRoles []string
+	// UserTraits are the traits assigned to the user.
+	UserTraits wrappers.Traits
+	// BeamID is the identifier of the Beam this session was created for.
+	BeamID string
+
+	// AuditSessionID is the audit session ID that should be the same
+	// for all processes in an SSH session. It is used to correlate
+	// audit events with the session. See
+	// https://github.com/torvalds/linux/blob/b75d8f38bcc9599af42635530c00268c71911f11/Documentation/ABI/stable/procfs-audit_loginuid
+	// for more details.
+	AuditSessionID uint32
 }
 
-// Config holds configuration for the BPF service.
-type Config struct {
-	// Enabled is if this service will try and install BPF programs on this system.
-	Enabled bool
-
-	// CommandBufferSize is the size of the perf buffer for command events.
-	CommandBufferSize *int
-
-	// DiskBufferSize is the size of the perf buffer for disk events.
-	DiskBufferSize *int
-
-	// NetworkBufferSize is the size of the perf buffer for network events.
-	NetworkBufferSize *int
-
-	// CgroupPath is where the cgroupv2 hierarchy is mounted.
-	CgroupPath string
+// EventCount is a simple struct to track the number of events.
+type EventCount struct {
+	commandEvents uint64
+	diskEvents    uint64
+	networkEvents uint64
 }
 
-// CheckAndSetDefaults checks BPF configuration.
-func (c *Config) CheckAndSetDefaults() error {
-	var perfBufferPageCount = defaults.PerfBufferPageCount
-	var openPerfBufferPageCount = defaults.OpenPerfBufferPageCount
-
-	if c.CommandBufferSize == nil {
-		c.CommandBufferSize = &perfBufferPageCount
+// Delta returns the number of events that have occurred since the previous
+// EventCount.
+func (e EventCount) Delta(prev EventCount) EventCount {
+	return EventCount{
+		commandEvents: e.commandEvents - prev.commandEvents,
+		diskEvents:    e.diskEvents - prev.diskEvents,
+		networkEvents: e.networkEvents - prev.networkEvents,
 	}
-	if c.DiskBufferSize == nil {
-		c.DiskBufferSize = &openPerfBufferPageCount
-	}
-	if c.NetworkBufferSize == nil {
-		c.NetworkBufferSize = &perfBufferPageCount
-	}
-	if c.CgroupPath == "" {
-		c.CgroupPath = defaults.CgroupPath
-	}
-
-	return nil
 }
 
-// RestrictedSessionConfig holds configuration for the RestrictedSession service.
-type RestrictedSessionConfig struct {
-	// Enabled if this service will try and install BPF programs on this system.
-	Enabled bool
-
-	// EventsBufferSize is the size (in pages) of the perf buffer for events.
-	EventsBufferSize *int
+// Empty returns true if there are no events.
+func (e EventCount) Empty() bool {
+	return max(e.commandEvents, e.diskEvents, e.networkEvents) == 0
 }
 
-// CheckAndSetDefaults checks BPF configuration.
-func (c *RestrictedSessionConfig) CheckAndSetDefaults() error {
-	var perfBufferPageCount = defaults.PerfBufferPageCount
+func (e EventCount) CommandEvents() uint64 {
+	return e.commandEvents
+}
 
-	if c.EventsBufferSize == nil {
-		c.EventsBufferSize = &perfBufferPageCount
-	}
+func (e EventCount) DiskEvents() uint64 {
+	return e.diskEvents
+}
 
-	return nil
+func (e EventCount) NetworkEvents() uint64 {
+	return e.networkEvents
 }
 
 // NOP is used on either non-Linux systems or when BPF support is not enabled.
-type NOP struct {
-}
+type NOP struct{}
 
 // Close closes the NOP service. Note this function does nothing.
-func (s *NOP) Close() error {
+func (s *NOP) Close(_ bool) error {
 	return nil
 }
 
 // OpenSession opens a NOP session. Note this function does nothing.
-func (s *NOP) OpenSession(_ *SessionContext) (uint64, error) {
-	return 0, nil
+func (s *NOP) OpenSession(_ *SessionContext) error {
+	return nil
 }
 
 // CloseSession closes a NOP session. Note this function does nothing.
@@ -159,15 +153,25 @@ func (s *NOP) CloseSession(_ *SessionContext) error {
 	return nil
 }
 
+func (s *NOP) Enabled() bool {
+	return false
+}
+
+// LostEvents returns the number of lost events. Note this function
+// does nothing.
+func (s *NOP) LostEvents() EventCount {
+	return EventCount{}
+}
+
 // IsHostCompatible checks that BPF programs can run on this host.
 func IsHostCompatible() error {
-	minKernel := semver.New(constants.EnhancedRecordingMinKernel)
 	version, err := utils.KernelVersion()
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if version.LessThan(*minKernel) {
-		return trace.BadParameter("incompatible kernel found, minimum supported kernel is %v", minKernel)
+	minKernelVersion := semver.Version{Major: 5, Minor: 11, Patch: 0}
+	if version.LessThan(minKernelVersion) {
+		return trace.BadParameter("incompatible kernel found, minimum supported kernel is %v", minKernelVersion)
 	}
 
 	if err = utils.HasBTF(); err != nil {

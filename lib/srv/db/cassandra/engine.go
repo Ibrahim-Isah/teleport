@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package cassandra
 
@@ -28,6 +30,7 @@ import (
 	"github.com/datastax/go-cassandra-native-protocol/message"
 	"github.com/gravitational/trace"
 
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/types/events"
 	libevents "github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/srv/db/cassandra/protocol"
@@ -65,7 +68,7 @@ func (e *Engine) SendError(sErr error) {
 	if utils.IsOKNetworkError(sErr) || sErr == nil {
 		return
 	}
-	e.Log.Debugf("Cassandra connection error: %v.", sErr)
+	e.Log.DebugContext(e.Context, "Cassandra connection error.", "error", sErr)
 	// Errors from Cassandra engine can be sent to the client only if handshake is triggered.
 	if e.handshakeTriggered {
 		return
@@ -73,7 +76,7 @@ func (e *Engine) SendError(sErr error) {
 
 	eh := failedHandshake{error: sErr}
 	if err := eh.handshake(e.clientConn, nil); err != nil {
-		e.Log.Warnf("Cassandra handshake error: %v.", sErr)
+		e.Log.WarnContext(e.Context, "Cassandra handshake error.", "error", sErr)
 	}
 }
 
@@ -87,6 +90,7 @@ func (e *Engine) InitializeConnection(clientConn net.Conn, sessionCtx *common.Se
 // HandleConnection processes the connection from Cassandra proxy coming
 // over reverse tunnel.
 func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Session) error {
+	observe := common.GetConnectionSetupTimeObserver(sessionCtx.Database)
 	err := e.authorizeConnection(ctx)
 	if err != nil {
 		return trace.Wrap(err)
@@ -100,6 +104,8 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 
 	e.Audit.OnSessionStart(e.Context, sessionCtx, nil)
 	defer e.Audit.OnSessionEnd(e.Context, sessionCtx)
+
+	observe()
 
 	if err := e.handshake(sessionCtx, e.clientConn, serverConn); err != nil {
 		return trace.Wrap(err)
@@ -120,7 +126,7 @@ func (e *Engine) handleClientServerConn(ctx context.Context, clientConn *protoco
 	}()
 
 	var errs []error
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case <-ctx.Done():
 			return trace.Wrap(ctx.Err())
@@ -136,11 +142,16 @@ func (e *Engine) handleClientServerConn(ctx context.Context, clientConn *protoco
 
 func (e *Engine) handleClientConnectionWithAudit(clientConn *protocol.Conn, serverConn net.Conn) error {
 	defer serverConn.Close()
+	msgFromClient := common.GetMessagesFromClientMetric(e.sessionCtx.Database)
+
 	for {
 		packet, err := clientConn.ReadPacket()
 		if err != nil {
 			return trace.Wrap(err)
 		}
+
+		msgFromClient.Inc()
+
 		if err := e.processPacket(packet); err != nil {
 			return trace.Wrap(err)
 		}
@@ -151,6 +162,7 @@ func (e *Engine) handleClientConnectionWithAudit(clientConn *protocol.Conn, serv
 }
 
 func (e *Engine) handleServerConnection(serverConn net.Conn) error {
+	// We cannot increase the db_messages_from_server metric because we pass the data from the server as-is, so we don't know the number of messages transferred.
 	defer e.clientConn.Close()
 	if _, err := io.Copy(e.clientConn, serverConn); err != nil {
 		return trace.Wrap(err)
@@ -238,7 +250,7 @@ func (e *Engine) processPacket(packet *protocol.Packet) error {
 	case *message.Revise:
 		// Revise message is support by DSE (DataStax Enterprise) only.
 		// Skip audit for this message.
-		e.Log.WithField("message", msg).Debug("Skip audit for revise message.")
+		e.Log.DebugContext(e.Context, "Skip audit for revise message.", "message", msg)
 	default:
 		return trace.BadParameter("received a message with unexpected type %T", body.Message)
 	}
@@ -255,11 +267,11 @@ func (e *Engine) authorizeConnection(ctx context.Context) error {
 	}
 	state := e.sessionCtx.GetAccessState(authPref)
 
-	dbRoleMatchers := role.DatabaseRoleMatchers(
-		e.sessionCtx.Database,
-		e.sessionCtx.DatabaseUser,
-		e.sessionCtx.DatabaseName,
-	)
+	dbRoleMatchers := role.GetDatabaseRoleMatchers(role.RoleMatchersConfig{
+		Database:     e.sessionCtx.Database,
+		DatabaseUser: e.sessionCtx.DatabaseUser,
+		DatabaseName: e.sessionCtx.DatabaseName,
+	})
 	err = e.sessionCtx.Checker.CheckAccess(
 		e.sessionCtx.Database,
 		state,
@@ -273,12 +285,12 @@ func (e *Engine) authorizeConnection(ctx context.Context) error {
 }
 
 func (e *Engine) connect(ctx context.Context, sessionCtx *common.Session) (*protocol.Conn, error) {
-	config, err := e.Auth.GetTLSConfig(ctx, sessionCtx)
+	config, err := e.Auth.GetTLSConfig(ctx, sessionCtx.GetExpiry(), sessionCtx.Database, sessionCtx.DatabaseUser)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	tlsDialer := tls.Dialer{Config: config}
-	serverConn, err := tlsDialer.DialContext(ctx, "tcp", sessionCtx.Database.GetURI())
+	serverConn, err := tlsDialer.DialContext(ctx, "tcp", getEndpoint(sessionCtx.Database))
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -291,16 +303,21 @@ func (e *Engine) handshake(sessionCtx *common.Session, clientConn, serverConn *p
 		return trace.Wrap(err)
 	}
 	e.handshakeTriggered = true
-	return auth.handleHandshake(clientConn, serverConn)
+	return auth.handleHandshake(e.Context, clientConn, serverConn)
 }
 
 func (e *Engine) getAuth(sessionCtx *common.Session) (handshakeHandler, error) {
 	switch {
 	case sessionCtx.Database.IsAWSHosted():
 		return &authAWSSigV4Auth{
-			ses: sessionCtx,
+			ses:       sessionCtx,
+			awsConfig: e.AWSConfigProvider,
 		}, nil
 	default:
 		return &basicHandshake{ses: sessionCtx}, nil
 	}
+}
+
+func getEndpoint(db types.Database) string {
+	return db.GetURI()
 }

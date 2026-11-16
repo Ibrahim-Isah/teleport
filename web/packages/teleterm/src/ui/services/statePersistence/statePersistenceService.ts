@@ -1,23 +1,26 @@
-/*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import { FileStorage } from 'teleterm/types';
 import { ConnectionTrackerState } from 'teleterm/ui/services/connectionTracker';
 import {
   Workspace,
+  WorkspaceColor,
   WorkspacesState,
 } from 'teleterm/ui/services/workspacesService';
 
@@ -29,17 +32,46 @@ interface UsageReportingState {
   askedForUserJobRole: boolean;
 }
 
-export type WorkspacesPersistedState = Omit<WorkspacesState, 'workspaces'> & {
-  workspaces: Record<string, Omit<Workspace, 'accessRequests'>>;
+/**
+ * Expected shape of the persisted workspaces.
+ * In the future, it should come from zod.
+ */
+export type PersistedWorkspace = Omit<
+  Workspace,
+  'accessRequests' | 'documentsRestoredOrDiscarded' | 'color'
+> & {
+  // TODO(gzdunek) DELETE IN v19.0.0: Make the field required by removing the 'color' type below and the omitted 'color' above.
+  // This only expresses that existing persisted state from older versions might not have color defined.
+  color?: WorkspaceColor;
+  proxyHost?: string;
 };
 
-interface StatePersistenceState {
+export type WorkspacesPersistedState = Omit<
+  WorkspacesState,
+  'workspaces' | 'isInitialized'
+> & {
+  workspaces: Record<string, PersistedWorkspace>;
+};
+
+export interface StatePersistenceState {
   connectionTracker: ConnectionTrackerState;
   workspacesState: WorkspacesPersistedState;
   shareFeedback: ShareFeedbackState;
   usageReporting: UsageReportingState;
+  vnet: {
+    autoStart: boolean;
+    /**
+     * Whether the user has successfully launched VNet at least once.
+     */
+    hasEverStarted: boolean;
+  };
+  /** Shows a banner above the cluster list to notify that a new tsh home dir is used. */
+  showTshHomeMigrationBanner: boolean;
+  /** Remembers whether the roles section in the identity popover is expanded. */
+  showRolesExpanded?: boolean;
 }
 
+// Before adding new methods to this service, consider using usePersistedState instead.
 export class StatePersistenceService {
   constructor(private _fileStorage: FileStorage) {}
 
@@ -91,8 +123,11 @@ export class StatePersistenceService {
     return this.getState().usageReporting;
   }
 
-  private getState(): StatePersistenceState {
-    const defaultState: StatePersistenceState = {
+  getState(): StatePersistenceState {
+    // Some legacy callsites expected StatePersistenceService to manage the default state for them,
+    // but with the move towards usePersistedState, we should put the default state close to where
+    // it's going to be used. Hence the use of Partial<StatePersistenceState> here.
+    const defaultState: Partial<StatePersistenceState> = {
       connectionTracker: {
         connections: [],
       },
@@ -106,10 +141,13 @@ export class StatePersistenceService {
         askedForUserJobRole: false,
       },
     };
-    return { ...defaultState, ...this._fileStorage.get('state') };
+    return {
+      ...defaultState,
+      ...(this._fileStorage.get('state') as StatePersistenceState),
+    };
   }
 
-  private putState(state: StatePersistenceState): void {
+  putState(state: StatePersistenceState): void {
     this._fileStorage.put('state', state);
   }
 }

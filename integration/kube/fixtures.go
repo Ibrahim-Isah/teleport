@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package kube
 
@@ -23,8 +27,9 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/integration/helpers"
-	"github.com/gravitational/teleport/lib/auth/native"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
@@ -38,8 +43,10 @@ const TestImpersonationGroup = "teleport-ci-test-group"
 type ProxyConfig struct {
 	T                   *helpers.TeleInstance
 	Username            string
+	PinnedIP            string
 	KubeUsers           []string
 	KubeGroups          []string
+	KubeCluster         string
 	Impersonation       *rest.ImpersonationConfig
 	RouteToCluster      string
 	CustomTLSServerName string
@@ -49,14 +56,22 @@ type ProxyConfig struct {
 // ProxyClient returns kubernetes client using local teleport proxy
 func ProxyClient(cfg ProxyConfig) (*kubernetes.Clientset, *rest.Config, error) {
 	ctx := context.Background()
+
+	// Require that the target Kubernetes cluster is specified rather than
+	// guessing it to avoid cache propagation delays which may falsely indicate that no
+	// clusters exist.
+	if cfg.KubeCluster == "" {
+		return nil, nil, trace.BadParameter("KubeCluster must be provided")
+	}
+
 	authServer := cfg.T.Process.GetAuthServer()
-	clusterName, err := authServer.GetClusterName()
+	clusterName, err := authServer.GetClusterName(ctx)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
 
 	// Fetch user info to get roles and max session TTL.
-	user, err := authServer.GetUser(cfg.Username, false)
+	user, err := authServer.GetUser(ctx, cfg.Username, false)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
@@ -81,21 +96,23 @@ func ProxyClient(cfg ProxyConfig) (*kubernetes.Clientset, *rest.Config, error) {
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
-	privPEM, _, err := native.GenerateKeyPair()
+	priv, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
-	priv, err := tlsca.ParsePrivateKeyPEM(privPEM)
+	privPEM, err := keys.MarshalPrivateKey(priv)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
 
 	id := tlsca.Identity{
-		Username:         cfg.Username,
-		Groups:           user.GetRoles(),
-		KubernetesUsers:  cfg.KubeUsers,
-		KubernetesGroups: cfg.KubeGroups,
-		RouteToCluster:   cfg.RouteToCluster,
+		Username:          cfg.Username,
+		Groups:            user.GetRoles(),
+		KubernetesUsers:   cfg.KubeUsers,
+		KubernetesGroups:  cfg.KubeGroups,
+		RouteToCluster:    cfg.RouteToCluster,
+		KubernetesCluster: cfg.KubeCluster,
+		PinnedIP:          cfg.PinnedIP,
 	}
 	subj, err := id.Subject()
 	if err != nil {

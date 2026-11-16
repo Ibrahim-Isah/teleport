@@ -1,51 +1,58 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
 import (
 	"context"
 	"io"
+	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
 	oteltrace "go.opentelemetry.io/otel/trace"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
+	decisionpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/decision/v1alpha1"
 	"github.com/gravitational/teleport/api/observability/tracing"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/api/utils/keys"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/authz"
+	"github.com/gravitational/teleport/lib/decision"
 	dtauthz "github.com/gravitational/teleport/lib/devicetrust/authz"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/observability/metrics"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/sshca"
 )
 
-var (
-	userSessionLimitHitCount = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: teleport.MetricUserMaxConcurrentSessionsHit,
-			Help: "Number of times a user exceeded their max concurrent ssh connections",
-		},
-	)
+var userSessionLimitHitCount = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Name: teleport.MetricUserMaxConcurrentSessionsHit,
+		Help: "Number of times a user exceeded their max concurrent ssh connections",
+	},
 )
 
 func init() {
@@ -72,7 +79,7 @@ type SessionControllerConfig struct {
 	// have different flows
 	Component string
 	// Logger is used to emit log entries
-	Logger *logrus.Entry
+	Logger *slog.Logger
 	// TracerProvider creates a tracer so that spans may be emitted
 	TracerProvider oteltrace.TracerProvider
 	// ServerID is the UUID of the server
@@ -111,7 +118,7 @@ func (c *SessionControllerConfig) CheckAndSetDefaults() error {
 	}
 
 	if c.Logger == nil {
-		c.Logger = logrus.WithField(trace.Component, "SessionCtrl")
+		c.Logger = slog.With(teleport.ComponentKey, "SessionCtrl")
 	}
 
 	if c.Clock == nil {
@@ -140,6 +147,94 @@ func NewSessionController(cfg SessionControllerConfig) (*SessionController, erro
 	return &SessionController{cfg: cfg}, nil
 }
 
+// WebSessionContext contains information associated with a session
+// established via the web ui.
+type WebSessionContext interface {
+	GetUserAccessChecker() (services.AccessChecker, error)
+	GetSSHCertificate() (*ssh.Certificate, error)
+	GetUser() string
+}
+
+// webSessionPermit is used to propagate session control information from the
+// access checker based system in lib/web to the permit based system used in this
+// package in order to allow lib/web to reuse the session control logic defined in
+// this package. Note that this permit is more of a stylistic compatibility tool
+// than a true permit in the sense of something like the ssh access permit. lib/web
+// will eventually need to be refactored to use a true web session permit which
+// will eventually replace use of this type.
+type webSessionPermit struct {
+	LockingMode      constants.LockingMode
+	LockTargets      []types.LockTarget
+	PrivateKeyPolicy keys.PrivateKeyPolicy
+	MaxConnections   int64
+	PinSourceIP      bool
+}
+
+// WebSessionController is a wrapper around [SessionController] which can be
+// used to create an [IdentityContext] and apply session controls for a web session.
+// This allows `lib/web` to not depend on `lib/srv`.
+func WebSessionController(controller *SessionController) func(ctx context.Context, sctx WebSessionContext, login, localAddr, remoteAddr string) (context.Context, error) {
+	return func(ctx context.Context, sctx WebSessionContext, login, localAddr, remoteAddr string) (context.Context, error) {
+		accessChecker, err := sctx.GetUserAccessChecker()
+		if err != nil {
+			return ctx, trace.Wrap(err)
+		}
+
+		sshCert, err := sctx.GetSSHCertificate()
+		if err != nil {
+			return ctx, trace.Wrap(err)
+		}
+
+		unmappedIdentity, err := sshca.DecodeIdentity(sshCert)
+		if err != nil {
+			return ctx, trace.Wrap(err)
+		}
+
+		authPref, err := controller.cfg.AccessPoint.GetAuthPreference(ctx)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		privateKeyPolicy, err := accessChecker.PrivateKeyPolicy(authPref.GetPrivateKeyPolicy())
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		clusterName, err := controller.cfg.AccessPoint.GetClusterName(ctx)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		lockTargets := services.SSHAccessLockTargets(clusterName.GetClusterName(), controller.cfg.ServerID, login, accessChecker.AccessInfo(), unmappedIdentity)
+
+		permit := webSessionPermit{
+			LockingMode:      accessChecker.LockingMode(authPref.GetLockingMode()),
+			PrivateKeyPolicy: privateKeyPolicy,
+			LockTargets:      lockTargets,
+			MaxConnections:   accessChecker.MaxConnections(),
+			PinSourceIP:      accessChecker.PinSourceIP(),
+		}
+
+		identity := IdentityContext{
+			UnmappedIdentity:                    unmappedIdentity,
+			webSessionPermit:                    &permit,
+			UnstableSessionJoiningAccessChecker: accessChecker,
+			UnstableClusterAccessChecker:        accessChecker.CheckAccessToRemoteCluster,
+			TeleportUser:                        sctx.GetUser(),
+			Login:                               login,
+			UnmappedRoles:                       unmappedIdentity.Roles,
+			ActiveRequests:                      unmappedIdentity.ActiveRequests,
+			Impersonator:                        unmappedIdentity.Impersonator,
+			// Web sessions are always local to the cluster they authenticated to.
+			OriginClusterName: clusterName.GetClusterName(),
+			MappedRoles:       accessChecker.RoleNames(),
+			Traits:            accessChecker.Traits(),
+		}
+		ctx, err = controller.AcquireSessionContext(ctx, identity, localAddr, remoteAddr)
+		return ctx, trace.Wrap(err)
+	}
+}
+
 // AcquireSessionContext attempts to create a context for the session. If the session is
 // not allowed due to session control an error is returned. The returned
 // context is scoped to the session and will be canceled in the event the semaphore lock
@@ -156,25 +251,47 @@ func (s *SessionController) AcquireSessionContext(ctx context.Context, identity 
 		return ctx, trace.Wrap(err)
 	}
 
-	clusterName, err := s.cfg.AccessPoint.GetClusterName()
-	if err != nil {
-		return ctx, trace.Wrap(err)
+	var lockingMode constants.LockingMode
+	var lockTargets []types.LockTarget
+	var requiredPolicy keys.PrivateKeyPolicy
+	var maxConnections int64
+	var pinSourceIP bool
+	switch {
+	case identity.AccessPermit != nil:
+		lockingMode = constants.LockingMode(identity.AccessPermit.GetLockingMode())
+		lockTargets = decision.LockTargetsFromProto(identity.AccessPermit.GetLockTargets())
+		requiredPolicy = keys.PrivateKeyPolicy(identity.AccessPermit.GetPrivateKeyPolicy())
+		maxConnections = identity.AccessPermit.GetMaxConnections()
+		pinSourceIP = slices.ContainsFunc(identity.AccessPermit.GetPreconditions(), func(p *decisionpb.Precondition) bool {
+			return p.GetKind() == decisionpb.PreconditionKind_PRECONDITION_KIND_PIN_SOURCE_IP
+		})
+	case identity.ProxyingPermit != nil:
+		lockingMode = identity.ProxyingPermit.LockingMode
+		lockTargets = identity.ProxyingPermit.LockTargets
+		requiredPolicy = identity.ProxyingPermit.PrivateKeyPolicy
+		maxConnections = identity.ProxyingPermit.MaxConnections
+		pinSourceIP = identity.ProxyingPermit.PinSourceIP
+	case identity.webSessionPermit != nil:
+		lockingMode = identity.webSessionPermit.LockingMode
+		lockTargets = identity.webSessionPermit.LockTargets
+		requiredPolicy = identity.webSessionPermit.PrivateKeyPolicy
+		maxConnections = identity.webSessionPermit.MaxConnections
+		pinSourceIP = identity.webSessionPermit.PinSourceIP
+	default:
+		return nil, trace.BadParameter("session context requires one of AccessPermit, ProxyingPermit, or webSessionPermit to be set (this is a bug)")
 	}
-
-	lockingMode := identity.AccessChecker.LockingMode(authPref.GetLockingMode())
-	lockTargets := ComputeLockTargets(clusterName.GetClusterName(), s.cfg.ServerID, identity)
 
 	if lockErr := s.cfg.LockEnforcer.CheckLockInForce(lockingMode, lockTargets...); lockErr != nil {
 		s.emitRejection(spanCtx, identity.GetUserMetadata(), localAddr, remoteAddr, lockErr.Error(), 0)
 		return ctx, trace.Wrap(lockErr)
 	}
 
-	// Check that the required private key policy, defined by roles and auth pref,
-	// is met by this Identity's ssh certificate.
-	identityPolicy := identity.Certificate.Extensions[teleport.CertExtensionPrivateKeyPolicy]
-	requiredPolicy := identity.AccessChecker.PrivateKeyPolicy(authPref.GetPrivateKeyPolicy())
-	if err := requiredPolicy.VerifyPolicy(keys.PrivateKeyPolicy(identityPolicy)); err != nil {
-		return ctx, trace.Wrap(err)
+	if !requiredPolicy.IsSatisfiedBy(identity.UnmappedIdentity.PrivateKeyPolicy) {
+		return ctx, keys.NewPrivateKeyPolicyError(requiredPolicy)
+	}
+
+	if err := authz.CheckIPPinning(ctx, remoteAddr, identity.UnmappedIdentity.PinnedIP, pinSourceIP, s.cfg.Logger); err != nil {
+		return nil, trace.Wrap(err)
 	}
 
 	// Don't apply the following checks in non-node contexts.
@@ -183,15 +300,15 @@ func (s *SessionController) AcquireSessionContext(ctx context.Context, identity 
 	}
 
 	// Device Trust: authorize device extensions.
-	if err := dtauthz.VerifySSHUser(authPref.GetDeviceTrust(), identity.Certificate); err != nil {
+	if err := dtauthz.VerifySSHUser(ctx, authPref.GetDeviceTrust(), identity.UnmappedIdentity); err != nil {
 		return ctx, trace.Wrap(err)
 	}
 
 	ctx, err = s.EnforceConnectionLimits(
 		ctx,
-		auth.ConnectionIdentity{
+		ConnectionIdentity{
 			Username:       identity.TeleportUser,
-			MaxConnections: identity.AccessChecker.MaxConnections(),
+			MaxConnections: maxConnections,
 			LocalAddr:      localAddr,
 			RemoteAddr:     remoteAddr,
 			UserMetadata:   identity.GetUserMetadata(),
@@ -201,10 +318,25 @@ func (s *SessionController) AcquireSessionContext(ctx context.Context, identity 
 	return ctx, trace.Wrap(err)
 }
 
+// ConnectionIdentity contains the identifying properties of a
+// client connection required to enforce connection limits.
+type ConnectionIdentity struct {
+	// Username is the name of the user
+	Username string
+	// MaxConnections the upper limit to number of open connections for a user
+	MaxConnections int64
+	// LocalAddr is the local address for the connection
+	LocalAddr string
+	// RemoteAddr is the remote address for the connection
+	RemoteAddr string
+	// UserMetadata contains metadata for a user
+	UserMetadata apievents.UserMetadata
+}
+
 // EnforceConnectionLimits retrieves a semaphore lock to ensure that connection limits
 // for the identity are enforced. If the lock is closed for any reason prior to the connection
 // being terminated any of the provided closers will be closed.
-func (s *SessionController) EnforceConnectionLimits(ctx context.Context, identity auth.ConnectionIdentity, closers ...io.Closer) (context.Context, error) {
+func (s *SessionController) EnforceConnectionLimits(ctx context.Context, identity ConnectionIdentity, closers ...io.Closer) (context.Context, error) {
 	maxConnections := identity.MaxConnections
 	if maxConnections == 0 {
 		// concurrent session control is not active, nothing
@@ -282,12 +414,13 @@ func (s *SessionController) emitRejection(ctx context.Context, userMetadata apie
 			RemoteAddr: remoteAddr,
 		},
 		ServerMetadata: apievents.ServerMetadata{
+			ServerVersion:   teleport.Version,
 			ServerID:        s.cfg.ServerID,
 			ServerNamespace: apidefaults.Namespace,
 		},
 		Reason:  reason,
 		Maximum: max,
 	}); err != nil {
-		s.cfg.Logger.WithError(err).Warn("Failed to emit session reject event.")
+		s.cfg.Logger.WarnContext(ctx, "Failed to emit session reject event", "error", err)
 	}
 }

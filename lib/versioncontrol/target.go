@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package versioncontrol
 
@@ -20,8 +22,9 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 
-	"golang.org/x/mod/semver"
+	"golang.org/x/mod/semver" //nolint:depguard // Usage precedes the x/mod/semver rule.
 )
 
 // NOTE: the contents of this file might be moving to the 'api' package in the future.
@@ -31,6 +34,10 @@ import (
 // criterea for keys and values in the future.
 var isValidLabel = regexp.MustCompile(`^[a-z0-9\.\-\/]+$`).MatchString
 
+// isValidLabelVal is the same as isValidLabel except that it also permits '|' which is interpreted
+// as a list delmeter for some labels.
+var isValidLabelVal = regexp.MustCompile(`^[a-z0-9\.\-\/|]+$`).MatchString
+
 // IsValidTargetKey checks if a string is a valid installation target key.
 func IsValidTargetKey(key string) bool {
 	return isValidLabel(key)
@@ -38,11 +45,14 @@ func IsValidTargetKey(key string) bool {
 
 // IsValidTargetVal checks if a string is a valid installtion target value.
 func IsValidTargetVal(val string) bool {
-	return isValidLabel(val)
+	return isValidLabelVal(val)
 }
 
 // LabelSecurityPatch indicates that a release is a security patch when set to 'yes'.
 const LabelSecurityPatch = "security-patch"
+
+// LabelSecurityPatchAlts lists alternative versions that provide the same security fixes.
+const LabelSecurityPatchAlts = "security-patch-alts"
 
 // LabelVersion is the only required label for an installation target and must be
 // valid go-style semver.
@@ -53,12 +63,20 @@ type TargetOption func(*targetOptions)
 
 type targetOptions struct {
 	secPatch bool
+	secAlts  []string
 }
 
 // SecurityPatch sets the security-patch=yes label if true.
 func SecurityPatch(sec bool) TargetOption {
 	return func(opts *targetOptions) {
 		opts.secPatch = sec
+	}
+}
+
+// SecurityPatchAlts appends version strings to the security-patch-alts label.
+func SecurityPatchAlts(alts ...string) TargetOption {
+	return func(opts *targetOptions) {
+		opts.secAlts = append(opts.secAlts, alts...)
 	}
 }
 
@@ -85,6 +103,11 @@ func NewTarget(version string, opts ...TargetOption) Target {
 	if options.secPatch {
 		target[LabelSecurityPatch] = "yes"
 	}
+
+	if len(options.secAlts) != 0 {
+		target[LabelSecurityPatchAlts] = strings.Join(options.secAlts, "|")
+	}
+
 	return target
 }
 
@@ -122,6 +145,43 @@ func (t Target) NextMajor() string {
 // SecurityPatch checks for the special label 'security-patch=yes'.
 func (t Target) SecurityPatch() bool {
 	return t[LabelSecurityPatch] == "yes"
+}
+
+// SecurityPatchAltOf performs a bidirectional check to see if this target and another
+// are security patch alternates (i.e. whether or not they provide the same security fix).
+func (t Target) SecurityPatchAltOf(other Target) bool {
+	if !t.Ok() || !other.Ok() {
+		return false
+	}
+
+	var alt bool
+
+	t.iterSecAlts(func(v string) {
+		if semver.Compare(v, other.Version()) == 0 {
+			alt = true
+		}
+	})
+
+	other.iterSecAlts(func(v string) {
+		if semver.Compare(v, t.Version()) == 0 {
+			alt = true
+		}
+	})
+
+	return alt
+}
+
+// iterSecAlts is a helper for iterating the valide values of the
+// security-patch-alts label.
+func (t Target) iterSecAlts(fn func(v string)) {
+	for alt := range strings.SplitSeq(t[LabelSecurityPatchAlts], "|") {
+		alt = strings.TrimSpace(alt)
+		if !semver.IsValid(alt) {
+			continue
+		}
+
+		fn(alt)
+	}
 }
 
 // Prerelease checks if this target represents a prerelease installation target

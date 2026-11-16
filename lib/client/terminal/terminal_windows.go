@@ -1,21 +1,27 @@
+//go:build !terraformprovider
+
 /*
-Copyright 2021 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package terminal
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -73,7 +79,10 @@ func initTerminal(input bool) (func(), error) {
 			// Attempt to reset the stdout mode before returning.
 			err = winterm.SetConsoleMode(uintptr(stdoutFd), oldOutMode)
 			if err != nil {
-				log.Errorf("Failed to reset terminal output mode to %d: %v\n", oldOutMode, err)
+				log.ErrorContext(context.Background(), "Failed to reset terminal output mode",
+					"original_output_mode", oldOutMode,
+					"error", err,
+				)
 			}
 
 			return func() {}, fmt.Errorf("failed to set stdin mode: %w", err)
@@ -83,13 +92,19 @@ func initTerminal(input bool) (func(), error) {
 	return func() {
 		err := winterm.SetConsoleMode(uintptr(stdoutFd), oldOutMode)
 		if err != nil {
-			log.Errorf("Failed to reset terminal output mode to %d: %v\n", oldOutMode, err)
+			log.ErrorContext(context.Background(), "Failed to reset terminal output mode",
+				"original_output_mode", oldOutMode,
+				"error", err,
+			)
 		}
 
 		if input {
 			err = winterm.SetConsoleMode(uintptr(stdinFd), oldInMode)
 			if err != nil {
-				log.Errorf("Failed to reset terminal input mode to %d: %v\n", oldInMode, err)
+				log.ErrorContext(context.Background(), "Failed to reset terminal input mode",
+					"original_input_mode", oldInMode,
+					"error", err,
+				)
 			}
 		}
 	}, nil

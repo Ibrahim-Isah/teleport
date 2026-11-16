@@ -1,5 +1,5 @@
 // This example program demonstrates how to connect to a Postgres database
-// using certificates issued by Teleport Machine ID.
+// using certificates issued by Teleport Machine & Workload Identity.
 
 package main
 
@@ -15,11 +15,13 @@ func main() {
 	// Open connection to database.
 	db, err := sql.Open("pgx", fmt.Sprint(
 		"host=localhost ",
-		"port=1234 ",
-		"dbname=example ",
+		"port=12345 ",
+		"dbname=example-db ",
 		"user=alice ",
+		// The next four options should be omitted if the local proxy has been
+		// placed in "authenticated tunnel" mode.
 		"sslmode=verify-full ",
-		"sslrootcert=/opt/machine-id/teleport-database-ca.crt ",
+		"sslrootcert=/opt/machine-id/teleport-host-ca.crt ",
 		"sslkey=/opt/machine-id/key ",
 		"sslcert=/opt/machine-id/tlscert ",
 	))

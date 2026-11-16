@@ -3,41 +3,57 @@
 # Generates protos for Teleport and Teleport API.
 set -eu
 
+echoed() {
+  echo "$*" >&2
+  "$@"
+}
+
 main() {
   cd "$(dirname "$0")"  # ./build-assets/
   cd ../                # teleport root
 
-  # Generated protos are written to
-  # <teleport-root>/github.com/gravitational/teleport/..., so we copy them to
-  # the correct relative path.
-  trap 'rm -fr github.com' EXIT  # don't leave github.com/ behind
-  rm -fr api/gen/proto gen/proto # cleanup gen/proto folders
+  # Parse optional args.
+  local skip_js=0 # skips Javascript and Typescript protogen
+  local skip_rm=0 # skips removal of old protos
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --skip-js)
+        skip_js=1
+        ;;
+      --skip-rm)
+        skip_rm=1
+        ;;
+      *)
+        echo "Unknown argument $1" >&2
+        exit 1
+        ;;
+    esac
+    shift
+  done
 
-  # Generate Gogo protos.
-  buf generate --template=buf-gogo.gen.yaml api/proto
-  buf generate --template=buf-gogo.gen.yaml proto
+  # Clean gen/proto directories before regenerating them. Legacy protos are
+  # generated all over the directory tree, so they won't get cleaned up
+  # automatically if the proto is deleted.
+  [[ $skip_rm -eq 0 ]] && echoed rm -fr api/gen/proto gen/proto
 
-  # Generate protoc-gen-go protos (preferred).
-  # Add your protos to the list if you can.
-  buf generate --template=buf-go.gen.yaml \
-    --path=api/proto/teleport/devicetrust/ \
-    --path=api/proto/teleport/kube/ \
-    --path=api/proto/teleport/loginrule/ \
-    --path=api/proto/teleport/plugins/ \
-    --path=api/proto/teleport/transport/ \
-    --path=proto/teleport/lib/multiplexer/ \
-    --path=proto/teleport/lib/teleterm/
+  # Generate Gogo protos. Generated protos are written to
+  # gogogen/github.com/gravitational/teleport/..., so we copy them to the
+  # correct relative path. This is in lieu of the module= option, which would do
+  # this for us (and which is what we use for the non-gogo protogen).
+  rm -fr gogogen
+  trap 'rm -fr gogogen' EXIT # don't leave files behind
+  echoed buf generate --template=buf-gogo.gen.yaml
+  cp -r gogogen/github.com/gravitational/teleport/. .
+  # error out if there's anything outside of github.com/gravitational/teleport
+  rm -fr gogogen/github.com/gravitational/teleport
+  rmdir gogogen/github.com/gravitational gogogen/github.com gogogen
 
-  # Generate connect-go protos.
-  buf generate --template=buf-connect-go.gen.yaml \
-    --path=proto/prehog/
+  # Generate go, go-grpc and connect-go protos (preferred).
+  echoed buf generate --template=buf-go.gen.yaml
+  echoed buf generate --template=buf-connect-go.gen.yaml
 
-  # Generate JS protos.
-	buf generate --template=buf-js.gen.yaml \
-    --path=proto/prehog/ \
-    --path=proto/teleport/lib/teleterm/
-
-  cp -r github.com/gravitational/teleport/* .
+  # Generate TS protos.
+  [[ $skip_js -eq 0 ]] && echoed buf generate --template=buf-ts.gen.yaml
 }
 
 main "$@"

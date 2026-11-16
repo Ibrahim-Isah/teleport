@@ -1,89 +1,216 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	gproto "google.golang.org/protobuf/proto"
 
 	"github.com/gravitational/teleport/api/client/proto"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
+	linuxdesktopv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/linuxdesktop/v1"
+	presencev1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/presence/v1"
 	"github.com/gravitational/teleport/api/types"
+	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/api/utils/retryutils"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/inventory"
+	"github.com/gravitational/teleport/lib/inventory/metadata"
 	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/interval"
 )
 
-// SSHServerHeartbeatConfig configures the HeartbeatV2 for an ssh server.
-type SSHServerHeartbeatConfig struct {
+// HeartbeatV2Config configures the HeartbeatV2.
+type HeartbeatV2Config[T any] struct {
 	// InventoryHandle is used to send heartbeats.
 	InventoryHandle inventory.DownstreamHandle
-	// GetServer gets the latest server spec.
-	GetServer func() *types.ServerV2
-	// Announcer is a fallback used to perform basic upsert-style heartbeats
-	// if the control stream is unavailable.
-	//
-	// DELETE IN: 11.0 (only exists for back-compat with v9 auth servers)
-	Announcer auth.Announcer
+	// GetResource gets the latest item to heartbeat.
+	GetResource func(context.Context) (T, error)
 
 	// -- below values are all optional
 
+	// Announcer is a fallback used to perform basic upsert-style heartbeats
+	// if the control stream is unavailable.
+	//
+	// This field is currently unused as all services migrated to heartbeatV2
+	// have deprecated V1 support. Future heartbeatV2 service migrations would
+	// need to set this field and use it to implement `SupportsFallback` and
+	// `FallbackAnnounce`. See git history prior to this change for exact
+	// code examples.
+	Announcer authclient.Announcer
 	// OnHeartbeat is a per-attempt callback (optional).
 	OnHeartbeat func(error)
 	// AnnounceInterval is the interval at which heartbeats are attempted (optional).
 	AnnounceInterval time.Duration
+	// DisruptionAnnounceInterval is the interval at which heartbeats are attempted when
+	// if there was a disuption in the control stream since the last heartbeat (optional).
+	DisruptionAnnounceInterval time.Duration
 	// PollInterval is the interval at which checks for change are performed (optional).
 	PollInterval time.Duration
 }
 
-func (c *SSHServerHeartbeatConfig) Check() error {
+func (c *HeartbeatV2Config[T]) Check() error {
 	if c.InventoryHandle == nil {
-		return trace.BadParameter("missing required parameter InventoryHandle for ssh heartbeat")
+		return trace.BadParameter("missing required parameter InventoryHandle for heartbeat")
 	}
-	if c.GetServer == nil {
-		return trace.BadParameter("missing required parameter GetServer for ssh heartbeat")
-	}
-	if c.Announcer == nil {
-		return trace.BadParameter("missing required parameter Announcer for ssh heartbeat")
+	if c.GetResource == nil {
+		return trace.BadParameter("missing required parameter GetResource for heartbeat")
 	}
 	return nil
 }
 
-func NewSSHServerHeartbeat(cfg SSHServerHeartbeatConfig) (*HeartbeatV2, error) {
+// NewSSHServerHeartbeat creates a [HeartbeatV2] that can be used to update
+// the presence of [types.ServerV2].
+func NewSSHServerHeartbeat(cfg HeartbeatV2Config[*types.ServerV2]) (*HeartbeatV2, error) {
 	if err := cfg.Check(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	inner := &sshServerHeartbeatV2{
-		getServer: cfg.GetServer,
-		announcer: cfg.Announcer,
+		getMetadata: metadata.Get,
+	}
+	inner.getServer = func(ctx context.Context) (*types.ServerV2, error) {
+		server, err := cfg.GetResource(ctx)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		doneCtx, cancel := context.WithCancel(ctx)
+		cancel() // not a typo
+
+		meta, err := inner.getMetadata(doneCtx)
+		if err == nil && meta != nil && meta.CloudMetadata != nil {
+			server.SetCloudMetadata(meta.CloudMetadata)
+		}
+
+		return server, nil
 	}
 
 	return newHeartbeatV2(cfg.InventoryHandle, inner, heartbeatV2Config{
-		onHeartbeatInner: cfg.OnHeartbeat,
-		announceInterval: cfg.AnnounceInterval,
-		pollInterval:     cfg.PollInterval,
+		onHeartbeatInner:           cfg.OnHeartbeat,
+		announceInterval:           cfg.AnnounceInterval,
+		disruptionAnnounceInterval: cfg.DisruptionAnnounceInterval,
+		pollInterval:               cfg.PollInterval,
+	}), nil
+}
+
+// NewAppServerHeartbeat creates a [HeartbeatV2] that can be used to update
+// the presence of [types.AppServerV3].
+func NewAppServerHeartbeat(cfg HeartbeatV2Config[*types.AppServerV3]) (*HeartbeatV2, error) {
+	if err := cfg.Check(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	inner := &appServerHeartbeatV2{
+		getServer: cfg.GetResource,
+	}
+
+	return newHeartbeatV2(cfg.InventoryHandle, inner, heartbeatV2Config{
+		onHeartbeatInner:           cfg.OnHeartbeat,
+		announceInterval:           cfg.AnnounceInterval,
+		disruptionAnnounceInterval: cfg.DisruptionAnnounceInterval,
+		pollInterval:               cfg.PollInterval,
+	}), nil
+}
+
+// NewDatabaseServerHeartbeat creates a [HeartbeatV2] that can be used to update
+// the presence of [types.DatabaseServerV3].
+func NewDatabaseServerHeartbeat(cfg HeartbeatV2Config[*types.DatabaseServerV3]) (*HeartbeatV2, error) {
+	if err := cfg.Check(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	inner := &dbServerHeartbeatV2{
+		getServer: cfg.GetResource,
+	}
+
+	return newHeartbeatV2(cfg.InventoryHandle, inner, heartbeatV2Config{
+		onHeartbeatInner:           cfg.OnHeartbeat,
+		announceInterval:           cfg.AnnounceInterval,
+		disruptionAnnounceInterval: cfg.DisruptionAnnounceInterval,
+		pollInterval:               cfg.PollInterval,
+	}), nil
+}
+
+// NewKubernetesServerHeartbeat creates a [HeartbeatV2] that can be used to update
+// the presence of [types.KubernetesServerV3].
+func NewKubernetesServerHeartbeat(cfg HeartbeatV2Config[*types.KubernetesServerV3]) (*HeartbeatV2, error) {
+	if err := cfg.Check(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	inner := &kubeServerHeartbeatV2{
+		getServer: cfg.GetResource,
+	}
+
+	return newHeartbeatV2(cfg.InventoryHandle, inner, heartbeatV2Config{
+		onHeartbeatInner:           cfg.OnHeartbeat,
+		announceInterval:           cfg.AnnounceInterval,
+		disruptionAnnounceInterval: cfg.DisruptionAnnounceInterval,
+		pollInterval:               cfg.PollInterval,
+	}), nil
+}
+
+// NewRelayServerHeartbeat creates a [HeartbeatV2] that advertises the presence
+// of a Relay service instance.
+func NewRelayServerHeartbeat(cfg HeartbeatV2Config[*presencev1.RelayServer], log *slog.Logger) (*HeartbeatV2, error) {
+	if err := cfg.Check(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	inner := &relayServerHeartbeatV2{
+		log:       log,
+		getServer: cfg.GetResource,
+	}
+
+	return newHeartbeatV2(cfg.InventoryHandle, inner, heartbeatV2Config{
+		onHeartbeatInner:           cfg.OnHeartbeat,
+		announceInterval:           cfg.AnnounceInterval,
+		disruptionAnnounceInterval: cfg.DisruptionAnnounceInterval,
+		pollInterval:               cfg.PollInterval,
+	}), nil
+}
+
+// NewLinuxDesktopHeartbeat creates a [HeartbeatV2] that can be used to update
+// the presence of [linuxdesktopv1.LinuxDesktop].
+func NewLinuxDesktopHeartbeat(cfg HeartbeatV2Config[*linuxdesktopv1.LinuxDesktop]) (*HeartbeatV2, error) {
+	if err := cfg.Check(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	inner := &linuxDesktopHeartbeatV2{
+		getDesktop: cfg.GetResource,
+	}
+
+	return newHeartbeatV2(cfg.InventoryHandle, inner, heartbeatV2Config{
+		onHeartbeatInner:           cfg.OnHeartbeat,
+		announceInterval:           cfg.AnnounceInterval,
+		disruptionAnnounceInterval: cfg.DisruptionAnnounceInterval,
+		pollInterval:               cfg.PollInterval,
 	}), nil
 }
 
@@ -105,9 +232,14 @@ const (
 	hbv2Start hbv2TestEvent = "hb-start"
 	hbv2Close hbv2TestEvent = "hb-close"
 
-	hbv2AnnounceInterval = "hb-announce-interval"
+	hbv2AnnounceInterval hbv2TestEvent = "hb-announce-interval"
 
-	hbv2FallbackBackoff = "hb-fallback-backoff"
+	hbv2FallbackBackoff hbv2TestEvent = "hb-fallback-backoff"
+
+	hbv2NoFallback hbv2TestEvent = "no-fallback"
+
+	hbv2OnHeartbeatOk  = "on-heartbeat-ok"
+	hbv2OnHeartbeatErr = "on-heartbeat-err"
 )
 
 // newHeartbeatV2 configures a new HeartbeatV2 instance to wrap a given implementation.
@@ -140,13 +272,9 @@ type HeartbeatV2 struct {
 	// all fields below this point are local variables for the
 	// background goroutine and not safe for access from anywhere
 	// else.
-
-	announceFailed error
-	fallbackFailed error
-
-	announce *interval.Interval
-	poll     *interval.Interval
-	dc       *interval.Interval
+	announce      *interval.Interval
+	poll          *interval.Interval
+	degradedCheck *interval.Interval
 
 	// fallbackBackoffTime approximately replicate the backoff used by heartbeat V1 when an announce
 	// fails. It can be removed once we remove the fallback announce operation, since control-stream
@@ -165,14 +293,16 @@ type HeartbeatV2 struct {
 }
 
 type heartbeatV2Config struct {
-	announceInterval time.Duration
-	pollInterval     time.Duration
-	onHeartbeatInner func(error)
+	announceInterval           time.Duration
+	disruptionAnnounceInterval time.Duration
+	pollInterval               time.Duration
+	onHeartbeatInner           func(error)
 
 	// -- below values only used in tests
 
-	fallbackBackoff time.Duration
-	testEvents      chan hbv2TestEvent
+	fallbackBackoff       time.Duration
+	testEvents            chan hbv2TestEvent
+	degradedCheckInterval time.Duration
 }
 
 func (c *heartbeatV2Config) SetDefaults() {
@@ -182,6 +312,11 @@ func (c *heartbeatV2Config) SetDefaults() {
 		// from the average of ~5m30s that was used for V1 ssh server heartbeats.
 		c.announceInterval = 2 * (apidefaults.ServerAnnounceTTL / 3)
 	}
+	if c.disruptionAnnounceInterval == 0 {
+		// if there was a disruption in the control stream, we want to heartbeat a bit
+		// sooner in case the disruption affected the most recent announce's success.
+		c.disruptionAnnounceInterval = 2 * (c.announceInterval / 3)
+	}
 	if c.pollInterval == 0 {
 		c.pollInterval = defaults.HeartbeatCheckPeriod
 	}
@@ -189,31 +324,52 @@ func (c *heartbeatV2Config) SetDefaults() {
 		// only set externally during tests
 		c.fallbackBackoff = time.Minute
 	}
+
+	if c.degradedCheckInterval == 0 {
+		// a lot of integration tests rely on overriding ServerKeepAliveTTL to modify how
+		// quickly teleport detects that it is in a degraded state.
+		c.degradedCheckInterval = apidefaults.ServerKeepAliveTTL()
+	}
 }
 
-// noSenderErr is used to periodically trigger "degraded state" events when the control
+// noSenderError is used to periodically trigger "degraded state" events when the control
 // stream has no sender available.
-var noSenderErr = trace.Errorf("no control stream sender available")
+type noSenderError struct{}
+
+func (noSenderError) Error() string {
+	return "no control stream sender available"
+}
+
+// announceFailedError is used to periodically trigger "degraded state" events when announcing
+// fails.
+type announceFailedError struct{}
+
+func (e announceFailedError) Error() string {
+	return "control stream heartbeat failed"
+}
+
+// fallbackFailedError is used to periodically trigger "degraded state" events when the
+// fallback upsert failed
+type fallbackFailedError struct{}
+
+func (e fallbackFailedError) Error() string {
+	return "upsert fallback heartbeat failed"
+}
 
 func (h *HeartbeatV2) run() {
-	// note: these errors are never actually displayed, but onHeartbeat expects an error,
-	// so we just allocate something reasonably descriptive once.
-	h.announceFailed = trace.Errorf("control stream heartbeat failed (variant=%T)", h.inner)
-	h.fallbackFailed = trace.Errorf("upsert fallback heartbeat failed (variant=%T)", h.inner)
-
 	// set up interval for forced announcement (i.e. heartbeat even if state is unchanged).
 	h.announce = interval.New(interval.Config{
-		FirstDuration: utils.HalfJitter(h.announceInterval),
+		FirstDuration: retryutils.HalfJitter(h.announceInterval),
 		Duration:      h.announceInterval,
-		Jitter:        retryutils.NewSeventhJitter(),
+		Jitter:        retryutils.SeventhJitter,
 	})
 	defer h.announce.Stop()
 
 	// set up interval for polling the inner heartbeat impl for changes.
 	h.poll = interval.New(interval.Config{
-		FirstDuration: utils.HalfJitter(h.pollInterval),
+		FirstDuration: retryutils.HalfJitter(h.pollInterval),
 		Duration:      h.pollInterval,
-		Jitter:        retryutils.NewSeventhJitter(),
+		Jitter:        retryutils.SeventhJitter,
 	})
 	defer h.poll.Stop()
 
@@ -223,40 +379,45 @@ func (h *HeartbeatV2) run() {
 	// down.  Since we no longer perform keepalives, we instead simply emit an error on this
 	// interval when we don't have a healthy control stream.
 	// TODO(fspmarshall): find a more elegant solution to this problem.
-	h.dc = interval.New(interval.Config{
-		Duration: apidefaults.ServerKeepAliveTTL(),
+	h.degradedCheck = interval.New(interval.Config{
+		Duration: h.degradedCheckInterval,
 	})
-	defer h.dc.Stop()
+	defer h.degradedCheck.Stop()
 
 	h.testEvent(hbv2Start)
 	defer h.testEvent(hbv2Close)
 
 	for {
 		// outer loop performs announcement via the fallback method (used for backwards compatibility
-		// with older auth servers).
+		// with older auth servers). Not all drivers support fallback.
 
 		if h.shouldAnnounce {
-			if time.Now().After(h.fallbackBackoffTime) {
-				if ok := h.inner.FallbackAnnounce(h.closeContext); ok {
-					h.testEvent(hbv2FallbackOk)
-					// reset announce interval and state on successful announce
-					h.announce.Reset()
-					h.shouldAnnounce = false
-					h.onHeartbeat(nil)
+			if h.inner.SupportsFallback() {
+				if time.Now().After(h.fallbackBackoffTime) {
+					if ok := h.inner.FallbackAnnounce(h.closeContext); ok {
+						h.testEvent(hbv2FallbackOk)
+						// reset announce interval and state on successful announce
+						h.announce.Reset()
+						h.degradedCheck.Reset()
+						h.shouldAnnounce = false
+						h.onHeartbeat(nil)
 
-					// unblock tests waiting on an announce operation
-					for _, waiter := range h.announceWaiters {
-						close(waiter)
+						// unblock tests waiting on an announce operation
+						for _, waiter := range h.announceWaiters {
+							close(waiter)
+						}
+						h.announceWaiters = nil
+					} else {
+						h.testEvent(hbv2FallbackErr)
+						// announce failed, enter a backoff state.
+						h.fallbackBackoffTime = time.Now().Add(retryutils.SeventhJitter(h.fallbackBackoff))
+						h.onHeartbeat(fallbackFailedError{})
 					}
-					h.announceWaiters = nil
 				} else {
-					h.testEvent(hbv2FallbackErr)
-					// announce failed, enter a backoff state.
-					h.fallbackBackoffTime = time.Now().Add(utils.SeventhJitter(h.fallbackBackoff))
-					h.onHeartbeat(h.fallbackFailed)
+					h.testEvent(hbv2FallbackBackoff)
 				}
 			} else {
-				h.testEvent(hbv2FallbackBackoff)
+				h.testEvent(hbv2NoFallback)
 			}
 		}
 
@@ -267,20 +428,23 @@ func (h *HeartbeatV2) run() {
 		case sender := <-h.handle.Sender():
 			// sender is available, hand off to the primary run loop
 			h.runWithSender(sender)
-			h.dc.Reset()
+			h.degradedCheck.Reset()
 		case <-h.announce.Next():
 			h.testEvent(hbv2AnnounceInterval)
 			h.shouldAnnounce = true
 		case <-h.poll.Next():
-			if h.inner.Poll() {
+			if h.inner.Poll(h.closeContext) {
 				h.testEvent(hbv2PollDiff)
 				h.shouldAnnounce = true
 			} else {
 				h.testEvent(hbv2PollSame)
 			}
-		case <-h.dc.Next():
-			if !h.inner.Poll() && !h.shouldAnnounce {
-				h.onHeartbeat(noSenderErr)
+		case <-h.degradedCheck.Next():
+			if !h.inner.SupportsFallback() || (!h.inner.Poll(h.closeContext) && !h.shouldAnnounce) {
+				// if we don't have fallback and/or aren't planning to hit the fallback
+				// soon, then we need to emit a heartbeat error in order to inform the
+				// rest of teleport that we are in a degraded state.
+				h.onHeartbeat(noSenderError{})
 			}
 		case ch := <-h.testAnnounce:
 			h.shouldAnnounce = true
@@ -288,13 +452,33 @@ func (h *HeartbeatV2) run() {
 		case <-h.closeContext.Done():
 			return
 		}
+
+		// check if we are closing to avoid randomly looping back into the sender
+		if h.closing() {
+			return
+		}
 	}
 }
 
 func (h *HeartbeatV2) runWithSender(sender inventory.DownstreamSender) {
 	// poll immediately when sender becomes available.
-	if h.inner.Poll() {
+	if h.inner.Poll(h.closeContext) {
 		h.shouldAnnounce = true
+	}
+
+	// in the event of disruption, we want to heartbeat a bit sooner than the normal.
+	// this helps prevent node heartbeats from getting too stale when auth servers fail
+	// in a manner that isn't immediately detected by the agent (e.g. deadlock,
+	// i/o timeout, etc). Since we're heartbeating over a channel, such failure modes
+	// can sometimes mean that the last announce failed "silently" from our perspective.
+	if t, ok := h.announce.LastTick(); ok {
+		elapsed := time.Since(t)
+		dai := retryutils.SeventhJitter(h.disruptionAnnounceInterval)
+		if elapsed >= dai {
+			h.shouldAnnounce = true
+		} else {
+			h.announce.ResetTo(dai - elapsed)
+		}
 	}
 
 	for {
@@ -303,6 +487,7 @@ func (h *HeartbeatV2) runWithSender(sender inventory.DownstreamSender) {
 				h.testEvent(hbv2AnnounceOk)
 				// reset announce interval and state on successful announce
 				h.announce.Reset()
+				h.degradedCheck.Reset()
 				h.shouldAnnounce = false
 				h.onHeartbeat(nil)
 
@@ -313,7 +498,7 @@ func (h *HeartbeatV2) runWithSender(sender inventory.DownstreamSender) {
 				h.announceWaiters = nil
 			} else {
 				h.testEvent(hbv2AnnounceErr)
-				h.onHeartbeat(h.announceFailed)
+				h.onHeartbeat(announceFailedError{})
 			}
 		}
 
@@ -326,11 +511,17 @@ func (h *HeartbeatV2) runWithSender(sender inventory.DownstreamSender) {
 			h.testEvent(hbv2AnnounceInterval)
 			h.shouldAnnounce = true
 		case <-h.poll.Next():
-			if h.inner.Poll() {
+			if h.inner.Poll(h.closeContext) {
 				h.testEvent(hbv2PollDiff)
 				h.shouldAnnounce = true
 			} else {
 				h.testEvent(hbv2PollSame)
+			}
+		case <-h.degradedCheck.Next():
+			if !h.inner.Poll(h.closeContext) && !h.shouldAnnounce {
+				// its been a while since we announced and we are not in a retry/announce
+				// state now, so clear up any degraded state.
+				h.onHeartbeat(nil)
 			}
 		case waiter := <-h.testAnnounce:
 			h.shouldAnnounce = true
@@ -358,30 +549,23 @@ func (h *HeartbeatV2) Close() error {
 	return nil
 }
 
-// ForceSend is used in tests to trigger an announce and block
-// until it one successfully completes or the provided timeout is reached.
-func (h *HeartbeatV2) ForceSend(timeout time.Duration) error {
-	timeoutC := time.After(timeout)
-	waiter := make(chan struct{})
-	select {
-	case <-timeoutC:
-		return trace.Errorf("timeout waiting to trigger announce")
-	case h.testAnnounce <- waiter:
-	}
-
-	select {
-	case <-timeoutC:
-		return trace.Errorf("timeout waiting for announce success")
-	case <-waiter:
-		return nil
-	}
-}
-
 func (h *HeartbeatV2) onHeartbeat(err error) {
+	if err != nil {
+		h.testEvent(hbv2OnHeartbeatErr)
+	} else {
+		h.testEvent(hbv2OnHeartbeatOk)
+	}
 	if h.onHeartbeatInner == nil {
 		return
 	}
+	if h.closing() {
+		return
+	}
 	h.onHeartbeatInner(err)
+}
+
+func (h *HeartbeatV2) closing() bool {
+	return h.closeContext.Err() != nil
 }
 
 // heartbeatV2Driver is the pluggable core of the HeartbeatV2 type. A service needing to use HeartbeatV2 should
@@ -389,7 +573,7 @@ func (h *HeartbeatV2) onHeartbeat(err error) {
 type heartbeatV2Driver interface {
 	// Poll is used to check for changes since last *successful* heartbeat (note: Poll should also
 	// return true if no heartbeat has been successfully executed yet).
-	Poll() (changed bool)
+	Poll(ctx context.Context) (changed bool)
 	// FallbackAnnounce is called if a heartbeat is needed but the inventory control stream is
 	// unavailable. In theory this is probably only relevant for cases where the auth has been
 	// downgraded to an earlier version than it should have been, but its still preferable to
@@ -397,45 +581,305 @@ type heartbeatV2Driver interface {
 	FallbackAnnounce(ctx context.Context) (ok bool)
 	// Announce attempts to heartbeat via the inventory control stream.
 	Announce(ctx context.Context, sender inventory.DownstreamSender) (ok bool)
+	// SupportsFallback checks if the driver supports fallback.
+	SupportsFallback() bool
 }
+
+// metadataGetter returns the instance metadata, unblocking with an error if
+// fetching the metadata takes longer than the context. If the metadata is
+// immediately available, it shall be returned even if the context passed in is
+// already done.
+type metadataGetter func(ctx context.Context) (*metadata.Metadata, error)
 
 // sshServerHeartbeatV2 is the heartbeatV2 implementation for ssh servers.
 type sshServerHeartbeatV2 struct {
-	getServer func() *types.ServerV2
-	announcer auth.Announcer
-	prev      *types.ServerV2
+	getServer   func(ctx context.Context) (*types.ServerV2, error)
+	getMetadata metadataGetter
+	prev        *types.ServerV2
 }
 
-func (h *sshServerHeartbeatV2) Poll() (changed bool) {
+func (h *sshServerHeartbeatV2) Poll(ctx context.Context) (changed bool) {
 	if h.prev == nil {
 		return true
 	}
-	return services.CompareServers(h.getServer(), h.prev) == services.Different
+
+	server, err := h.getServer(ctx)
+	if err != nil {
+		return false
+	}
+
+	return services.CompareServers(server, h.prev) == services.Different
+}
+
+func (h *sshServerHeartbeatV2) SupportsFallback() bool {
+	return false
 }
 
 func (h *sshServerHeartbeatV2) FallbackAnnounce(ctx context.Context) (ok bool) {
-	if h.announcer == nil {
+	return false
+}
+
+func (h *sshServerHeartbeatV2) Announce(ctx context.Context, sender inventory.DownstreamSender) (ok bool) {
+	server, err := h.getServer(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "Failed to perform inventory heartbeat for ssh server", "error", err)
 		return false
 	}
-	server := h.getServer()
-	_, err := h.announcer.UpsertNode(ctx, server)
-	if err != nil {
-		log.Warnf("Failed to perform fallback heartbeat for ssh server: %v", err)
+
+	if err := sender.Send(ctx, proto.InventoryHeartbeat_builder{SSHServer: apiutils.CloneProtoMsg(server)}.Build()); err != nil {
+		slog.WarnContext(ctx, "Failed to perform inventory heartbeat for ssh server", "error", err)
 		return false
 	}
 	h.prev = server
 	return true
 }
 
-func (h *sshServerHeartbeatV2) Announce(ctx context.Context, sender inventory.DownstreamSender) (ok bool) {
-	server := h.getServer()
-	err := sender.Send(ctx, proto.InventoryHeartbeat{
-		SSHServer: h.getServer(),
-	})
+// appServerHeartbeatV2 is the heartbeatV2 implementation for app servers.
+type appServerHeartbeatV2 struct {
+	getServer func(ctx context.Context) (*types.AppServerV3, error)
+	prev      *types.AppServerV3
+}
+
+func (h *appServerHeartbeatV2) Poll(ctx context.Context) (changed bool) {
+	if h.prev == nil {
+		return true
+	}
+
+	server, err := h.getServer(ctx)
 	if err != nil {
-		log.Warnf("Failed to perform inventory heartbeat for ssh server: %v", err)
 		return false
 	}
+
+	return services.CompareServers(server, h.prev) == services.Different
+}
+
+func (h *appServerHeartbeatV2) SupportsFallback() bool {
+	return false
+}
+
+func (h *appServerHeartbeatV2) FallbackAnnounce(ctx context.Context) (ok bool) {
+	return false
+}
+
+func (h *appServerHeartbeatV2) Announce(ctx context.Context, sender inventory.DownstreamSender) (ok bool) {
+	server, err := h.getServer(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "Failed to perform inventory heartbeat for app server", "error", err)
+		return false
+	}
+
+	if err := sender.Send(ctx, proto.InventoryHeartbeat_builder{AppServer: apiutils.CloneProtoMsg(server)}.Build()); err != nil {
+		if !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled {
+			slog.WarnContext(ctx, "Failed to perform inventory heartbeat for app server", "error", err)
+		}
+		return false
+	}
+
 	h.prev = server
+	return true
+}
+
+// dbServerHeartbeatV2 is the heartbeatV2 implementation for db servers.
+type dbServerHeartbeatV2 struct {
+	getServer func(ctx context.Context) (*types.DatabaseServerV3, error)
+	prev      *types.DatabaseServerV3
+}
+
+func (h *dbServerHeartbeatV2) Poll(ctx context.Context) (changed bool) {
+	if h.prev == nil {
+		return true
+	}
+
+	server, err := h.getServer(ctx)
+	if err != nil {
+		return false
+	}
+
+	return services.CompareServers(server, h.prev) == services.Different
+}
+
+func (h *dbServerHeartbeatV2) SupportsFallback() bool {
+	return false
+}
+
+func (h *dbServerHeartbeatV2) FallbackAnnounce(ctx context.Context) (ok bool) {
+	return false
+}
+
+func (h *dbServerHeartbeatV2) Announce(ctx context.Context, sender inventory.DownstreamSender) (ok bool) {
+	server, err := h.getServer(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "Failed to perform inventory heartbeat for database server", "error", err)
+		return false
+	}
+	if err := sender.Send(ctx, proto.InventoryHeartbeat_builder{DatabaseServer: apiutils.CloneProtoMsg(server)}.Build()); err != nil {
+		if !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled {
+			slog.WarnContext(ctx, "Failed to perform inventory heartbeat for database server", "error", err)
+		}
+		return false
+	}
+
+	h.prev = server
+	return true
+}
+
+// kubeServerHeartbeatV2 is the heartbeatV2 implementation for kubernetes servers.
+type kubeServerHeartbeatV2 struct {
+	getServer func(ctx context.Context) (*types.KubernetesServerV3, error)
+	prev      *types.KubernetesServerV3
+}
+
+func (h *kubeServerHeartbeatV2) Poll(ctx context.Context) (changed bool) {
+	if h.prev == nil {
+		return true
+	}
+
+	server, err := h.getServer(ctx)
+	if err != nil {
+		return false
+	}
+
+	return services.CompareServers(server, h.prev) == services.Different
+}
+
+func (h *kubeServerHeartbeatV2) SupportsFallback() bool {
+	return false
+}
+
+func (h *kubeServerHeartbeatV2) FallbackAnnounce(ctx context.Context) (ok bool) {
+	return false
+}
+
+func (h *kubeServerHeartbeatV2) Announce(ctx context.Context, sender inventory.DownstreamSender) (ok bool) {
+	server, err := h.getServer(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "Failed to perform inventory heartbeat for kubernetes server", "error", err)
+		return false
+	}
+	if err := sender.Send(ctx, proto.InventoryHeartbeat_builder{KubernetesServer: apiutils.CloneProtoMsg(server)}.Build()); err != nil {
+		if !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled {
+			slog.WarnContext(ctx, "Failed to perform inventory heartbeat for kubernetes server", "error", err)
+		}
+		return false
+	}
+
+	h.prev = server
+	return true
+}
+
+// linuxDesktopHeartbeatV2 is the heartbeatV2 implementation for linux desktops.
+type linuxDesktopHeartbeatV2 struct {
+	getDesktop func(ctx context.Context) (*linuxdesktopv1.LinuxDesktop, error)
+	prev       *linuxdesktopv1.LinuxDesktop
+}
+
+var _ heartbeatV2Driver = (*linuxDesktopHeartbeatV2)(nil)
+
+func (h *linuxDesktopHeartbeatV2) Poll(ctx context.Context) (changed bool) {
+	if h.prev == nil {
+		return true
+	}
+
+	desktop, err := h.getDesktop(ctx)
+	if err != nil {
+		return false
+	}
+
+	ldesktop := types.ProtoResource153ToLegacy(desktop)
+	lprev := types.ProtoResource153ToLegacy(h.prev)
+	return services.CompareServers(ldesktop, lprev) == services.Different
+}
+
+func (h *linuxDesktopHeartbeatV2) SupportsFallback() bool {
+	return false
+}
+
+func (h *linuxDesktopHeartbeatV2) FallbackAnnounce(ctx context.Context) (ok bool) {
+	return false
+}
+
+func (h *linuxDesktopHeartbeatV2) Announce(ctx context.Context, sender inventory.DownstreamSender) (ok bool) {
+	hello := sender.Hello()
+	switch {
+	case !hello.HasCapabilities():
+		return false
+	case !hello.GetCapabilities().GetLinuxDesktopHeartbeats():
+		return false
+	}
+
+	desktop, err := h.getDesktop(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "Failed to perform inventory heartbeat for linux desktop", "error", err)
+		return false
+	}
+
+	if err := sender.Send(ctx, proto.InventoryHeartbeat_builder{LinuxDesktop: apiutils.CloneProtoMsg(desktop)}.Build()); err != nil {
+		if !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled {
+			slog.WarnContext(ctx, "Failed to perform inventory heartbeat for linux desktop", "error", err)
+		}
+		return false
+	}
+	h.prev = desktop
+	return true
+}
+
+// relayServerHeartbeatV2 is a heartbeat driver for Relay heartbeats.
+type relayServerHeartbeatV2 struct {
+	log *slog.Logger
+	// getServer should return a relay_server item with no expiry. The value is
+	// checked against the previous relay_server with protobuf equality.
+	getServer func(ctx context.Context) (*presencev1.RelayServer, error)
+
+	last *presencev1.RelayServer
+}
+
+var _ heartbeatV2Driver = (*relayServerHeartbeatV2)(nil)
+
+// Poll implements [heartbeatV2Driver].
+func (h *relayServerHeartbeatV2) Poll(ctx context.Context) (changed bool) {
+	if h.last == nil {
+		return true
+	}
+
+	server, err := h.getServer(ctx)
+	if err != nil {
+		return false
+	}
+
+	return !gproto.Equal(h.last, server)
+}
+
+// SupportsFallback implements [heartbeatV2Driver].
+func (h *relayServerHeartbeatV2) SupportsFallback() bool {
+	return false
+}
+
+// FallbackAnnounce implements [heartbeatV2Driver].
+func (h *relayServerHeartbeatV2) FallbackAnnounce(ctx context.Context) (ok bool) {
+	return false
+}
+
+// Announce implements [heartbeatV2Driver].
+func (h *relayServerHeartbeatV2) Announce(ctx context.Context, sender inventory.DownstreamSender) (ok bool) {
+	if !sender.Hello().GetCapabilities().GetRelayServerHeartbeatsCleanup() {
+		return false
+	}
+
+	server, err := h.getServer(ctx)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled {
+			h.log.WarnContext(ctx, "Failed to get server value for Relay service announce", "error", err)
+		}
+		return false
+	}
+
+	if err := sender.Send(ctx, proto.InventoryHeartbeat_builder{RelayServer: gproto.CloneOf(server)}.Build()); err != nil {
+		if !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled {
+			h.log.WarnContext(ctx, "Failed to perform Relay service announce", "error", err)
+		}
+		return false
+	}
+
+	h.last = server
 	return true
 }

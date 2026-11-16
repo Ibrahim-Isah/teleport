@@ -1,18 +1,20 @@
 /*
-Copyright 2016-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package defaults contains default constants set in various parts of
 // teleport codebase
@@ -22,13 +24,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"golang.org/x/exp/slices"
-	"gopkg.in/square/go-jose.v2"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/defaults"
@@ -88,6 +90,13 @@ const (
 	// RDPListenPort is the standard port for RDP servers.
 	RDPListenPort = 3389
 
+	// CloudProxyListenPort is the Proxy Service port when running in Teleport Cloud.
+	CloudProxyListenPort = 443
+
+	// CloudDomainSuffix can be used to identify when an address is a Teleport Cloud domain
+	// and provide helpful Cloud-specific instructions.
+	CloudDomainSuffix = "teleport.sh"
+
 	// BackendDir is a default backend subdirectory
 	BackendDir = "backend"
 
@@ -97,8 +106,9 @@ const (
 	// By default SSH server (and SSH proxy) will bind to this IP
 	BindIP = "0.0.0.0"
 
-	// By default all users use /bin/bash
-	DefaultShell = "/bin/bash"
+	// GRPCMaxConcurrentStreams is the max GRPC streams that can be active at a time.  Once the limit is reached new
+	// RPC calls will queue until capacity is available.
+	GRPCMaxConcurrentStreams = 1000
 
 	// HTTPMaxIdleConns is the max idle connections across all hosts.
 	HTTPMaxIdleConns = 2000
@@ -135,7 +145,7 @@ const (
 
 	// ReadHeadersTimeout is a default TCP timeout when we wait
 	// for the response headers to arrive
-	ReadHeadersTimeout = time.Second
+	ReadHeadersTimeout = 10 * time.Second
 
 	// DatabaseConnectTimeout is a timeout for connecting to a database via
 	// database access.
@@ -143,7 +153,7 @@ const (
 
 	// HandshakeReadDeadline is the default time to wait for the client during
 	// the TLS handshake.
-	HandshakeReadDeadline = 5 * time.Second
+	HandshakeReadDeadline = 15 * time.Second
 
 	// SignupTokenTTL is a default TTL for a web signup one time token
 	SignupTokenTTL = time.Hour
@@ -163,10 +173,14 @@ const (
 
 	// MaxRenewableCertTTL is the maximum TTL that a certificate renewal bot
 	// can request for a renewable user certificate.
-	MaxRenewableCertTTL = 24 * time.Hour
+	MaxRenewableCertTTL = 7 * 24 * time.Hour
 
 	// DefaultBotJoinTTL is the default TTL for bot join tokens.
 	DefaultBotJoinTTL = 1 * time.Hour
+
+	// DefaultBotMaxSessionTTL is the default max_session_ttl on generated bot
+	// roles, unless overridden during bot creation.
+	DefaultBotMaxSessionTTL = 12 * time.Hour
 
 	// RecoveryStartTokenTTL is a default expiry time for a recovery start token.
 	RecoveryStartTokenTTL = 3 * time.Hour
@@ -180,13 +194,28 @@ const (
 	// ResetPasswordLength is the length of the reset user password
 	ResetPasswordLength = 16
 
+	// BearerTokenTTL specifies standard bearer token to exist before
+	// it has to be renewed by the client
+	BearerTokenTTL = 10 * time.Minute
+
+	// TokenLenBytes is len in bytes of the invite token
+	TokenLenBytes = 16
+
+	// RecoveryTokenLenBytes is len in bytes of a user token for recovery.
+	RecoveryTokenLenBytes = 32
+
+	// SessionTokenBytes is the number of bytes of a web or application session.
+	SessionTokenBytes = 32
+
 	// ProvisioningTokenTTL is a the default TTL for server provisioning
 	// tokens. When a user generates a token without an explicit TTL, this
 	// value is used.
 	ProvisioningTokenTTL = 30 * time.Minute
 
-	// MinPasswordLength is minimum password length
-	MinPasswordLength = 6
+	// MinPasswordLength is minimum password length.
+	// PCI DSS v4.0 control 8.3.6 requires a minimum password length of 12 characters.
+	// NIST SP 800-63B section 5.1.1.1 requires a minimum password length of 8 characters.
+	MinPasswordLength = 12
 
 	// MaxPasswordLength is maximum password length (for sanity)
 	MaxPasswordLength = 128
@@ -225,13 +254,10 @@ const (
 	// before a user account is locked for AccountLockInterval
 	MaxLoginAttempts int = 5
 
-	// MaxAccountRecoveryAttempts sets the max number of allowed failed recovery attempts
-	// before a user is locked from login and further recovery attempts for AccountLockInterval.
-	MaxAccountRecoveryAttempts = 3
-
 	// AccountLockInterval defines a time interval during which a user account
-	// is locked after MaxLoginAttempts
-	AccountLockInterval = 20 * time.Minute
+	// is locked after MaxLoginAttempts.
+	// PCI DSS v4.0 control 8.3.4 requires a minimum lockout duration of 30 minutes.
+	AccountLockInterval = 30 * time.Minute
 
 	// AttemptTTL is TTL for login attempt
 	AttemptTTL = time.Minute * 30
@@ -257,9 +283,12 @@ const (
 	// refer to all addresses on the machine.
 	AnyAddress = "0.0.0.0"
 
-	// CallbackTimeout is how long to wait for a response from SSO provider
+	// SSOCallbackTimeout is how long to wait for a response from SSO provider
 	// before timeout.
-	CallbackTimeout = 180 * time.Second
+	SSOCallbackTimeout = 180 * time.Second
+
+	// HeadlessLoginTimeout is how long to wait for user to approve/reject headless login request.
+	HeadlessLoginTimeout = SSOCallbackTimeout
 
 	// NodeJoinTokenTTL is when a token for nodes expires.
 	NodeJoinTokenTTL = 4 * time.Hour
@@ -293,10 +322,6 @@ const (
 	// LowResPollingPeriod is a default low resolution polling period
 	LowResPollingPeriod = 600 * time.Second
 
-	// HighResReportingPeriod is a high resolution polling reporting
-	// period used in services
-	HighResReportingPeriod = 10 * time.Second
-
 	// SessionControlTimeout is the maximum amount of time a controlled session
 	// may persist after contact with the auth server is lost (sessctl semaphore
 	// leases are refreshed at a rate of ~1/2 this duration).
@@ -307,7 +332,11 @@ const (
 
 	// MaxWatcherBackoff is the maximum retry time a watcher should use in
 	// the event of connection issues
-	MaxWatcherBackoff = time.Minute
+	MaxWatcherBackoff = 90 * time.Second
+
+	// MaxLongWatcherBackoff is the maximum backoff used for watchers that incur high cluster-level
+	// load (non-control-plane caches being the primary example).
+	MaxLongWatcherBackoff = 256 * time.Second
 )
 
 const (
@@ -316,6 +345,12 @@ const (
 
 	// ProxyQueueSize is proxy service queue size
 	ProxyQueueSize = 8192
+
+	// RelayQueueSize is the watcher queue size for the relay cache.
+	RelayQueueSize = 8192
+
+	// UnifiedResourcesQueueSize is the unified resource watcher queue size
+	UnifiedResourcesQueueSize = 8192
 
 	// NodeQueueSize is node service queue size
 	NodeQueueSize = 128
@@ -331,6 +366,9 @@ const (
 
 	// WindowsDesktopQueueSize is windows_desktop service watch queue size.
 	WindowsDesktopQueueSize = 128
+
+	// LinuxDesktopQueueSize is linux_desktop service watch queue size.
+	LinuxDesktopQueueSize = 128
 
 	// DiscoveryQueueSize is discovery service queue size.
 	DiscoveryQueueSize = 128
@@ -350,23 +388,29 @@ const (
 	// LimiterMaxConnections Number of max. simultaneous connections to a service
 	LimiterMaxConnections = 15000
 
-	// LimiterMaxConcurrentUsers Number of max. simultaneous connected users/logins
-	LimiterMaxConcurrentUsers = 250
-
 	// LimiterMaxConcurrentSignatures limits maximum number of concurrently
 	// generated signatures by the auth server
 	LimiterMaxConcurrentSignatures = 10
 )
 
-// Default rate limits for unauthenticated passwordless endpoints.
+// Default rate limits for unauthenticated endpoints.
 const (
-	// LimiterPasswordlessPeriod is the default period for passwordless limiters.
-	LimiterPasswordlessPeriod = 1 * time.Minute
-	// LimiterPasswordlessAverage is the default average for passwordless
-	// limiters.
-	LimiterPasswordlessAverage = 10
-	// LimiterPasswordlessBurst is the default burst for passwordless limiters.
-	LimiterPasswordlessBurst = 20
+	// LimiterPeriod is the default period for unauthenticated limiters.
+	LimiterPeriod = 1 * time.Minute
+	// LimiterAverage is the default average for unauthenticated limiters.
+	LimiterAverage = 20
+	// LimiterBurst is the default burst for unauthenticated limiters.
+	LimiterBurst = 40
+)
+
+// Default high rate limits for unauthenticated endpoints that are CPU constrained.
+const (
+	// LimiterHighPeriod is the default period for high rate unauthenticated limiters.
+	LimiterHighPeriod = 1 * time.Minute
+	// LimiterHighAverage is the default average for high rate unauthenticated limiters.
+	LimiterHighAverage = 120
+	// LimiterHighBurst is the default burst for high rate unauthenticated limiters.
+	LimiterHighBurst = 480
 )
 
 const (
@@ -406,6 +450,8 @@ const (
 	RoleDatabase = "db"
 	// RoleWindowsDesktop is a Windows desktop service.
 	RoleWindowsDesktop = "windowsdesktop"
+	// RoleLinuxDesktop is a Linux desktop service.
+	RoleLinuxDesktop = "linuxdesktop"
 	// RoleDiscovery is a discovery service
 	RoleDiscovery = "discovery"
 )
@@ -417,6 +463,8 @@ const (
 	ProtocolMySQL = "mysql"
 	// ProtocolMongoDB is the MongoDB database protocol.
 	ProtocolMongoDB = "mongodb"
+	// ProtocolOracle is the Oracle database protocol.
+	ProtocolOracle = "oracle"
 	// ProtocolRedis is the Redis database protocol.
 	ProtocolRedis = "redis"
 	// ProtocolCockroachDB is the CockroachDB database protocol.
@@ -433,8 +481,17 @@ const (
 	ProtocolCassandra = "cassandra"
 	// ProtocolElasticsearch is the Elasticsearch database protocol.
 	ProtocolElasticsearch = "elasticsearch"
+	// ProtocolOpenSearch is the OpenSearch database protocol.
+	ProtocolOpenSearch = "opensearch"
 	// ProtocolDynamoDB is the DynamoDB database protocol.
 	ProtocolDynamoDB = "dynamodb"
+	// ProtocolClickHouse is the ClickHouse database native write protocol.
+	// (https://clickhouse.com/docs/en/interfaces/tcp)
+	ProtocolClickHouse = "clickhouse"
+	// ProtocolClickHouseHTTP is the ClickHouse database HTTP protocol.
+	ProtocolClickHouseHTTP = "clickhouse-http"
+	// ProtocolSpanner is the GCP Spanner database protocol.
+	ProtocolSpanner = "spanner"
 )
 
 // DatabaseProtocols is a list of all supported database protocols.
@@ -442,16 +499,21 @@ var DatabaseProtocols = []string{
 	ProtocolPostgres,
 	ProtocolMySQL,
 	ProtocolMongoDB,
+	ProtocolOracle,
 	ProtocolCockroachDB,
 	ProtocolRedis,
 	ProtocolSnowflake,
 	ProtocolSQLServer,
 	ProtocolCassandra,
 	ProtocolElasticsearch,
+	ProtocolOpenSearch,
 	ProtocolDynamoDB,
+	ProtocolClickHouse,
+	ProtocolClickHouseHTTP,
+	ProtocolSpanner,
 }
 
-// ReadableDatabaseProtocol returns a more human readable string of the
+// ReadableDatabaseProtocol returns a more human-readable string of the
 // provided database protocol.
 func ReadableDatabaseProtocol(p string) string {
 	switch p {
@@ -461,6 +523,8 @@ func ReadableDatabaseProtocol(p string) string {
 		return "MySQL"
 	case ProtocolMongoDB:
 		return "MongoDB"
+	case ProtocolOracle:
+		return "Oracle"
 	case ProtocolCockroachDB:
 		return "CockroachDB"
 	case ProtocolRedis:
@@ -469,12 +533,20 @@ func ReadableDatabaseProtocol(p string) string {
 		return "Snowflake"
 	case ProtocolElasticsearch:
 		return "Elasticsearch"
+	case ProtocolOpenSearch:
+		return "OpenSearch"
 	case ProtocolSQLServer:
 		return "Microsoft SQL Server"
 	case ProtocolCassandra:
 		return "Cassandra"
 	case ProtocolDynamoDB:
 		return "DynamoDB"
+	case ProtocolClickHouse:
+		return "Clickhouse"
+	case ProtocolClickHouseHTTP:
+		return "Clickhouse (HTTP)"
+	case ProtocolSpanner:
+		return "GCloud Spanner"
 	default:
 		// Unknown protocol. Return original string.
 		return p
@@ -482,14 +554,18 @@ func ReadableDatabaseProtocol(p string) string {
 }
 
 const (
-	// PerfBufferPageCount is the size of the perf ring buffer in number of pages.
-	// Must be power of 2.
-	PerfBufferPageCount = 8
+	// CmdPerfBufferPageCount is the size of buffered channel that receives
+	// eBPF command event messages.
+	CmdPerfBufferPageCount = 64
 
-	// OpenPerfBufferPageCount is the page count for the perf buffer. Open
-	// events generate many events so this buffer needs to be extra large.
-	// Must be power of 2.
+	// OpenPerfBufferPageCount is the size of buffered channel that receives
+	// eBPF disk event messages. Open events generate many events so this
+	// buffer needs to be extra large.
 	OpenPerfBufferPageCount = 128
+
+	// NetPerfBufferPageCount is the size of the buffered channel that receives
+	// eBPF network event messages.
+	NetPerfBufferPageCount = 64
 
 	// CgroupPath is where the cgroupv2 hierarchy will be mounted.
 	CgroupPath = "/cgroup2"
@@ -570,7 +646,6 @@ const (
 // ConfigureLimiter assigns the default parameters to a connection throttler (AKA limiter)
 func ConfigureLimiter(lc *limiter.Config) {
 	lc.MaxConnections = LimiterMaxConnections
-	lc.MaxNumberOfUsers = LimiterMaxConcurrentUsers
 }
 
 // AuthListenAddr returns the default listening address for the Auth service
@@ -610,11 +685,6 @@ func ReverseTunnelListenAddr() *utils.NetAddr {
 	return makeAddr(BindIP, SSHProxyTunnelListenPort)
 }
 
-// MetricsServiceListenAddr returns the default listening address for the metrics service
-func MetricsServiceListenAddr() *utils.NetAddr {
-	return makeAddr(BindIP, MetricsListenPort)
-}
-
 func ProxyPeeringListenAddr() *utils.NetAddr {
 	return makeAddr(BindIP, ProxyPeeringListenPort)
 }
@@ -648,18 +718,35 @@ const (
 	// WebsocketResize is receiving a resize request.
 	WebsocketResize = "w"
 
-	// WebsocketWebauthnChallenge is sending a webauthn challenge.
-	WebsocketWebauthnChallenge = "n"
+	// WebsocketFileTransferRequest is received when a new file transfer has been requested
+	WebsocketFileTransferRequest = "f"
+
+	// WebsocketFileTransferDecision is received when a response (approve/deny) has been
+	// made for an existing file transfer request
+	WebsocketFileTransferDecision = "t"
+
+	// WebsocketMFAChallenge is sending an MFA challenge. Only supports WebAuthn and SSO MFA.
+	WebsocketMFAChallenge = "n"
 
 	// WebsocketSessionMetadata is sending the data for a ssh session.
 	WebsocketSessionMetadata = "s"
 
 	// WebsocketError is sending an error message.
 	WebsocketError = "e"
+
+	// WebsocketLatency provides latency information for a session.
+	WebsocketLatency = "l"
+
+	// WebsocketKubeExec provides latency information for a session.
+	WebsocketKubeExec = "k"
+
+	// WebsocketDatabaseSessionRequest is received when a new database session
+	// is requested.
+	WebsocketDatabaseSessionRequest = "d"
 )
 
 // The following are cryptographic primitives Teleport does not support in
-// it's default configuration.
+// its default configuration.
 const (
 	DiffieHellmanGroup14SHA1 = "diffie-hellman-group14-sha1"
 	DiffieHellmanGroup1SHA1  = "diffie-hellman-group1-sha1"
@@ -668,63 +755,125 @@ const (
 )
 
 const (
-	// ApplicationTokenKeyType is the type of asymmetric key used to sign tokens.
-	// See https://tools.ietf.org/html/rfc7518#section-6.1 for possible values.
-	ApplicationTokenKeyType = "RSA"
-	// ApplicationTokenAlgorithm is the default algorithm used to sign
-	// application access tokens.
-	ApplicationTokenAlgorithm = jose.RS256
+	// JWTUse is the default usage of the JWT.
+	// See https://www.rfc-editor.org/rfc/rfc7517#section-4.2 for more information.
+	JWTUse = "sig"
 )
 
 var (
-	// FIPSCipherSuites is a list of supported FIPS compliant TLS cipher suites.
+	// FIPSCipherSuites is a list of supported FIPS compliant TLS cipher suites (for TLS 1.2 only).
+	// Order will dictate the selected cipher, as per RFC 5246 § 7.4.1.2.
+	// See https://datatracker.ietf.org/doc/html/rfc5246#section-7.4.1.2 for more information.
+	// This aligns to `crypto/tls`'s `CipherSuites` `supportedOnlyTLS12` list, but
+	// just constrained to only FIPS-approved ciphers supported by `crypto/tls`
+	// and ordered based on `cipherSuitesPreferenceOrder`.
 	FIPSCipherSuites = []uint16{
-		//
-		// These two ciper suites:
-		//
-		// tls.TLS_RSA_WITH_AES_128_GCM_SHA256
-		// tls.TLS_RSA_WITH_AES_256_GCM_SHA384
-		//
-		// although supported by FIPS, are blacklisted in http2 spec:
-		//
-		// https://tools.ietf.org/html/rfc7540#appendix-A
-		//
-		// therefore we do not include them in this list.
-		//
-		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 	}
 
 	// FIPSCiphers is a list of supported FIPS compliant SSH ciphers.
+	// Order will dictate the selected cipher, as per RFC 4253 § 7.1.
+	// See `encryption_algorithms` section of https://datatracker.ietf.org/doc/html/rfc4253#section-7.1.
+	// This aligns to `x/crypto/ssh`'s `preferredCiphers`, but just constrained to
+	// only FIPS-approved ciphers.
+	// Can also be compared to OpenSSH's `KEX_SERVER_ENCRYPT` / `KEX_CLIENT_ENCRYPT`.
 	FIPSCiphers = []string{
+		"aes128-gcm@openssh.com",
+		"aes256-gcm@openssh.com",
 		"aes128-ctr",
 		"aes192-ctr",
 		"aes256-ctr",
-		"aes128-gcm@openssh.com",
 	}
 
 	// FIPSKEXAlgorithms is a list of supported FIPS compliant SSH kex algorithms.
+	// Order will dictate the selected algorithm, as per RFC 4253 § 7.1.
+	// See `kex_algorithms` section of https://datatracker.ietf.org/doc/html/rfc4253#section-7.1.
+	// This aligns to `x/crypto/ssh`'s `preferredKeyAlgos`, but just constrained to
+	// only FIPS-approved algorithms.
+	// Can also be compared to OpenSSH's `KEX_SERVER_KEX` / `KEX_CLIENT_KEX`.
 	FIPSKEXAlgorithms = []string{
 		"ecdh-sha2-nistp256",
 		"ecdh-sha2-nistp384",
-		"echd-sha2-nistp521",
 	}
 
 	// FIPSMACAlgorithms is a list of supported FIPS compliant SSH mac algorithms.
+	// Order will dictate the selected algorithm, as per RFC 4253 § 7.1.
+	// See `mac_algorithms` section of https://datatracker.ietf.org/doc/html/rfc4253#section-7.1.
+	// This aligns to `x/crypto/ssh`'s `preferredMACs`, but just constrained to
+	// only FIPS-approved algorithms.
+	// Can also be compared to OpenSSH's `KEX_SERVER_MAC` / `KEX_CLIENT_MAC`.
 	FIPSMACAlgorithms = []string{
 		"hmac-sha2-256-etm@openssh.com",
+		"hmac-sha2-512-etm@openssh.com",
 		"hmac-sha2-256",
+		"hmac-sha2-512",
+	}
+
+	// FIPSPubKeyAuthAlgorithms is a list of supported FIPS compliant SSH public
+	// key authentication algorithms.
+	// Order will dictate the selected algorithm, as per RFC 4253 § 7.1.
+	// See `server_host_key_algorithms` section of https://datatracker.ietf.org/doc/html/rfc4253#section-7.1.
+	// This aligns to `x/crypto/ssh`'s `preferredPubKeyAuthAlgos`, but just
+	// constrained to only FIPS-approved algorithms.
+	// Can also be compared to OpenSSH's `KEX_DEFAULT_PK_ALG`.
+	FIPSPubKeyAuthAlgorithms = []string{
+		ssh.KeyAlgoECDSA256,
+		ssh.KeyAlgoECDSA384,
+		ssh.KeyAlgoRSASHA256,
+		ssh.KeyAlgoRSASHA512,
 	}
 )
 
-// Transport returns a new http.Client with sensible defaults.
-func HTTPClient() (*http.Client, error) {
+// HTTPClientOption is an option for configuring the HTTP client.
+type HTTPClientOption func(*httpClientOptions) *httpClientOptions
+
+type httpClientOptions struct {
+	useProxyFromEnvironment *bool
+}
+
+// UseProxyFromEnvironment configures the HTTP client to use proxy
+// settings from the environment variables HTTP_PROXY, HTTPS_PROXY, and NO_PROXY.
+func UseProxyFromEnvironment() HTTPClientOption {
+	return func(opts *httpClientOptions) *httpClientOptions {
+		enable := true
+		opts.useProxyFromEnvironment = &enable
+		return opts
+	}
+}
+
+// DisableProxyFromEnvironment configures the HTTP client to ignore proxy
+// settings from the environment variables HTTP_PROXY, HTTPS_PROXY, and NO_PROXY.
+func DisableProxyFromEnvironment() HTTPClientOption {
+	return func(opts *httpClientOptions) *httpClientOptions {
+		enable := false
+		opts.useProxyFromEnvironment = &enable
+		return opts
+	}
+}
+
+// HTTPClient returns a new http.Client with sensible defaults.
+func HTTPClient(opts ...HTTPClientOption) (*http.Client, error) {
 	transport, err := Transport()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+
+	httpOpts := &httpClientOptions{}
+	for _, o := range opts {
+		httpOpts = o(httpOpts)
+	}
+
+	switch {
+	case httpOpts.useProxyFromEnvironment == nil:
+	case *httpOpts.useProxyFromEnvironment == true:
+		transport.Proxy = http.ProxyFromEnvironment
+	case *httpOpts.useProxyFromEnvironment == false:
+		transport.Proxy = nil
+	}
+
 	return &http.Client{
 		Transport: transport,
 	}, nil
@@ -793,7 +942,7 @@ var DefaultFormats = []string{teleport.Text, teleport.JSON, teleport.YAML}
 
 // FormatFlagDescription creates the description for the --format flag.
 func FormatFlagDescription(formats ...string) string {
-	return fmt.Sprintf("Format output (%s)", strings.Join(formats, ", "))
+	return fmt.Sprintf("Format output (%s).", strings.Join(formats, ", "))
 }
 
 func SearchSessionRange(clock clockwork.Clock, fromUTC, toUTC, recordingsSince string) (from time.Time, to time.Time, err error) {
@@ -842,19 +991,16 @@ func SearchSessionRange(clock clockwork.Clock, fromUTC, toUTC, recordingsSince s
 }
 
 const (
-	// AWSInstallerDocument is the name of the default AWS document
-	// that will be called when executing the SSM command.
-	AWSInstallerDocument = "TeleportDiscoveryInstaller"
+	// HostnameLabel is the name of the label added to the sample SSH config generated by the teleport
+	// node configure command.
+	HostnameLabel = "hostname"
+)
 
-	// AWSAgentlessInstallerDocument is the name of the default AWS document
-	// that will be called when executing the SSM command .
-	AWSAgentlessInstallerDocument = "TeleportAgentlessDiscoveryInstaller"
-
-	// IAMInviteTokenName is the name of the default Teleport IAM
-	// token to use when templating the script to be executed.
-	IAMInviteTokenName = "aws-discovery-iam-token"
-
-	// SSHDConfigPath is the path to the sshd config file to modify
-	// when using the agentless installer
-	SSHDConfigPath = "/etc/ssh/sshd_config"
+const (
+	// FilePermissions are safe default permissions to use when
+	// creating files.
+	FilePermissions = 0o644
+	// DirectoryPermissions are safe default permissions to use when
+	// creating directories.
+	DirectoryPermissions = 0o755
 )

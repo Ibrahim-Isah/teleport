@@ -1,0 +1,50 @@
+suite: Operator RoleBinding
+templates:
+  - rolebinding.yaml
+# Override chart version so snapshots are stable across releases.
+chart:
+  version: "99.0.0"
+  appVersion: "99.0.0"
+tests:
+  - it: creates no RoleBinding when operator is not enabled
+    values:
+      - ../.lint/disabled.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: creates no RoleBinding when rbac.create is false
+    set:
+      rbac:
+        create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: creates a RoleBinding by default
+    asserts:
+      - containsDocument:
+          any: true
+          kind: RoleBinding
+          apiVersion: rbac.authorization.k8s.io/v1
+          name: RELEASE-NAME-teleport-operator
+
+  - it: shortens fullname if .Release.Name == .Chart.Name
+    release:
+      name: teleport-operator
+    asserts:
+      - containsDocument:
+          any: true
+          kind: RoleBinding
+          apiVersion: rbac.authorization.k8s.io/v1
+          name: teleport-operator
+
+  - it: respects the nameOverride
+    set:
+      nameOverride: operator
+    asserts:
+      - containsDocument:
+          any: true
+          kind: RoleBinding
+          apiVersion: rbac.authorization.k8s.io/v1
+          name: RELEASE-NAME-operator

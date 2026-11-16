@@ -1,321 +1,179 @@
-/*
-Copyright 2021 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2025 Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { useCallback, useEffect, useState } from 'react';
+import { matchPath, useParams } from 'react-router';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
+import { Logger } from 'design/logger';
 import {
-  Indicator,
-  Box,
-  Text,
-  Flex,
-  ButtonSecondary,
-  ButtonPrimary,
-} from 'design';
-import { Danger } from 'design/Alert';
-import Dialog, {
-  DialogHeader,
-  DialogTitle,
-  DialogContent,
-  DialogFooter,
-} from 'design/Dialog';
+  DisconnectedState,
+  DesktopSessionWithSharing as SharedDesktopSession,
+} from 'shared/components/DesktopSession';
+import { SessionSelection } from 'shared/components/DesktopSession/DesktopSession';
+import { useAsync } from 'shared/hooks/useAsync';
+import {
+  selectDirectoryInBrowser,
+  TdpClient,
+  useListener,
+} from 'shared/libs/tdp';
 
-import TdpClientCanvas from 'teleport/components/TdpClientCanvas';
+import { useTeleport } from 'teleport';
 import AuthnDialog from 'teleport/components/AuthnDialog';
+import cfg, { UrlDesktopParams } from 'teleport/config';
+import { AuthenticatedWebSocket } from 'teleport/lib/AuthenticatedWebSocket';
+import { adaptWebSocketToTdpTransport } from 'teleport/lib/tdp';
+import { shouldShowMfaPrompt, useMfaEmitter } from 'teleport/lib/useMfa';
+import { getHostName } from 'teleport/services/api';
+import auth from 'teleport/services/auth';
+import { useUser } from 'teleport/User/UserContext';
 
-import useDesktopSession from './useDesktopSession';
-import TopBar from './TopBar';
+export function DesktopSession() {
+  const ctx = useTeleport();
+  const { preferences } = useUser();
+  const { username, desktopName, clusterId } = useParams<UrlDesktopParams>();
+  useEffect(() => {
+    document.title = `${username} on ${desktopName} • ${clusterId}`;
+  }, [clusterId, desktopName, username]);
 
-import type { PropsWithChildren } from 'react';
+  const linuxDesktop =
+    matchPath(cfg.routes.linuxDesktop, location.pathname) !== null;
+  const addr = linuxDesktop
+    ? cfg.api.linuxDesktopWsAddr
+    : cfg.api.desktopWsAddr;
 
-import type { State } from './useDesktopSession';
+  const [client] = useState(
+    () =>
+      //TODO(gzdunek): It doesn't really matter here, but make TdpClient reactive to addr change.
+      new TdpClient(
+        abortSignal =>
+          adaptWebSocketToTdpTransport(
+            new AuthenticatedWebSocket(
+              addr
+                .replace(':fqdn', getHostName())
+                .replace(':clusterId', clusterId)
+                .replace(':desktopName', desktopName)
+                .replace(':username', username)
+                .replace(':version', 'teleport-tdpb-1.0')
+            ),
+            abortSignal
+          ),
+        selectDirectoryInBrowser,
+        new Logger('TDPClient')
+      )
+  );
+  const mfa = useMfaEmitter(client, undefined, {
+    // When the user cancels the MFA prompt, shut down the connection.
+    // To get a new challenge, we need to recreate it.
+    onPromptCancel: useCallback(() => client.shutdown(), [client]),
+  });
 
-export default function Container() {
-  const state = useDesktopSession();
-  return <DesktopSession {...state} />;
-}
+  const [aclAttempt, fetchAcl] = useAsync(
+    useCallback(async () => {
+      const { acl } = await ctx.userService.fetchUserContext();
+      return acl;
+    }, [ctx.userService])
+  );
 
-declare global {
-  interface Window {
-    showDirectoryPicker: () => Promise<FileSystemDirectoryHandle>;
-  }
-}
-
-export function DesktopSession(props: State) {
-  const {
-    fetchAttempt,
-    tdpConnection,
-    disconnected,
-    wsConnection,
-    setTdpConnection,
-    showAnotherSessionActiveDialog,
-    setShowAnotherSessionActiveDialog,
-  } = props;
-
-  const processing =
-    fetchAttempt.status === 'processing' ||
-    tdpConnection.status === 'processing';
-
-  // onDialogClose is called when a user
-  // dismisses a non-fatal error dialog.
-  const onDialogClose = () => {
-    // The following state-setting calls will
-    // cause the useEffect below to calculate the
-    // errorDialog state.
-
-    setTdpConnection(prevState => {
-      if (prevState.status === '') {
-        // If prevState.status was a non-fatal error,
-        // we assume that the TDP connection remains open.
-        return { status: 'success' };
-      }
-      return prevState;
-    });
-  };
-
-  const computeErrorDialog = () => {
-    // Websocket is closed but we haven't
-    // closed it on purpose or registered a fatal tdp error.
-    const unknownConnectionError =
-      wsConnection === 'closed' &&
-      !disconnected &&
-      (tdpConnection.status === 'success' || tdpConnection.status === '');
-
-    let errorText = '';
-    if (fetchAttempt.status === 'failed') {
-      errorText = fetchAttempt.statusText || 'fetch attempt failed';
-    } else if (tdpConnection.status === 'failed') {
-      errorText = tdpConnection.statusText || 'tdp connection failed';
-    } else if (tdpConnection.status === '') {
-      errorText = tdpConnection.statusText || 'encountered a non-fatal error';
-    } else if (unknownConnectionError) {
-      errorText = 'Session disconnected for an unknown reason.';
-    } else if (
-      fetchAttempt.status === 'processing' &&
-      tdpConnection.status === 'success'
-    ) {
-      errorText =
-        'The application has detected an invalid internal application state. \
-        Please file a bug report for this issue at \
-        https://github.com/gravitational/teleport/issues/new?assignees=&labels=bug&template=bug_report.md';
+  // Returns an active session only if per-session MFA is disabled.
+  // This improves the user experience by preventing multiple confirmation prompts:
+  // - one from the active desktop alert,
+  // - another from the per-session MFA prompt.
+  // The check for another session was added to prevent a situation where a user could be tricked
+  // into clicking a link that would DOS another user's active session.
+  // https://github.com/gravitational/webapps/pull/1297
+  // Showing only the MFA prompt is enough for security.
+  const hasAnotherSession = useCallback(async (): Promise<boolean> => {
+    if (linuxDesktop) {
+      return false;
     }
-    const open = errorText !== '';
+    const [mfaRequiredResponse, desktopActive] = await Promise.all([
+      auth.checkMfaRequired(clusterId, {
+        windows_desktop: {
+          desktop_name: desktopName,
+          login: username,
+        },
+      }),
+      ctx.desktopService.checkDesktopIsActive(clusterId, desktopName),
+    ]);
+    if (mfaRequiredResponse.required) {
+      return false;
+    }
+    return desktopActive;
+  }, [clusterId, ctx.desktopService, desktopName, username, linuxDesktop]);
 
-    return { open, text: errorText };
-  };
+  useEffect(() => {
+    fetchAcl();
+  }, [username, clusterId, fetchAcl]);
 
-  const errorDialog = computeErrorDialog();
+  const [sessions, setSessions] = useState([]);
+  useListener(client.onServerCapabilities, caps =>
+    setSessions(caps.availableSessions)
+  );
 
-  if (errorDialog.open) {
-    return (
-      <Session {...props} initTdpCli={false} displayCanvas={false}>
-        <Dialog
-          dialogCss={() => ({ width: '484px' })}
-          onClose={onDialogClose}
-          open={errorDialog.open}
-        >
-          <DialogHeader style={{ flexDirection: 'column' }}>
-            <DialogTitle>Error</DialogTitle>
-          </DialogHeader>
-          <DialogContent>
-            <>
-              <Danger children={<>{errorDialog.text}</>} />
-              Refresh the page to try again.
-            </>
-          </DialogContent>
-          <DialogFooter>
-            <ButtonSecondary
-              size="large"
-              width="30%"
-              onClick={() => {
-                window.location.reload();
-              }}
-            >
-              Refresh
-            </ButtonSecondary>
-          </DialogFooter>
-        </Dialog>
-      </Session>
-    );
-  }
+  const onConnect = useCallback(
+    (session: string) => {
+      setSessions([]);
+      client.sendSessionSelection(session);
+    },
+    [client]
+  );
 
-  if (showAnotherSessionActiveDialog) {
-    // Don't start the TDP connection until the user confirms they're ok
-    // with potentially killing another user's connection.
-    const initTdpCli = false;
-
-    return (
-      <Session {...props} initTdpCli={initTdpCli} displayCanvas={false}>
-        <Dialog
-          dialogCss={() => ({ width: '484px' })}
-          onClose={() => {}}
-          open={true}
-        >
-          <DialogHeader style={{ flexDirection: 'column' }}>
-            <DialogTitle>Another Session Is Active</DialogTitle>
-          </DialogHeader>
-          <DialogContent>
-            This desktop has an active session, connecting to it may close the
-            other session. Do you wish to continue?
-          </DialogContent>
-          <DialogFooter>
-            <ButtonPrimary
-              mr={3}
-              onClick={() => {
-                window.close();
-              }}
-            >
-              Abort
-            </ButtonPrimary>
-            <ButtonSecondary
-              onClick={() => {
-                setShowAnotherSessionActiveDialog(false);
-              }}
-            >
-              Continue
-            </ButtonSecondary>
-          </DialogFooter>
-        </Dialog>
-      </Session>
-    );
-  }
-
-  if (disconnected) {
-    return (
-      <Session {...props} initTdpCli={false} displayCanvas={false}>
-        <Box textAlign="center" m={10}>
-          <Text>Session successfully disconnected</Text>
-        </Box>
-      </Session>
-    );
-  }
-
-  if (processing) {
-    // We don't know whether another session for this desktop is active while the
-    // fetchAttempt is still processing, so hold off on starting a TDP connection
-    // until that information is available.
-    const initTdpCli = fetchAttempt.status !== 'processing';
-
-    return (
-      <Session {...props} initTdpCli={initTdpCli} displayCanvas={false}>
-        <Box textAlign="center" m={10}>
-          <Indicator />
-        </Box>
-      </Session>
-    );
-  }
-
-  return <Session {...props} initTdpCli={true} displayCanvas={true} />;
-}
-
-function Session({
-  setDisconnected,
-  webauthn,
-  tdpClient,
-  username,
-  hostname,
-  setClipboardSharingEnabled,
-  directorySharingState,
-  setDirectorySharingState,
-  onPngFrame,
-  onClipboardData,
-  onTdpError,
-  onTdpWarning,
-  onWsClose,
-  onWsOpen,
-  onKeyDown,
-  onKeyUp,
-  onMouseMove,
-  onMouseDown,
-  onMouseUp,
-  onMouseWheelScroll,
-  onContextMenu,
-  initTdpCli,
-  displayCanvas,
-  clipboardSharingEnabled,
-  onShareDirectory,
-  warnings,
-  onRemoveWarning,
-  children,
-}: PropsWithChildren<Props>) {
   return (
-    <Flex flexDirection="column">
-      <TopBar
-        onDisconnect={() => {
-          setDisconnected(true);
-          setClipboardSharingEnabled(false);
-          setDirectorySharingState(prevState => ({
-            ...prevState,
-            isSharing: false,
-          }));
-          tdpClient.shutdown();
-        }}
-        userHost={`${username}@${hostname}`}
-        canShareDirectory={directorySharingState.canShare}
-        isSharingDirectory={directorySharingState.isSharing}
-        clipboardSharingEnabled={clipboardSharingEnabled}
-        onShareDirectory={onShareDirectory}
-        warnings={warnings}
-        onRemoveWarning={onRemoveWarning}
-      />
-
-      {children}
-
-      {webauthn.requested && (
-        <AuthnDialog
-          onContinue={webauthn.authenticate}
-          onCancel={() => {
-            webauthn.setState(prevState => {
-              return {
-                ...prevState,
-                errorText:
-                  'This session requires multi factor authentication to continue. Please hit "Retry" and follow the prompts given by your browser to complete authentication.',
-              };
-            });
-          }}
-          errorText={webauthn.errorText}
-        />
-      )}
-
-      <TdpClientCanvas
-        style={{
-          display: displayCanvas ? 'flex' : 'none',
-          flex: 1, // ensures the canvas fills available screen space
-        }}
-        tdpCli={tdpClient}
-        tdpCliInit={initTdpCli}
-        tdpCliOnPngFrame={onPngFrame}
-        tdpCliOnClipboardData={onClipboardData}
-        tdpCliOnTdpError={onTdpError}
-        tdpCliOnTdpWarning={onTdpWarning}
-        tdpCliOnWsClose={onWsClose}
-        tdpCliOnWsOpen={onWsOpen}
-        onKeyDown={onKeyDown}
-        onKeyUp={onKeyUp}
-        onMouseMove={onMouseMove}
-        onMouseDown={onMouseDown}
-        onMouseUp={onMouseUp}
-        onMouseWheelScroll={onMouseWheelScroll}
-        onContextMenu={onContextMenu}
-      />
-    </Flex>
+    <SharedDesktopSession
+      client={client}
+      username={username}
+      desktop={desktopName}
+      customConnectionState={({ retry }) => {
+        if (sessions.length > 0) {
+          return (
+            <SessionSelection
+              desktopName={desktopName}
+              sessions={sessions}
+              onConnect={onConnect}
+            />
+          );
+        }
+        // Errors, except for dialog cancellations, are handled within the MFA dialog.
+        if (mfa.attempt.status === 'error' && !shouldShowMfaPrompt(mfa)) {
+          return (
+            <DisconnectedState
+              message={{
+                title: 'This session requires multi-factor authentication',
+                details: mfa.attempt.statusText,
+              }}
+              desktopName={desktopName}
+              onRetry={() => {
+                // Clear the MFA attempt to hide this alert state.
+                mfa.reset();
+                retry();
+              }}
+            />
+          );
+        }
+        if (shouldShowMfaPrompt(mfa)) {
+          return <AuthnDialog mfaState={mfa} />;
+        }
+      }}
+      aclAttempt={aclAttempt}
+      linuxDesktop={linuxDesktop}
+      browserSupportsSharing={navigator.userAgent.includes('Chrome')}
+      hasAnotherSession={hasAnotherSession}
+      keyboardLayout={preferences.keyboardLayout}
+    />
   );
 }
-
-type Props = State & {
-  // Determines whether the tdp client that's passed to the TdpClientCanvas
-  // should be initialized.
-  initTdpCli: boolean;
-  displayCanvas: boolean;
-};

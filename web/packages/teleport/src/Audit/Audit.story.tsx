@@ -1,26 +1,27 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { MemoryRouter, Route, Routes } from 'react-router';
 
-    http://www.apache.org/licenses/LICENSE-2.0
+import { Context, ContextProvider } from 'teleport';
+import cfg from 'teleport/config';
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-import { Router } from 'react-router';
-import { createMemoryHistory } from 'history';
-
-import { ContextProvider, Context } from 'teleport';
-
-import Audit from './Audit';
+import { AuditContainer as Audit } from './Audit';
 import EventList from './EventList';
 import { events, eventsSample } from './fixtures';
 
@@ -32,6 +33,7 @@ export const LoadedSample = () => {
   const ctx = new Context();
   ctx.auditService.fetchEvents = () =>
     Promise.resolve({ events: eventsSample, startKey: '' });
+  ctx.clusterService.fetchClusters = () => Promise.resolve([]);
 
   return render(ctx);
 };
@@ -40,6 +42,7 @@ export const LoadedFetchMore = () => {
   const ctx = new Context();
   ctx.auditService.fetchEvents = () =>
     Promise.resolve({ events, startKey: 'any-text' });
+  ctx.clusterService.fetchClusters = () => Promise.resolve([]);
 
   return render(ctx);
 };
@@ -47,6 +50,8 @@ export const LoadedFetchMore = () => {
 export const Processing = () => {
   const ctx = new Context();
   ctx.auditService.fetchEvents = () => new Promise(() => null);
+  ctx.clusterService.fetchClusters = () => Promise.resolve([]);
+
   return render(ctx);
 };
 
@@ -54,30 +59,29 @@ export const Failed = () => {
   const ctx = new Context();
   ctx.auditService.fetchEvents = () =>
     Promise.reject(new Error('server error'));
+  ctx.clusterService.fetchClusters = () => Promise.resolve([]);
+
   return render(ctx);
 };
 
 export const AllPossibleEvents = () => (
   <EventList
-    clusterId="im-a-cluster"
     events={events}
-    fetchMore={() => null}
-    fetchStatus={''}
-    pageSize={1000}
+    search=""
+    setSearch={() => null}
+    setSort={() => null}
+    sort={{ dir: 'ASC', fieldName: 'created' }}
   />
 );
 
 function render(ctx) {
-  const history = createMemoryHistory({
-    initialEntries: ['/web/cluster/localhost/audit/events'],
-    initialIndex: 0,
-  });
-
   return (
-    <ContextProvider ctx={ctx}>
-      <Router history={history}>
-        <Audit />
-      </Router>
-    </ContextProvider>
+    <MemoryRouter initialEntries={['/web/cluster/localhost/audit/events']}>
+      <ContextProvider ctx={ctx}>
+        <Routes>
+          <Route path={cfg.routes.audit} element={<Audit />} />
+        </Routes>
+      </ContextProvider>
+    </MemoryRouter>
   );
 }

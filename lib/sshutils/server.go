@@ -1,30 +1,31 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package sshutils contains the implementations of the base SSH
 // server used throughout Teleport.
 package sshutils
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -33,7 +34,6 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
 	semconv "go.opentelemetry.io/otel/semconv/v1.10.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/ssh"
@@ -61,7 +61,7 @@ var proxyConnectionLimitHitCount = prometheus.NewCounter(
 type Server struct {
 	sync.RWMutex
 
-	log logrus.FieldLogger
+	logger *slog.Logger
 	// component is a name of the facility which uses this server,
 	// used for logging/debugging. typically it's "proxy" or "auth api", etc
 	component string
@@ -75,6 +75,7 @@ type Server struct {
 	newChanHandler NewChanHandler
 	reqHandler     RequestHandler
 	newConnHandler NewConnHandler
+	getHostSigners GetHostSignersFunc
 
 	cfg     ssh.ServerConfig
 	limiter *limiter.Limiter
@@ -91,7 +92,7 @@ type Server struct {
 	// they are a valid certificate. Used in tests.
 	insecureSkipHostValidation bool
 
-	// fips means Teleport started in a FedRAMP/FIPS 140-2 compliant
+	// fips means Teleport started in a FedRAMP/FIPS compliant
 	// configuration.
 	fips bool
 
@@ -101,6 +102,8 @@ type Server struct {
 
 	// clock is used to control time.
 	clock clockwork.Clock
+
+	clusterName string
 
 	// ingressReporter reports new and active connections.
 	ingressReporter *ingress.Reporter
@@ -118,10 +121,6 @@ const (
 	// SSH version string
 	// https://tools.ietf.org/html/rfc4253
 	MaxVersionStringBytes = 255
-
-	// TrueClientAddrVar environment variable is used by the web UI to pass
-	// the remote IP (user's IP) from the browser/HTTP session into an SSH session
-	TrueClientAddrVar = "TELEPORT_CLIENT_ADDR"
 )
 
 // ServerOption is a functional argument for server
@@ -137,9 +136,9 @@ func SetIngressReporter(service string, r *ingress.Reporter) ServerOption {
 }
 
 // SetLogger sets the logger for the server
-func SetLogger(logger logrus.FieldLogger) ServerOption {
+func SetLogger(logger *slog.Logger) ServerOption {
 	return func(s *Server) error {
-		s.log = logger.WithField(trace.Component, "ssh:"+s.component)
+		s.logger = logger.With(teleport.ComponentKey, teleport.Component("ssh", s.component))
 		return nil
 	}
 }
@@ -149,6 +148,15 @@ func SetLimiter(limiter *limiter.Limiter) ServerOption {
 		s.limiter = limiter
 		return nil
 	}
+}
+
+// ConnectionLimitExceededCallback records connection limit hits rejected by a
+// limiter.Listener before they reach this server's accept loop.
+func ConnectionLimitExceededCallback(ctx context.Context, logger *slog.Logger) limiter.ListenerOption {
+	return limiter.WithLimitExceededCallback(func(remoteAddr string, err error) {
+		proxyConnectionLimitHitCount.Inc()
+		logger.ErrorContext(ctx, "connection limit exceeded", "client_ip", remoteAddr, "error", err)
+	})
 }
 
 // SetShutdownPollPeriod sets a polling period for graceful shutdowns of SSH servers
@@ -184,11 +192,18 @@ func SetClock(clock clockwork.Clock) ServerOption {
 	}
 }
 
+func SetClusterName(clusterName string) ServerOption {
+	return func(s *Server) error {
+		s.clusterName = clusterName
+		return nil
+	}
+}
+
 func NewServer(
 	component string,
 	a utils.NetAddr,
 	h NewChanHandler,
-	hostSigners []ssh.Signer,
+	getHostSigners GetHostSignersFunc,
 	ah AuthMethods,
 	opts ...ServerOption,
 ) (*Server, error) {
@@ -199,11 +214,10 @@ func NewServer(
 
 	closeContext, cancel := context.WithCancel(context.TODO())
 	s := &Server{
-		log: logrus.WithFields(logrus.Fields{
-			trace.Component: "ssh:" + component,
-		}),
+		logger:         slog.With(teleport.ComponentKey, teleport.Component("ssh", component)),
 		addr:           a,
 		newChanHandler: h,
+		getHostSigners: getHostSigners,
 		component:      component,
 		closeContext:   closeContext,
 		closeFunc:      cancel,
@@ -226,17 +240,19 @@ func NewServer(
 		s.tracerProvider = tracing.DefaultProvider()
 	}
 
-	err = s.checkArguments(a, h, hostSigners, ah)
+	err = s.checkArguments(a, h, getHostSigners, ah)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, signer := range hostSigners {
-		(&s.cfg).AddHostKey(signer)
-	}
 	s.cfg.PublicKeyCallback = ah.PublicKey
+	s.cfg.VerifiedPublicKeyCallback = ah.VerifiedPublicKey
 	s.cfg.PasswordCallback = ah.Password
 	s.cfg.NoClientAuth = ah.NoClient
+
+	if s.fips {
+		s.cfg.PublicKeyAuthAlgorithms = defaults.FIPSPubKeyAuthAlgorithms
+	}
 
 	// Teleport servers need to identify as such to allow passing of the client
 	// IP from the client to the proxy to the destination node.
@@ -268,7 +284,7 @@ func SetNewConnHandler(handler NewConnHandler) ServerOption {
 
 func SetCiphers(ciphers []string) ServerOption {
 	return func(s *Server) error {
-		s.log.Debugf("Supported ciphers: %q.", ciphers)
+		s.logger.DebugContext(context.Background(), "Supported ciphers updated", "ciphers", ciphers)
 		if ciphers != nil {
 			s.cfg.Ciphers = ciphers
 		}
@@ -278,7 +294,7 @@ func SetCiphers(ciphers []string) ServerOption {
 
 func SetKEXAlgorithms(kexAlgorithms []string) ServerOption {
 	return func(s *Server) error {
-		s.log.Debugf("Supported KEX algorithms: %q.", kexAlgorithms)
+		s.logger.DebugContext(context.Background(), "Supported KEX algorithms updated", "kex_algorithms", kexAlgorithms)
 		if kexAlgorithms != nil {
 			s.cfg.KeyExchanges = kexAlgorithms
 		}
@@ -288,7 +304,7 @@ func SetKEXAlgorithms(kexAlgorithms []string) ServerOption {
 
 func SetMACAlgorithms(macAlgorithms []string) ServerOption {
 	return func(s *Server) error {
-		s.log.Debugf("Supported MAC algorithms: %q.", macAlgorithms)
+		s.logger.DebugContext(context.Background(), "Supported MAC algorithms updated", "mac_algorithms", macAlgorithms)
 		if macAlgorithms != nil {
 			s.cfg.MACs = macAlgorithms
 		}
@@ -312,9 +328,11 @@ func (s *Server) Addr() string {
 	return s.listener.Addr().String()
 }
 
-func (s *Server) Serve(listener net.Listener) error {
-	if err := s.SetListener(listener); err != nil {
-		return trace.Wrap(err)
+// Serve serves SSH connections using an already configured listener and blocks
+// until the listener is closed.
+func (s *Server) Serve() error {
+	if s.Addr() == "" {
+		return trace.BadParameter("listener is not set")
 	}
 	s.acceptConnections()
 	return nil
@@ -327,11 +345,19 @@ func (s *Server) Start() error {
 			return trace.ConvertSystemError(err)
 		}
 
-		if err := s.SetListener(s.limiter.WrapListener(listener)); err != nil {
+		listener, err = s.limiter.WrapListener(listener, ConnectionLimitExceededCallback(
+			s.closeContext,
+			s.logger.With("listen_addr", listener.Addr().String()),
+		))
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
+		if err := s.SetListener(listener); err != nil {
 			return trace.Wrap(err)
 		}
 	}
-	s.log.WithField("addr", s.listener.Addr().String()).Debug("Server start.")
+	s.logger.DebugContext(s.closeContext, "Starting server", "addr", s.listener.Addr().String())
 	go s.acceptConnections()
 	return nil
 }
@@ -339,6 +365,9 @@ func (s *Server) Start() error {
 func (s *Server) SetListener(l net.Listener) error {
 	s.Lock()
 	defer s.Unlock()
+	if l == nil {
+		return trace.BadParameter("listener is nil")
+	}
 	if s.listener != nil {
 		return trace.BadParameter("listener is already set to %v", s.listener.Addr())
 	}
@@ -365,23 +394,33 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if activeConnections == 0 {
 		return err
 	}
-	s.log.Infof("Shutdown: waiting for %v connections to finish.", activeConnections)
-	lastReport := time.Time{}
+	minReportInterval := 10 * s.shutdownPollPeriod
+	maxReportInterval := 600 * s.shutdownPollPeriod
+	s.logger.InfoContext(ctx, "Shutdown: waiting for active connections to finish", "active_connections", activeConnections)
+	reportedConnections := activeConnections
+	lastReport := time.Now()
+	reportInterval := minReportInterval
 	ticker := time.NewTicker(s.shutdownPollPeriod)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ticker.C:
+		case now := <-ticker.C:
 			activeConnections = s.trackUserConnections(0)
 			if activeConnections == 0 {
 				return err
 			}
-			if time.Since(lastReport) > 10*s.shutdownPollPeriod {
-				s.log.Infof("Shutdown: waiting for %v connections to finish.", activeConnections)
-				lastReport = time.Now()
+			if activeConnections != reportedConnections || now.Sub(lastReport) > reportInterval {
+				s.logger.InfoContext(ctx, "Shutdown: waiting for active connections to finish", "active_connections", activeConnections)
+				lastReport = now
+				if activeConnections == reportedConnections {
+					reportInterval = min(reportInterval*2, maxReportInterval)
+				} else {
+					reportInterval = minReportInterval
+					reportedConnections = activeConnections
+				}
 			}
 		case <-ctx.Done():
-			s.log.Infof("Context canceled wait, returning.")
+			s.logger.InfoContext(ctx, "Context canceled wait, returning")
 			return trace.ConnectionProblem(err, "context canceled")
 		}
 	}
@@ -406,27 +445,27 @@ func (s *Server) Close() error {
 
 func (s *Server) acceptConnections() {
 	defer s.closeFunc()
-	addr := s.Addr()
-	s.log.Debugf("Listening on %v.", addr)
+	logger := s.logger.With("listen_addr", s.Addr())
+	logger.DebugContext(s.closeContext, "Listening for connections")
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
 			if trace.IsLimitExceeded(err) {
 				proxyConnectionLimitHitCount.Inc()
-				s.log.Error(err.Error())
+				logger.ErrorContext(s.closeContext, "connection limit exceeded", "error", err)
 				continue
 			}
 
 			if utils.IsUseOfClosedNetworkError(err) {
-				s.log.Debugf("Server %v has closed.", addr)
+				logger.DebugContext(s.closeContext, "Server has closed")
 				return
 			}
 			select {
 			case <-s.closeContext.Done():
-				s.log.Debugf("Server %v has closed.", addr)
+				logger.DebugContext(s.closeContext, "Server has closed")
 				return
 			case <-time.After(5 * time.Second):
-				s.log.Debugf("Backoff on network error: %v.", err)
+				logger.DebugContext(s.closeContext, "Applying backoff in response to network error", "error", err)
 			}
 		} else {
 			go s.HandleConnection(conn)
@@ -436,6 +475,23 @@ func (s *Server) acceptConnections() {
 
 func (s *Server) trackUserConnections(delta int32) int32 {
 	return atomic.AddInt32(&s.userConns, delta)
+}
+
+// TrackUserConnection tracks a user connection that should prevent
+// the server from being terminated if active. The returned function
+// should be called when the connection is terminated.
+func (s *Server) TrackUserConnection() (release func()) {
+	s.trackUserConnections(1)
+
+	return sync.OnceFunc(func() {
+		s.trackUserConnections(-1)
+	})
+}
+
+// ActiveConnections returns the number of connections that are
+// being served.
+func (s *Server) ActiveConnections() int32 {
+	return atomic.LoadInt32(&s.userConns)
 }
 
 // HandleConnection is called every time an SSH server accepts a new
@@ -450,28 +506,40 @@ func (s *Server) HandleConnection(conn net.Conn) {
 		defer s.ingressReporter.ConnectionClosed(s.ingressService, conn)
 	}
 
+	hostSigners := s.getHostSigners()
+	if err := s.validateHostSigners(hostSigners); err != nil {
+		s.logger.ErrorContext(s.closeContext, "Error during server setup for a new SSH connection (this is a bug)",
+			"error", err,
+			"remote_addr", conn.RemoteAddr(),
+		)
+		conn.Close()
+		return
+	}
+
+	cfg := s.cfg
+	for _, signer := range hostSigners {
+		cfg.AddHostKey(signer)
+	}
+	if v := serverVersionOverrideFromConn(conn); v != "" && v != cfg.ServerVersion {
+		cfg.ServerVersion = v
+	}
+
 	// apply idle read/write timeout to this connection.
-	conn = utils.ObeyIdleTimeout(conn,
-		defaults.DefaultIdleConnectionDuration,
-		s.component)
+	conn = utils.ObeyIdleTimeout(conn, defaults.DefaultIdleConnectionDuration)
 	// Wrap connection with a tracker used to monitor how much data was
 	// transmitted and received over the connection.
-	wconn := utils.NewTrackingConn(conn)
+	conn = utils.NewTrackingConn(conn)
 
-	// create a new SSH server which handles the handshake (and pass the custom
-	// payload structure which will be populated only when/if this connection
-	// comes from another Teleport proxy):
-	wrappedConn := WrapConnection(wconn, s.log)
-	sconn, chans, reqs, err := ssh.NewServerConn(wrappedConn, &s.cfg)
+	sconn, chans, reqs, err := ssh.NewServerConn(conn, &cfg)
 	if err != nil {
 		// Ignore EOF as these are triggered by loadbalancer health checks
 		if !errors.Is(err, io.EOF) {
-			s.log.
-				WithError(err).
-				WithField("remote_addr", conn.RemoteAddr()).
-				Warn("Error occurred in handshake for new SSH conn")
+			s.logger.WarnContext(s.closeContext, "Error occurred in handshake for new SSH conn",
+				"error", err,
+				"remote_addr", conn.RemoteAddr(),
+			)
 		}
-		conn.SetDeadline(time.Time{})
+		conn.Close()
 		return
 	}
 
@@ -479,7 +547,6 @@ func (s *Server) HandleConnection(conn net.Conn) {
 		s.ingressReporter.ConnectionAuthenticated(s.ingressService, conn)
 		defer s.ingressReporter.AuthenticatedConnectionClosed(s.ingressService, conn)
 	}
-	ctx := tracing.WithPropagationContext(context.Background(), wrappedConn.traceContext)
 
 	certType := "unknown"
 	if sconn.Permissions != nil {
@@ -493,18 +560,22 @@ func (s *Server) HandleConnection(conn net.Conn) {
 
 	user := sconn.User()
 	if err := s.limiter.RegisterRequest(user); err != nil {
-		s.log.Errorf(err.Error())
+		s.logger.ErrorContext(s.closeContext, "user connection rate limit exceeded", "user", user, "error", err)
 		sconn.Close()
 		conn.Close()
 		return
 	}
 	// Connection successfully initiated
-	s.log.Debugf("Incoming connection %v -> %v version: %v, certtype: %q",
-		sconn.RemoteAddr(), sconn.LocalAddr(), string(sconn.ClientVersion()), certType)
+	s.logger.DebugContext(s.closeContext, "handling incoming connection",
+		"remote_addr", sconn.RemoteAddr(),
+		"local_addr", sconn.LocalAddr(),
+		"version", string(sconn.ClientVersion()),
+		"cert_type", certType,
+	)
 
 	// will be called when the connection is closed
 	connClosed := func() {
-		s.log.Debugf("Closed connection %v.", sconn.RemoteAddr())
+		s.logger.DebugContext(s.closeContext, "Closed connection", "remote_addr", sconn.RemoteAddr())
 	}
 
 	// The keepalive ticket will ensure that SSH keepalive requests are being sent
@@ -517,7 +588,7 @@ func (s *Server) HandleConnection(conn net.Conn) {
 	// closeContext field is used to trigger starvation on cancellation by halting
 	// the acceptance of new connections; it is not intended to halt in-progress
 	// connection handling, and is therefore orthogonal to the role of ConnectionContext.
-	ctx, ccx := NewConnectionContext(ctx, wconn, sconn, SetConnectionContextClock(s.clock))
+	ctx, ccx := NewConnectionContext(context.Background(), conn, sconn, SetConnectionContextClock(s.clock))
 	defer ccx.Close()
 
 	if s.newConnHandler != nil {
@@ -526,7 +597,7 @@ func (s *Server) HandleConnection(conn net.Conn) {
 		// from a NewConnHandler are rejections.
 		ctx, err = s.newConnHandler.HandleNewConn(ctx, ccx)
 		if err != nil {
-			s.log.Warnf("Dropping inbound ssh connection due to error: %v", err)
+			s.logger.WarnContext(ctx, "Dropping inbound ssh connection due to error", "error", err)
 			// Immediately dropping the ssh connection results in an
 			// EOF error for the client.  We therefore wait briefly
 			// to see if the client opens a channel or sends any global
@@ -537,13 +608,17 @@ func (s *Server) HandleConnection(conn net.Conn) {
 			for {
 				select {
 				case req := <-reqs:
+					if req == nil {
+						connClosed()
+						break
+					}
 					// wait for a request that wants a reply to send the error
 					if !req.WantReply {
 						continue
 					}
 
 					if err := req.Reply(false, []byte(err.Error())); err != nil {
-						s.log.WithError(err).Warnf("failed to reply to request %s", req.Type)
+						s.logger.WarnContext(ctx, "failed to reply to request", "request_type", req.Type, "error", err)
 					}
 				case firstChan := <-chans:
 					// channel was closed, terminate the connection
@@ -552,7 +627,7 @@ func (s *Server) HandleConnection(conn net.Conn) {
 					}
 
 					if err := firstChan.Reject(ssh.Prohibited, err.Error()); err != nil {
-						s.log.WithError(err).Warnf("failed to reject channel %s", firstChan.ChannelType())
+						s.logger.WarnContext(ctx, "failed to reject channel", "channel_type", firstChan.ChannelType(), "error", err)
 					}
 				case <-waitCtx.Done():
 				}
@@ -561,10 +636,10 @@ func (s *Server) HandleConnection(conn net.Conn) {
 			}
 
 			if err := sconn.Close(); err != nil && !utils.IsOKNetworkError(err) {
-				s.log.WithError(err).Warn("failed to close ssh server connection")
+				s.logger.WarnContext(ctx, "failed to close ssh server connection", "error", err)
 			}
 			if err := conn.Close(); err != nil && !utils.IsOKNetworkError(err) {
-				s.log.WithError(err).Warn("failed to close ssh client connection")
+				s.logger.WarnContext(ctx, "failed to close ssh client connection", "error", err)
 			}
 			return
 		}
@@ -578,7 +653,7 @@ func (s *Server) HandleConnection(conn net.Conn) {
 				connClosed()
 				return
 			}
-			s.log.Debugf("Received out-of-band request: %+v.", req)
+			s.logger.DebugContext(ctx, "Received out-of-band request", "request_type", req.Type)
 
 			reqCtx := tracessh.ContextFromRequest(req)
 			ctx, span := s.tracerProvider.Tracer("ssh").Start(
@@ -595,7 +670,7 @@ func (s *Server) HandleConnection(conn net.Conn) {
 			if s.reqHandler != nil {
 				go func(span oteltrace.Span) {
 					defer span.End()
-					s.reqHandler.HandleRequest(ctx, req)
+					s.reqHandler.HandleRequest(ctx, ccx, req)
 				}(span)
 			} else {
 				span.End()
@@ -605,24 +680,6 @@ func (s *Server) HandleConnection(conn net.Conn) {
 			if nch == nil {
 				connClosed()
 				return
-			}
-
-			// This is a request from clients to determine if tracing is enabled.
-			// Handle here so that we always alert clients that we can handle tracing envelopes.
-			if nch.ChannelType() == tracessh.TracingChannel {
-				ch, _, err := nch.Accept()
-				if err != nil {
-					s.log.Warnf("Unable to accept channel: %v", err)
-					if err := nch.Reject(ssh.ConnectionFailed, fmt.Sprintf("unable to accept channel: %v", err)); err != nil {
-						s.log.Warnf("Failed to reject channel: %v", err)
-					}
-					continue
-				}
-
-				if err := ch.Close(); err != nil {
-					s.log.Warnf("Unable to close %q channel: %v", nch.ChannelType(), err)
-				}
-				continue
 			}
 
 			chanCtx, nch := tracessh.ContextFromNewChannel(nch)
@@ -646,17 +703,17 @@ func (s *Server) HandleConnection(conn net.Conn) {
 			const wantReply = true
 			_, _, err = sconn.SendRequest(teleport.KeepAliveReqType, wantReply, keepAlivePayload[:])
 			if err != nil {
-				s.log.Errorf("Failed sending keepalive request: %v", err)
+				s.logger.ErrorContext(ctx, "Failed sending keepalive request", "error", err)
 			}
 		case <-ctx.Done():
-			s.log.Debugf("Connection context canceled: %v -> %v", conn.RemoteAddr(), conn.LocalAddr())
+			s.logger.DebugContext(ctx, "Connection context canceled", "remote_addr", conn.RemoteAddr(), "local_addr", conn.LocalAddr())
 			return
 		}
 	}
 }
 
 type RequestHandler interface {
-	HandleRequest(ctx context.Context, r *ssh.Request)
+	HandleRequest(ctx context.Context, ccx *ConnectionContext, r *ssh.Request)
 }
 
 type NewChanHandler interface {
@@ -676,13 +733,34 @@ type NewConnHandler interface {
 	HandleNewConn(ctx context.Context, ccx *ConnectionContext) (context.Context, error)
 }
 
-type AuthMethods struct {
-	PublicKey PublicKeyFunc
-	Password  PasswordFunc
-	NoClient  bool
+// NewConnHandlerFunc wraps a function to satisfy NewConnHandler interface.
+type NewConnHandlerFunc func(ctx context.Context, ccx *ConnectionContext) (context.Context, error)
+
+func (f NewConnHandlerFunc) HandleNewConn(ctx context.Context, ccx *ConnectionContext) (context.Context, error) {
+	return f(ctx, ccx)
 }
 
-func (s *Server) checkArguments(a utils.NetAddr, h NewChanHandler, hostSigners []ssh.Signer, ah AuthMethods) error {
+type AuthMethods struct {
+	PublicKey         PublicKeyFunc
+	VerifiedPublicKey VerifiedPublicKeyFunc
+	Password          PasswordFunc
+	NoClient          bool
+}
+
+// GetHostSignersFunc is an infallible function that returns host signers for
+// use with a new SSH connection. It should not block, as it's called while the
+// SSH client is already connected and waiting for the SSH handshake.
+type GetHostSignersFunc = func() []ssh.Signer
+
+// StaticHostSigners returns a [GetHostSignersFunc] that always returns the
+// given host signers.
+func StaticHostSigners(hostSigners ...ssh.Signer) GetHostSignersFunc {
+	return func() []ssh.Signer {
+		return hostSigners
+	}
+}
+
+func (s *Server) checkArguments(a utils.NetAddr, h NewChanHandler, getHostSigners GetHostSignersFunc, ah AuthMethods) error {
 	// If the server is not in tunnel mode, an address must be specified.
 	if s.listener != nil {
 		if a.Addr == "" || a.AddrNetwork == "" {
@@ -693,22 +771,29 @@ func (s *Server) checkArguments(a utils.NetAddr, h NewChanHandler, hostSigners [
 	if h == nil {
 		return trace.BadParameter("missing NewChanHandler")
 	}
-	if len(hostSigners) == 0 {
-		return trace.BadParameter("need at least one signer")
+	if getHostSigners == nil {
+		return trace.BadParameter("missing GetHostSignersFunc")
 	}
+	if err := s.validateHostSigners(getHostSigners()); err != nil {
+		return trace.Wrap(err)
+	}
+	if ah.PublicKey == nil && ah.Password == nil && !ah.NoClient {
+		return trace.BadParameter("need at least one auth method")
+	}
+	return nil
+}
+
+func (s *Server) validateHostSigners(hostSigners []ssh.Signer) error {
 	for _, signer := range hostSigners {
 		if signer == nil {
 			return trace.BadParameter("host signer can not be nil")
 		}
-		if !s.insecureSkipHostValidation {
-			err := validateHostSigner(s.fips, signer)
-			if err != nil {
-				return trace.Wrap(err)
-			}
+		if s.insecureSkipHostValidation {
+			continue
 		}
-	}
-	if ah.PublicKey == nil && ah.Password == nil && !ah.NoClient {
-		return trace.BadParameter("need at least one auth method")
+		if err := validateHostSigner(s.fips, signer); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 	return nil
 }
@@ -735,8 +820,9 @@ func validateHostSigner(fips bool, signer ssh.Signer) error {
 }
 
 type (
-	PublicKeyFunc func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error)
-	PasswordFunc  func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error)
+	PublicKeyFunc         func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error)
+	VerifiedPublicKeyFunc func(conn ssh.ConnMetadata, key ssh.PublicKey, permissions *ssh.Permissions, signatureAlgorithm string) (*ssh.Permissions, error)
+	PasswordFunc          func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error)
 )
 
 // ClusterDetails specifies information about a cluster
@@ -745,81 +831,30 @@ type ClusterDetails struct {
 	FIPSEnabled    bool
 }
 
-// ConnectionWrapper allows the SSH server to perform custom handshake which
-// lets teleport proxy servers to relay a true remote client IP address
-// to the SSH server.
-//
-// (otherwise connection.RemoteAddr (client IP) will always point to a proxy IP
-// instead of a true client IP)
-type ConnectionWrapper struct {
-	net.Conn
-	logger logrus.FieldLogger
-
-	// upstreamReader reads from the underlying (wrapped) connection
-	upstreamReader io.Reader
-
-	// clientAddr points to the true client address (client is behind
-	// a proxy). Keeping this address is the entire point of the
-	// connection wrapper.
-	clientAddr net.Addr
-
-	// traceContext is the tracing context that was passed across the
-	// connection, used to correlate spans.
-	traceContext tracing.PropagationContext
+// SSHServerVersionOverrider returns a SSH server version string that should be
+// used instead of the one from a static configuration (typically because the
+// version was already sent and can't be un-sent). If SSHServerVersionOverride
+// returns a blank string (which is an invalid version string, as version
+// strings should start with "SSH-2.0-") then no override is specified. The
+// string is intended to be passed as the [ssh.ServerConfig.ServerVersion], so
+// it should not include a trailing CRLF pair ("\r\n").
+type SSHServerVersionOverrider interface {
+	SSHServerVersionOverride() string
 }
 
-// RemoteAddr returns the behind-the-proxy client address
-func (c *ConnectionWrapper) RemoteAddr() net.Addr {
-	return c.clientAddr
-}
-
-// Read implements io.Read() part of net.Connection which allows us
-// peek at the beginning of SSH handshake (that's why we're wrapping the connection)
-func (c *ConnectionWrapper) Read(b []byte) (int, error) {
-	// handshake already took place, forward upstream:
-	if c.upstreamReader != nil {
-		return c.upstreamReader.Read(b)
-	}
-	// inspect the client's hello message and see if it's a teleport
-	// proxy connecting?
-	buff := make([]byte, MaxVersionStringBytes)
-	n, err := c.Conn.Read(buff)
-	if err != nil {
-		// EOF happens quite often, don't pollute the logs with it
-		if !trace.IsEOF(err) {
-			c.logger.Error(err)
-		}
-		return n, err
-	}
-	// chop off extra unused bytes at the end of the buffer:
-	buff = buff[:n]
-	skip := 0
-
-	// are we reading from a Teleport proxy?
-	if bytes.HasPrefix(buff, []byte(sshutils.ProxyHelloSignature)) {
-		// the JSON payload ends with a binary zero:
-		payloadBoundary := bytes.IndexByte(buff, 0x00)
-		if payloadBoundary > 0 {
-			var hp sshutils.HandshakePayload
-			payload := buff[len(sshutils.ProxyHelloSignature):payloadBoundary]
-			if err = json.Unmarshal(payload, &hp); err != nil {
-				c.logger.Error(err)
-			} else {
-				c.traceContext = hp.TracingContext
+func serverVersionOverrideFromConn(nc net.Conn) string {
+	for nc != nil {
+		if overrider, ok := nc.(SSHServerVersionOverrider); ok {
+			if v := overrider.SSHServerVersionOverride(); v != "" {
+				return v
 			}
-			skip = payloadBoundary + 1
 		}
-	}
-	c.upstreamReader = io.MultiReader(bytes.NewBuffer(buff[skip:]), c.Conn)
-	return c.upstreamReader.Read(b)
-}
 
-// WrapConnection takes a network connection, wraps it into ConnectionWrapper
-// object (which overrides Read method) and returns the wrapper.
-func WrapConnection(conn net.Conn, logger logrus.FieldLogger) *ConnectionWrapper {
-	return &ConnectionWrapper{
-		Conn:       conn,
-		clientAddr: conn.RemoteAddr(),
-		logger:     logger,
+		netConner, ok := nc.(interface{ NetConn() net.Conn })
+		if !ok {
+			break
+		}
+		nc = netConner.NetConn()
 	}
+	return ""
 }

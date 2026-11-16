@@ -1,42 +1,49 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { unique } from 'teleterm/ui/utils';
+import { Struct } from 'gen-proto-ts/google/protobuf/struct_pb';
+import { IPtyHostService } from 'gen-proto-ts/teleport/web/teleterm/ptyhost/v1/pty_host_service_pb.grpc-server';
 
 import Logger from 'teleterm/logger';
+import { unique } from 'teleterm/ui/utils';
 
-import { PtyProcess } from './ptyProcess';
-import { IPtyHostServer } from './../api/protogen/ptyHostService_grpc_pb';
-import { PtyCwd, PtyId } from './../api/protogen/ptyHostService_pb';
 import { PtyEventsStreamHandler } from './ptyEventsStreamHandler';
+import { PtyProcess } from './ptyProcess';
 
-export function createPtyHostService(): IPtyHostServer {
+export function createPtyHostService(): IPtyHostService & {
+  dispose(): Promise<void>;
+} {
   const logger = new Logger('PtyHostService');
   const ptyProcesses = new Map<string, PtyProcess>();
 
   return {
     createPtyProcess: (call, callback) => {
-      const ptyOptions = call.request.toObject();
+      const ptyOptions = call.request;
       const ptyId = unique();
       try {
         const ptyProcess = new PtyProcess({
-          ...ptyOptions,
+          path: ptyOptions.path,
+          args: ptyOptions.args,
+          cwd: ptyOptions.cwd,
           ptyId,
-          args: ptyOptions.argsList,
-          env: call.request.getEnv()?.toJavaScript() as Record<string, string>,
+          env: Struct.toJson(call.request.env!) as Record<string, string>,
+          initMessage: ptyOptions.initMessage,
+          useConpty: ptyOptions.useConpty,
         });
         ptyProcesses.set(ptyId, ptyProcess);
       } catch (error) {
@@ -44,11 +51,11 @@ export function createPtyHostService(): IPtyHostServer {
         callback(error);
         return;
       }
-      callback(null, new PtyId().setId(ptyId));
+      callback(null, { id: ptyId });
       logger.info(`created PTY process for id ${ptyId}`);
     },
     getCwd: (call, callback) => {
-      const id = call.request.getId();
+      const id = call.request.id;
       const ptyProcess = ptyProcesses.get(id);
       if (!ptyProcess) {
         const message = `PTY process with id: ${id} does not exist`;
@@ -58,14 +65,21 @@ export function createPtyHostService(): IPtyHostServer {
       ptyProcess
         .getCwd()
         .then(cwd => {
-          const response = new PtyCwd().setCwd(cwd);
-          callback(null, response);
+          callback(null, { cwd });
         })
         .catch(error => {
           logger.error(`could not read CWD for id: ${id}`, error);
           callback(error);
         });
     },
-    exchangeEvents: stream => new PtyEventsStreamHandler(stream, ptyProcesses),
+    managePtyProcess: stream =>
+      new PtyEventsStreamHandler(stream, ptyProcesses),
+    dispose: async () => {
+      await Promise.all(
+        Array.from(ptyProcesses.values()).map(ptyProcess =>
+          ptyProcess.dispose()
+        )
+      );
+    },
   };
 }

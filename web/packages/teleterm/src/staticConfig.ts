@@ -1,23 +1,25 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 /**
  * `StaticConfig` allows providing different values between the dev build and
  * the packaged app.
- * The proper config is resolved by webpack at compile time.
+ * The proper config is resolved by Vite at compile time.
  * This differs from `RuntimeSettings`, where properties are resolved during
  * the app's runtime.
  */
@@ -29,18 +31,16 @@ interface IStaticConfig {
 
 let staticConfig: IStaticConfig;
 
-if (process.env.NODE_ENV === 'development') {
-  staticConfig = {
-    prehogAddress: 'https://reporting-staging.teleportinfra.dev',
-    feedbackAddress:
-      'https://kcwm2is93l.execute-api.us-west-2.amazonaws.com/prod',
-  };
-}
-
 if (process.env.NODE_ENV === 'production') {
   staticConfig = {
-    prehogAddress: '',
+    prehogAddress: 'https://reporting-connect.teleportinfra.sh',
     feedbackAddress: 'https://usage.teleport.dev',
+  };
+} else {
+  staticConfig = {
+    prehogAddress: 'https://reporting-connect-staging.teleportinfra.dev',
+    feedbackAddress:
+      'https://kcwm2is93l.execute-api.us-west-2.amazonaws.com/prod',
   };
 }
 

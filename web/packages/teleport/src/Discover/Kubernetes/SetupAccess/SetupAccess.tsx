@@ -1,36 +1,37 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useState, useEffect } from 'react';
-import { Box } from 'design';
+import React, { useEffect, useState } from 'react';
+
+import { Box, Text } from 'design';
 
 import {
-  SelectCreatable,
   Option,
+  SelectCreatable,
 } from 'teleport/Discover/Shared/SelectCreatable';
 import {
-  useUserTraits,
   SetupAccessWrapper,
+  useUserTraits,
+  type State,
 } from 'teleport/Discover/Shared/SetupAccess';
 
-import type { AgentStepProps } from '../../types';
-import type { State } from 'teleport/Discover/Shared/SetupAccess';
-
-export default function Container(props: AgentStepProps) {
-  const state = useUserTraits(props);
+export default function Container() {
+  const state = useUserTraits();
   return <SetupAccess {...state} />;
 }
 
@@ -40,6 +41,7 @@ export function SetupAccess(props: State) {
     initSelectedOptions,
     getFixedOptions,
     getSelectableOptions,
+    agentMeta,
     ...restOfProps
   } = props;
   const [groupInputValue, setGroupInputValue] = useState('');
@@ -48,6 +50,7 @@ export function SetupAccess(props: State) {
   const [userInputValue, setUserInputValue] = useState('');
   const [selectedUsers, setSelectedUsers] = useState<Option[]>([]);
 
+  const wantAutoDiscover = !!agentMeta.autoDiscovery;
   useEffect(() => {
     if (props.attempt.status === 'success') {
       setSelectedGroups(initSelectedOptions('kubeGroups'));
@@ -84,7 +87,17 @@ export function SetupAccess(props: State) {
   }
 
   function handleOnProceed() {
-    onProceed({ kubeGroups: selectedGroups, kubeUsers: selectedUsers });
+    let numStepsToIncrement;
+    // Skip test connection since test connection currently
+    // only supports one resource testing and auto enrolling
+    // enrolls resources > 1.
+    if (wantAutoDiscover) {
+      numStepsToIncrement = 2;
+    }
+    onProceed(
+      { kubeGroups: selectedGroups, kubeUsers: selectedUsers },
+      numStepsToIncrement
+    );
   }
 
   const hasTraits = selectedGroups.length > 0 || selectedUsers.length > 0;
@@ -100,7 +113,15 @@ export function SetupAccess(props: State) {
       traitDescription="users and groups"
       hasTraits={hasTraits}
       onProceed={handleOnProceed}
+      wantAutoDiscover={wantAutoDiscover}
     >
+      {wantAutoDiscover && (
+        <Text mb={3}>
+          Since auto-discovery is enabled, make sure to include all Kubernetes
+          users and groups that will be used to connect to the discovered
+          clusters.
+        </Text>
+      )}
       <Box mb={4}>
         Kubernetes Groups
         <SelectCreatable

@@ -23,7 +23,7 @@ import (
 
 	"github.com/gravitational/trace"
 
-	"github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/utils"
 )
 
 // WebSessionsGetter provides access to web sessions
@@ -63,10 +63,14 @@ type WebSession interface {
 	SetUser(string)
 	// GetPub is returns public certificate signed by auth server
 	GetPub() []byte
-	// GetPriv returns private OpenSSH key used to auth with SSH nodes
-	GetPriv() []byte
-	// SetPriv sets private key
-	SetPriv([]byte)
+	// GetSSHPriv returns private SSH key used to auth with SSH nodes.
+	GetSSHPriv() []byte
+	// SetSSHPriv sets SSH private key.
+	SetSSHPriv([]byte)
+	// GetTLSPriv returns private TLS key.
+	GetTLSPriv() []byte
+	// SetTLSPriv sets TLS private key.
+	SetTLSPriv([]byte)
 	// GetTLSCert returns PEM encoded TLS certificate associated with session
 	GetTLSCert() []byte
 	// GetBearerToken is a special bearer token used for additional
@@ -78,6 +82,13 @@ type WebSession interface {
 	GetBearerTokenExpiryTime() time.Time
 	// GetExpiryTime - absolute time when web session expires
 	GetExpiryTime() time.Time
+	// GetEarliestExpiry returns the time after which the session should be
+	// considered dead by the system. For standard sessions this is the
+	// earliest of BearerTokenExpires and Expires (treating zero as infinity);
+	// for ACCESS_GRAPH_API sessions, which authenticate via client TLS
+	// certificate and carry no bearer token, it is Expires. See
+	// [WebSessionV2.GetEarliestExpiry] for the full rationale.
+	GetEarliestExpiry() time.Time
 	// GetLoginTime returns the time this user recently logged in.
 	GetLoginTime() time.Time
 	// SetLoginTime sets when this user logged in.
@@ -96,6 +107,35 @@ type WebSession interface {
 	SetSAMLSession(*SAMLSessionData)
 	// GetSAMLSession gets the SAML session data. Is considered secret.
 	GetSAMLSession() *SAMLSessionData
+	// SetDeviceWebToken sets the session's DeviceWebToken.
+	// The token is considered a secret.
+	SetDeviceWebToken(*DeviceWebToken)
+	// GetDeviceWebToken returns the session's DeviceWebToken, if any.
+	// The token is considered a secret.
+	GetDeviceWebToken() *DeviceWebToken
+	// GetHasDeviceExtensions returns the HasDeviceExtensions value.
+	// If true the session's TLS and SSH certificates are augmented with device
+	// extensions.
+	GetHasDeviceExtensions() bool
+	// SetTrustedDeviceRequirement sets the session's trusted device requirement.
+	// See [TrustedDeviceRequirement].
+	SetTrustedDeviceRequirement(r TrustedDeviceRequirement)
+	// GetTrustedDeviceRequirement returns the session's trusted device
+	// requirement.
+	// See [TrustedDeviceRequirement].
+	GetTrustedDeviceRequirement() TrustedDeviceRequirement
+	// GetUsage returns the intended usage of the session.
+	GetUsage() WebSessionUsage
+	// SetUsage sets the intended usage of the session.
+	SetUsage(WebSessionUsage)
+	// GetDBSCPublicKey returns the device-bound public key (JWK format) for
+	// Device Bound Session Credentials.
+	GetDBSCPublicKey() []byte
+	// SetDBSCPublicKey sets the device-bound public key (JWK format) for
+	// Device Bound Session Credentials.
+	SetDBSCPublicKey([]byte)
+	// Copy returns a clone of the session resource.
+	Copy() WebSession
 }
 
 // NewWebSession returns new instance of the web session based on the V2 spec
@@ -117,6 +157,11 @@ func NewWebSession(name string, subkind string, spec WebSessionSpecV2) (WebSessi
 // GetKind gets resource Kind
 func (ws *WebSessionV2) GetKind() string {
 	return ws.Kind
+}
+
+// Copy returns a clone of the session resource.
+func (ws *WebSessionV2) Copy() WebSession {
+	return utils.CloneProtoMsg(ws)
 }
 
 // GetSubKind gets resource SubKind
@@ -159,14 +204,14 @@ func (ws *WebSessionV2) GetMetadata() Metadata {
 	return ws.Metadata
 }
 
-// GetResourceID gets ResourceID
-func (ws *WebSessionV2) GetResourceID() int64 {
-	return ws.Metadata.GetID()
+// GetRevision returns the revision
+func (ws *WebSessionV2) GetRevision() string {
+	return ws.Metadata.GetRevision()
 }
 
-// SetResourceID sets ResourceID
-func (ws *WebSessionV2) SetResourceID(id int64) {
-	ws.Metadata.SetID(id)
+// SetRevision sets the revision
+func (ws *WebSessionV2) SetRevision(rev string) {
+	ws.Metadata.SetRevision(rev)
 }
 
 // GetIdleTimeout returns the max idle timeout duration.
@@ -174,11 +219,14 @@ func (ws *WebSessionV2) GetIdleTimeout() time.Duration {
 	return ws.Spec.IdleTimeout.Duration()
 }
 
-// WithoutSecrets returns copy of the object but without secrets
+// WithoutSecrets returns a copy of the WebSession without secrets.
 func (ws *WebSessionV2) WithoutSecrets() WebSession {
-	ws.Spec.Priv = nil
-	ws.Spec.SAMLSession = nil
-	return ws
+	cp := *ws
+	cp.Spec.Priv = nil
+	cp.Spec.TLSPriv = nil
+	cp.Spec.SAMLSession = nil
+	cp.Spec.DeviceWebToken = nil
+	return &cp
 }
 
 // SetConsumedAccessRequestID sets the ID of the access request from which additional roles to assume were obtained.
@@ -201,6 +249,58 @@ func (ws *WebSessionV2) GetSAMLSession() *SAMLSessionData {
 	return ws.Spec.SAMLSession
 }
 
+// SetDeviceWebToken sets the session's DeviceWebToken.
+// The token is considered a secret.
+func (ws *WebSessionV2) SetDeviceWebToken(webToken *DeviceWebToken) {
+	ws.Spec.DeviceWebToken = webToken
+}
+
+// GetDeviceWebToken returns the session's DeviceWebToken, if any.
+// The token is considered a secret.
+func (ws *WebSessionV2) GetDeviceWebToken() *DeviceWebToken {
+	return ws.Spec.DeviceWebToken
+}
+
+// GetHasDeviceExtensions returns the HasDeviceExtensions value.
+// If true the session's TLS and SSH certificates are augmented with device
+// extensions.
+func (ws *WebSessionV2) GetHasDeviceExtensions() bool {
+	return ws.Spec.HasDeviceExtensions
+}
+
+// SetTrustedDeviceRequirement sets the session's trusted device requirement.
+func (ws *WebSessionV2) SetTrustedDeviceRequirement(r TrustedDeviceRequirement) {
+	ws.Spec.TrustedDeviceRequirement = r
+}
+
+// GetTrustedDeviceRequirement returns the session's trusted device
+// requirement.
+func (ws *WebSessionV2) GetTrustedDeviceRequirement() TrustedDeviceRequirement {
+	return ws.Spec.TrustedDeviceRequirement
+}
+
+// GetUsage returns the intended usage of the session.
+func (ws *WebSessionV2) GetUsage() WebSessionUsage {
+	return ws.Spec.Usage
+}
+
+// SetUsage sets the intended usage of the session.
+func (ws *WebSessionV2) SetUsage(usage WebSessionUsage) {
+	ws.Spec.Usage = usage
+}
+
+// GetDBSCPublicKey returns the device-bound public key (JWK format) for
+// Device Bound Session Credentials.
+func (ws *WebSessionV2) GetDBSCPublicKey() []byte {
+	return ws.Spec.DBSCPublicKey
+}
+
+// SetDBSCPublicKey sets the device-bound public key (JWK format) for
+// Device Bound Session Credentials.
+func (ws *WebSessionV2) SetDBSCPublicKey(pubKey []byte) {
+	ws.Spec.DBSCPublicKey = pubKey
+}
+
 // setStaticFields sets static resource header and metadata fields.
 func (ws *WebSessionV2) setStaticFields() {
 	ws.Version = V2
@@ -213,7 +313,6 @@ func (ws *WebSessionV2) CheckAndSetDefaults() error {
 	if err := ws.Metadata.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}
-
 	if ws.Spec.User == "" {
 		return trace.BadParameter("missing User")
 	}
@@ -254,14 +353,24 @@ func (ws *WebSessionV2) GetPub() []byte {
 	return ws.Spec.Pub
 }
 
-// GetPriv returns private OpenSSH key used to auth with SSH nodes
-func (ws *WebSessionV2) GetPriv() []byte {
+// GetSSHPriv returns private SSH key.
+func (ws *WebSessionV2) GetSSHPriv() []byte {
 	return ws.Spec.Priv
 }
 
-// SetPriv sets private key
-func (ws *WebSessionV2) SetPriv(priv []byte) {
+// SetSSHPriv sets private SSH key.
+func (ws *WebSessionV2) SetSSHPriv(priv []byte) {
 	ws.Spec.Priv = priv
+}
+
+// GetTLSPriv returns private TLS key.
+func (ws *WebSessionV2) GetTLSPriv() []byte {
+	return ws.Spec.TLSPriv
+}
+
+// SetTLSPriv sets private TLS key.
+func (ws *WebSessionV2) SetTLSPriv(priv []byte) {
+	ws.Spec.TLSPriv = priv
 }
 
 // GetBearerToken gets a special bearer token used for additional
@@ -283,6 +392,47 @@ func (ws *WebSessionV2) GetBearerTokenExpiryTime() time.Time {
 // GetExpiryTime - absolute time when web session expires
 func (ws *WebSessionV2) GetExpiryTime() time.Time {
 	return ws.Spec.Expires
+}
+
+// GetEarliestExpiry returns the time after which the session should be considered
+// dead by the system. The choice depends on which credential authenticates
+// requests for that session's [WebSessionUsage]:
+//
+//   - WEB_SESSION_USAGE_UNSPECIFIED: requests are authenticated with the
+//     bearer token (cookie + Authorization header). Returns the earliest of
+//     BearerTokenExpires and Expires so the session dies as soon as either
+//     the bearer token or the session itself expires. In practice the auth
+//     server caps the bearer-token TTL at the session TTL, so the
+//     bearer-token expiry is the typical winner; the session-expiry cap
+//     guards against externally-constructed sessions that violate that
+//     invariant.
+//
+//   - WEB_SESSION_USAGE_ACCESS_GRAPH_API: requests are authenticated with a
+//     client TLS certificate. There is no bearer token (BearerToken is empty
+//     and BearerTokenExpires is zero), so the session lives until the
+//     certificate / session itself expires. Returns Expires.
+//
+// Callers that compute a backend item TTL or fall back to a session-local
+// expiry decision when a backend lookup is inconclusive should prefer this
+// method over reading the bearer/session expiries directly, so the
+// usage-specific choice stays in one place.
+func (ws *WebSessionV2) GetEarliestExpiry() time.Time {
+	if ws.Spec.Usage == WebSessionUsage_WEB_SESSION_USAGE_ACCESS_GRAPH_API {
+		return ws.Spec.Expires
+	}
+	// Return the earlier of the two expiries, treating a zero time as "no
+	// expiry" rather than the epoch.
+	bearer, sess := ws.Spec.BearerTokenExpires, ws.Spec.Expires
+	switch {
+	case bearer.IsZero():
+		return sess
+	case sess.IsZero():
+		return bearer
+	case bearer.Before(sess):
+		return bearer
+	default:
+		return sess
+	}
 }
 
 // GetLoginTime returns the time this user recently logged in.
@@ -325,53 +475,6 @@ func (r *GetSnowflakeSessionRequest) Check() error {
 	return nil
 }
 
-// GetSAMLIdPSessionRequest contains the parameters to request a SAML IdP
-// session.
-type GetSAMLIdPSessionRequest struct {
-	// SessionID is the session ID of the SAML IdP session.
-	SessionID string
-}
-
-// Check validates the request.
-func (r *GetSAMLIdPSessionRequest) Check() error {
-	if r.SessionID == "" {
-		return trace.BadParameter("session ID missing")
-	}
-	return nil
-}
-
-// CreateAppSessionRequest contains the parameters needed to request
-// creating an application web session.
-type CreateAppSessionRequest struct {
-	// Username is the identity of the user requesting the session.
-	Username string `json:"username"`
-	// PublicAddr is the public address of the application.
-	PublicAddr string `json:"public_addr"`
-	// ClusterName is the name of the cluster within which the application is running.
-	ClusterName string `json:"cluster_name"`
-	// AWSRoleARN is AWS role this the user wants to assume.
-	AWSRoleARN string `json:"aws_role_arn"`
-	// AzureIdentity is Azure identity this the user wants to assume.
-	AzureIdentity string `json:"azure_identity"`
-	// GCPServiceAccount is GCP service account this the user wants to assume.
-	GCPServiceAccount string `json:"gcp_service_account"`
-}
-
-// Check validates the request.
-func (r CreateAppSessionRequest) Check() error {
-	if r.Username == "" {
-		return trace.BadParameter("username missing")
-	}
-	if r.PublicAddr == "" {
-		return trace.BadParameter("public address missing")
-	}
-	if r.ClusterName == "" {
-		return trace.BadParameter("cluster name missing")
-	}
-
-	return nil
-}
-
 // CreateSnowflakeSessionRequest contains the parameters needed to request
 // creating a Snowflake web session.
 type CreateSnowflakeSessionRequest struct {
@@ -383,29 +486,6 @@ type CreateSnowflakeSessionRequest struct {
 	TokenTTL time.Duration
 }
 
-// CreateSAMLIdPSessionRequest contains the parameters needed to request
-// creating a SAML IdP session.
-type CreateSAMLIdPSessionRequest struct {
-	// SessionID is the identifier for the session.
-	SessionID string
-	// Username is the identity of the user requesting the session.
-	Username string `json:"username"`
-	// SAMLSession is the session data associated with the SAML IdP session.
-	SAMLSession *SAMLSessionData `json:"saml_session"`
-}
-
-// Check validates the request.
-func (r CreateSAMLIdPSessionRequest) Check() error {
-	if r.Username == "" {
-		return trace.BadParameter("username missing")
-	}
-	if r.SAMLSession == nil {
-		return trace.BadParameter("saml session missing")
-	}
-
-	return nil
-}
-
 // DeleteAppSessionRequest are the parameters used to request removal of
 // an application web session.
 type DeleteAppSessionRequest struct {
@@ -415,12 +495,6 @@ type DeleteAppSessionRequest struct {
 // DeleteSnowflakeSessionRequest are the parameters used to request removal of
 // a Snowflake web session.
 type DeleteSnowflakeSessionRequest struct {
-	SessionID string `json:"session_id"`
-}
-
-// DeleteSAMLIdPSessionRequest are the parameters used to request removal of
-// a SAML IdP session.
-type DeleteSAMLIdPSessionRequest struct {
 	SessionID string `json:"session_id"`
 }
 
@@ -440,12 +514,24 @@ func NewWebToken(expires time.Time, spec WebTokenSpecV3) (WebToken, error) {
 }
 
 // WebTokensGetter provides access to web tokens
+//
+// TODO(okraport): DELETE IN v21
+//
+// Deprecated: Use [Client] methods directly such as
+// [Client.GetWebToken], [Client.GetWebTokens], [Client.DeleteWebToken] or
+// [Client.DeleteAllWebTokens]
 type WebTokensGetter interface {
 	// WebTokens returns the tokens manager
 	WebTokens() WebTokenInterface
 }
 
 // WebTokenInterface defines interface for managing web tokens
+//
+// TODO(okraport): DELETE IN v21
+//
+// Deprecated: Use [Client] methods directly such as
+// [Client.GetWebToken], [Client.GetWebTokens], [Client.DeleteWebToken] or
+// [Client.DeleteAllWebTokens]
 type WebTokenInterface interface {
 	// Get returns a token specified by the request.
 	Get(ctx context.Context, req GetWebTokenRequest) (WebToken, error)
@@ -478,9 +564,17 @@ type WebToken interface {
 	SetUser(user string)
 	// String returns the text representation of this token
 	String() string
+	// Clone returns a copy of the token.
+	Clone() WebToken
 }
 
 var _ WebToken = &WebTokenV3{}
+
+// Clone returns a copy of the token.
+// GetMetadata returns the token metadata
+func (r *WebTokenV3) Clone() WebToken {
+	return utils.CloneProtoMsg(r)
+}
 
 // GetMetadata returns the token metadata
 func (r *WebTokenV3) GetMetadata() Metadata {
@@ -517,14 +611,14 @@ func (r *WebTokenV3) SetName(name string) {
 	r.Metadata.Name = name
 }
 
-// GetResourceID returns the token resource ID
-func (r *WebTokenV3) GetResourceID() int64 {
-	return r.Metadata.GetID()
+// GetRevision returns the revision
+func (r *WebTokenV3) GetRevision() string {
+	return r.Metadata.GetRevision()
 }
 
-// SetResourceID sets the token resource ID
-func (r *WebTokenV3) SetResourceID(id int64) {
-	r.Metadata.SetID(id)
+// SetRevision sets the revision
+func (r *WebTokenV3) SetRevision(rev string) {
+	r.Metadata.SetRevision(rev)
 }
 
 // GetToken returns the token value
@@ -586,43 +680,6 @@ func (r *WebTokenV3) CheckAndSetDefaults() error {
 func (r *WebTokenV3) String() string {
 	return fmt.Sprintf("WebToken(kind=%v,user=%v,token=%v,expires=%v)",
 		r.GetKind(), r.GetUser(), r.GetToken(), r.Expiry())
-}
-
-// CheckAndSetDefaults validates the request and sets defaults.
-func (r *NewWebSessionRequest) CheckAndSetDefaults() error {
-	if r.User == "" {
-		return trace.BadParameter("user name required")
-	}
-	if len(r.Roles) == 0 {
-		return trace.BadParameter("roles required")
-	}
-	if len(r.Traits) == 0 {
-		return trace.BadParameter("traits required")
-	}
-	if r.SessionTTL == 0 {
-		r.SessionTTL = defaults.CertDuration
-	}
-	return nil
-}
-
-// NewWebSessionRequest defines a request to create a new user
-// web session
-type NewWebSessionRequest struct {
-	// User specifies the user this session is bound to
-	User string
-	// Roles optionally lists additional user roles
-	Roles []string
-	// Traits optionally lists role traits
-	Traits map[string][]string
-	// SessionTTL optionally specifies the session time-to-live.
-	// If left unspecified, the default certificate duration is used.
-	SessionTTL time.Duration
-	// LoginTime is the time that this user recently logged in.
-	LoginTime time.Time
-	// AccessRequests contains the UUIDs of the access requests currently in use.
-	AccessRequests []string
-	// RequestedResourceIDs optionally lists requested resources
-	RequestedResourceIDs []ResourceID
 }
 
 // Check validates the request.

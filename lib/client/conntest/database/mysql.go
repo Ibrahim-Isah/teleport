@@ -1,39 +1,57 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package database
 
 import (
 	"context"
 	"errors"
-	"fmt"
+	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/srv/db/common"
 )
 
 // MySQLPinger implements the DatabasePinger interface for the MySQL protocol.
 type MySQLPinger struct{}
+
+// convertError converts the error from MySQL client since it can be wrapped in an [errors.Causer].
+// The MySQL engine in the agent already does this, but we need it here because
+// the error is from the MySQL client.
+func convertError(err error) error {
+	// causer defines an interface for errors wrapped by the [errors] package.
+	type causer interface {
+		Cause() error
+	}
+
+	var c causer
+	if errors.As(err, &c) {
+		return trace.Wrap(c.Cause())
+	}
+
+	return trace.Wrap(err)
+}
 
 // Ping connects to the database and issues a basic select statement to validate the connection.
 func (p *MySQLPinger) Ping(ctx context.Context, params PingParams) error {
@@ -42,7 +60,7 @@ func (p *MySQLPinger) Ping(ctx context.Context, params PingParams) error {
 	}
 
 	var nd net.Dialer
-	addr := fmt.Sprintf("%s:%d", params.Host, params.Port)
+	addr := net.JoinHostPort(params.Host, strconv.Itoa(params.Port))
 	conn, err := client.ConnectWithDialer(ctx, "tcp", addr,
 		params.Username,
 		"", // no password, we're dialing into a tunnel.
@@ -50,20 +68,17 @@ func (p *MySQLPinger) Ping(ctx context.Context, params PingParams) error {
 		nd.DialContext,
 	)
 	if err != nil {
-		// convert the error from MySQL client since it can be wrapped in a "Causer".
-		// The MySQL engine in the agent already does this, but we need it here because
-		// the error is from the MySQL client.
-		return trace.Wrap(common.ConvertError(err))
+		return convertError(err)
 	}
 
 	defer func() {
-		if err := conn.Close(); err != nil {
-			logrus.WithError(err).Info("Failed to close connection in MySQLPinger.Ping")
+		if err := conn.Quit(); err != nil {
+			slog.InfoContext(context.Background(), "Failed to close connection in MySQLPinger.Ping", "error", err)
 		}
 	}()
 
 	if err := conn.Ping(); err != nil {
-		return trace.Wrap(common.ConvertError(err))
+		return convertError(err)
 	}
 
 	return nil

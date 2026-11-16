@@ -1,42 +1,46 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
+	"context"
+	"log/slog"
+
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/mysql/armmysqlflexibleservers"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/cloud/azure"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
 // newAzureMySQLFlexServerFetcher creates a fetcher for Azure MySQL Flexible server.
 func newAzureMySQLFlexServerFetcher(config azureFetcherConfig) (common.Fetcher, error) {
-	return newAzureFetcher[*armmysqlflexibleservers.Server, azure.MySQLFlexServersClient](config, &azureMySQLFlexServerFetcher{})
+	return newAzureFetcher(config, &azureMySQLFlexServerFetcher{})
 }
 
 // azureMySQLFlexServerFetcher implements azureFetcherPlugin for Azure MySQL Flexible server.
-type azureMySQLFlexServerFetcher struct {
-}
+type azureMySQLFlexServerFetcher struct{}
 
 // GetListClient returns a server-listing client for Azure MySQL Flexible server.
-func (f *azureMySQLFlexServerFetcher) GetListClient(cfg *azureFetcherConfig, subID string) (azure.MySQLFlexServersClient, error) {
-	client, err := cfg.AzureClients.GetAzureMySQLFlexServersClient(subID)
+func (f *azureMySQLFlexServerFetcher) GetListClient(ctx context.Context, cfg *azureFetcherConfig, subID string) (azure.MySQLFlexServersClient, error) {
+	client, err := cfg.AzureClients.GetMySQLFlexServersClient(ctx, subID)
 	return client, trace.Wrap(err)
 }
 
@@ -46,17 +50,21 @@ func (f *azureMySQLFlexServerFetcher) GetServerLocation(server *armmysqlflexible
 }
 
 // NewDatabaseFromServer converts an Azure MySQL Flexible server to a Teleport database.
-func (f *azureMySQLFlexServerFetcher) NewDatabaseFromServer(server *armmysqlflexibleservers.Server, log logrus.FieldLogger) types.Database {
-	if !f.isAvailable(server, log) {
-		log.Debugf("The current status of Azure MySQL Flexible server %q is %q. Skipping.",
-			azure.StringVal(server.Name),
-			azure.StringVal(server.Properties.State))
+func (f *azureMySQLFlexServerFetcher) NewDatabaseFromServer(ctx context.Context, server *armmysqlflexibleservers.Server, logger *slog.Logger) types.Database {
+	if !f.isAvailable(server, logger) {
+		logger.DebugContext(ctx, "Skipping unavailable Azure MySQL Flexible server",
+			"server", azure.StringVal(server.Name),
+			"state", azure.StringVal(server.Properties.State),
+		)
 		return nil
 	}
 
-	database, err := services.NewDatabaseFromAzureMySQLFlexServer(server)
+	database, err := common.NewDatabaseFromAzureMySQLFlexServer(server)
 	if err != nil {
-		log.Warnf("Could not convert Azure MySQL server %q to database resource: %v.", azure.StringVal(server.Name), err)
+		logger.WarnContext(ctx, "Could not convert Azure MySQL server to database resource",
+			"server", azure.StringVal(server.Name),
+			"error", err,
+		)
 		return nil
 	}
 	return database
@@ -64,7 +72,7 @@ func (f *azureMySQLFlexServerFetcher) NewDatabaseFromServer(server *armmysqlflex
 
 // isAvailable checks the status of the server and returns true if the server
 // is available.
-func (f *azureMySQLFlexServerFetcher) isAvailable(server *armmysqlflexibleservers.Server, log logrus.FieldLogger) bool {
+func (f *azureMySQLFlexServerFetcher) isAvailable(server *armmysqlflexibleservers.Server, logger *slog.Logger) bool {
 	state := armmysqlflexibleservers.ServerState(azure.StringVal(server.Properties.State))
 	switch state {
 	case armmysqlflexibleservers.ServerStateReady, armmysqlflexibleservers.ServerStateUpdating:
@@ -77,8 +85,9 @@ func (f *azureMySQLFlexServerFetcher) isAvailable(server *armmysqlflexibleserver
 		// server state is known and it's not available.
 		return false
 	}
-	log.Warnf("Unknown status type: %q. Assuming Azure MySQL Flexible server %q is available.",
-		state,
-		azure.StringVal(server.Name))
+	logger.WarnContext(context.Background(), "Assuming Azure MySQL Flexible server with unknown status type is available",
+		"status", state,
+		"server", azure.StringVal(server.Name),
+	)
 	return true
 }

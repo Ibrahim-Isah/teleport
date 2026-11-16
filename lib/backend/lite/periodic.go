@@ -1,23 +1,26 @@
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package lite
 
 import (
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/gravitational/trace"
@@ -35,30 +38,24 @@ func (l *Backend) runPeriodicOperations() {
 	for {
 		select {
 		case <-l.ctx.Done():
-			if err := l.closeDatabase(); err != nil {
-				l.Warningf("Error closing database: %v", err)
-			}
 			return
 		case <-t.C:
-			err := l.removeExpiredKeys()
-			if err != nil {
+			if err := l.removeExpiredKeys(); err != nil {
 				// connection problem means that database is closed
-				// or is closing, downgrade the log to debug
-				// to avoid polluting logs in production
-				if trace.IsConnectionProblem(err) {
-					l.Debugf("Failed to run remove expired keys: %v", err)
-				} else {
-					l.Warningf("Failed to run remove expired keys: %v", err)
+				// or is closing, omit the log to avoid polluting logs in production
+				if !trace.IsConnectionProblem(err) && l.ctx.Err() == nil {
+					l.logger.DebugContext(l.ctx, "Failed to run remove expired keys", "error", err)
 				}
 			}
 			if !l.EventsOff {
-				err = l.removeOldEvents()
-				if err != nil {
-					l.Warningf("Failed to run remove old events: %v", err)
+				err := l.removeOldEvents()
+				if err != nil && !trace.IsConnectionProblem(err) && l.ctx.Err() == nil {
+					l.logger.WarnContext(l.ctx, "Failed to run remove old events", "error", err)
 				}
+
 				rowid, err = l.pollEvents(rowid)
-				if err != nil {
-					l.Warningf("Failed to run poll events: %v", err)
+				if err != nil && !trace.IsConnectionProblem(err) && l.ctx.Err() == nil {
+					l.logger.WarnContext(l.ctx, "Failed to run poll events", "error", err)
 				}
 			}
 		}
@@ -66,12 +63,6 @@ func (l *Backend) runPeriodicOperations() {
 }
 
 func (l *Backend) removeExpiredKeys() error {
-	// In mirror mode, don't expire any elements. This allows the cache to setup
-	// a watch and expire elements as the events roll in.
-	if l.Mirror {
-		return nil
-	}
-
 	now := l.clock.Now().UTC()
 	return l.inTransaction(l.ctx, func(tx *sql.Tx) error {
 		q, err := tx.PrepareContext(l.ctx,
@@ -86,9 +77,9 @@ func (l *Backend) removeExpiredKeys() error {
 			return trace.Wrap(err)
 		}
 		defer rows.Close()
-		var keys [][]byte
+		var keys []backend.Key
 		for rows.Next() {
-			var key []byte
+			var key backend.Key
 			if err := rows.Scan(&key); err != nil {
 				return trace.Wrap(err)
 			}
@@ -136,7 +127,7 @@ func (l *Backend) pollEvents(rowid int64) (int64, error) {
 			row := q.QueryRow()
 			prevRowID := rowid
 			if err := row.Scan(&rowid); err != nil {
-				if err != sql.ErrNoRows {
+				if !errors.Is(err, sql.ErrNoRows) {
 					// Scan does not explicitly promise not to modify its inputs if it returns an error (though this is likely
 					// how it behaves).  Just in case, make sure that rowid is preserved so that we don't accidentally skip
 					// some init logic on retry.
@@ -152,7 +143,7 @@ func (l *Backend) pollEvents(rowid int64) (int64, error) {
 		if err != nil {
 			return rowid, trace.Wrap(err)
 		}
-		l.Debugf("Initialized event ID iterator to %v", rowid)
+		l.logger.DebugContext(l.ctx, "Initialized event ID iterator", "event_id", rowid)
 		l.buf.SetInit()
 	}
 
@@ -160,7 +151,7 @@ func (l *Backend) pollEvents(rowid int64) (int64, error) {
 	var lastID int64
 	err := l.inTransaction(l.ctx, func(tx *sql.Tx) error {
 		q, err := tx.PrepareContext(l.ctx,
-			"SELECT id, type, kv_key, kv_value, kv_modified, kv_expires FROM events WHERE id > ? ORDER BY id LIMIT ?")
+			"SELECT id, type, kv_key, kv_value, kv_expires, kv_revision FROM events WHERE id > ? ORDER BY id LIMIT ?")
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -176,8 +167,8 @@ func (l *Backend) pollEvents(rowid int64) (int64, error) {
 		defer rows.Close()
 		for rows.Next() {
 			var event backend.Event
-			var expires NullTime
-			if err := rows.Scan(&lastID, &event.Type, &event.Item.Key, &event.Item.Value, &event.Item.ID, &expires); err != nil {
+			var expires sql.NullTime
+			if err := rows.Scan(&lastID, &event.Type, &event.Item.Key, &event.Item.Value, &expires, &event.Item.Revision); err != nil {
 				return trace.Wrap(err)
 			}
 			if expires.Valid {

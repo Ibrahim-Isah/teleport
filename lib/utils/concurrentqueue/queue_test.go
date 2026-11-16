@@ -1,23 +1,25 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package concurrentqueue
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -33,7 +35,7 @@ func TestOrdering(t *testing.T) {
 	q := New(func(v int) int {
 		// introduce a short random delay to ensure that work
 		// completes out of order.
-		time.Sleep(time.Duration(rand.Int63n(int64(time.Millisecond * 12))))
+		time.Sleep(rand.N(time.Millisecond * 12))
 		return v
 	}, Workers(10))
 	t.Cleanup(func() { require.NoError(t, q.Close()) })
@@ -42,13 +44,13 @@ func TestOrdering(t *testing.T) {
 	go func() {
 		defer close(done)
 		// verify that queue outputs items in expected order
-		for i := 0; i < testItems; i++ {
+		for i := range testItems {
 			itm := <-q.Pop()
 			assert.Equal(t, i, itm)
 		}
 	}()
 
-	for i := 0; i < testItems; i++ {
+	for i := range testItems {
 		q.Push() <- i
 	}
 	<-done
@@ -147,7 +149,7 @@ func runBackpressureScenario(t *testing.T, tt bpt) {
 	)
 	defer func() { require.NoError(t, q.Close()) }()
 
-	for i := 0; i < tt.expect; i++ {
+	for i := range tt.expect {
 		select {
 		case q.Push() <- i:
 		case <-time.After(time.Millisecond * 200):
@@ -170,6 +172,9 @@ cpu: Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz
 BenchmarkQueue-16    	     156	   7342841 ns/op
 */
 func BenchmarkQueue(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping heavy benchmark")
+	}
 	const workers = 16
 	const iters = 4096
 	workfn := func(v int) int {
@@ -181,17 +186,15 @@ func BenchmarkQueue(b *testing.B) {
 	q := New(workfn, Workers(workers))
 	defer q.Close()
 
-	b.ResetTimer()
-
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		collected := make(chan struct{})
 		go func() {
-			for i := 0; i < iters; i++ {
+			for range iters {
 				<-q.Pop()
 			}
 			close(collected)
 		}()
-		for i := 0; i < iters; i++ {
+		for i := range iters {
 			q.Push() <- i
 		}
 		<-collected

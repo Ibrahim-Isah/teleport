@@ -1,32 +1,35 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package web
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/utils"
 )
 
 // ServerConfig provides dependencies required to create a [Server].
@@ -36,7 +39,7 @@ type ServerConfig struct {
 	// Handler web handler
 	Handler *APIHandler
 	// Log to write log messages
-	Log logrus.FieldLogger
+	Log *slog.Logger
 	// ShutdownPollPeriod sets polling period for shutdown
 	ShutdownPollPeriod time.Duration
 }
@@ -56,7 +59,7 @@ func (c *ServerConfig) CheckAndSetDefaults() error {
 	}
 
 	if c.Log == nil {
-		c.Log = utils.NewLogger().WithField(trace.Component, teleport.ComponentProxy)
+		c.Log = slog.With(teleport.ComponentKey, teleport.ComponentProxy)
 	}
 
 	return nil
@@ -66,8 +69,9 @@ func (c *ServerConfig) CheckAndSetDefaults() error {
 type Server struct {
 	cfg ServerConfig
 
-	mu sync.Mutex
-	ln net.Listener
+	mu     sync.Mutex
+	ln     net.Listener
+	closed bool
 }
 
 // NewServer constructs a [Server] from the provided [ServerConfig].
@@ -85,12 +89,25 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 func (s *Server) Serve(l net.Listener) error {
 	s.mu.Lock()
 	s.ln = l
+	closed := s.closed
+	if closed {
+		s.ln.Close()
+	}
 	s.mu.Unlock()
+	if closed {
+		return trace.Errorf("serve called on previously closed server")
+	}
 	return trace.Wrap(s.cfg.Server.Serve(l))
 }
 
 // Close immediately closes the [http.Server].
 func (s *Server) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	if s.ln != nil {
+		s.ln.Close()
+	}
+	s.mu.Unlock()
 	return trace.NewAggregate(s.cfg.Handler.Close(), s.cfg.Server.Close())
 }
 
@@ -107,7 +124,11 @@ func (s *Server) HandleConnection(ctx context.Context, conn net.Conn) error {
 // web UI will not prevent the [http.Server] from shutting down.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
-	err := s.ln.Close()
+	var err error
+	s.closed = true
+	if s.ln != nil {
+		err = s.ln.Close()
+	}
 	s.mu.Unlock()
 
 	activeConnections := s.cfg.Handler.handler.userConns.Load()
@@ -116,7 +137,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return trace.NewAggregate(err, s.cfg.Handler.Close())
 	}
 
-	s.cfg.Log.Infof("Shutdown: waiting for %v connections to finish.", activeConnections)
+	s.cfg.Log.InfoContext(ctx, "Shutdown: waiting for active connections to finish", "active_connection_count", activeConnections)
 	lastReport := time.Time{}
 	ticker := time.NewTicker(s.cfg.ShutdownPollPeriod)
 	defer ticker.Stop()
@@ -129,11 +150,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 				return trace.NewAggregate(err, s.cfg.Handler.Close())
 			}
 			if time.Since(lastReport) > 10*s.cfg.ShutdownPollPeriod {
-				s.cfg.Log.Infof("Shutdown: waiting for %v connections to finish.", activeConnections)
+				s.cfg.Log.InfoContext(ctx, "Shutdown: waiting for active connections to finish", "active_connection_count", activeConnections)
 				lastReport = time.Now()
 			}
 		case <-ctx.Done():
-			s.cfg.Log.Infof("Context canceled wait, returning.")
+			s.cfg.Log.InfoContext(ctx, "Context canceled wait, returning")
 			return trace.ConnectionProblem(trace.NewAggregate(err, s.cfg.Handler.Close()), "context canceled")
 		}
 	}

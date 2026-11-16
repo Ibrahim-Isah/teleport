@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package tester
 
@@ -21,13 +25,13 @@ import (
 
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/services"
 )
 
-func githubTest(c auth.ClientI, connector types.GithubConnector) (*AuthRequestInfo, error) {
+func githubTest(c *authclient.Client, connector types.GithubConnector) (*AuthRequestInfo, error) {
 	ctx := context.Background()
 	// get connector spec
 	var spec types.GithubConnectorSpecV3
@@ -41,10 +45,14 @@ func githubTest(c auth.ClientI, connector types.GithubConnector) (*AuthRequestIn
 	requestInfo := &AuthRequestInfo{}
 
 	makeRequest := func(req client.SSOLoginConsoleReq) (*client.SSOLoginConsoleResponse, error) {
+		if err := req.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
+		}
 		ghRequest := types.GithubAuthRequest{
 			ConnectorID:       req.ConnectorID + "-" + connector.GetName(),
 			Type:              constants.Github,
-			PublicKey:         req.PublicKey,
+			SshPublicKey:      req.SSHPubKey,
+			TlsPublicKey:      req.TLSPubKey,
 			CertTTL:           defaults.GithubAuthRequestTTL,
 			CreateWebSession:  false,
 			ClientRedirectURL: req.RedirectURL,
@@ -67,11 +75,11 @@ func githubTest(c auth.ClientI, connector types.GithubConnector) (*AuthRequestIn
 		return &client.SSOLoginConsoleResponse{RedirectURL: request.RedirectURL}, nil
 	}
 
-	requestInfo.Config = &client.RedirectorConfig{SSOLoginConsoleRequestFn: makeRequest}
+	requestInfo.SSOLoginConsoleRequestFn = makeRequest
 	return requestInfo, nil
 }
 
-func handleGithubConnector(c auth.ClientI, connBytes []byte) (*AuthRequestInfo, error) {
+func handleGithubConnector(c *authclient.Client, connBytes []byte) (*AuthRequestInfo, error) {
 	conn, err := services.UnmarshalGithubConnector(connBytes)
 	if err != nil {
 		return nil, trace.Wrap(err, "Unable to load GitHub connector. Correct the definition and try again.")

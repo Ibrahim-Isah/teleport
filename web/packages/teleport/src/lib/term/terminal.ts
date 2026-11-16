@@ -1,31 +1,39 @@
-/*
-Copyright 2019-2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { FitAddon } from '@xterm/addon-fit';
+import { ImageAddon } from '@xterm/addon-image';
+import { WebLinksAddon } from '@xterm/addon-web-links';
+import { WebglAddon } from '@xterm/addon-webgl';
+import { ITheme, Terminal } from '@xterm/xterm';
+import '@xterm/xterm/css/xterm.css';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-import 'xterm/css/xterm.css';
-import { Terminal } from 'xterm';
-import { FitAddon } from 'xterm-addon-fit';
-import { debounce, isInteger } from 'shared/utils/highbar';
-import { WebLinksAddon } from 'xterm-addon-web-links';
+import {
+  SearchAddon,
+  TerminalSearcher,
+} from 'shared/components/TerminalSearch';
 import Logger from 'shared/libs/logger';
+import { debounce, isInteger, type DebouncedFunc } from 'shared/utils/highbar';
 
 import cfg from 'teleport/config';
 
 import { TermEvent } from './enums';
 import Tty from './tty';
-
-import type { DebouncedFunc } from 'shared/utils/highbar';
 
 const logger = Logger.create('lib/term/terminal');
 const DISCONNECT_TXT = 'disconnected';
@@ -34,26 +42,55 @@ const WINDOW_RESIZE_DEBOUNCE_DELAY = 200;
 /**
  * TtyTerminal is a wrapper on top of xtermjs
  */
-export default class TtyTerminal {
+export default class TtyTerminal implements TerminalSearcher {
   term: Terminal;
   tty: Tty;
 
+  // TODO (avatus): migrate all of these to using `private` instead of underscore
   _el: HTMLElement;
   _scrollBack: number;
   _fontFamily: string;
   _fontSize: number;
+  _convertEol: boolean;
   _debouncedResize: DebouncedFunc<() => void>;
   _fitAddon = new FitAddon();
+  _imageAddon: ImageAddon | undefined;
+  _searchAddon = new SearchAddon();
   _webLinksAddon = new WebLinksAddon();
+  _webglAddon: WebglAddon | undefined;
 
-  constructor(tty: Tty, options: Options) {
-    const { el, scrollBack, fontFamily, fontSize } = options;
+  private customKeyEventHandlers = new Set<(event: KeyboardEvent) => boolean>();
+
+  private _disableCopy: boolean;
+  private _onCopyBlocked?: () => void;
+  private _blockCopy = (e: ClipboardEvent) => {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    this._onCopyBlocked?.();
+  };
+
+  constructor(
+    tty: Tty,
+    private options: Options
+  ) {
+    const {
+      el,
+      scrollBack,
+      fontFamily,
+      fontSize,
+      convertEol,
+      disableCopy,
+      onCopyBlocked,
+    } = options;
     this._el = el;
     this._fontFamily = fontFamily || undefined;
     this._fontSize = fontSize || 14;
     // Passing scrollback will overwrite the default config. This is to support ttyplayer.
     // Default to the config when not passed anything, which is the normal usecase
     this._scrollBack = scrollBack || cfg.ui.scrollbackLines;
+    this._convertEol = convertEol || false;
+    this._disableCopy = !!disableCopy;
+    this._onCopyBlocked = onCopyBlocked;
     this.tty = tty;
     this.term = null;
 
@@ -62,21 +99,65 @@ export default class TtyTerminal {
     }, WINDOW_RESIZE_DEBOUNCE_DELAY);
   }
 
+  registerCustomKeyEventHandler(customHandler: (e: KeyboardEvent) => boolean) {
+    this.customKeyEventHandlers.add(customHandler);
+    return {
+      unregister: () => this.customKeyEventHandlers.delete(customHandler),
+    };
+  }
+
   open() {
     this.term = new Terminal({
       lineHeight: 1,
       fontFamily: this._fontFamily,
       fontSize: this._fontSize,
       scrollback: this._scrollBack,
+      convertEol: this._convertEol,
       cursorBlink: false,
-      allowTransparency: true,
+      minimumContrastRatio: 4.5, // minimum for WCAG AA compliance
+      screenReaderMode: true,
+      theme: this.options.theme,
+      allowProposedApi: true, // required for customizing SearchAddon properties
     });
 
     this.term.loadAddon(this._fitAddon);
     this.term.loadAddon(this._webLinksAddon);
+    this.term.loadAddon(this._searchAddon);
+
+    // @xterm/addon-image relies on WebAssembly internally. The vite plugin guard-wasm
+    // rewrites bare WebAssembly references so the module can be statically imported
+    // without crashing; construction will still throw when WebAssembly is genuinely
+    // unavailable, so we catch that here.
+    try {
+      this._imageAddon = new ImageAddon();
+      this.term.loadAddon(this._imageAddon);
+    } catch (e) {
+      logger.error('Failed to load image addon', e);
+    }
+
+    try {
+      // The constructor may throw if WebGL is not supported.
+      // xterm.js can also asynchronously throw an error in Terminal.prototype.open()
+      // (`Uncaught Error: WebGL2 not supported`) that cannot be caught.
+      this._webglAddon = new WebglAddon();
+      // Triggered if the addon fails to recover the WebGL context after multiple retries.
+      this._webglAddon.onContextLoss(() => {
+        logger.info('WebGL context lost. Using default renderer.');
+        this._webglAddon?.dispose();
+      });
+      this.term.loadAddon(this._webglAddon);
+    } catch {
+      this._webglAddon?.dispose();
+      logger.info('WebGL could not be loaded. Using default renderer.');
+    }
+
     this.term.open(this._el);
     this._fitAddon.fit();
-    this.term.focus();
+
+    if (this._disableCopy) {
+      // Intercept copy events if disableCopy is true to block copying to the clipboard.
+      this._el.addEventListener('copy', this._blockCopy, true);
+    }
     this.term.onData(data => {
       this.tty.send(data);
     });
@@ -92,20 +173,89 @@ export default class TtyTerminal {
 
     // subscribe to window resize events
     window.addEventListener('resize', this._debouncedResize);
+
+    // Xterm.js v6 removed the workaround that converted Alt+Arrow to Ctrl+Arrow sequences for word
+    // navigation (https://github.com/xtermjs/xterm.js/pull/5346). Re-add this behavior by sending
+    // the appropriate escape sequences, matching what VS Code does.
+    // https://github.com/microsoft/vscode/blob/5bb327de4bf14578c8c0bd1b553ee14dd2977e18/src/vs/workbench/contrib/terminalContrib/sendSequence/browser/terminal.sendSequence.contribution.ts#L163-L182
+    //
+    // Terminal.app and iTerm2 have bindings only for Alt+Left/Right, so we follow their steps and
+    // send ESC b / ESC f (readline word navigation).
+    this.registerCustomKeyEventHandler(e => {
+      // Only handle pure Alt+Arrow. Other modifier combinations (e.g. Ctrl+Alt+Arrow,
+      // Shift+Alt+Arrow) have their own distinct escape sequences that Xterm.js already handles.
+      if (
+        e.type !== 'keydown' ||
+        !e.altKey ||
+        e.ctrlKey ||
+        e.metaKey ||
+        e.shiftKey
+      ) {
+        return true;
+      }
+
+      let seq: string | undefined;
+      switch (e.key) {
+        case 'ArrowRight':
+          seq = '\x1bf';
+          break;
+        case 'ArrowLeft':
+          seq = '\x1bb';
+          break;
+      }
+
+      if (seq) {
+        this.term.input(seq, false /* wasUserInput */);
+        e.preventDefault();
+        // Event handled, do not process it in xterm.
+        return false;
+      }
+
+      return true;
+    });
+
+    this.term.attachCustomKeyEventHandler(e => {
+      for (const eventHandler of this.customKeyEventHandlers) {
+        if (!eventHandler(e)) {
+          // The event was handled, we can return early.
+          return false;
+        }
+      }
+      // The event wasn't handled, pass it to xterm.
+      return true;
+    });
+  }
+
+  focus() {
+    this.term.focus();
   }
 
   connect() {
     this.tty.connect(this.term.cols, this.term.rows);
   }
 
+  updateTheme(theme: ITheme): void {
+    this.term.options.theme = theme;
+  }
+
   destroy() {
     this._disconnect();
     this._debouncedResize.cancel();
     this._fitAddon.dispose();
+    this._imageAddon?.dispose();
+    this._searchAddon?.dispose();
+    this._webglAddon?.dispose();
+    if (this._disableCopy) {
+      this._el.removeEventListener('copy', this._blockCopy, true);
+    }
     this._el.innerHTML = null;
     this.term?.dispose();
 
     window.removeEventListener('resize', this._debouncedResize);
+  }
+
+  getSearchAddon() {
+    return this._searchAddon;
   }
 
   reset() {
@@ -150,7 +300,11 @@ export default class TtyTerminal {
   _processData(data) {
     try {
       this.tty.pauseFlow();
-      this.term.write(data, () => this.tty.resumeFlow());
+
+      // during a live session, data is emitted as a string.
+      // during playback, data from the websocket comes over as a DataView
+      const d: any = typeof data === 'string' ? data : new Uint8Array(data);
+      this.term.write(d, () => this.tty.resumeFlow());
     } catch (err) {
       logger.error('xterm.write', data, err);
       // recover xtermjs by resetting it
@@ -173,7 +327,13 @@ export default class TtyTerminal {
 
 type Options = {
   el: HTMLElement;
+  theme: ITheme;
   scrollBack?: number;
   fontFamily?: string;
   fontSize?: number;
+  convertEol?: boolean;
+  // disableCopy blocks copying terminal text to clipboard.
+  disableCopy?: boolean;
+  // onCopyBlocked is called whenever a copy attempt is blocked because disableCopy is true.
+  onCopyBlocked?: () => void;
 };

@@ -1,24 +1,32 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package apiserver
 
 import (
+	"log/slog"
+
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
+	"github.com/jonboulle/clockwork"
 	"google.golang.org/grpc"
 
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/lib/teleterm/clusteridcache"
 	"github.com/gravitational/teleport/lib/teleterm/daemon"
 	"github.com/gravitational/teleport/lib/utils"
 )
@@ -26,12 +34,16 @@ import (
 // Config is the APIServer configuration
 type Config struct {
 	// HostAddr is the APIServer host address
-	HostAddr string
+	HostAddr           string
+	InsecureSkipVerify bool
 	// Daemon is the terminal daemon service
-	Daemon *daemon.Service
-	// Log is a component logger
-	Log             logrus.FieldLogger
+	Daemon         *daemon.Service
+	ClusterIDCache *clusteridcache.Cache
+	InstallationID string
+	// Logger is a component logger
+	Logger          *slog.Logger
 	TshdServerCreds grpc.ServerOption
+	Clock           clockwork.Clock
 	// ListeningC propagates the address on which the gRPC server listens. Mostly useful in tests, as
 	// the Electron app gets the server port from stdout.
 	ListeningC chan<- utils.NetAddr
@@ -55,8 +67,20 @@ func (c *Config) CheckAndSetDefaults() error {
 		return trace.BadParameter("missing TshdServerCreds")
 	}
 
-	if c.Log == nil {
-		c.Log = logrus.WithField(trace.Component, "conn:apiserver")
+	if c.Logger == nil {
+		c.Logger = slog.With(teleport.ComponentKey, "conn:apiserver")
+	}
+
+	if c.InstallationID == "" {
+		return trace.BadParameter("missing installation ID")
+	}
+
+	if c.ClusterIDCache == nil {
+		c.ClusterIDCache = &clusteridcache.Cache{}
+	}
+
+	if c.Clock == nil {
+		c.Clock = clockwork.NewRealClock()
 	}
 
 	return nil

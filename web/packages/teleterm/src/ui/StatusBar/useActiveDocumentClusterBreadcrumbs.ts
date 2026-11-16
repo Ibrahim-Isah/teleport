@@ -1,52 +1,74 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { useAppContext } from 'teleterm/ui/appContextProvider';
-import { getResourceUri } from 'teleterm/ui/services/workspacesService';
+import { ComponentType, useCallback } from 'react';
+
+import { IconProps } from 'design/Icon/Icon';
+
+import {
+  getResourceUri,
+  getStaticNameAndIcon,
+} from 'teleterm/ui/services/workspacesService';
 import { routing } from 'teleterm/ui/uri';
 
-export function useActiveDocumentClusterBreadcrumbs(): string {
-  const ctx = useAppContext();
-  ctx.workspacesService.useState();
-  ctx.clustersService.useState();
+import { useStoreSelector } from '../hooks/useStoreSelector';
 
-  const activeDocument = ctx.workspacesService
-    .getActiveWorkspaceDocumentService()
-    ?.getActive();
+interface Breadcrumb {
+  name: string;
+  Icon?: ComponentType<IconProps>;
+}
 
-  if (!activeDocument) {
+export function useActiveDocumentClusterBreadcrumbs(): Breadcrumb[] {
+  const activeDocument = useStoreSelector(
+    'workspacesService',
+    useCallback(state => {
+      const workspace = state.workspaces[state.rootClusterUri];
+      return workspace?.documents.find(d => d.uri === workspace?.location);
+    }, [])
+  );
+  const resourceUri = activeDocument && getResourceUri(activeDocument);
+  const staticNameAndIcon =
+    activeDocument && getStaticNameAndIcon(activeDocument);
+  const clusterUri = resourceUri && routing.ensureClusterUri(resourceUri);
+  const rootClusterUri =
+    resourceUri && routing.ensureRootClusterUri(resourceUri);
+
+  const cluster = useStoreSelector(
+    'clustersService',
+    useCallback(state => state.clusters.get(clusterUri), [clusterUri])
+  );
+  const rootCluster = useStoreSelector(
+    'clustersService',
+    useCallback(state => state.clusters.get(rootClusterUri), [rootClusterUri])
+  );
+
+  if (!cluster || !rootCluster || !staticNameAndIcon) {
     return;
   }
 
-  const resourceUri = getResourceUri(activeDocument);
-  if (!resourceUri) {
-    return;
-  }
-
-  const clusterUri = routing.ensureClusterUri(resourceUri);
-  const rootClusterUri = routing.ensureRootClusterUri(resourceUri);
-
-  const rootCluster = ctx.clustersService.findCluster(rootClusterUri);
-  const leafCluster =
-    clusterUri === rootClusterUri
-      ? undefined
-      : ctx.clustersService.findCluster(clusterUri);
-
-  return [rootCluster, leafCluster]
-    .filter(Boolean)
-    .map(c => c.name)
-    .join(' > ');
+  return [
+    { name: `${routing.parseClusterName(rootClusterUri)}` },
+    clusterUri !== rootClusterUri && {
+      name: routing.parseClusterName(clusterUri),
+    },
+    {
+      name: staticNameAndIcon.name,
+      Icon: staticNameAndIcon.Icon,
+    },
+  ].filter(Boolean);
 }

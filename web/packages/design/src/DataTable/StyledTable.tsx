@@ -1,33 +1,30 @@
-/*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import styled from 'styled-components';
 
-import { space, borderRadius } from 'design/system';
-import { darken } from 'design/theme/utils/colorManipulator';
+import { borderRadius, BorderRadiusProps } from 'design/system';
 
-import Icon from '../Icon';
-
-export const StyledTable = styled.table(
-  props => `
-  background: ${props.theme.colors.primary.light};
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.24);
+export const StyledTable = styled.table<BorderRadiusProps>`
   border-collapse: collapse;
   border-spacing: 0;
-  font-size: 12px;
+  border-style: hidden;
+  font-size: ${props => props.theme.fontSizes[1]}px;
   width: 100%;
 
   & > thead > tr > th,
@@ -36,14 +33,16 @@ export const StyledTable = styled.table(
   & > thead > tr > td,
   & > tbody > tr > td,
   & > tfoot > tr > td {
-    padding: 8px 8px;
+    padding: ${p => p.theme.space[2]}px ${p => p.theme.space[2]}px;
     vertical-align: middle;
 
     &:first-child {
-      padding-left: 24px;
+      // should match padding-left on StyledInput to align Search content to Table content
+      padding-left: ${props => props.theme.space[4]}px;
     }
+
     &:last-child {
-      padding-right: 24px;
+      padding-right: ${props => props.theme.space[4]}px;
     }
   }
 
@@ -52,66 +51,64 @@ export const StyledTable = styled.table(
   }
 
   & > thead > tr > th {
-    background: ${props.theme.colors.primary.dark};
-    color: ${props.theme.colors.primary.contrastText};
+    color: ${props => props.theme.colors.text.main};
+    ${props => props.theme.typography.h3};
+    line-height: 24px;
     cursor: pointer;
-    font-size: 10px;
-    font-weight: 400;
     padding-bottom: 0;
     padding-top: 0;
     text-align: left;
-    opacity: 0.75;
-    text-transform: uppercase;
     white-space: nowrap;
 
-    ${Icon} {
-      font-weight: bold;
-      font-size: 8px;
-      margin-left: 8px;
+    svg {
+      height: 12px;
     }
   }
 
   & > tbody > tr > td {
-    color: rgba(255, 255, 255, 0.87);
-    line-height: 16px;
+    color: ${props => props.theme.colors.text.main};
+    ${props => props.theme.typography.table}
   }
 
   tbody tr {
-    border-bottom: 1px solid ${props.theme.colors.primary.main};
-  }
+    transition: all 150ms;
+    position: relative;
+    border-top: ${props => props.theme.borders[2]}
+      ${props => props.theme.colors.spotBackground[0]};
 
-  tbody tr:hover {
-    background-color: ${darken(props.theme.colors.primary.lighter, 0.14)};
-  }
+    &:hover {
+      border-top: ${props => props.theme.borders[2]} rgba(0, 0, 0, 0);
+      background-color: ${props => props.theme.colors.levels.surface};
 
-  `,
-  space,
-  borderRadius
-);
+      // We use a pseudo element for the shadow with position: absolute in order to prevent
+      // the shadow from increasing the size of the layout and causing scrollbar flicker.
+      &:after {
+        box-shadow: ${props => props.theme.boxShadow[3]};
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        z-index: -1;
+        width: 100%;
+        height: 100%;
+      }
+
+      + tr {
+        // on hover, hide border on adjacent sibling
+        border-top: ${props => props.theme.borders[2]} rgba(0, 0, 0, 0);
+      }
+    }
+
+    ${borderRadius}
+  }
+`;
 
 export const StyledPanel = styled.nav`
-  padding: 16px 24px;
   display: flex;
-  height: 24px;
   flex-shrink: 0;
   align-items: center;
   justify-content: space-between;
-  background: ${props => props.theme.colors.primary.light};
-  ${borderRadius}
+  padding: 0 0 ${props => props.theme.space[3]}px 0;
+  max-height: ${props => props.theme.space[6]}px;
+  margin-top: ${props => props.theme.space[1]}px;
 `;
-
-export const StyledEmptyIndicator = styled.div(
-  props => `
-  background: ${props.theme.colors.primary.main};
-  border-radius: 4px;
-  box-sizing: border-box;
-  margin: 48px auto;
-  max-width: 720px;
-  padding: 48px 32px;
-  text-align: center;
-
-  a {
-    color: ${props.theme.colors.link};
-  }
-`
-);

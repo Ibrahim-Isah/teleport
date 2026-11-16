@@ -1,18 +1,20 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
@@ -23,6 +25,8 @@ import (
 	"github.com/gravitational/trace"
 	"golang.org/x/crypto/ssh"
 
+	tracingssh "github.com/gravitational/teleport/api/observability/tracing/ssh"
+	"github.com/gravitational/teleport/api/types"
 	rsession "github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/sshutils"
 )
@@ -74,7 +78,7 @@ func (t *TermHandlers) HandlePTYReq(ctx context.Context, ch ssh.Channel, req *ss
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	scx.Debugf("Requested terminal %q of size %v", ptyRequest.Env, *params)
+	scx.Logger.DebugContext(ctx, "Terminal has been requested", "terminal", ptyRequest.Env, "width", params.W, "height", params.H)
 
 	// get an existing terminal or create a new one
 	term := scx.GetTerm()
@@ -86,19 +90,17 @@ func (t *TermHandlers) HandlePTYReq(ctx context.Context, ch ssh.Channel, req *ss
 		}
 		scx.SetTerm(term)
 		scx.termAllocated = true
-		if term.TTY() != nil {
-			scx.ttyName = term.TTY().Name()
-		}
+		scx.ttyName = term.TTYName()
 	}
 	if err := term.SetWinSize(ctx, *params); err != nil {
-		scx.Errorf("Failed setting window size: %v", err)
+		scx.Logger.ErrorContext(ctx, "Failed setting window size", "error", err)
 	}
 	term.SetTermType(ptyRequest.Env)
 	term.SetTerminalModes(termModes)
 
 	// update the session
 	if err := t.SessionRegistry.NotifyWinChange(ctx, *params, scx); err != nil {
-		scx.Errorf("Unable to update session: %v", err)
+		scx.Logger.ErrorContext(ctx, "Unable to update session", "error", err)
 	}
 
 	return nil
@@ -122,11 +124,60 @@ func (t *TermHandlers) HandleShell(ctx context.Context, ch ssh.Channel, req *ssh
 	if err := scx.SetExecRequest(execRequest); err != nil {
 		return trace.Wrap(err)
 	}
-	if err := t.SessionRegistry.OpenSession(ctx, ch, scx); err != nil {
+
+	if joinSid := scx.GetSessionParams().JoinSessionID; joinSid != "" {
+		err := t.SessionRegistry.JoinSession(ctx, ch, scx, joinSid, scx.GetSessionParams().JoinMode)
+
+		// TODO(Joerger): DELETE IN 20.0.0 - v19+ only set TELEPORT_SESSION
+		// when they want to join a session. Always return an error instead
+		// of ignoring the client provided session ID and creating a new session.
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+	}
+
+	return t.SessionRegistry.OpenSession(ctx, ch, scx)
+}
+
+// HandleFileTransferDecision handles requests of type "file-transfer-decision@goteleport.com" which will
+// approve or deny an existing file transfer request. This response will update an active file transfer request
+// accordingly and emit the updated file transfer request state to other members in the party.
+func (t *TermHandlers) HandleFileTransferDecision(ctx context.Context, ch ssh.Channel, req *ssh.Request, scx *ServerContext) error {
+	params, err := parseFileTransferDecisionRequest(req)
+	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	return nil
+	session := scx.getSession()
+	if session == nil {
+		t.SessionRegistry.logger.DebugContext(ctx, "Unable to create file transfer Request, no session found in context.")
+		return nil
+	}
+
+	if params.Approved {
+		return trace.Wrap(session.approveFileTransferRequest(params, scx))
+	}
+
+	return trace.Wrap(session.denyFileTransferRequest(params, scx))
+}
+
+// HandleFileTransferRequest handles requests of type "file-transfer-request" which will
+// create a FileTransferRequest that will be sent to other members in the party to be
+// reviewed and approved/denied.
+func (t *TermHandlers) HandleFileTransferRequest(ctx context.Context, ch ssh.Channel, req *ssh.Request, scx *ServerContext) error {
+	params, err := parseFileTransferRequest(req)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	params.Requester = scx.Identity.TeleportUser
+
+	session := scx.getSession()
+	if session == nil {
+		t.SessionRegistry.logger.DebugContext(ctx, "Unable to create file transfer Request, no session found in context.")
+		return nil
+	}
+
+	return trace.Wrap(session.addFileTransferRequest(params, scx))
 }
 
 // HandleWinChange handles requests of type "window-change" which update the
@@ -148,8 +199,18 @@ func (t *TermHandlers) HandleWinChange(ctx context.Context, ch ssh.Channel, req 
 	return nil
 }
 
-func (t *TermHandlers) HandleForceTerminate(ch ssh.Channel, req *ssh.Request, ctx *ServerContext) error {
-	err := t.SessionRegistry.ForceTerminate(ctx)
+func (t *TermHandlers) HandleForceTerminate(_ ssh.Channel, _ *ssh.Request, ctx *ServerContext) error {
+	p := ctx.getParty()
+	if p == nil {
+		t.SessionRegistry.logger.DebugContext(t.SessionRegistry.Srv.Context(), "Unable to terminate session, not party to a session.")
+		return nil
+	}
+
+	if p.mode != types.SessionModeratorMode {
+		return trace.AccessDenied("only moderators can force terminate a session")
+	}
+
+	err := t.SessionRegistry.ForceTerminate(p.s)
 	return trace.Wrap(err)
 }
 
@@ -211,4 +272,31 @@ func parseWinChange(req *ssh.Request) (*rsession.TerminalParams, error) {
 
 	params, err := rsession.NewTerminalParamsFromUint32(r.W, r.H)
 	return params, trace.Wrap(err)
+}
+
+func parseFileTransferRequest(req *ssh.Request) (*rsession.FileTransferRequestParams, error) {
+	var r tracingssh.FileTransferReq
+	if err := ssh.Unmarshal(req.Payload, &r); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	params := &rsession.FileTransferRequestParams{
+		Location: r.Location,
+		Filename: r.Filename,
+		Download: r.Download,
+	}
+	return params, nil
+}
+
+func parseFileTransferDecisionRequest(req *ssh.Request) (*rsession.FileTransferDecisionParams, error) {
+	var r tracingssh.FileTransferDecisionReq
+	if err := ssh.Unmarshal(req.Payload, &r); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	params := &rsession.FileTransferDecisionParams{
+		RequestID: r.RequestID,
+		Approved:  r.Approved,
+	}
+	return params, nil
 }

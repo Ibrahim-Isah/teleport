@@ -1,23 +1,26 @@
 /**
- * Copyright 2021-2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useRef } from 'react';
+import { useRef } from 'react';
 import styled from 'styled-components';
+
 import { Box, ButtonPrimary, Card, Flex, Text } from 'design';
-import copyToClipboard from 'design/utils/copyToClipboard';
+import { copyToClipboard } from 'design/utils/copyToClipboard';
 import selectElementContent from 'design/utils/selectElementContent';
 
 import { RecoveryCodes } from 'teleport/services/auth';
@@ -29,8 +32,8 @@ export default function RecoveryCodesDialog({
   isNewCodes,
   continueText = 'Continue',
   username = '',
-}: Props) {
-  const codesRef = useRef();
+}: RecoveryCodesProps) {
+  const codesRef = useRef(undefined);
 
   const captureRecoveryCodeEvent = (event: CaptureEvent) => {
     if (username) {
@@ -85,14 +88,14 @@ export default function RecoveryCodesDialog({
       >
         <Flex
           flex={4}
-          bg="primary.light"
+          bg="levels.surface"
           minWidth="584px"
           flexDirection="column"
           p={5}
           className="print"
         >
           <Box mb={5}>
-            <Text typography="h2" mb={3} color="light">
+            <Text typography="h4" mb={3} color="text.main">
               {title}
             </Text>
             <Text mb={1}>
@@ -108,7 +111,7 @@ export default function RecoveryCodesDialog({
               Recovery Codes ({recoveryCodes?.codes.length} Total)
             </Text>
             <Flex
-              bg="primary.dark"
+              bg="levels.sunken"
               p={2}
               pb={4}
               pl={3}
@@ -146,16 +149,18 @@ export default function RecoveryCodesDialog({
         </Flex>
         <Flex
           flex={2}
-          bg="primary.main"
           minWidth="384px"
           flexDirection="column"
           p={5}
+          css={`
+            background: ${props => props.theme.colors.spotBackground[0]};
+          `}
         >
           <Box mb={4}>
             <Text typography="h4" mb={2}>
               Why do I need these codes?
             </Text>
-            <Text color="text.secondary">
+            <Text color="text.slightlyMuted">
               Use them in the event of losing your password or two-factor
               device.
             </Text>
@@ -164,7 +169,7 @@ export default function RecoveryCodesDialog({
             <Text typography="h4" mb={2}>
               How long do the codes last for?
             </Text>
-            <Text color="text.secondary">
+            <Text color="text.slightlyMuted">
               Recovery codes can only be used once. After recovering your
               account, we will generate a new set of codes for you.
             </Text>
@@ -174,7 +179,7 @@ export default function RecoveryCodesDialog({
               <Text typography="h4" mb={2}>
                 What about my old codes?
               </Text>
-              <Text color="text.secondary">
+              <Text color="text.slightlyMuted">
                 Your old recovery codes are no longer valid, please replace them
                 with these new ones.
               </Text>
@@ -214,7 +219,7 @@ const MiniActionButton = styled(ButtonPrimary)`
   font-size: 10px;
 `;
 
-export type Props = {
+export type RecoveryCodesProps = {
   recoveryCodes: RecoveryCodes;
   onContinue: () => void;
   isNewCodes: boolean;

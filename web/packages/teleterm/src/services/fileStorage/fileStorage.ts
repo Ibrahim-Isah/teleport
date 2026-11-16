@@ -1,21 +1,27 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import fs, { existsSync, readFileSync, writeFileSync } from 'fs';
+// Both versions are imported because some operations need to be sync.
+import fs from 'node:fs';
+import fsAsync from 'node:fs/promises';
+import path from 'node:path';
 
+import { isErrnoException } from 'shared/utils/error';
 import { debounce } from 'shared/utils/highbar';
 
 import Logger from 'teleterm/logger';
@@ -23,26 +29,110 @@ import Logger from 'teleterm/logger';
 const logger = new Logger('FileStorage');
 
 export interface FileStorage {
-  put(path: string, json: any): void;
+  /** Asynchronously updates value for a given key. */
+  put(key: string, json: any): void;
 
-  putAllSync(): void;
+  /** Asynchronously replaces the entire storage state with a new value. */
+  replace(json: any): void;
 
-  get<T>(path?: string): T;
+  /** Asynchronously writes the storage state to disk. */
+  write(): Promise<void>;
+
+  /** Returns value for a given key. If the key is omitted, the entire storage state is returned. */
+  // TODO(ravicious): Add a generic type to createFileStorage rather than returning `unknown`.
+  // https://github.com/gravitational/teleport/pull/22728#discussion_r1129566566
+  get(key?: string): unknown;
+
+  /** Returns the file path used to create the storage. */
+  getFilePath(): string;
+
+  /** Returns the file name used to create the storage.
+   *
+   * Added so that ConfigService itself doesn't need to import node:path and can remain universal.
+   */
+  getFileName(): string;
+
+  /** Returns the error that could occur while reading and parsing the file. */
+  getFileLoadingError(): unknown;
 }
 
+/**
+ * createFileStorage reads and parses existing JSON structure from filePath or creates a new file
+ * under filePath with an empty object if the file is missing.
+ *
+ * createFileStorage itself uses blocking filesystem APIs but the functions of the returned
+ * FileStorage interface, such as write and replace, are async.
+ */
+// createFileStorage needs to be kept sync so that initialization of the app in main.ts can be sync.
+// createFileStorage is called only during initialization, so blocking the main process during that
+// time is acceptable.
+//
+// However, functions such as write or replace returned by createFileStorage need to be async as
+// those are called after initialization.
 export function createFileStorage(opts: {
   filePath: string;
   debounceWrites: boolean;
+  /** Prevents state updates when the file has not been loaded correctly, so its content will not be overwritten. */
+  discardUpdatesOnLoadError?: boolean;
 }): FileStorage {
   if (!opts || !opts.filePath) {
     throw Error('missing filePath');
   }
 
   const { filePath } = opts;
-  const state = loadState(opts.filePath);
 
-  function put(key: string, json: any) {
+  let state: any, error: unknown;
+  try {
+    state = loadStateSync(filePath);
+  } catch (e) {
+    state = {};
+    error = e;
+    logger.error(`Cannot read ${filePath} file`, e);
+  }
+
+  const discardUpdates = error && opts.discardUpdatesOnLoadError;
+
+  function put(key: string, json: any): void {
+    if (discardUpdates) {
+      return;
+    }
     state[key] = json;
+    stringifyAndWrite();
+  }
+
+  function write(): Promise<void> {
+    if (discardUpdates) {
+      return;
+    }
+    const text = stringify(state);
+    return writeFile(filePath, text);
+  }
+
+  function replace(json: any): void {
+    if (discardUpdates) {
+      return;
+    }
+    state = json;
+    stringifyAndWrite();
+  }
+
+  function get(key?: string): unknown {
+    return key ? state[key] : state;
+  }
+
+  function getFilePath(): string {
+    return opts.filePath;
+  }
+
+  function getFileName(): string {
+    return path.basename(opts.filePath);
+  }
+
+  function getFileLoadingError(): unknown {
+    return error;
+  }
+
+  function stringifyAndWrite(): void {
     const text = stringify(state);
 
     opts.debounceWrites
@@ -50,36 +140,33 @@ export function createFileStorage(opts: {
       : writeFile(filePath, text);
   }
 
-  function putAllSync() {
-    const text = stringify(state);
-    try {
-      fs.writeFileSync(filePath, text);
-    } catch (error) {
-      logger.error(`Cannot update ${filePath} file`, error);
-    }
-  }
-
-  function get<T>(key?: string): T {
-    return key ? state[key] : (state as T);
-  }
-
   return {
     put,
-    putAllSync,
+    write,
     get,
+    replace,
+    getFilePath,
+    getFileName,
+    getFileLoadingError,
   };
 }
 
-function loadState(filePath: string) {
-  try {
-    if (!existsSync(filePath)) {
-      writeFileSync(filePath, '{}');
-    }
+function loadStateSync(filePath: string): any {
+  const file = readOrCreateFileSync(filePath);
+  return JSON.parse(file);
+}
 
-    return JSON.parse(readFileSync(filePath, { encoding: 'utf-8' }));
+const defaultValue = '{}' as const;
+
+function readOrCreateFileSync(filePath: string): string {
+  try {
+    return fs.readFileSync(filePath, { encoding: 'utf-8' });
   } catch (error) {
-    logger.error(`Cannot read ${filePath} file`, error);
-    return {};
+    if (isErrnoException(error, 'ENOENT')) {
+      fs.writeFileSync(filePath, defaultValue);
+      return defaultValue;
+    }
+    throw error;
   }
 }
 
@@ -93,6 +180,6 @@ const writeFileDebounced = debounce(
 );
 
 const writeFile = (filePath: string, text: string) =>
-  fs.promises.writeFile(filePath, text).catch(error => {
+  fsAsync.writeFile(filePath, text).catch(error => {
     logger.error(`Cannot update ${filePath} file`, error);
   });

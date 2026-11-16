@@ -1,37 +1,38 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gatewaytest
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
-	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
-	"fmt"
+	"io"
 	"net"
-	"os"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
 
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/tlsca"
 )
@@ -55,7 +56,7 @@ func BlockUntilGatewayAcceptsConnections(t *testing.T, address string) {
 	// httptest.NewTLSServer) doesn't support.
 	//
 	// So we just expect EOF here. In case of a timeout, this check will fail.
-	require.True(t, trace.IsEOF(err), "expected EOF, got %v", err)
+	require.ErrorIs(t, err, io.EOF, "expected EOF, got %v", err)
 
 	err = conn.Close()
 	require.NoError(t, err)
@@ -80,7 +81,7 @@ func (m *MockTCPPortAllocator) Listen(localAddress, localPort string) (net.Liste
 		return nil, trace.BadParameter("address already in use")
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%s", "localhost", "0"))
+	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -127,7 +128,7 @@ func (m *MockListener) Addr() net.Addr {
 		return m.realListener.Addr()
 	}
 
-	addr, err := net.ResolveTCPAddr("", fmt.Sprintf("%s:%s", "localhost", m.fakePort))
+	addr, err := net.ResolveTCPAddr("", net.JoinHostPort("localhost", m.fakePort))
 
 	if err != nil {
 		panic(err)
@@ -140,52 +141,8 @@ func (m *MockListener) RealAddr() net.Addr {
 	return m.realListener.Addr()
 }
 
-type KeyPairPaths struct {
-	CertPath string
-	KeyPath  string
-}
-
-func MustGenAndSaveCert(t *testing.T, identity tlsca.Identity) KeyPairPaths {
+func MustGenCACert(t *testing.T) *tlsca.CertAuthority {
 	t.Helper()
-
-	dir := t.TempDir()
-
-	ca := mustGenCACert(t)
-
-	tlsCert := mustGenCertSignedWithCA(t, ca, identity)
-
-	privateKey, ok := tlsCert.PrivateKey.(*rsa.PrivateKey)
-	require.True(t, ok, "Failed to cast tlsCert.PrivateKey")
-
-	// Save the cert.
-
-	certFile, err := os.CreateTemp(dir, "cert")
-	require.NoError(t, err)
-
-	pemCert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tlsCert.Certificate[0]})
-
-	_, err = certFile.Write(pemCert)
-	require.NoError(t, err)
-	require.NoError(t, certFile.Close())
-
-	// Save the private key.
-
-	keyFile, err := os.CreateTemp(dir, "key")
-	require.NoError(t, err)
-
-	pemPrivateKey := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
-
-	_, err = keyFile.Write(pemPrivateKey)
-	require.NoError(t, err)
-	require.NoError(t, keyFile.Close())
-
-	return KeyPairPaths{
-		CertPath: certFile.Name(),
-		KeyPath:  keyFile.Name(),
-	}
-}
-
-func mustGenCACert(t *testing.T) *tlsca.CertAuthority {
 	caKey, caCert, err := tlsca.GenerateSelfSignedCA(pkix.Name{
 		CommonName: "localhost",
 	}, []string{"localhost"}, defaults.CATTL)
@@ -196,12 +153,13 @@ func mustGenCACert(t *testing.T) *tlsca.CertAuthority {
 	return ca
 }
 
-func mustGenCertSignedWithCA(t *testing.T, ca *tlsca.CertAuthority, identity tlsca.Identity) tls.Certificate {
+func MustGenCertSignedWithCA(t *testing.T, ca *tlsca.CertAuthority, identity tlsca.Identity) tls.Certificate {
+	t.Helper()
 	clock := clockwork.NewRealClock()
 	subj, err := identity.Subject()
 	require.NoError(t, err)
 
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	privateKey, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
 	require.NoError(t, err)
 
 	tlsCert, err := ca.GenerateCertificate(tlsca.CertificateRequest{
@@ -213,8 +171,8 @@ func mustGenCertSignedWithCA(t *testing.T, ca *tlsca.CertAuthority, identity tls
 	})
 	require.NoError(t, err)
 
-	keyRaw := x509.MarshalPKCS1PrivateKey(privateKey)
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyRaw})
+	keyPEM, err := keys.MarshalPrivateKey(privateKey)
+	require.NoError(t, err)
 	cert, err := tls.X509KeyPair(tlsCert, keyPEM)
 	require.NoError(t, err)
 	return cert

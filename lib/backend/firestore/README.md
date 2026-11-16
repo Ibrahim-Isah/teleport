@@ -7,17 +7,6 @@ This package enables Teleport auth server to store secrets in
 
 WARNING: Using Firestore involves recurring charge from GCP.
 
-### Building
-
-Firestore backend is not enabled by default. To enable it you have to 
-compile Teleport with `firestore` build flag.
-
-To build Teleport with Firestore enabled, run:
-
-```
-ADDFLAGS='-tags firestore' make teleport
-```
-
 ### Quick Start
 
 There are currently two Firestore mode options for any given GCP Project; `Native mode` and
@@ -71,7 +60,7 @@ There are three authentication/authorization modes available;
 Google Application Default Credentials for authentication. This only works in cases
 where Teleport is installed on GCE instances and have service accounts with IAM role/profile
 associations authorizing that GCE instance to use Firestore.  
-2. With `endpoint` defined, Firestore will create clients no auth, GRPC in-secure, clients pointed
+2. With `endpoint` defined, Firestore will create clients no auth, gRPC in-secure, clients pointed
 at the specified endpoint. **This is only used for tests, see `Tests` section below.**
 3. With `credentialsPath` defined, Firestore will create clients authenticating against
 live systems with the Service Account bound to the JSON key file referenced in the option.

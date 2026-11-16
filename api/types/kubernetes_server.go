@@ -21,11 +21,14 @@ import (
 	"sort"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api"
+	"github.com/gravitational/teleport/api/types/compare"
+	"github.com/gravitational/teleport/api/utils"
 )
+
+var _ compare.IsEqual[KubeServer] = (*KubernetesServerV3)(nil)
 
 // KubeServer represents a single Kubernetes server.
 type KubeServer interface {
@@ -47,20 +50,54 @@ type KubeServer interface {
 	String() string
 	// Copy returns a copy of this kube server object.
 	Copy() KubeServer
+	// CloneResource returns a copy of the KubeServer as a ResourceWithLabels
+	CloneResource() ResourceWithLabels
 	// GetCluster returns the Kubernetes Cluster this kube server proxies.
 	GetCluster() KubeCluster
 	// SetCluster sets the kube cluster this kube server server proxies.
 	SetCluster(KubeCluster) error
 	// ProxiedService provides common methods for a proxied service.
 	ProxiedService
+	// GetRelayGroup returns the name of the Relay group that the kube server is
+	// connected to.
+	GetRelayGroup() string
+	// GetRelayIDs returns the list of Relay host IDs that the kube server is
+	// connected to.
+	GetRelayIDs() []string
+	// GetTargetHealth gets health details for a target Kubernetes cluster.
+	GetTargetHealth() *TargetHealth
+	// SetTargetHealth sets health details for a target Kubernetes cluster.
+	SetTargetHealth(h *TargetHealth)
+	// GetTargetHealthStatus gets the health status of a target Kubernetes cluster.
+	GetTargetHealthStatus() TargetHealthStatus
+	// SetTargetHealthStatus sets the health status of a target Kubernetes cluster.
+	SetTargetHealthStatus(status TargetHealthStatus)
+	// GetScope returns the scope this server belongs to.
+	GetScope() string
+	// IsEqual determines if two kube server resources are equivalent to one another.
+	IsEqual(i KubeServer) bool
+}
+
+type kubeServerOpt func(*KubernetesServerV3)
+
+// KubeServerWithScope is an option that sets the scope when building a [KubernetesServerV3].
+func KubeServerWithScope(scope string) kubeServerOpt {
+	return func(s *KubernetesServerV3) {
+		s.Scope = scope
+	}
 }
 
 // NewKubernetesServerV3 creates a new kube server instance.
-func NewKubernetesServerV3(meta Metadata, spec KubernetesServerSpecV3) (*KubernetesServerV3, error) {
+func NewKubernetesServerV3(meta Metadata, spec KubernetesServerSpecV3, opts ...kubeServerOpt) (*KubernetesServerV3, error) {
 	s := &KubernetesServerV3{
 		Metadata: meta,
 		Spec:     spec,
 	}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+
 	if err := s.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -69,58 +106,16 @@ func NewKubernetesServerV3(meta Metadata, spec KubernetesServerSpecV3) (*Kuberne
 
 // NewKubernetesServerV3FromCluster creates a new kubernetes server from the provided clusters.
 func NewKubernetesServerV3FromCluster(cluster *KubernetesClusterV3, hostname, hostID string) (*KubernetesServerV3, error) {
-	return NewKubernetesServerV3(Metadata{
-		Name: cluster.GetName(),
-	}, KubernetesServerSpecV3{
-		Hostname: hostname,
-		HostID:   hostID,
-		Cluster:  cluster,
-	})
-}
-
-// NewLegacyKubeServer creates legacy Kube server object. Used in tests.
-//
-// DELETE IN 13.0.0
-func NewLegacyKubeServer(cluster *KubernetesClusterV3, hostname, hostID string) (Server, error) {
-	return NewServer(hostID, KindKubeService,
-		ServerSpecV2{
-			Hostname: hostname,
-			KubernetesClusters: []*KubernetesCluster{
-				{
-					Name:          cluster.GetName(),
-					DynamicLabels: LabelsToV2(cluster.GetDynamicLabels()),
-					StaticLabels:  cluster.GetStaticLabels(),
-				},
-			},
-		})
-}
-
-// NewKubeServersV3FromServer creates a list of kube servers from a legacy Server resource.
-//
-// DELETE IN 13.0.0
-func NewKubeServersV3FromServer(server Server) (result []KubeServer, err error) {
-	for _, legacyCluster := range server.GetKubernetesClusters() {
-		kubeCluster, err := NewKubernetesClusterV3FromLegacyCluster(server.GetNamespace(), legacyCluster)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		kubeServer, err := NewKubernetesServerV3(Metadata{
-			Name:    kubeCluster.GetName(),
-			Expires: server.GetMetadata().Expires,
+	return NewKubernetesServerV3(
+		Metadata{
+			Name: cluster.GetName(),
 		}, KubernetesServerSpecV3{
-			Version:  server.GetTeleportVersion(),
-			Hostname: server.GetAddr(),
-			HostID:   server.GetName(),
-			Rotation: server.GetRotation(),
-			Cluster:  kubeCluster,
-			ProxyIDs: server.GetProxyIDs(),
-		})
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		result = append(result, kubeServer)
-	}
-	return result, nil
+			Hostname: hostname,
+			HostID:   hostID,
+			Cluster:  cluster,
+		},
+		KubeServerWithScope(cluster.GetScope()),
+	)
 }
 
 // GetVersion returns the kubernetes server resource version.
@@ -158,14 +153,14 @@ func (s *KubernetesServerV3) SetSubKind(sk string) {
 	s.SubKind = sk
 }
 
-// GetResourceID returns the resource ID.
-func (s *KubernetesServerV3) GetResourceID() int64 {
-	return s.Metadata.ID
+// GetRevision returns the revision
+func (s *KubernetesServerV3) GetRevision() string {
+	return s.Metadata.GetRevision()
 }
 
-// SetResourceID sets the resource ID.
-func (s *KubernetesServerV3) SetResourceID(id int64) {
-	s.Metadata.ID = id
+// SetRevision sets the revision
+func (s *KubernetesServerV3) SetRevision(rev string) {
+	s.Metadata.SetRevision(rev)
 }
 
 // GetMetadata returns the resource metadata.
@@ -210,6 +205,9 @@ func (s *KubernetesServerV3) SetRotation(r Rotation) {
 
 // GetCluster returns the cluster this kube server proxies.
 func (s *KubernetesServerV3) GetCluster() KubeCluster {
+	if s.Spec.Cluster == nil {
+		return nil
+	}
 	return s.Spec.Cluster
 }
 
@@ -278,6 +276,35 @@ func (s *KubernetesServerV3) SetProxyIDs(proxyIDs []string) {
 	s.Spec.ProxyIDs = proxyIDs
 }
 
+// GetRelayGroup implements [KubeServer].
+func (s *KubernetesServerV3) GetRelayGroup() string {
+	if s == nil {
+		return ""
+	}
+	return s.Spec.RelayGroup
+}
+
+// GetRelayIDs implements [KubeServer].
+func (s *KubernetesServerV3) GetRelayIDs() []string {
+	if s == nil {
+		return nil
+	}
+	return s.Spec.RelayIds
+}
+
+// GetLabel retrieves the label with the provided key. If not found
+// value will be empty and ok will be false.
+func (s *KubernetesServerV3) GetLabel(key string) (value string, ok bool) {
+	if s.Spec.Cluster != nil {
+		if v, ok := s.Spec.Cluster.GetLabel(key); ok {
+			return v, ok
+		}
+	}
+
+	v, ok := s.Metadata.Labels[key]
+	return v, ok
+}
+
 // GetAllLabels returns all resource's labels. Considering:
 // * Static labels from `Metadata.Labels` and `Spec.Cluster`.
 // * Dynamic labels from `Spec.Cluster.Spec`.
@@ -296,7 +323,7 @@ func (s *KubernetesServerV3) GetAllLabels() map[string]string {
 		dynamicLabels = s.Spec.Cluster.Spec.DynamicLabels
 	}
 
-	return CombineLabels(staticLabels, dynamicLabels)
+	return CombineLabels(nil, staticLabels, dynamicLabels)
 }
 
 // GetStaticLabels returns the kube server static labels.
@@ -311,13 +338,80 @@ func (s *KubernetesServerV3) SetStaticLabels(sl map[string]string) {
 
 // Copy returns a copy of this kube server object.
 func (s *KubernetesServerV3) Copy() KubeServer {
-	return proto.Clone(s).(*KubernetesServerV3)
+	return utils.CloneProtoMsg(s)
+}
+
+// CloneResource returns a copy of this kube server object.
+func (s *KubernetesServerV3) CloneResource() ResourceWithLabels {
+	return s.Copy()
 }
 
 // MatchSearch goes through select field values and tries to
 // match against the list of search values.
 func (s *KubernetesServerV3) MatchSearch(values []string) bool {
 	return MatchSearch(nil, values, nil)
+}
+
+// IsEqual determines if two kube server resources are equivalent to one another.
+func (k *KubernetesServerV3) IsEqual(i KubeServer) bool {
+	if other, ok := i.(*KubernetesServerV3); ok {
+		return deriveTeleportEqualKubernetesServerV3(k, other)
+	}
+	return false
+}
+
+// GetTargetHealth gets health details for a target Kubernetes cluster.
+func (s *KubernetesServerV3) GetTargetHealth() *TargetHealth {
+	return s.GetStatus().GetTargetHealth()
+}
+
+// SetTargetHealth sets health details for a target Kubernetes cluster.
+func (s *KubernetesServerV3) SetTargetHealth(h *TargetHealth) {
+	if s.Status == nil {
+		s.Status = &KubernetesServerStatusV3{}
+	}
+	s.Status.TargetHealth = h
+}
+
+// GetTargetHealthStatus gets the health status of a target Kubernetes cluster.
+func (s *KubernetesServerV3) GetTargetHealthStatus() TargetHealthStatus {
+	health := s.GetStatus().GetTargetHealth()
+	if health == nil {
+		return TargetHealthStatusUnknown
+	}
+	return TargetHealthStatus(health.Status)
+}
+
+// SetTargetHealthStatus sets the health status of a target Kubernetes cluster.
+func (s *KubernetesServerV3) SetTargetHealthStatus(status TargetHealthStatus) {
+	if s.Status == nil {
+		s.Status = &KubernetesServerStatusV3{}
+	}
+	if s.Status.TargetHealth == nil {
+		s.Status.TargetHealth = &TargetHealth{}
+	}
+	s.Status.TargetHealth.Status = string(status)
+}
+
+// GetStatus gets the Kubernetes server status.
+func (s *KubernetesServerV3) GetStatus() *KubernetesServerStatusV3 {
+	if s == nil {
+		return nil
+	}
+	return s.Status
+}
+
+// GetScope returns the scope this server belongs to.
+func (s *KubernetesServerV3) GetScope() string {
+	return s.Scope
+}
+
+// GetTargetHealth gets the health of a Kubernetes cluster.
+func (s *KubernetesServerStatusV3) GetTargetHealth() *TargetHealth {
+	if s == nil {
+		return nil
+	}
+	return s.TargetHealth
 }
 
 // KubeServers represents a list of kube servers.
@@ -340,6 +434,15 @@ func (s KubeServers) Less(i, j int) bool {
 
 // Swap swaps two kube servers.
 func (s KubeServers) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+// ToMap returns these kubernetes clusters as a map keyed by cluster name.
+func (s KubeServers) ToMap() map[string]KubeServer {
+	m := make(map[string]KubeServer, len(s))
+	for _, kubeServer := range s {
+		m[kubeServer.GetName()] = kubeServer
+	}
+	return m
+}
 
 // SortByCustom custom sorts by given sort criteria.
 func (s KubeServers) SortByCustom(sortBy SortBy) error {

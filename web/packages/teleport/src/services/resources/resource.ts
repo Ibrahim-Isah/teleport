@@ -1,41 +1,201 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import api from 'teleport/services/api';
-import cfg from 'teleport/config';
+import { AuthProvider } from 'shared/services';
 
-import { makeResource, makeResourceList } from './';
+import cfg, { UrlListRolesParams, UrlResourcesParams } from 'teleport/config';
+import api from 'teleport/services/api';
+
+import { ResourcesResponse, UnifiedResource } from '../agents';
+import auth, { MfaChallengeScope } from '../auth/auth';
+import { MfaChallengeResponse } from '../mfa';
+import {
+  isPathNotFoundError,
+  withGenericUnsupportedError,
+} from '../version/unsupported';
+import {
+  CreateOrOverwriteGitServer,
+  DefaultAuthConnector,
+  GitServer,
+  KindAuthConnectors,
+  makeResource,
+  makeResourceList,
+  RequestableRole,
+  Resource,
+  RoleResource,
+} from './';
+import { makeUnifiedResource } from './makeUnifiedResource';
 
 class ResourceService {
+  createOrOverwriteGitServer(
+    clusterId: string,
+    req: CreateOrOverwriteGitServer
+  ): Promise<GitServer> {
+    return api.put(
+      cfg.getGitServerUrl({ clusterId }, 'createOrOverwrite'),
+      req
+    );
+  }
+
+  deleteGitServer(clusterId: string, name: string): Promise<GitServer> {
+    return api.delete(cfg.getGitServerUrl({ clusterId, name }, 'delete'));
+  }
+
   fetchTrustedClusters() {
     return api
       .get(cfg.getTrustedClustersUrl())
       .then(res => makeResourceList<'trusted_cluster'>(res));
   }
 
-  fetchGithubConnectors() {
+  fetchUnifiedResources(
+    clusterId?: string,
+    params?: UrlResourcesParams,
+    signal?: AbortSignal
+  ): Promise<ResourcesResponse<UnifiedResource>> {
     return api
-      .get(cfg.getGithubConnectorsUrl())
-      .then(res => makeResourceList<'github'>(res));
+      .get(cfg.getUnifiedResourcesUrl(clusterId, params), signal)
+      .then(json => {
+        const items = json?.items || [];
+
+        return {
+          agents: items.map(makeUnifiedResource),
+          startKey: json?.startKey,
+          totalCount: json?.totalCount,
+        };
+      });
   }
 
-  fetchRoles() {
+  fetchAuthConnectorsList<K extends KindAuthConnectors>(
+    url: string,
+    signal?: AbortSignal
+  ): Promise<{
+    defaultConnector: DefaultAuthConnector;
+    connectors: Resource<K>[];
+  }> {
+    return api.get(url, signal, undefined, { allowReuse: true }).then(res => ({
+      defaultConnector: {
+        name: res.defaultConnectorName,
+        type: res.defaultConnectorType,
+      },
+      connectors: makeResourceList(res.connectors),
+    }));
+  }
+
+  fetchGithubConnectors() {
+    return this.fetchAuthConnectorsList<'github'>(cfg.getGithubConnectorsUrl());
+  }
+
+  async setDefaultAuthConnector(
+    req: DefaultAuthConnector | { type: 'local' },
+    abortSignal?: AbortSignal
+  ) {
+    // This is an admin action that needs an mfa challenge with reuse allowed.
+    const challenge = await auth.getMfaChallenge({
+      scope: MfaChallengeScope.ADMIN_ACTION,
+      allowReuse: true,
+      isMfaRequiredRequest: {
+        admin_action: {},
+      },
+    });
+
+    const challengeResponse = await auth.getMfaChallengeResponse(challenge);
+
+    return api.put(
+      cfg.api.defaultConnectorPath,
+      req,
+      abortSignal,
+      challengeResponse
+    );
+  }
+
+  async getUserMatchedAuthConnectors(
+    username: string
+  ): Promise<AuthProvider[]> {
     return api
-      .get(cfg.getRolesUrl())
+      .post(cfg.api.authConnectorsPath, { username })
+      .then(res => res.connectors || []);
+  }
+
+  async fetchRoles(
+    params?: Omit<UrlListRolesParams, 'includeSystemRoles' | 'includeObject'>,
+    signal?: AbortSignal
+  ): Promise<{
+    items: RoleResource[];
+    startKey: string;
+  }> {
+    return await api.get(cfg.getRoleUrl({ action: 'list', params }), signal);
+  }
+
+  async fetchRolesV2(
+    params?: UrlListRolesParams,
+    signal?: AbortSignal
+  ): Promise<{
+    items: RoleResource[];
+    startKey: string;
+  }> {
+    try {
+      return await api.get(
+        cfg.getRoleUrl({ action: 'listv2', params }),
+        signal
+      );
+    } catch (err) {
+      withGenericUnsupportedError(err, '18.4.2');
+    }
+  }
+
+  async fetchRequestableRoles(
+    params: UrlListRolesParams,
+    // TODO(rudream): DELETE IN v21.0. This is here now to maintain backwards compatibility with an older auth version
+    // that may not have the requestable roles endpoint.
+    allRequestableRoles: string[]
+  ): Promise<{
+    items: RequestableRole[];
+    startKey: string;
+  }> {
+    return await api.get(cfg.getListRequestableRolesUrl(params)).catch(err => {
+      // If the endpoint isn't found due to it being in an older version than the client, fallback to using the full list of requestable roles
+      // to maintain compatibility with the paginated table component which expects a paginated response.
+      // TODO(rudream): DELETE IN v21.0
+      if (isPathNotFoundError(err)) {
+        return makeRequestableRolesPageLocally(params, allRequestableRoles);
+      } else {
+        throw err;
+      }
+    });
+  }
+
+  fetchPresetRoles() {
+    return api
+      .get(cfg.getPresetRolesUrl())
       .then(res => makeResourceList<'role'>(res));
+  }
+
+  /**
+   * @deprecated use standalone fetchRole function defined below this class
+   */
+  async fetchRole(name: string): Promise<RoleResource> {
+    return makeResource<'role'>(
+      await api.get(
+        cfg.getRoleUrl({ action: 'get', name }),
+        undefined,
+        undefined
+      )
+    );
   }
 
   createTrustedCluster(content: string) {
@@ -44,9 +204,14 @@ class ResourceService {
       .then(res => makeResource<'trusted_cluster'>(res));
   }
 
-  createRole(content: string) {
+  createRole(content: string, mfaResponse?: MfaChallengeResponse) {
     return api
-      .post(cfg.getRolesUrl(), { content })
+      .post(
+        cfg.api.role.create,
+        { content },
+        undefined /* abort signal */,
+        mfaResponse
+      )
       .then(res => makeResource<'role'>(res));
   }
 
@@ -62,10 +227,19 @@ class ResourceService {
       .then(res => makeResource<'trusted_cluster'>(res));
   }
 
+  /**
+   * @deprecated use standalone updateRole function defined below this class
+   */
   updateRole(name: string, content: string) {
     return api
-      .put(cfg.getRolesUrl(name), { content })
+      .put(cfg.getRoleUrl({ action: 'update', name }), { content })
       .then(res => makeResource<'role'>(res));
+  }
+
+  fetchGithubConnector(name: string) {
+    return api
+      .get(cfg.getGithubConnectorUrl(name))
+      .then(res => makeResource<'github'>(res));
   }
 
   updateGithubConnector(name: string, content: string) {
@@ -79,12 +253,78 @@ class ResourceService {
   }
 
   deleteRole(name: string) {
-    return api.delete(cfg.getRolesUrl(name));
+    return api.delete(cfg.getRoleUrl({ action: 'delete', name }));
   }
 
   deleteGithubConnector(name: string) {
-    return api.delete(cfg.getGithubConnectorsUrl(name));
+    return this.deleteAuthConnector(cfg.getGithubConnectorsUrl(name));
+  }
+
+  /**
+   * deleteAuthConnector deletes the connector at the given URL. The backend
+   * makes multiple admin action calls (the delete plus an auth preference
+   * read/update), so we send a reusable MFA response that satisfies each one.
+   */
+  async deleteAuthConnector(url: string) {
+    const mfaResponse = await auth.getMfaChallengeResponseForAdminAction(true);
+    return api.deleteWithOptions(url, { mfaResponse });
   }
 }
 
 export default ResourceService;
+
+export async function fetchRole(
+  name: string,
+  signal?: AbortSignal
+): Promise<RoleResource> {
+  return makeResource<'role'>(
+    await api.get(cfg.getRoleUrl({ action: 'get', name }), signal, undefined)
+  );
+}
+
+export async function updateRole({
+  name,
+  content,
+}: {
+  name: string;
+  content: string;
+}): Promise<RoleResource> {
+  return api
+    .put(cfg.getRoleUrl({ action: 'update', name }), { content })
+    .then(res => makeResource<'role'>(res));
+}
+
+/**
+ * makeRequestableRolesPageLocally mocks a paginated response for requestable roles so that a list of all requestable roles
+ * can be handled by the serverside paginated table component.
+ */
+// TODO(rudream): DELETE IN v21.0
+function makeRequestableRolesPageLocally(
+  params: UrlListRolesParams,
+  allRequestableRoles: string[]
+): {
+  items: RequestableRole[];
+  startKey: string;
+} {
+  if (params.search) {
+    allRequestableRoles = allRequestableRoles.filter(r =>
+      r.toLowerCase().includes(params.search.toLowerCase())
+    );
+  }
+
+  if (params.startKey) {
+    const startIndex = allRequestableRoles.findIndex(
+      r => r === params.startKey
+    );
+    allRequestableRoles = allRequestableRoles.slice(startIndex);
+  }
+
+  const limit = params.limit || 200;
+  const nextKey = allRequestableRoles.at(limit) || '';
+  allRequestableRoles = allRequestableRoles.slice(0, limit);
+
+  return {
+    items: allRequestableRoles.map(r => ({ name: r, description: '' })),
+    startKey: nextKey,
+  };
+}

@@ -1,26 +1,31 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import ReactDOM from 'react-dom';
 import React from 'react';
+import { createRoot } from 'react-dom/client';
 
-import { ElectronGlobals } from 'teleterm/types';
-import { App, FailedApp } from 'teleterm/ui/App';
-import AppContext from 'teleterm/ui/appContext';
+import { getErrorMessage } from 'shared/utils/error';
+
 import Logger from 'teleterm/logger';
+import { ElectronGlobals } from 'teleterm/types';
+import { App } from 'teleterm/ui/App';
+import AppContext from 'teleterm/ui/appContext';
+import { FailedApp } from 'teleterm/ui/components/App';
 
 async function boot(): Promise<void> {
   Logger.init(window['loggerService']);
@@ -32,8 +37,12 @@ async function boot(): Promise<void> {
     const appContext = new AppContext(globals);
 
     window.addEventListener('error', event => {
-      console.error(event.error.stack);
-      logger.error(event.error.stack);
+      // The event object is a `ErrorEvent` instance if it was generated from
+      // a user interface element, or an `Event` instance otherwise.
+      // https://developer.mozilla.org/en-US/docs/Web/API/Window/error_event#event_type
+      const message = event.error ? event.error.stack : event.message;
+      console.error(message);
+      logger.error(message);
     });
 
     window.addEventListener('unhandledrejection', event => {
@@ -43,16 +52,42 @@ async function boot(): Promise<void> {
     renderApp(<App ctx={appContext} />);
   } catch (e) {
     logger.error('Failed to boot the React app', e);
-    renderApp(<FailedApp message={e.toString()} />);
+    renderApp(
+      <FailedApp
+        message={`Could not start the application: ${getErrorMessage(e)}`}
+      />
+    );
   }
 }
 
+/**
+ * getElectronGlobals retrieves privileged APIs exposed through the contextBridge from preload.ts.
+ *
+ * It also immediately removes them from the window object so that if an attacker gets to execute
+ * arbitrary JS on the page, they don't get easy access to those privileged APIs.
+ */
 async function getElectronGlobals(): Promise<ElectronGlobals> {
-  return await window['electron'];
+  const globals = await window['electron'];
+  const globalsCopy = { ...globals };
+
+  // Technically, each value exposed through the contextBridge gets frozen. [1] Since we expose a
+  // promise returning an object however, we can delete properties from that object, effectively
+  // removing the APIs from the window object.
+  //
+  // We suspect that the semantics of this might change between Electron or Chromium updates.
+  // At the moment we're in the process of investigating how brittle this workaround is. [2]
+  //
+  // [1] https://www.electronjs.org/docs/latest/api/context-bridge#api
+  // [2] https://github.com/electron/electron/issues/38243
+  for (const property in globals) {
+    delete globals[property];
+  }
+
+  return globalsCopy;
 }
 
 function renderApp(content: React.ReactElement): void {
-  ReactDOM.render(content, document.getElementById('app'));
+  createRoot(document.getElementById('app')).render(content);
 }
 
 boot();

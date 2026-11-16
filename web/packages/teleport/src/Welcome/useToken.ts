@@ -1,36 +1,42 @@
-/*
-Copyright 2021-2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import { useEffect, useState } from 'react';
+
 import useAttempt from 'shared/hooks/useAttemptNext';
 
 import cfg from 'teleport/config';
-import history from 'teleport/services/history';
 import auth, {
   ChangedUserAuthn,
   RecoveryCodes,
+  ResetPasswordReqWithEvent,
+  ResetPasswordWithWebauthnReqWithEvent,
   ResetToken,
 } from 'teleport/services/auth';
-import { CaptureEvent, userEventService } from 'teleport/services/userEvent';
+import history from 'teleport/services/history';
+import { DeviceUsage } from 'teleport/services/mfa';
+import { UseTokenState } from 'teleport/Welcome/NewCredentials/types';
 
-export default function useToken(tokenId: string) {
+export default function useToken(tokenId: string): UseTokenState {
   const [resetToken, setResetToken] = useState<ResetToken>();
   const [recoveryCodes, setRecoveryCodes] = useState<RecoveryCodes>();
   const [success, setSuccess] = useState(false); // TODO rename
-  const [privateKeyPolicyEnabled, setPrivateKeyPolicyEnabled] = useState(false);
+  const [credential, setCredential] = useState<Credential | undefined>();
 
   const fetchAttempt = useAttempt('');
   const submitAttempt = useAttempt('');
@@ -45,14 +51,6 @@ export default function useToken(tokenId: string) {
   }, []);
 
   function handleResponse(res: ChangedUserAuthn) {
-    userEventService.capturePreUserEvent({
-      event: CaptureEvent.PreUserOnboardSetCredentialSubmitEvent,
-      username: resetToken.user,
-    });
-
-    if (res.privateKeyPolicyEnabled) {
-      setPrivateKeyPolicyEnabled(true);
-    }
     if (res.recovery.createdDate) {
       setRecoveryCodes(res.recovery);
     } else {
@@ -61,19 +59,35 @@ export default function useToken(tokenId: string) {
   }
 
   function onSubmit(password: string, otpCode = '', deviceName = '') {
+    const req: ResetPasswordReqWithEvent = {
+      req: { tokenId, password, otpCode, deviceName },
+      eventMeta: { username: resetToken.user },
+    };
+
     submitAttempt.setAttempt({ status: 'processing' });
     auth
-      .resetPassword({ tokenId, password, otpCode, deviceName })
+      .resetPassword(req)
       .then(handleResponse)
       .catch(submitAttempt.handleError);
   }
 
+  function createNewWebAuthnDevice(deviceUsage: DeviceUsage) {
+    submitAttempt.run(async () => {
+      setCredential(
+        await auth.createNewWebAuthnDevice({ tokenId, deviceUsage })
+      );
+    });
+  }
+
   function onSubmitWithWebauthn(password?: string, deviceName = '') {
-    submitAttempt.setAttempt({ status: 'processing' });
-    auth
-      .resetPasswordWithWebauthn({ tokenId, password, deviceName })
-      .then(handleResponse)
-      .catch(submitAttempt.handleError);
+    const req: ResetPasswordWithWebauthnReqWithEvent = {
+      req: { tokenId, password, deviceName },
+      credential,
+      eventMeta: { username: resetToken.user, mfaType: auth2faType },
+    };
+    submitAttempt.run(async () => {
+      handleResponse(await auth.resetPasswordWithWebauthn(req));
+    });
   }
 
   function redirect() {
@@ -82,6 +96,7 @@ export default function useToken(tokenId: string) {
 
   function clearSubmitAttempt() {
     submitAttempt.setAttempt({ status: '' });
+    setCredential(undefined);
   }
 
   function finishedRegister() {
@@ -94,16 +109,15 @@ export default function useToken(tokenId: string) {
     isPasswordlessEnabled: cfg.isPasswordlessEnabled(),
     fetchAttempt: fetchAttempt.attempt,
     submitAttempt: submitAttempt.attempt,
+    credential,
     clearSubmitAttempt,
     onSubmit,
+    createNewWebAuthnDevice, // Added missing property
     onSubmitWithWebauthn,
     resetToken,
     recoveryCodes,
     redirect,
     success,
     finishedRegister,
-    privateKeyPolicyEnabled,
   };
 }
-
-export type State = ReturnType<typeof useToken>;

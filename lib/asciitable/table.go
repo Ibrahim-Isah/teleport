@@ -1,18 +1,20 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package asciitable implements a simple ASCII table formatter for printing
 // tabular values into a text terminal.
@@ -21,11 +23,25 @@ package asciitable
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 
+	"github.com/gravitational/trace"
 	"golang.org/x/term"
+)
+
+// Layout constants, for callers sizing columns against a terminal width: a
+// column occupies max(MinColumnWidth, widest cell+ColumnPadding).
+const (
+	// MinColumnWidth is the narrowest a column renders, whatever its contents.
+	MinColumnWidth = 5
+	// ColumnPadding follows every cell, including the last one on a row.
+	ColumnPadding = 1
+	// TruncationSuffix is appended to cells over [Column.MaxCellLength].
+	TruncationSuffix = "..."
 )
 
 // Column represents a column in the table.
@@ -98,16 +114,16 @@ func MakeTableWithTruncatedColumn(columnOrder []string, rows [][]string, truncat
 		}
 		if column.MaxCellLength > maxColWidth {
 			column.MaxCellLength = maxColWidth
-			totalLen += column.MaxCellLength + 4 // "...<space>"
+			totalLen += column.MaxCellLength + len(TruncationSuffix) + ColumnPadding // "...<space>"
 		} else {
-			totalLen += column.MaxCellLength + 1 // +1 for column separator
+			totalLen += column.MaxCellLength + ColumnPadding // +1 for column separator
 		}
 		columns = append(columns, column)
 	}
 
 	for _, column := range columns {
 		if column.Title == truncatedColumn {
-			column.MaxCellLength = max(width-totalLen-len("... "), 0)
+			column.MaxCellLength = max(width-totalLen-len(TruncationSuffix)-ColumnPadding, 0)
 		}
 		t.AddColumn(column)
 	}
@@ -127,7 +143,7 @@ func (t *Table) AddColumn(c Column) {
 // AddRow adds a row of cells to the table.
 func (t *Table) AddRow(row []string) {
 	limit := min(len(row), len(t.columns))
-	for i := 0; i < limit; i++ {
+	for i := range limit {
 		cell, _ := t.truncateCell(i, row[i])
 		t.columns[i].width = max(len(cell), t.columns[i].width)
 	}
@@ -146,7 +162,7 @@ func (t *Table) truncateCell(colIndex int, cell string) (string, bool) {
 	if maxCellLength == 0 || len(cell) <= maxCellLength {
 		return cell, false
 	}
-	truncatedCell := fmt.Sprintf("%v...", cell[:maxCellLength])
+	truncatedCell := cell[:maxCellLength] + TruncationSuffix
 	footnoteLabel := t.columns[colIndex].FootnoteLabel
 	if footnoteLabel == "" {
 		return truncatedCell, false
@@ -155,29 +171,49 @@ func (t *Table) truncateCell(colIndex int, cell string) (string, bool) {
 }
 
 // AsBuffer returns a *bytes.Buffer with the printed output of the table.
+//
+// TODO(nklaassen): delete this, all calls either immediately copy the buffer to
+// another writer or just call .String() once.
 func (t *Table) AsBuffer() *bytes.Buffer {
 	var buffer bytes.Buffer
+	// Writes to bytes.Buffer never return an error.
+	_ = t.WriteTo(&buffer)
+	return &buffer
+}
 
-	writer := tabwriter.NewWriter(&buffer, 5, 0, 1, ' ', 0)
+func (t *Table) String() string {
+	var sb strings.Builder
+	// Writes to strings.Builder never return an error.
+	_ = t.WriteTo(&sb)
+	return sb.String()
+}
+
+// WriteTo writes the full table to [w] or else returns an error.
+func (t *Table) WriteTo(w io.Writer) error {
+	writer := tabwriter.NewWriter(w, MinColumnWidth, 0, ColumnPadding, ' ', 0)
 	template := strings.Repeat("%v\t", len(t.columns))
 
 	// Header and separator.
 	if !t.IsHeadless() {
-		var colh []interface{}
-		var cols []interface{}
+		var colh []any
+		var cols []any
 
 		for _, col := range t.columns {
 			colh = append(colh, col.Title)
 			cols = append(cols, strings.Repeat("-", col.width))
 		}
-		fmt.Fprintf(writer, template+"\n", colh...)
-		fmt.Fprintf(writer, template+"\n", cols...)
+		if _, err := fmt.Fprintf(writer, template+"\n", colh...); err != nil {
+			return trace.Wrap(err)
+		}
+		if _, err := fmt.Fprintf(writer, template+"\n", cols...); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 
 	// Body.
 	footnoteLabels := make(map[string]struct{})
 	for _, row := range t.rows {
-		var rowi []interface{}
+		var rowi []any
 		for i := range row {
 			cell, addFootnote := t.truncateCell(i, row[i])
 			if addFootnote {
@@ -185,17 +221,23 @@ func (t *Table) AsBuffer() *bytes.Buffer {
 			}
 			rowi = append(rowi, cell)
 		}
-		fmt.Fprintf(writer, template+"\n", rowi...)
+		if _, err := fmt.Fprintf(writer, template+"\n", rowi...); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 
 	// Footnotes.
 	for label := range footnoteLabels {
-		fmt.Fprintln(writer)
-		fmt.Fprintln(writer, label, t.footnotes[label])
+		if _, err := fmt.Fprintln(writer); err != nil {
+			return trace.Wrap(err)
+		}
+		if _, err := fmt.Fprintln(writer, label, t.footnotes[label]); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 
 	writer.Flush()
-	return &buffer
+	return nil
 }
 
 // IsHeadless returns true if none of the table title cells contains any text.
@@ -208,16 +250,26 @@ func (t *Table) IsHeadless() bool {
 	return true
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+// SortRowsBy sorts the table rows with the given column indices as the sorting
+// key, optionally performing a stable sort. Column indices out of range are
+// ignored - it is the caller's responsibility to ensure the indices are in
+// range.
+func (t *Table) SortRowsBy(colIdxKey []int, stable bool) {
+	lessFn := func(a, b []string) int {
+		for _, col := range colIdxKey {
+			limit := min(len(a), len(b))
+			if col >= limit {
+				continue
+			}
+			if a[col] != b[col] {
+				return strings.Compare(a[col], b[col])
+			}
+		}
+		return 0 // Rows are equal.
 	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
+	if stable {
+		slices.SortStableFunc(t.rows, lessFn)
+	} else {
+		slices.SortFunc(t.rows, lessFn)
 	}
-	return b
 }

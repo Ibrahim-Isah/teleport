@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -19,16 +23,20 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
+	"time"
 
 	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
 	"google.golang.org/grpc/credentials"
 
+	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/authz"
 )
 
 // UserGetter is responsible for building an authenticated user based on TLS metadata
 type UserGetter interface {
-	GetUser(connState tls.ConnectionState) (IdentityGetter, error)
+	GetUser(ctx context.Context, connState tls.ConnectionState) (authz.IdentityGetter, error)
 }
 
 // ConnectionIdentity contains the identifying properties of a
@@ -66,13 +74,26 @@ type TransportCredentialsConfig struct {
 	// Authorizer prevents any connections from being established if the user is not
 	// authorized due to locks, private key policy, device trust, etc. If not set
 	// then no authorization is performed.
-	Authorizer Authorizer
+	Authorizer authz.Authorizer
+
+	// ScopedAuthorizer is an additional optional authorizer that can be used to perform
+	// authorization of scoped identities.  Note that when present, this field is preferred
+	// over the above Authorizer, though scoped contexts can be undwrapped into unscoped
+	// contexts if not all methods of the underlying service are being ported over to be scope-aware.
+	ScopedAuthorizer authz.ScopedAuthorizer
+
 	// Enforcer prevents any connections from being established if the user would
 	// exceed their configured max connection limit. Any connections that are
 	// permitted may be terminated if there is an issue determining if the number
 	// of active connections is within the limit. If not set then no connection
 	// limits are enforced.
 	Enforcer ConnectionEnforcer
+	// Clock used to tell time.
+	Clock clockwork.Clock
+	// GetAuthPreference is used to retrieve the auth preference per connection
+	// to determine if connections should be terminated as soon as the client
+	// certificate has expired.
+	GetAuthPreference func(ctx context.Context) (types.AuthPreference, error)
 }
 
 // Check validates that the configuration is valid for use and
@@ -100,9 +121,12 @@ func (c *TransportCredentialsConfig) Check() error {
 type TransportCredentials struct {
 	credentials.TransportCredentials
 
-	userGetter UserGetter
-	authorizer Authorizer
-	enforcer   ConnectionEnforcer
+	userGetter        UserGetter
+	authorizer        authz.Authorizer
+	scopedAuthorizer  authz.ScopedAuthorizer
+	enforcer          ConnectionEnforcer
+	getAuthPreference func(context.Context) (types.AuthPreference, error)
+	clock             clockwork.Clock
 }
 
 // NewTransportCredentials returns a new TransportCredentials
@@ -111,11 +135,26 @@ func NewTransportCredentials(cfg TransportCredentialsConfig) (*TransportCredenti
 		return nil, trace.Wrap(err)
 	}
 
+	getAuthPreference := func(context.Context) (types.AuthPreference, error) {
+		return types.DefaultAuthPreference(), nil
+	}
+	if cfg.GetAuthPreference != nil {
+		getAuthPreference = cfg.GetAuthPreference
+	}
+
+	clock := clockwork.NewRealClock()
+	if cfg.Clock != nil {
+		clock = cfg.Clock
+	}
+
 	return &TransportCredentials{
 		TransportCredentials: cfg.TransportCredentials,
 		userGetter:           cfg.UserGetter,
 		authorizer:           cfg.Authorizer,
+		scopedAuthorizer:     cfg.ScopedAuthorizer,
 		enforcer:             cfg.Enforcer,
+		getAuthPreference:    getAuthPreference,
+		clock:                clock,
 	}, nil
 }
 
@@ -128,52 +167,128 @@ type IdentityInfo struct {
 	*credentials.TLSInfo
 	// IdentityGetter provides a mechanism to retrieve the
 	// identity of the client.
-	IdentityGetter IdentityGetter
+	IdentityGetter authz.IdentityGetter
 	// AuthContext contains information about the traits and roles
 	// that an identity may have. This will be unset if the
 	// [TransportCredentialsConfig.Authorizer] provided to [NewTransportCredentials]
 	// was nil.
-	AuthContext *Context
+	AuthContext *authz.Context
+
+	// ScopedContext contains scoped authorization context. This will be unset if
+	// the [TransportCredentialsConfig.ScopedAuthorizer] provided to [NewTransportCredentials]
+	// was nil.
+	ScopedAuthContext *authz.ScopedContext
+
+	// Conn is the underlying [net.Conn] of the gRPC connection.
+	Conn net.Conn
 }
 
-// ServerHandshake does the authentication handshake for servers. It returns
-// the authenticated connection and the corresponding auth information about
-// the connection.
-// At minimum the TLS handshake is performed and the identity is built from
+func (i IdentityInfo) AuthzContext() (ctx *authz.Context, ok bool) {
+	return i.AuthContext, i.AuthContext != nil
+}
+
+func (i IdentityInfo) ScopedAuthzContext() (ctx *authz.ScopedContext, ok bool) {
+	return i.ScopedAuthContext, i.ScopedAuthContext != nil
+}
+
+// timeoutConn wraps a connection that is to be closed when
+// the timer expires.
+type timeoutConn struct {
+	net.Conn // The underlying [net.Conn] of the gRPC connection.
+	timer    clockwork.Timer
+}
+
+// newTimeoutConn creates a [net.Conn] wrapper that closes the rawConn
+// if the timeout is exceeded.
+func newTimeoutConn(conn net.Conn, clock clockwork.Clock, expires time.Time) (net.Conn, error) {
+	if expires.IsZero() {
+		return conn, nil
+	}
+
+	return &timeoutConn{
+		Conn: conn,
+		timer: clock.AfterFunc(expires.Sub(clock.Now()), func() {
+			logger.DebugContext(context.Background(), "Closing gRPC connection due to certificate expiry")
+			conn.Close()
+		}),
+	}, nil
+}
+
+// Close closes the wrapped [net.Conn] and stops the timer
+// to prevent leaking it.
+func (c *timeoutConn) Close() error {
+	c.timer.Stop()
+	return trace.Wrap(c.Conn.Close())
+}
+
+// ServerHandshake performs the authentication handshake for servers as per
+// the [credentials.TransportCredentials] interface. It returns the authenticated
+// connection and the corresponding auth information about the connection.
+// At minimum, the TLS handshake is performed and the identity is built from
 // the [tls.ConnectionState]. If the TransportCredentials is configured with
-// and Authorizer and ConnectionEnforcer then additional session controls are
-// applied before the handshake completes.
-func (c *TransportCredentials) ServerHandshake(rawConn net.Conn) (_ net.Conn, _ credentials.AuthInfo, err error) {
+// an [authz.Authorizer] and a [ConnectionEnforcer], then additional session
+// controls are applied before the handshake completes.
+func (c *TransportCredentials) ServerHandshake(rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	conn, tlsInfo, err := c.performTLSHandshake(rawConn)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
 
-	defer func() {
-		if err != nil {
-			conn.Close()
-		}
-	}()
-
-	identityGetter, err := c.userGetter.GetUser(tlsInfo.State)
+	validatedConn, info, err := c.validateIdentity(conn, tlsInfo)
 	if err != nil {
-		return nil, nil, trace.Wrap(err)
+		return nil, nil, trace.NewAggregate(err, conn.Close())
 	}
+	return validatedConn, info, nil
+}
 
+// validateIdentity extracts the identity from the client certificate,
+// authorizes the user, enforces any connection limits, and ensures the
+// connection is terminated at expiry of the client certificate if required.
+func (c *TransportCredentials) validateIdentity(conn net.Conn, tlsInfo *credentials.TLSInfo) (net.Conn, IdentityInfo, error) {
 	ctx := context.Background()
-	authCtx, err := c.authorize(ctx, conn.RemoteAddr().String(), identityGetter, &tlsInfo.State)
+
+	identityGetter, err := c.userGetter.GetUser(ctx, tlsInfo.State)
 	if err != nil {
-		return nil, nil, trace.Wrap(err)
+		return nil, IdentityInfo{}, trace.Wrap(err)
 	}
 
-	if err := c.enforceConnectionLimits(ctx, authCtx, conn); err != nil {
-		return nil, nil, trace.Wrap(err)
+	authCtx, scopedAuthCtx, err := c.authorize(ctx, conn.RemoteAddr(), identityGetter, &tlsInfo.State)
+	if err != nil {
+		return nil, IdentityInfo{}, trace.Wrap(err)
+	}
+
+	if authCtx != nil {
+		// TODO(fspmarshall/scopes): enforce connection limits for scoped identities, or rework this to have a cleaner
+		// abstraction if we decide that there is no sane concept of connection-limits for scopes (likely, there won't
+		// be unelss we special-case root role assignments or introduce some additional control mechanism outside of
+		// scoped roles).
+		if err := c.enforceConnectionLimits(ctx, authCtx, conn); err != nil {
+			return nil, IdentityInfo{}, trace.Wrap(err)
+		}
+
+		if authPreference, err := c.getAuthPreference(ctx); err == nil {
+			expiry := authCtx.GetDisconnectCertExpiry(authPreference)
+			conn, err = newTimeoutConn(conn, c.clock, expiry)
+			if err != nil {
+				return nil, IdentityInfo{}, trace.Wrap(err)
+			}
+		}
+	} else {
+		if authPreference, err := c.getAuthPreference(ctx); err == nil {
+			expiry := scopedAuthCtx.GetDisconnectCertExpiry(authPreference)
+			conn, err = newTimeoutConn(conn, c.clock, expiry)
+			if err != nil {
+				return nil, IdentityInfo{}, trace.Wrap(err)
+			}
+		}
 	}
 
 	return conn, IdentityInfo{
-		TLSInfo:        tlsInfo,
-		IdentityGetter: identityGetter,
-		AuthContext:    authCtx,
+		TLSInfo:           tlsInfo,
+		IdentityGetter:    identityGetter,
+		AuthContext:       authCtx,
+		ScopedAuthContext: scopedAuthCtx,
+		Conn:              conn,
 	}, nil
 }
 
@@ -187,8 +302,7 @@ func (c *TransportCredentials) performTLSHandshake(rawConn net.Conn) (net.Conn, 
 
 	tlsInfo, ok := info.(credentials.TLSInfo)
 	if !ok {
-		conn.Close()
-		return nil, nil, trace.BadParameter("unexpected type in tls auth info %T", info)
+		return nil, nil, trace.NewAggregate(conn.Close(), trace.BadParameter("unexpected type in tls auth info %T", info))
 	}
 
 	return conn, &tlsInfo, nil
@@ -197,27 +311,37 @@ func (c *TransportCredentials) performTLSHandshake(rawConn net.Conn) (net.Conn, 
 // authorize enforces that the identity is not restricted from connecting due
 // to things like locks, private key policy, device trust, etc. If the TransportCredentials
 // was not configured to do authorization then this is a noop and will return nil, nil.
-func (c *TransportCredentials) authorize(ctx context.Context, remoteAddr string, identityGetter IdentityGetter, connState *tls.ConnectionState) (*Context, error) {
-	if c.authorizer == nil {
-		return &Context{
+func (c *TransportCredentials) authorize(ctx context.Context, remoteAddr net.Addr, identityGetter authz.IdentityGetter, connState *tls.ConnectionState) (*authz.Context, *authz.ScopedContext, error) {
+	if c.authorizer == nil && c.scopedAuthorizer == nil {
+		return &authz.Context{
 			Identity: identityGetter,
-		}, nil
+		}, nil, nil
 	}
 
 	// construct a context with the keys expected by the Authorizer
-	ctx = context.WithValue(ctx, contextUserCertificate, certFromConnState(connState))
-	ctx = context.WithValue(ctx, ContextClientAddr, remoteAddr)
-	ctx = context.WithValue(ctx, ContextUser, identityGetter)
+	ctx = authz.ContextWithUserCertificate(ctx, certFromConnState(connState))
+	ctx = authz.ContextWithClientSrcAddr(ctx, remoteAddr)
+	ctx = authz.ContextWithUser(ctx, identityGetter)
+
+	if c.scopedAuthorizer != nil {
+		scopedCtx, err := c.scopedAuthorizer.AuthorizeScoped(ctx)
+		if err != nil {
+			return nil, nil, trace.Wrap(err)
+		}
+
+		authCtx, _ := scopedCtx.UnscopedContext()
+		return authCtx, scopedCtx, nil
+	}
 
 	authCtx, err := c.authorizer.Authorize(ctx)
-	return authCtx, trace.Wrap(err)
+	return authCtx, nil, trace.Wrap(err)
 }
 
 // enforceConnectionLimits prevents the identity from exceeding any configured
 // connection limits. The provided connection will be closed by the enforcer
 // if connectivity to Auth is interrupted. If the TransportCredentials
 // was not configured to do connection limiting then this is a noop and will return nil.
-func (c *TransportCredentials) enforceConnectionLimits(ctx context.Context, authCtx *Context, conn net.Conn) error {
+func (c *TransportCredentials) enforceConnectionLimits(ctx context.Context, authCtx *authz.Context, conn net.Conn) error {
 	if c.enforcer == nil {
 		return nil
 	}
@@ -233,7 +357,7 @@ func (c *TransportCredentials) enforceConnectionLimits(ctx context.Context, auth
 			MaxConnections: authCtx.Checker.MaxConnections(),
 			LocalAddr:      conn.LocalAddr().String(),
 			RemoteAddr:     conn.RemoteAddr().String(),
-			UserMetadata:   ClientUserMetadata(ctx),
+			UserMetadata:   authz.ClientUserMetadata(ctx),
 		},
 		conn,
 	)
@@ -246,7 +370,9 @@ func (c *TransportCredentials) Clone() credentials.TransportCredentials {
 	return &TransportCredentials{
 		userGetter:           c.userGetter,
 		authorizer:           c.authorizer,
+		scopedAuthorizer:     c.scopedAuthorizer,
 		enforcer:             c.enforcer,
 		TransportCredentials: c.TransportCredentials.Clone(),
+		clock:                c.clock,
 	}
 }

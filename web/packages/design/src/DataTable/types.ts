@@ -1,26 +1,62 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+import type { JSX } from 'react';
+
 import { MatchCallback } from 'design/utils/match';
+
+import { Pagination } from './useTable';
 
 export type TableProps<T> = {
   data: T[];
   columns: TableColumn<T>[];
+  infiniteScrollProps?: {
+    fetchStatus: FetchStatus;
+  };
+  hideEmptyIcon?: boolean;
   emptyText: string;
-  pagination?: PaginationConfig;
+  /**
+   * Optional button that is rendered below emptyText if there's no data, during processing or on
+   * error.
+   */
+  emptyButton?: JSX.Element;
+  /**
+   * Optional hint that is rendered below emptyText if there's no data, during processing or on
+   * error.
+   */
+  emptyHint?: string;
+  pagination?: PaginationConfig<T>;
+  /**
+   * config for client searching.
+   * supports any table except when "serversideProps"
+   * field is defined
+   */
+  clientSearch?: {
+    /**
+     * By default, no initial search is applied (empty search),
+     * unless "initialSearchValue" is defined.
+     */
+    initialSearchValue: string;
+    /**
+     * After setting a new search value, this function will be called.
+     */
+    onSearchValueChange(searchString: string): void;
+  };
   isSearchable?: boolean;
   searchableProps?: Extract<keyof T, string>[];
   // customSearchMatchers contains custom functions to run when search matching.
@@ -40,13 +76,43 @@ export type TableProps<T> = {
   // any client table filtering supplied by default.
   // Use case: filtering is done on the caller side e.g. server side.
   disableFilter?: boolean;
+  /**
+   * row configuration
+   */
+  row?: {
+    onClick?(row: T): void;
+    /**
+     * conditionally style a row (eg: cursor: pointer, disabled)
+     */
+    getStyle?(row: T): React.CSSProperties;
+    /**
+     * conditionally render a custom row
+     * use case: by default all columns are represented by cells
+     * but certain rows you need all the columns to be merged
+     * into one cell to render other related elements like a
+     * dropdown selector.
+     */
+    customRow?(row: T): JSX.Element;
+    /**
+     * conditionally render a custom row after either `customRow` or
+     * the base table row.
+     */
+    renderAfter?(row: T): JSX.Element | null;
+    /**
+     * Returns a stable React key for the row. When the table can reorder
+     * (sort, filter, paginate, refetch), provide this so that stateful cells
+     * (e.g. open action menus) stay attached to their item rather than the
+     * row index. Falls back to the row index when not provided.
+     */
+    getKey?(row: T): React.Key;
+  };
 };
 
 type TableColumnBase<T> = {
   headerText?: string;
   render?: (row: T) => JSX.Element;
   isSortable?: boolean;
-  onSort?: (a, b) => number;
+  onSort?: (a: T, b: T) => number;
   // isNonRender is a flag that when true,
   // does not render the column or cell in table.
   // Use case: when a column combines two
@@ -54,9 +120,20 @@ type TableColumnBase<T> = {
   isNonRender?: boolean;
 };
 
-export type PaginationConfig = {
+export type PagerPosition = 'top' | 'bottom' | 'both';
+
+type PaginationConfig<T> = {
   pageSize?: number;
-  pagerPosition?: 'top' | 'bottom';
+  /**
+   * "undefined" will show both pagers if data on current page is some
+   * sufficient length.
+   *
+   * Otherwise, it will only show the top pager.
+   *
+   * "both" will show both regardless of data length.
+   */
+  pagerPosition?: PagerPosition;
+  CustomTable?: (p: PagedTableProps<T>) => JSX.Element;
 };
 
 /**
@@ -80,6 +157,7 @@ export type FetchingConfig = {
   onFetchPrev?: () => void;
   onFetchMore?: () => void;
   fetchStatus: FetchStatus;
+  disableLoadingIndicator?: boolean;
 };
 
 export type ServersideProps = {
@@ -90,10 +168,13 @@ export type ServersideProps = {
 
 // Makes it so either key or altKey is required
 type TableColumnWithKey<T> = TableColumnBase<T> & {
-  key: Extract<keyof T, string>;
-  // altSortKey is the alternative field to sort column by,
-  // if provided. Otherwise it falls back to sorting by field
-  // "key".
+  key: keyof T & string;
+  /**
+   * altSortKey is the alternative field to sort column by,
+   * if provided.
+   * Otherwise, it falls back to sorting by field "key".
+   * @deprecated Provide the custom sorting logic through `onSort` function.
+   */
   altSortKey?: Extract<keyof T, string>;
   altKey?: never;
 };
@@ -136,4 +217,33 @@ export type LabelDescription = {
 
 export type CustomSort = SortType & {
   onSort(s: SortType): void;
+};
+
+export type BasicTableProps<T> = {
+  data: T[];
+  renderHeaders: () => JSX.Element;
+  renderBody: (data: T[]) => JSX.Element;
+  className?: string;
+  style?: React.CSSProperties;
+};
+
+export type SearchableBasicTableProps<T> = BasicTableProps<T> & {
+  searchValue: string;
+  setSearchValue: (searchValue: string) => void;
+};
+
+export type PagedTableProps<T> = SearchableBasicTableProps<T> & {
+  nextPage: () => void;
+  prevPage: () => void;
+  pagination: Pagination<T>;
+  fetching?: FetchingConfig;
+  isSearchable?: boolean;
+};
+
+export type ServersideTableProps<T> = BasicTableProps<T> & {
+  nextPage?: () => void;
+  prevPage?: () => void;
+  pagination?: Pagination<T>;
+  serversideProps: ServersideProps;
+  fetchStatus?: FetchStatus;
 };

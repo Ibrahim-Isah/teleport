@@ -1,30 +1,41 @@
 /**
- * Copyright 2021 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
 import { render, screen } from 'design/utils/testing';
 
 import ConnectDialog, { Props } from './ConnectDialog';
-import { ConnectWithRequestId } from './ConnectDialog.story';
 
 test('correct connect command generated for postgres db', () => {
   render(<ConnectDialog {...props} dbProtocol="postgres" />);
 
+  // --db-name flag should be required
   const expectedOutput =
-    'tsh db connect [--db-user=<user>] [--db-name=<name>] aurora';
+    'tsh db connect aurora --db-user=<user> --db-name=<name>';
+
+  expect(screen.getByText(expectedOutput)).toBeInTheDocument();
+});
+
+test('correct connect command generated for spanner', () => {
+  render(<ConnectDialog {...props} dbName="gspanner" dbProtocol="spanner" />);
+
+  // --db-name flag should be required
+  const expectedOutput =
+    'tsh db connect gspanner --db-user=<user> --db-name=<name>';
 
   expect(screen.getByText(expectedOutput)).toBeInTheDocument();
 });
@@ -32,8 +43,27 @@ test('correct connect command generated for postgres db', () => {
 test('correct connect command generated for mysql db', () => {
   render(<ConnectDialog {...props} dbProtocol="mysql" />);
 
+  // --db-name flag should be optional
   const expectedOutput =
-    'tsh db connect [--db-user=<user>] [--db-name=<name>] aurora';
+    'tsh db connect aurora --db-user=<user> [--db-name=<name>]';
+
+  expect(screen.getByText(expectedOutput)).toBeInTheDocument();
+});
+
+test('correct connect command generated for redis', () => {
+  render(<ConnectDialog {...props} dbProtocol="redis" />);
+
+  // There should be no --db-name flag
+  const expectedOutput = 'tsh db connect aurora --db-user=<user>';
+
+  expect(screen.getByText(expectedOutput)).toBeInTheDocument();
+});
+
+test('correct connect command generated for dynamodb', () => {
+  render(<ConnectDialog {...props} dbProtocol="dynamodb" />);
+
+  // Command should be `tsh proxy db --tunnel` instead of `tsh connect db`
+  const expectedOutput = 'tsh proxy db --tunnel aurora --db-user=<user>';
 
   expect(screen.getByText(expectedOutput)).toBeInTheDocument();
 });
@@ -59,18 +89,6 @@ test('correct tsh login command generated with passwordless authType', () => {
     'tsh login --proxy=localhost:443 --auth=passwordless --user=yassine im-a-cluster';
 
   expect(screen.getByText(output)).toBeInTheDocument();
-});
-
-test('render dialog with instructions to connect to database', () => {
-  render(<ConnectDialog {...props} />);
-
-  expect(screen.getByTestId('Modal')).toMatchSnapshot();
-});
-
-test('render dialog with instructions to connect to database with requestId', () => {
-  const { baseElement } = render(<ConnectWithRequestId />);
-
-  expect(baseElement).toMatchSnapshot();
 });
 
 const props: Props = {

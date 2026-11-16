@@ -1,35 +1,77 @@
-/*
-Copyright 2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import api from 'teleport/services/api';
 import cfg from 'teleport/config';
+import api from 'teleport/services/api';
 
 import { makeLabelMapOfStrArrs } from '../agents/make';
-
+import auth from '../auth/auth';
+import { MfaChallengeResponse } from '../mfa';
+import { withUnsupportedLabelFeatureErrorConversion } from '../version/unsupported';
 import makeJoinToken from './makeJoinToken';
-import { JoinToken, JoinRule, JoinTokenRequest } from './types';
+import {
+  CreateJoinTokenRequest,
+  JoinRule,
+  JoinToken,
+  JoinTokenRequest,
+} from './types';
+
+const TeleportTokenNameHeader = 'X-Teleport-TokenName';
 
 class JoinTokenService {
-  fetchJoinToken(
+  // TODO (avatus) refactor this code to eventually use `createJoinToken`
+  fetchJoinTokenV2(
     req: JoinTokenRequest,
-    signal: AbortSignal = null
+    signal?: AbortSignal,
+    mfaResponse?: MfaChallengeResponse
+  ): Promise<JoinToken> {
+    return (
+      api
+        .post(
+          cfg.api.discoveryJoinToken.createV2,
+          {
+            roles: req.roles,
+            join_method: req.method || 'token',
+            allow: makeAllowField(req.rules || []),
+            suggested_agent_matcher_labels: makeLabelMapOfStrArrs(
+              req.suggestedAgentMatcherLabels
+            ),
+            suggested_labels: makeLabelMapOfStrArrs(req.suggestedLabels),
+          },
+          signal,
+          mfaResponse
+        )
+        .then(makeJoinToken)
+        // TODO(kimlisa): DELETE IN 19.0
+        .catch(withUnsupportedLabelFeatureErrorConversion)
+    );
+  }
+
+  // TODO(kimlisa): DELETE IN 19.0
+  // replaced by fetchJoinTokenV2 that accepts labels.
+  fetchJoinToken(
+    req: Omit<JoinTokenRequest, 'suggestedLabels'>,
+    signal?: AbortSignal,
+    mfaResponse?: MfaChallengeResponse
   ): Promise<JoinToken> {
     return api
       .post(
-        cfg.getJoinTokenUrl(),
+        cfg.api.discoveryJoinToken.create,
         {
           roles: req.roles,
           join_method: req.method || 'token',
@@ -38,9 +80,80 @@ class JoinTokenService {
             req.suggestedAgentMatcherLabels
           ),
         },
-        signal
+        signal,
+        mfaResponse
       )
       .then(makeJoinToken);
+  }
+
+  upsertJoinTokenYAML(
+    req: JoinTokenRequest,
+    tokenName: string
+  ): Promise<JoinToken> {
+    return api
+      .putWithHeaders(
+        cfg.getJoinTokenYamlUrl(),
+        {
+          content: req.content,
+        },
+        {
+          [TeleportTokenNameHeader]: tokenName,
+          'Content-Type': 'application/json',
+        }
+      )
+      .then(makeJoinToken);
+  }
+
+  async createJoinToken(
+    req: CreateJoinTokenRequest,
+    mfaResponse?: MfaChallengeResponse
+  ) {
+    return api
+      .post(
+        cfg.getJoinTokenUrl({ action: 'create' }),
+        req,
+        null /* abortSignal */,
+        mfaResponse
+      )
+      .then(makeJoinToken);
+  }
+
+  async editJoinToken(
+    req: CreateJoinTokenRequest,
+    mfaResponse?: MfaChallengeResponse,
+    abortSignal?: AbortSignal
+  ) {
+    const json = await api.put(
+      cfg.getJoinTokenUrl({ action: 'update' }),
+      req,
+      abortSignal,
+      mfaResponse
+    );
+    return makeJoinToken(json);
+  }
+
+  async fetchJoinTokens(signal?: AbortSignal) {
+    // Fetching all join tokens calls multiple RPCs internally, so we need a
+    // reusable mfa response.
+    const mfaResponse = await auth.getMfaChallengeResponseForAdminAction(
+      true /* allow re-use */
+    );
+
+    return api
+      .get(cfg.getJoinTokenUrl({ action: 'list' }), signal, mfaResponse)
+      .then(resp => {
+        return {
+          items: resp.items?.map(makeJoinToken) || [],
+        };
+      });
+  }
+
+  deleteJoinToken(id: string, signal?: AbortSignal) {
+    return api.deleteWithHeaders(
+      cfg.getJoinTokenUrl({ action: 'list' }),
+      { [TeleportTokenNameHeader]: id },
+      signal
+    );
   }
 }
 

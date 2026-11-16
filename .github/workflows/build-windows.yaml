@@ -2,27 +2,23 @@ name: Build on Windows
 run-name: Build on Windows
 
 on:
-  push:
-    branches:
-      - master
-  pull_request:
-    # We only build tsh on Windows so only consider Go code as tsh doesn't
-    # run any Rust.
-    paths:
-      - '**.go'
-      - 'go.mod'
-      - 'go.sum'
-      - 'build.assets/Makefile'
-      - 'build.assets/Dockerfile*'
   merge_group:
-    # We only build tsh on Windows so only consider Go code as tsh doesn't
-    # run any Rust.
     paths:
-      - '**.go'
-      - 'go.mod'
-      - 'go.sum'
-      - 'build.assets/Makefile'
-      - 'build.assets/Dockerfile*'
+      - ".github/workflows/build-windows.yaml"
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - "build.assets/Makefile"
+      - "build.assets/Dockerfile*"
+      - "Makefile"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "lib/srv/desktop/rdp/decoder/Cargo.toml"
+      - "lib/srv/desktop/rdp/decoder/src/**.rs"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -35,19 +31,16 @@ jobs:
 
     steps:
       - name: Checkout Teleport
-        uses: actions/checkout@v3
-
-      - name: Get Go version
-        id: go-version
-        shell: bash
-        run: echo "go-version=$(make --no-print-directory print-go-version | tr -d '\n')" >> $GITHUB_OUTPUT
+        uses: actions/checkout@v6
 
       - name: Setup Go
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v7
         with:
-          go-version: ${{ steps.go-version.outputs.go-version }}
+          cache: false
+          go-version-file: go.mod
 
       - name: Build
+        shell: bash
         run: |
-          $Env:OS="windows"
-          make build/tsh
+          export OS="windows"
+          make build/tsh build/tctl build/tbot

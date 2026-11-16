@@ -1,54 +1,41 @@
-/*
-Copyright 2021 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { Link } from 'react-router';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-import { Link } from 'react-router-dom';
-
-import { Text, Box, Flex, ButtonPrimary, ButtonOutlined } from 'design';
-import Image from 'design/Image';
+import {
+  Box,
+  ButtonPrimary,
+  ButtonPrimaryBorder,
+  Card,
+  Flex,
+  H1,
+  H2,
+  ResourceIcon,
+  Text,
+} from 'design';
 
 import cfg from 'teleport/config';
-
-import application from './assets/appplication.png';
-import database from './assets/database.png';
-import desktop from './assets/desktop.png';
-import stack from './assets/stack.png';
-
-type ResourceType =
-  | 'application'
-  | 'database'
-  | 'desktop'
-  | 'kubernetes'
-  | 'server';
-
-function getAccentImage(resourceType: ResourceType): string {
-  const accentImages = {
-    application: application,
-    database: database,
-    desktop: desktop,
-    kubernetes: stack,
-    server: stack,
-  };
-  return accentImages[resourceType];
-}
 
 export default function Empty(props: Props) {
   const { canCreate, clusterId, emptyStateInfo } = props;
 
-  const { byline, docsURL, resourceType, readOnly, title } = emptyStateInfo;
+  const { readOnly, title } = emptyStateInfo;
 
   // always show the welcome for enterprise users who have access to create an app
   if (!canCreate) {
@@ -58,12 +45,10 @@ export default function Empty(props: Props) {
         mx="auto"
         maxWidth="664px"
         textAlign="center"
-        color="text.primary"
+        color="text.main"
         borderRadius="12px"
       >
-        <Text typography="h2" mb="3">
-          {readOnly.title}
-        </Text>
+        <H1 mb="3">{readOnly.title}</H1>
         <Text>
           Either there are no {readOnly.resource} in the "
           <Text as="span" bold>
@@ -75,63 +60,89 @@ export default function Empty(props: Props) {
     );
   }
 
+  const showCloud = cfg.isCloud;
+
   return (
-    <Box
-      p={8}
-      pt={5}
-      as={Flex}
-      width="100%"
-      mx="auto"
-      alignItems="center"
-      justifyContent="center"
-    >
-      <Box maxWidth={600}>
-        <Box mb={4} textAlign="center">
-          <Image
-            src={getAccentImage(resourceType)}
-            ml="auto"
-            mr="auto"
-            mb={4}
-            height="160px"
+    <Box p={8} pt={5} width="100%">
+      <Card
+        p={4}
+        maxWidth={showCloud ? '780px' : '390px'}
+        minWidth={showCloud ? '593px' : '390px'}
+        mx="auto"
+      >
+        <Box mb={showCloud ? 4 : 2} textAlign="center">
+          <ResourceIcon name="server" mx="auto" mb={4} height="150px" />
+          <H1>{title}</H1>
+        </Box>
+        <Flex>
+          {showCloud && (
+            <Pane
+              title="Automatically Discover"
+              text="Use Terraform to connect your AWS, Azure, or GCP accounts to Teleport and automatically discover your resources."
+              button={
+                <ButtonPrimary
+                  as={Link}
+                  to={cfg.getIntegrationsEnrollRoute({ tags: ['terraform'] })}
+                  width="100%"
+                >
+                  Connect Cloud Account
+                </ButtonPrimary>
+              }
+            />
+          )}
+
+          {showCloud && <Divider />}
+
+          <Pane
+            title={showCloud ? 'Manually Enter' : undefined}
+            text="Browse and add individual servers, databases, or apps one at a time."
+            button={
+              <ButtonPrimaryBorder
+                as={Link}
+                to={cfg.routes.discover}
+                state={{ entity: 'unified_resource' }}
+                width="100%"
+              >
+                Enroll New Resource
+              </ButtonPrimaryBorder>
+            }
           />
-          <Text typography="h5" mb={2} fontWeight={700} fontSize={24}>
-            {title}
-          </Text>
-          <Text fontWeight={400} fontSize={14} style={{ opacity: '0.6' }}>
-            {byline}
-          </Text>
-        </Box>
-        <Box textAlign="center">
-          <Link
-            to={{
-              pathname: `${cfg.routes.root}/discover`,
-              state: { entity: resourceType },
-            }}
-            style={{ textDecoration: 'none' }}
-          >
-            <ButtonPrimary width="224px">Add {resourceType}</ButtonPrimary>
-          </Link>
-          <ButtonOutlined
-            size="medium"
-            as="a"
-            href={docsURL}
-            target="_blank"
-            width="224px"
-            ml={4}
-            rel="noreferrer"
-          >
-            View Documentation
-          </ButtonOutlined>
-        </Box>
-      </Box>
+        </Flex>
+      </Card>
     </Box>
   );
 }
 
+function Pane({ title, text, button }) {
+  return (
+    <Flex p={4} flex={1} textAlign="left" flexDirection="column">
+      {title && <H2>{title}</H2>}
+      <Text mb={2}>{text}</Text>
+      <Box mt="auto">{button}</Box>
+    </Flex>
+  );
+}
+
+function Divider() {
+  const height = '54px';
+  return (
+    <Flex
+      width="48px"
+      flexDirection="column"
+      alignItems="center"
+      justifyContent="center"
+      flexShrink={0}
+    >
+      <Box width="1px" height={height} bg="text.muted" />
+      <Text my={2} color="text.muted">
+        or
+      </Text>
+      <Box width="1px" height={height} bg="text.muted" />
+    </Flex>
+  );
+}
+
 export type EmptyStateInfo = {
-  byline: string;
-  docsURL: string;
-  resourceType: ResourceType;
   readOnly: {
     title: string;
     resource: string;

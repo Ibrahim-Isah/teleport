@@ -1,23 +1,27 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package conntest
 
 import (
 	"context"
+	"encoding/base32"
 	"encoding/json"
-	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -25,16 +29,20 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/gravitational/teleport/api/constants"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/integration/helpers"
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/client/conntest"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/service"
+	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/db/common"
 	"github.com/gravitational/teleport/lib/srv/db/postgres"
@@ -59,7 +67,10 @@ func startPostgresTestServer(t *testing.T, authServer *auth.Server) *postgres.Te
 }
 
 func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
+	modules.SetInsecureTestMode(true)
+
 	ctx := context.Background()
+	diagnoseConnectionEndpoint := strings.Join([]string{"sites", "$site", "diagnostics", "connections"}, "/")
 
 	// Start Teleport Auth and Proxy services
 	authProcess, proxyProcess, provisionToken := helpers.MakeTestServers(t)
@@ -74,7 +85,7 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 	databaseResourceName := "mypsqldb"
 	databaseDBName := "dbname"
 	databaseDBUser := "dbuser"
-	helpers.MakeTestDatabaseServer(t, *proxyAddr, provisionToken, nil /* resource matchers */, service.Database{
+	helpers.MakeTestDatabaseServer(t, *proxyAddr, provisionToken, nil /* resource matchers */, servicecfg.Database{
 		Name:     databaseResourceName,
 		Protocol: defaults.ProtocolPostgres,
 		URI:      net.JoinHostPort("localhost", postgresTestServer.Port()),
@@ -94,7 +105,8 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	require.NoError(t, authServer.UpsertRole(ctx, roleWithFullAccess))
+	roleWithFullAccess, err = authServer.UpsertRole(ctx, roleWithFullAccess)
+	require.NoError(t, err)
 
 	for _, tt := range []struct {
 		name         string
@@ -122,12 +134,12 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 				{
 					Type:    types.ConnectionDiagnosticTrace_RBAC_DATABASE,
 					Status:  types.ConnectionDiagnosticTrace_SUCCESS,
-					Details: "A Database Agent is available to proxy the connection to the Database.",
+					Details: "A Teleport Database Service is available to proxy the connection to the Database.",
 				},
 				{
 					Type:    types.ConnectionDiagnosticTrace_CONNECTIVITY,
 					Status:  types.ConnectionDiagnosticTrace_SUCCESS,
-					Details: "Database is accessible from the Database Agent.",
+					Details: "Database is accessible from the Teleport Database Service.",
 				},
 				{
 					Type:    types.ConnectionDiagnosticTrace_RBAC_DATABASE_LOGIN,
@@ -163,8 +175,8 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 					Status: types.ConnectionDiagnosticTrace_FAILED,
 					Details: "Database not found. " +
 						"Ensure your role grants access by adding it to the 'db_labels' property. " +
-						"This can also happen when you don't have a Database Agent proxying the database - " +
-						"you can fix that by adding the database labels to the 'db_service.resources.labels' in 'teleport.yaml' file of the database agent.",
+						"This can also happen when you don't have a Teleport Database Service proxying the database - " +
+						"you can fix that by adding the database labels to the 'db_service.resources.labels' in 'teleport.yaml' file of the Database Service.",
 				},
 			},
 		},
@@ -195,7 +207,8 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 			require.NoError(t, err)
 
 			user.AddRole(roleWithFullAccess.GetName())
-			require.NoError(t, authServer.UpsertUser(user))
+			_, err = authServer.UpsertUser(ctx, user)
+			require.NoError(t, err)
 
 			userPassword := uuid.NewString()
 			require.NoError(t, authServer.UpsertPassword(tt.teleportUser, []byte(userPassword)))
@@ -211,15 +224,8 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 				DialTimeout:        time.Second,
 				InsecureSkipVerify: true,
 			}
-			diagnoseConnectionEndpoint := strings.Join([]string{"sites", "$site", "diagnostics", "connections"}, "/")
-			resp, err := webPack.DoRequest(http.MethodPost, diagnoseConnectionEndpoint, diagnoseReq)
-			require.NoError(t, err)
-
-			respBody, err := io.ReadAll(resp.Body)
-			require.NoError(t, err)
-
-			defer resp.Body.Close()
-			require.Equal(t, http.StatusOK, resp.StatusCode, string(respBody))
+			respStatusCode, respBody := webPack.DoWebAPIRequest(t, http.MethodPost, diagnoseConnectionEndpoint, diagnoseReq)
+			require.Equal(t, http.StatusOK, respStatusCode, string(respBody))
 
 			var connectionDiagnostic ui.ConnectionDiagnostic
 			require.NoError(t, json.Unmarshal(respBody, &connectionDiagnostic))
@@ -260,6 +266,56 @@ func TestDiagnoseConnectionForPostgresDatabases(t *testing.T) {
 			require.Equal(t, expectedFailedTraces, gotFailedTraces)
 		})
 	}
+
+	// Test success with per-session MFA.
+
+	// Set up user.
+	user, err := types.NewUser("llama")
+	require.NoError(t, err)
+	user.AddRole(roleWithFullAccess.GetName())
+	_, err = authServer.UpsertUser(ctx, user)
+	require.NoError(t, err)
+	userPassword := uuid.NewString()
+	require.NoError(t, authServer.UpsertPassword("llama", []byte(userPassword)))
+	webPack := helpers.LoginWebClient(t, proxyAddr.String(), "llama", userPassword)
+
+	// Require per-session mfa.
+	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:           constants.Local,
+		SecondFactor:   constants.SecondFactorOTP,
+		RequireMFAType: types.RequireMFAType_SESSION,
+	})
+	require.NoError(t, err)
+	_, err = authServer.UpsertAuthPreference(ctx, ap)
+	require.NoError(t, err)
+
+	// Set up otp device.
+	otpSecret := base32.StdEncoding.EncodeToString([]byte("abc123"))
+	dev, err := services.NewTOTPDevice("otp", otpSecret, authServer.GetClock().Now())
+	require.NoError(t, err)
+	err = authServer.UpsertMFADevice(ctx, "llama", dev)
+	require.NoError(t, err)
+	validToken, err := totp.GenerateCode(otpSecret, authServer.GetClock().Now())
+	require.NoError(t, err)
+
+	diagnoseReq := conntest.TestConnectionRequest{
+		ResourceKind: types.KindDatabase,
+		ResourceName: databaseResourceName,
+		DatabaseUser: databaseDBUser,
+		DatabaseName: databaseDBName,
+		// Default is 30 seconds but since tests run locally, we can reduce this value to also improve test responsiveness
+		DialTimeout:        time.Second,
+		InsecureSkipVerify: true,
+		MFAResponse: client.MFAChallengeResponse{
+			TOTPCode: validToken,
+		},
+	}
+	respStatusCode, respBody := webPack.DoWebAPIRequest(t, http.MethodPost, diagnoseConnectionEndpoint, diagnoseReq)
+	require.Equal(t, http.StatusOK, respStatusCode, string(respBody))
+
+	var connectionDiagnostic ui.ConnectionDiagnostic
+	require.NoError(t, json.Unmarshal(respBody, &connectionDiagnostic))
+	require.True(t, connectionDiagnostic.Success)
 }
 
 func waitForDatabases(t *testing.T, authServer *auth.Server, dbNames []string) {
@@ -283,5 +339,5 @@ func waitForDatabases(t *testing.T, authServer *auth.Server, dbNames []string) {
 			}
 		}
 		return registered == len(dbNames)
-	}, 10*time.Second, 100*time.Millisecond)
+	}, 30*time.Second, 100*time.Millisecond)
 }

@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package client
 
@@ -22,19 +24,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"time"
+	"log/slog"
+	"sync"
 
 	"github.com/gorilla/websocket"
 	"github.com/gravitational/trace"
 	"k8s.io/client-go/tools/remotecommand"
 
+	"github.com/gravitational/teleport/api/client"
+	"github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/mfa"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/client/terminal"
 	"github.com/gravitational/teleport/lib/kube/proxy/streamproto"
 	"github.com/gravitational/teleport/lib/utils"
 )
-
-const mfaChallengeInterval = time.Second * 30
 
 // KubeSession a joined kubernetes session from the client side.
 type KubeSession struct {
@@ -43,22 +48,37 @@ type KubeSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	meta   types.SessionTracker
+	wg     sync.WaitGroup
+}
+
+// KubeSessionConfig contains configuration parameters used to join
+// an existing Kubernetes session by [NewKubeSession].
+type KubeSessionConfig struct {
+	KubeProxyAddr                 string
+	WebProxyAddr                  string
+	TLSRoutingConnUpgradeRequired bool
+	EnableEscapeSequences         bool
+	Tracker                       types.SessionTracker
+	TLSConfig                     *tls.Config
+	Mode                          types.SessionParticipantMode
+	AuthClient                    func(context.Context) (authclient.ClientI, error)
+	Ceremony                      *mfa.Ceremony
+	Stdin                         io.Reader
+	Stdout                        io.Writer
+	Stderr                        io.Writer
 }
 
 // NewKubeSession joins a live kubernetes session.
-func NewKubeSession(ctx context.Context, tc *TeleportClient, meta types.SessionTracker, kubeAddr string, tlsServer string, mode types.SessionParticipantMode, tlsConfig *tls.Config) (*KubeSession, error) {
+func NewKubeSession(ctx context.Context, cfg KubeSessionConfig) (*KubeSession, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	joinEndpoint := "wss://" + kubeAddr + "/api/v1/teleport/join/" + meta.GetSessionID()
-
-	if tlsServer != "" {
-		tlsConfig.ServerName = tlsServer
-	}
+	joinEndpoint := "wss://" + cfg.KubeProxyAddr + "/api/v1/teleport/join/" + cfg.Tracker.GetSessionID()
 
 	dialer := &websocket.Dialer{
-		TLSClientConfig: tlsConfig,
+		NetDialContext:  kubeSessionNetDialer(ctx, cfg).DialContext,
+		TLSClientConfig: cfg.TLSConfig,
 	}
 
-	ws, resp, err := dialer.Dial(joinEndpoint, nil)
+	ws, resp, err := dialer.DialContext(ctx, joinEndpoint, nil)
 	if resp != nil && resp.Body != nil {
 		defer resp.Body.Close()
 	}
@@ -69,7 +89,7 @@ func NewKubeSession(ctx context.Context, tc *TeleportClient, meta types.SessionT
 		}
 
 		body, _ := io.ReadAll(resp.Body)
-		var respData map[string]interface{}
+		var respData map[string]any
 		if err := json.Unmarshal(body, &respData); err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -82,14 +102,27 @@ func NewKubeSession(ctx context.Context, tc *TeleportClient, meta types.SessionT
 
 		return nil, trace.BadParameter("failed to decode remote error: %v", string(body))
 	}
+	defer func() {
+		if err == nil {
+			return
+		}
 
-	stream, err := streamproto.NewSessionStream(ws, streamproto.ClientHandshake{Mode: mode})
+		if err := ws.Close(); err != nil {
+			log.DebugContext(ctx, "Close stream in response to context termination", "error", err)
+		}
+	}()
+
+	stream, err := streamproto.NewSessionStream(ws, streamproto.ClientHandshake{Mode: cfg.Mode})
 	if err != nil {
 		cancel()
 		return nil, trace.Wrap(err)
 	}
 
-	term, err := terminal.New(tc.Stdin, tc.Stdout, tc.Stderr)
+	context.AfterFunc(ctx, func() {
+		_ = stream.Close()
+	})
+
+	term, err := terminal.New(cfg.Stdin, cfg.Stdout, cfg.Stderr)
 	if err != nil {
 		cancel()
 		return nil, trace.Wrap(err)
@@ -103,83 +136,105 @@ func NewKubeSession(ctx context.Context, tc *TeleportClient, meta types.SessionT
 
 	stdout := utils.NewSyncWriter(term.Stdout())
 
-	go handleOutgoingResizeEvents(ctx, stream, term)
-	go handleIncomingResizeEvents(stream, term)
+	go handleResizeEvents(ctx, stream, term)
 
-	s := &KubeSession{stream, term, ctx, cancel, meta}
-	err = s.handleMFA(ctx, tc, mode, stdout)
-	if err != nil {
+	s := &KubeSession{stream, term, ctx, cancel, cfg.Tracker, sync.WaitGroup{}}
+	if err := s.handleMFA(ctx, cfg.AuthClient, cfg.Ceremony, cfg.Mode, stdout); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	s.pipeInOut(stdout, tc.EnableEscapeSequences, mode)
+	s.pipeInOut(ctx, stdout, cfg.EnableEscapeSequences, cfg.Mode)
 	return s, nil
 }
 
-func handleOutgoingResizeEvents(ctx context.Context, stream *streamproto.SessionStream, term *terminal.Terminal) {
-	queue := stream.ResizeQueue()
-
-	select {
-	case <-ctx.Done():
-		return
-	case size := <-queue:
-		if size == nil {
-			return
-		}
-
-		term.Resize(int16(size.Width), int16(size.Height))
+func kubeSessionNetDialer(ctx context.Context, cfg KubeSessionConfig) client.ContextDialer {
+	dialOpts := []client.DialOption{
+		client.WithInsecureSkipVerify(cfg.TLSConfig.InsecureSkipVerify),
 	}
+
+	// Add options for ALPN connection upgrade only if kube is served at Proxy
+	// web address.
+	if cfg.WebProxyAddr == cfg.KubeProxyAddr && cfg.TLSRoutingConnUpgradeRequired {
+		dialOpts = append(dialOpts,
+			client.WithALPNConnUpgrade(cfg.TLSRoutingConnUpgradeRequired),
+			client.WithALPNConnUpgradePing(true), // Use Ping protocol for long-lived connections.
+		)
+	}
+
+	return client.NewDialer(
+		ctx,
+		defaults.DefaultIdleTimeout,
+		defaults.DefaultIOTimeout,
+		dialOpts...,
+	)
 }
 
-func handleIncomingResizeEvents(stream *streamproto.SessionStream, term *terminal.Terminal) {
-	events := term.Subscribe()
-
+func handleResizeEvents(ctx context.Context, stream *streamproto.SessionStream, term *terminal.Terminal) {
+	streamResizes := stream.ResizeQueue()
+	terminalResizes := term.Subscribe()
+	defer stream.Close()
 	for {
-		event, more := <-events
-		_, ok := event.(terminal.ResizeEvent)
-		if ok {
-			w, h, err := term.Size()
-			if err != nil {
-				fmt.Printf("Error attempting to fetch terminal size: %v\n\r", err)
+		select {
+		case <-ctx.Done():
+			return
+		case size, more := <-streamResizes:
+			if !more {
+				return
 			}
-
-			size := remotecommand.TerminalSize{Width: uint16(w), Height: uint16(h)}
-			err = stream.Resize(&size)
-			if err != nil {
+			if size == nil {
+				continue
+			}
+			if err := term.Resize(int16(size.Width), int16(size.Height)); err != nil {
 				fmt.Printf("Error attempting to resize terminal: %v\n\r", err)
 			}
-		}
+		case event, more := <-terminalResizes:
+			if !more {
+				return
+			}
+			_, ok := event.(terminal.ResizeEvent)
+			if ok {
+				w, h, err := term.Size()
+				if err != nil {
+					fmt.Printf("Error attempting to fetch terminal size: %v\n\r", err)
+				}
 
-		if !more {
-			break
+				size := remotecommand.TerminalSize{Width: uint16(w), Height: uint16(h)}
+				if err := stream.Resize(&size); err != nil {
+					fmt.Printf("Error attempting to resize terminal: %v\n\r", err)
+				}
+			}
 		}
 	}
 }
 
-func (s *KubeSession) handleMFA(ctx context.Context, tc *TeleportClient, mode types.SessionParticipantMode, stdout io.Writer) error {
+func (s *KubeSession) handleMFA(ctx context.Context, authFn func(context.Context) (authclient.ClientI, error), ceremony *mfa.Ceremony, mode types.SessionParticipantMode, stdout io.Writer) error {
 	if s.stream.MFARequired && mode == types.SessionModeratorMode {
-		proxy, err := tc.ConnectToProxy(ctx)
+		auth, err := authFn(ctx)
 		if err != nil {
 			return trace.Wrap(err)
 		}
 
-		auth, err := proxy.ConnectToCluster(ctx, s.meta.GetClusterName())
-		if err != nil {
-			return trace.Wrap(err)
-		}
-
-		go runPresenceTask(ctx, stdout, auth, tc, s.meta.GetSessionID())
+		go func() {
+			defer auth.Close()
+			if err := RunDefaultPresenceTask(ctx, stdout, auth, s.meta.GetSessionID(), ceremony); err != nil {
+				slog.DebugContext(ctx, "Presence check terminated unexpectedly", "error", err)
+			}
+		}()
 	}
 
 	return nil
 }
 
 // pipeInOut starts background tasks that copy input to and from the terminal.
-func (s *KubeSession) pipeInOut(stdout io.Writer, enableEscapeSequences bool, mode types.SessionParticipantMode) {
+func (s *KubeSession) pipeInOut(ctx context.Context, stdout io.Writer, enableEscapeSequences bool, mode types.SessionParticipantMode) {
+	// wait for the session to copy everything
+	s.wg.Add(1)
 	go func() {
-		defer s.cancel()
-		_, err := io.Copy(stdout, s.stream)
-		if err != nil {
+		defer func() {
+			s.wg.Done()
+			s.cancel()
+		}()
+		if _, err := io.Copy(stdout, s.stream); err != nil {
 			fmt.Printf("Error while reading remote stream: %v\n\r", err.Error())
 		}
 	}()
@@ -192,9 +247,8 @@ func (s *KubeSession) pipeInOut(stdout io.Writer, enableEscapeSequences bool, mo
 			handlePeerControls(s.term, enableEscapeSequences, s.stream)
 		default:
 			handleNonPeerControls(mode, s.term, func() {
-				err := s.stream.ForceTerminate()
-				if err != nil {
-					log.Debugf("Error sending force termination request: %v", err)
+				if err := s.stream.ForceTerminate(); err != nil {
+					log.DebugContext(ctx, "Error sending force termination request", "error", err)
 					fmt.Print("\n\rError while sending force termination request\n\r")
 				}
 			})
@@ -204,7 +258,8 @@ func (s *KubeSession) pipeInOut(stdout io.Writer, enableEscapeSequences bool, mo
 
 // Wait waits for the session to finish.
 func (s *KubeSession) Wait() {
-	<-s.ctx.Done()
+	// Wait for the session to copy everything into stdout
+	s.wg.Wait()
 }
 
 // Close sends a close request to the other end and waits it to gracefully terminate the connection.
@@ -213,7 +268,7 @@ func (s *KubeSession) Close() error {
 		return trace.Wrap(err)
 	}
 
-	<-s.ctx.Done()
+	s.wg.Wait()
 	return trace.Wrap(s.Detach())
 }
 

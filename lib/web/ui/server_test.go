@@ -1,29 +1,38 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package ui
 
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	apidefaults "github.com/gravitational/teleport/api/defaults"
+	headerv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/header/v1"
+	linuxdesktopv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/linuxdesktop/v1"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/componentfeatures"
+	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/ui"
+	"github.com/gravitational/teleport/lib/utils/set"
 )
 
 func TestStripProtocolAndPort(t *testing.T) {
@@ -311,7 +320,8 @@ func TestGetAllowedKubeUsersAndGroupsForCluster(t *testing.T) {
 	}
 	for _, tc := range tt[:1] {
 		t.Run(tc.name, func(t *testing.T) {
-			users, groups := getAllowedKubeUsersAndGroupsForCluster(tc.roleSet, tc.cluster)
+			accessChecker := services.NewAccessCheckerWithRoleSet(&services.AccessInfo{}, "clustername", tc.roleSet)
+			users, groups := getAllowedKubeUsersAndGroupsForCluster(accessChecker, tc.cluster)
 			require.Equal(t, tc.expectedUsers, users)
 			require.Equal(t, tc.expectedGroups, groups)
 		})
@@ -335,7 +345,7 @@ func TestMakeClusterHiddenLabels(t *testing.T) {
 	type testCase struct {
 		name           string
 		clusters       []types.KubeCluster
-		expectedLabels [][]Label
+		expectedLabels [][]ui.Label
 		roleSet        services.RoleSet
 	}
 
@@ -348,7 +358,7 @@ func TestMakeClusterHiddenLabels(t *testing.T) {
 					"label2":                 "value2",
 				}),
 			},
-			expectedLabels: [][]Label{
+			expectedLabels: [][]ui.Label{
 				{
 					{
 						Name:  "label2",
@@ -361,7 +371,8 @@ func TestMakeClusterHiddenLabels(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			clusters := MakeKubeClusters(tc.clusters, tc.roleSet)
+			accessChecker := services.NewAccessCheckerWithRoleSet(&services.AccessInfo{}, "clusterName", tc.roleSet)
+			clusters := MakeKubeClusters(tc.clusters, accessChecker)
 			for i, cluster := range clusters {
 				require.Equal(t, tc.expectedLabels[i], cluster.Labels)
 			}
@@ -374,8 +385,7 @@ func TestMakeServersHiddenLabels(t *testing.T) {
 		name           string
 		clusterName    string
 		servers        []types.Server
-		expectedLabels [][]Label
-		roleSet        services.RoleSet
+		expectedLabels [][]ui.Label
 	}
 
 	testCases := []testCase{
@@ -388,7 +398,7 @@ func TestMakeServersHiddenLabels(t *testing.T) {
 					"teleport.internal/app": "app1",
 				}),
 			},
-			expectedLabels: [][]Label{
+			expectedLabels: [][]ui.Label{
 				{
 					{
 						Name:  "simple",
@@ -401,10 +411,9 @@ func TestMakeServersHiddenLabels(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			servers, err := MakeServers(tc.clusterName, tc.servers, tc.roleSet)
-			require.NoError(t, err)
-			for i, server := range servers {
-				require.Equal(t, tc.expectedLabels[i], server.Labels)
+			for i, srv := range tc.servers {
+				server := MakeServer(srv, MakeServerConfig{ClusterName: tc.clusterName, RequiresRequest: false})
+				assert.Equal(t, tc.expectedLabels[i], server.Labels)
 			}
 		})
 	}
@@ -427,9 +436,10 @@ func TestMakeDatabaseHiddenLabels(t *testing.T) {
 		},
 	}
 
-	outputDb := MakeDatabase(inputDb, nil, nil)
+	accessChecker := services.NewAccessCheckerWithRoleSet(&services.AccessInfo{}, "clusterName", nil)
+	outputDb := MakeDatabase(inputDb, accessChecker, &mockDatabaseInteractiveChecker{}, false)
 
-	require.Equal(t, []Label{
+	require.Equal(t, []ui.Label{
 		{
 			Name:  "label",
 			Value: "value1",
@@ -448,9 +458,8 @@ func TestMakeDesktopHiddenLabel(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	desktop, err := MakeDesktop(windowsDesktop, services.NewRoleSet())
-	require.NoError(t, err)
-	labels := []Label{
+	desktop := MakeWindowsDesktop(windowsDesktop, nil, false)
+	labels := []ui.Label{
 		{
 			Name:  "label3",
 			Value: "value2",
@@ -458,6 +467,133 @@ func TestMakeDesktopHiddenLabel(t *testing.T) {
 	}
 
 	require.Equal(t, labels, desktop.Labels)
+}
+
+func TestMakeLinuxDesktop(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		desktop         func(t *testing.T) *linuxdesktopv1.LinuxDesktop
+		logins          []string
+		requiresRequest bool
+		expected        Desktop
+	}{
+		{
+			name: "basic linux desktop",
+			desktop: func(t *testing.T) *linuxdesktopv1.LinuxDesktop {
+				return linuxdesktopv1.LinuxDesktop_builder{
+					Kind:    types.KindLinuxDesktop,
+					Version: types.V3,
+					Metadata: headerv1.Metadata_builder{
+						Name: "linux-desktop-1",
+						Labels: map[string]string{
+							"env":    "prod",
+							"region": "us-west",
+						},
+					}.Build(),
+					Spec: linuxdesktopv1.LinuxDesktopSpec_builder{
+						Addr:     "10.0.0.1:22",
+						Hostname: "linux-host-1",
+						ProxyIds: []string{"proxy-1"},
+					}.Build(),
+				}.Build()
+			},
+			logins:          []string{"ubuntu", "root"},
+			requiresRequest: false,
+			expected: Desktop{
+				Kind:   types.KindLinuxDesktop,
+				OS:     "linux",
+				Name:   "linux-host-1",
+				Addr:   "10.0.0.1:22",
+				HostID: "linux-desktop-1",
+				Labels: []ui.Label{
+					{Name: "env", Value: "prod"},
+					{Name: "region", Value: "us-west"},
+				},
+				Logins:          []string{"ubuntu", "root"},
+				RequiresRequest: false,
+			},
+		},
+		{
+			name: "linux desktop with internal labels filtered",
+			desktop: func(t *testing.T) *linuxdesktopv1.LinuxDesktop {
+				return linuxdesktopv1.LinuxDesktop_builder{
+					Kind:    types.KindLinuxDesktop,
+					Version: types.V3,
+					Metadata: headerv1.Metadata_builder{
+						Name: "linux-desktop-2",
+						Labels: map[string]string{
+							"teleport.internal/resource-id": "12345",
+							"teleport.hidden/secret":        "value",
+							"visible":                       "label",
+						},
+					}.Build(),
+					Spec: linuxdesktopv1.LinuxDesktopSpec_builder{
+						Addr:     "192.168.1.100:22",
+						Hostname: "linux-host-2",
+					}.Build(),
+				}.Build()
+			},
+			logins:          []string{"admin"},
+			requiresRequest: true,
+			expected: Desktop{
+				Kind:   types.KindLinuxDesktop,
+				OS:     "linux",
+				Name:   "linux-host-2",
+				Addr:   "192.168.1.100:22",
+				HostID: "linux-desktop-2",
+				Labels: []ui.Label{
+					{Name: "visible", Value: "label"},
+				},
+				Logins:          []string{"admin"},
+				RequiresRequest: true,
+			},
+		},
+		{
+			name: "linux desktop with no labels",
+			desktop: func(t *testing.T) *linuxdesktopv1.LinuxDesktop {
+				return linuxdesktopv1.LinuxDesktop_builder{
+					Kind:    types.KindLinuxDesktop,
+					Version: types.V3,
+					Metadata: headerv1.Metadata_builder{
+						Name: "linux-desktop-3",
+					}.Build(),
+					Spec: linuxdesktopv1.LinuxDesktopSpec_builder{
+						Addr:     "example.com:2222",
+						Hostname: "linux-host-3",
+					}.Build(),
+				}.Build()
+			},
+			logins:          nil,
+			requiresRequest: false,
+			expected: Desktop{
+				Kind:            types.KindLinuxDesktop,
+				OS:              "linux",
+				Name:            "linux-host-3",
+				Addr:            "example.com:2222",
+				HostID:          "linux-desktop-3",
+				Labels:          []ui.Label{},
+				Logins:          nil,
+				RequiresRequest: false,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			desktop := MakeLinuxDesktop(tt.desktop(t), tt.logins, tt.requiresRequest)
+
+			require.Equal(t, tt.expected.Kind, desktop.Kind)
+			require.Equal(t, tt.expected.OS, desktop.OS)
+			require.Equal(t, tt.expected.Name, desktop.Name)
+			require.Equal(t, tt.expected.Addr, desktop.Addr)
+			require.Equal(t, tt.expected.HostID, desktop.HostID)
+			require.Equal(t, tt.expected.Logins, desktop.Logins)
+			require.Equal(t, tt.expected.RequiresRequest, desktop.RequiresRequest)
+			require.ElementsMatch(t, tt.expected.Labels, desktop.Labels)
+		})
+	}
 }
 
 func TestMakeDesktopServiceHiddenLabel(t *testing.T) {
@@ -473,7 +609,7 @@ func TestMakeDesktopServiceHiddenLabel(t *testing.T) {
 	}
 
 	desktopService := MakeDesktopService(windowsDesktopService)
-	labels := []Label{
+	labels := []ui.Label{
 		{
 			Name:  "label3",
 			Value: "value2",
@@ -481,4 +617,391 @@ func TestMakeDesktopServiceHiddenLabel(t *testing.T) {
 	}
 
 	require.Equal(t, labels, desktopService.Labels)
+}
+
+func TestSortedLabels(t *testing.T) {
+	type testCase struct {
+		name           string
+		clusterName    string
+		servers        []types.Server
+		expectedLabels [][]ui.Label
+	}
+
+	testCases := []testCase{
+		{
+			name:        "Server with aws labels pushed to back",
+			clusterName: "cluster1",
+			servers: []types.Server{
+				makeTestServer(t, "server1", map[string]string{
+					"teleport.dev/origin":   "config-file",
+					"aws/asdfasdf":          "hello",
+					"simple":                "value1",
+					"ultra-cool-label":      "value1",
+					"teleport.internal/app": "app1",
+				}),
+			},
+			expectedLabels: [][]ui.Label{
+				{
+					{
+						Name:  "simple",
+						Value: "value1",
+					},
+					{
+						Name:  "ultra-cool-label",
+						Value: "value1",
+					},
+					{
+						Name:  "teleport.dev/origin",
+						Value: "config-file",
+					},
+					{
+						Name:  "aws/asdfasdf",
+						Value: "hello",
+					},
+				},
+			},
+		},
+		{
+			name:        "database with azure labels pushed to back",
+			clusterName: "cluster1",
+			servers: []types.Server{
+				makeTestServer(t, "server1", map[string]string{
+					"azure/asdfasdf":        "hello",
+					"simple":                "value1",
+					"anotherone":            "value2",
+					"teleport.internal/app": "app1",
+				}),
+			},
+			expectedLabels: [][]ui.Label{
+				{
+					{
+						Name:  "anotherone",
+						Value: "value2",
+					},
+					{
+						Name:  "simple",
+						Value: "value1",
+					},
+					{
+						Name:  "azure/asdfasdf",
+						Value: "hello",
+					},
+				},
+			},
+		},
+		{
+			name:        "Server with gcp labels pushed to back",
+			clusterName: "cluster1",
+			servers: []types.Server{
+				makeTestServer(t, "server1", map[string]string{
+					"gcp/asdfasdf":          "hello",
+					"simple":                "value1",
+					"teleport.internal/app": "app1",
+				}),
+			},
+			expectedLabels: [][]ui.Label{
+				{
+					{
+						Name:  "simple",
+						Value: "value1",
+					},
+					{
+						Name:  "gcp/asdfasdf",
+						Value: "hello",
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			for i, srv := range tc.servers {
+				server := MakeServer(srv, MakeServerConfig{ClusterName: tc.clusterName, RequiresRequest: false})
+				assert.Equal(t, tc.expectedLabels[i], server.Labels)
+			}
+		})
+	}
+}
+
+func TestMakeServer_SSHLoginsGrantedVsRequestable(t *testing.T) {
+	t.Parallel()
+
+	srv, err := types.NewServer("test-node", types.KindNode, types.ServerSpecV2{
+		Hostname: "test-node",
+		Addr:     "1.2.3.4:22",
+	})
+	require.NoError(t, err)
+
+	allLogins := set.New("root", "ubuntu", "admin")
+	grantedLogins := set.New("ubuntu")
+
+	server := MakeServer(srv, MakeServerConfig{
+		ClusterName:       "cluster",
+		Logins:            &PrincipalSet{All: allLogins, Granted: grantedLogins},
+		RequiresRequest:   false,
+		SupportedFeatures: nil,
+	})
+
+	// SSHLogins should still contain all logins for backwards compatibility.
+	require.ElementsMatch(t, []string{"root", "ubuntu", "admin"}, server.SSHLogins)
+
+	// SSHLoginDetails should contain per-login metadata.
+	require.Len(t, server.SSHLoginDetails, 3)
+
+	loginMap := make(map[string]SSHLogin)
+	for _, l := range server.SSHLoginDetails {
+		loginMap[l.Login] = l
+	}
+	// ubuntu is granted, so RequiresRequest should be false.
+	assert.False(t, loginMap["ubuntu"].RequiresRequest)
+	// root and admin are not granted, so RequiresRequest should be true.
+	assert.True(t, loginMap["root"].RequiresRequest)
+	assert.True(t, loginMap["admin"].RequiresRequest)
+}
+
+func TestMakeServer_SupportedFeatureIDs(t *testing.T) {
+	t.Parallel()
+
+	srv, err := types.NewServer("test-node", types.KindNode, types.ServerSpecV2{
+		Hostname: "test-node",
+		Addr:     "1.2.3.4:22",
+	})
+	require.NoError(t, err)
+
+	t.Run("nil features yields empty SupportedFeatureIDs", func(t *testing.T) {
+		server := MakeServer(srv, MakeServerConfig{ClusterName: "cluster", RequiresRequest: false})
+		require.Empty(t, server.SupportedFeatureIDs)
+	})
+
+	t.Run("features are converted to SupportedFeatureIDs", func(t *testing.T) {
+		features := componentfeatures.New(componentfeatures.FeatureResourceConstraintsV1)
+		server := MakeServer(srv, MakeServerConfig{ClusterName: "cluster", RequiresRequest: false, SupportedFeatures: features})
+		require.ElementsMatch(t, features.GetFeatures(), server.SupportedFeatureIDs)
+	})
+}
+
+func TestMakeServer_AllLoginsRequireRequest(t *testing.T) {
+	t.Parallel()
+
+	srv, err := types.NewServer("test-node", types.KindNode, types.ServerSpecV2{
+		Hostname: "test-node",
+		Addr:     "1.2.3.4:22",
+	})
+	require.NoError(t, err)
+
+	allLogins := set.New("root", "ubuntu")
+	grantedLogins := set.New[string]() // empty: all logins require a request
+
+	server := MakeServer(srv, MakeServerConfig{
+		ClusterName:       "cluster",
+		RequiresRequest:   false,
+		Logins:            &PrincipalSet{All: allLogins, Granted: grantedLogins},
+		SupportedFeatures: nil,
+	})
+
+	require.ElementsMatch(t, []string{"root", "ubuntu"}, server.SSHLogins)
+	require.Len(t, server.SSHLoginDetails, 2)
+	for _, detail := range server.SSHLoginDetails {
+		assert.True(t, detail.RequiresRequest, "login %q should require request", detail.Login)
+	}
+}
+
+func TestMakeDatabaseSupportsInteractive(t *testing.T) {
+	db := &types.DatabaseV3{}
+	accessChecker := services.NewAccessCheckerWithRoleSet(&services.AccessInfo{}, "clusterName", nil)
+
+	for name, tc := range map[string]struct {
+		supports bool
+	}{
+		"supported":   {supports: true},
+		"unsupported": {supports: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			interactiveChecker := &mockDatabaseInteractiveChecker{supports: tc.supports}
+			single := MakeDatabase(db, accessChecker, interactiveChecker, false)
+			require.Equal(t, tc.supports, single.SupportsInteractive)
+
+			multi := MakeDatabases([]*types.DatabaseV3{db}, accessChecker, interactiveChecker)
+			require.Len(t, multi, 1)
+			require.Equal(t, tc.supports, multi[0].SupportsInteractive)
+		})
+	}
+}
+
+func TestMakeDatabaseConnectOptions(t *testing.T) {
+	interactiveChecker := &mockDatabaseInteractiveChecker{}
+
+	for name, tc := range map[string]struct {
+		roles        services.RoleSet
+		db           *types.DatabaseV3
+		assertResult require.ValueAssertionFunc
+		username     string
+	}{
+		"names wildcard": {
+			db: makeTestDatabase(t, map[string]string{"env": "dev"}, false),
+			roles: services.NewRoleSet(&types.RoleV6{
+				Spec: types.RoleSpecV6{
+					Allow: types.RoleConditions{
+						Namespaces:     []string{apidefaults.Namespace},
+						DatabaseLabels: types.Labels{"*": []string{"*"}},
+						DatabaseNames:  []string{"*", "mydatabase"},
+					},
+				},
+			}),
+			assertResult: func(t require.TestingT, v any, _ ...any) {
+				db, _ := v.(Database)
+				require.ElementsMatch(t, []string{"*", "mydatabase"}, db.DatabaseNames)
+			},
+		},
+		"users wildcard": {
+			db: makeTestDatabase(t, map[string]string{"env": "dev"}, false),
+			roles: services.NewRoleSet(&types.RoleV6{
+				Spec: types.RoleSpecV6{
+					Allow: types.RoleConditions{
+						Namespaces:     []string{apidefaults.Namespace},
+						DatabaseLabels: types.Labels{"*": []string{"*"}},
+						DatabaseUsers:  []string{"*", "myuser"},
+					},
+				},
+			}),
+			assertResult: func(t require.TestingT, v any, _ ...any) {
+				db, _ := v.(Database)
+				require.ElementsMatch(t, []string{"*", "myuser"}, db.DatabaseUsers)
+			},
+		},
+		"roles wildcard": {
+			db: makeTestDatabase(t, map[string]string{"env": "dev"}, false),
+			roles: services.NewRoleSet(&types.RoleV6{
+				Spec: types.RoleSpecV6{
+					Allow: types.RoleConditions{
+						Namespaces:     []string{apidefaults.Namespace},
+						DatabaseLabels: types.Labels{"*": []string{"*"}},
+						DatabaseRoles:  []string{"*", "myrole"},
+					},
+					Options: types.RoleOptions{
+						CreateDatabaseUserMode: types.CreateDatabaseUserMode_DB_USER_MODE_BEST_EFFORT_DROP,
+					},
+				},
+			}),
+			assertResult: func(t require.TestingT, v any, _ ...any) {
+				db, _ := v.(Database)
+				require.ElementsMatch(t, []string{"*", "myrole"}, db.DatabaseRoles)
+			},
+		},
+		"only wildcards": {
+			db: makeTestDatabase(t, map[string]string{"env": "dev"}, false),
+			roles: services.NewRoleSet(&types.RoleV6{
+				Spec: types.RoleSpecV6{
+					Allow: types.RoleConditions{
+						Namespaces:     []string{apidefaults.Namespace},
+						DatabaseLabels: types.Labels{"*": []string{"*"}},
+						DatabaseNames:  []string{"*"},
+						DatabaseUsers:  []string{"*"},
+						DatabaseRoles:  []string{"*"},
+					},
+					Options: types.RoleOptions{
+						CreateDatabaseUserMode: types.CreateDatabaseUserMode_DB_USER_MODE_BEST_EFFORT_DROP,
+					},
+				},
+			}),
+			assertResult: func(t require.TestingT, v any, _ ...any) {
+				db, _ := v.(Database)
+				require.ElementsMatch(t, []string{"*"}, db.DatabaseNames)
+				require.ElementsMatch(t, []string{"*"}, db.DatabaseUsers)
+				require.ElementsMatch(t, []string{"*"}, db.DatabaseRoles)
+			},
+		},
+		"auto-user provisioning enabled": {
+			db:       makeTestDatabase(t, map[string]string{"env": "dev"}, true),
+			username: "alice",
+			roles: services.NewRoleSet(&types.RoleV6{
+				Spec: types.RoleSpecV6{
+					Allow: types.RoleConditions{
+						Namespaces:     []string{apidefaults.Namespace},
+						DatabaseLabels: types.Labels{"*": []string{"*"}},
+						DatabaseUsers:  []string{"otheruser"},
+						DatabaseRoles:  []string{"myrole"},
+					},
+					Options: types.RoleOptions{
+						CreateDatabaseUserMode: types.CreateDatabaseUserMode_DB_USER_MODE_BEST_EFFORT_DROP,
+					},
+				},
+			}),
+			assertResult: func(t require.TestingT, v any, _ ...any) {
+				db, _ := v.(Database)
+				require.True(t, db.AutoUsersEnabled)
+				require.ElementsMatch(t, []string{"alice"}, db.DatabaseUsers)
+				require.ElementsMatch(t, []string{"myrole"}, db.DatabaseRoles)
+			},
+		},
+		"auto-user provisioning at database but disabled on role": {
+			db:       makeTestDatabase(t, map[string]string{"env": "dev"}, true),
+			username: "alice",
+			roles: services.NewRoleSet(&types.RoleV6{
+				Spec: types.RoleSpecV6{
+					Allow: types.RoleConditions{
+						Namespaces:     []string{apidefaults.Namespace},
+						DatabaseLabels: types.Labels{"*": []string{"*"}},
+						DatabaseUsers:  []string{"*", "myuser"},
+					},
+					Options: types.RoleOptions{
+						CreateDatabaseUserMode: types.CreateDatabaseUserMode_DB_USER_MODE_OFF,
+					},
+				},
+			}),
+			assertResult: func(t require.TestingT, v any, _ ...any) {
+				db, _ := v.(Database)
+				require.False(t, db.AutoUsersEnabled)
+				require.ElementsMatch(t, []string{"*", "myuser"}, db.DatabaseUsers)
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			accessChecker := services.NewAccessCheckerWithRoleSet(&services.AccessInfo{Username: tc.username}, "clusterName", tc.roles)
+			single := MakeDatabase(tc.db, accessChecker, interactiveChecker, false)
+			tc.assertResult(t, single)
+
+			multi := MakeDatabases([]*types.DatabaseV3{tc.db}, accessChecker, interactiveChecker)
+			require.Len(t, multi, 1)
+			tc.assertResult(t, multi[0])
+		})
+	}
+}
+
+// makeTestDatabase creates a database with labels and admin options.
+func makeTestDatabase(t *testing.T, labels map[string]string, autoProvisioningEnabled bool) *types.DatabaseV3 {
+	t.Helper()
+
+	spec := types.DatabaseSpecV3{
+		Protocol: defaults.ProtocolPostgres,
+		URI:      "localhost:5432",
+	}
+	if autoProvisioningEnabled {
+		spec.AdminUser = &types.DatabaseAdminUser{
+			Name:            "teleport-admin",
+			DefaultDatabase: "teleport",
+		}
+	}
+
+	db, err := types.NewDatabaseV3(
+		types.Metadata{
+			Name:   "db",
+			Labels: labels,
+		}, spec,
+	)
+	require.NoError(t, err)
+	if autoProvisioningEnabled {
+		require.True(t, db.IsAutoUsersEnabled(), "The database was expected to have auto-users enabled but it isn't. Check if the auto-users enabled definition changed and update this helper to match it.")
+	}
+
+	return db
+}
+
+type mockDatabaseInteractiveChecker struct {
+	supports bool
+}
+
+func (m *mockDatabaseInteractiveChecker) IsSupported(_ string) bool {
+	return m.supports
 }

@@ -1,46 +1,41 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { useState } from 'react';
+import 'react-day-picker/style.css';
+import styled from 'styled-components';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React, { useState } from 'react';
-import { components } from 'react-select';
-import 'react-day-picker/lib/style.css';
-import { Text } from 'design';
+import { Box, ButtonBorder, Text } from 'design';
+import { displayDate } from 'design/datetime';
 import Dialog from 'design/DialogConfirmation';
-import { displayDate } from 'shared/services/loc';
+import { Calendar } from 'design/Icon';
+import { useRefClickOutside } from 'shared/hooks/useRefClickOutside';
 
-import Select, { Option, DarkStyledSelect } from 'shared/components/Select';
-
-import { State } from 'teleport/Audit/useAuditEvents';
-
-import CustomRange from './Custom';
+import { CustomRange } from './Custom';
 import { EventRange } from './utils';
 
-export default function DataRange({ ml, range, onChangeRange, ranges }: Props) {
+export default function DateRange({ ml, range, onChangeRange }: Props) {
   const [isPickerOpen, openDayPicker] = useState(false);
-  const [rangeOptions] = useState(() =>
-    ranges.map(range => ({ value: range, label: range.name }))
-  );
 
-  function handleOnChange(option: Option<EventRange>) {
-    if (option.value.isCustom) {
-      openDayPicker(true);
-    } else {
-      onChangeRange(option.value);
-    }
-  }
+  const dayPickerRef = useRefClickOutside<HTMLDivElement>({
+    open: isPickerOpen,
+    setOpen: openDayPicker,
+  });
 
   function onClosePicker() {
     openDayPicker(false);
@@ -53,15 +48,16 @@ export default function DataRange({ ml, range, onChangeRange, ranges }: Props) {
 
   return (
     <>
-      <DarkStyledSelect ml={ml} width="210px">
-        <Select
-          isSearchable={false}
-          components={{ ValueContainer }}
-          options={rangeOptions}
-          onChange={handleOnChange}
-          value={{ value: range, label: range.name }}
-        />
-      </DarkStyledSelect>
+      <Box ml={ml}>
+        <DateRangeButton onClick={() => openDayPicker(true)}>
+          <Calendar size={16} mr={2} />
+          {range ? (
+            <Text>{`${displayDate(range.from)} - ${displayDate(range.to)}`}</Text>
+          ) : (
+            <Text color="text.muted">Select date range...</Text>
+          )}
+        </DateRangeButton>
+      </Box>
       <Dialog
         dialogCss={() => ({ padding: '0' })}
         disableEscapeKeyDown={false}
@@ -69,38 +65,29 @@ export default function DataRange({ ml, range, onChangeRange, ranges }: Props) {
         open={isPickerOpen}
       >
         <CustomRange
-          from={range.from}
-          to={range.to}
+          initialRange={
+            range
+              ? { from: range.from, to: range.to }
+              : { from: new Date(), to: new Date() }
+          }
           onChange={onSetCustomRange}
-          onClosePicker={onClosePicker}
+          ref={dayPickerRef}
         />
       </Dialog>
     </>
   );
 }
 
-const ValueContainer = ({ children, ...props }) => {
-  const { isCustom, from, to } = props.getValue()[0].value;
-
-  if (isCustom) {
-    return (
-      <components.ValueContainer {...props}>
-        <Text color="text.primary">
-          {`${displayDate(from)} - ${displayDate(to)}`}
-        </Text>
-        {children}
-      </components.ValueContainer>
-    );
-  }
-
-  return (
-    <components.ValueContainer {...props}>{children}</components.ValueContainer>
-  );
-};
+const DateRangeButton = styled(ButtonBorder)`
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  min-width: 240px;
+  padding: 8px 12px;
+`;
 
 type Props = {
   ml?: string | number;
-  range: State['range'];
-  onChangeRange: State['setRange'];
-  ranges: State['rangeOptions'];
+  range: EventRange | undefined;
+  onChangeRange: (range: EventRange) => void;
 };

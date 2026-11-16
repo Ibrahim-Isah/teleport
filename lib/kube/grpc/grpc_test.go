@@ -1,28 +1,34 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package kubev1
 
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"log/slog"
 	"net"
+	"slices"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -33,18 +39,24 @@ import (
 	proto "github.com/gravitational/teleport/api/gen/proto/go/teleport/kube/v1"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth"
-	kubeproxy "github.com/gravitational/teleport/lib/kube/proxy"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/auth/authtest"
+	"github.com/gravitational/teleport/lib/authz"
 	testingkubemock "github.com/gravitational/teleport/lib/kube/proxy/testing/kube_server"
 	"github.com/gravitational/teleport/lib/limiter"
+	"github.com/gravitational/teleport/lib/modules"
 )
 
 func TestListKubernetesResources(t *testing.T) {
+	modules.SetInsecureTestMode(true)
 	var (
-		usernameWithFullAccess = "full_user"
-		usernameNoAccess       = "limited_user"
-		kubeCluster            = "test_cluster"
-		kubeUsers              = []string{"kube_user"}
-		kubeGroups             = []string{"kube_user"}
+		usernameWithFullAccess                = "full_user"
+		usernameNoAccess                      = "limited_user"
+		usernameWithEnforceKubePodOrNamespace = "request_kind_enforce_pod_user"
+		usernameWithEnforceKubeSecret         = "request_kind_enforce_secret_user"
+		kubeCluster                           = "test_cluster"
+		kubeUsers                             = []string{"kube_user"}
+		kubeGroups                            = []string{"kube_user"}
 	)
 	// kubeMock is a Kubernetes API mock for the session tests.
 	// Once a new session is created, this mock will write to
@@ -55,11 +67,11 @@ func TestListKubernetesResources(t *testing.T) {
 	t.Cleanup(func() { kubeMock.Close() })
 
 	// creates a Kubernetes service with a configured cluster pointing to mock api server
-	testCtx := kubeproxy.SetupTestContext(
+	testCtx := SetupTestContext(
 		context.Background(),
 		t,
-		kubeproxy.TestConfig{
-			Clusters: []kubeproxy.KubeClusterConfig{{Name: kubeCluster, APIEndpoint: kubeMock.URL}},
+		TestConfig{
+			Clusters: []KubeClusterConfig{{Name: kubeCluster, APIEndpoint: kubeMock.URL}},
 		},
 	)
 	// close tests
@@ -73,10 +85,64 @@ func TestListKubernetesResources(t *testing.T) {
 		testCtx.Context,
 		t,
 		usernameWithFullAccess,
-		kubeproxy.RoleSpec{
+		RoleSpec{
 			Name:       usernameWithFullAccess,
 			KubeUsers:  kubeUsers,
 			KubeGroups: kubeGroups,
+			SetupRoleFunc: func(r types.Role) {
+				// override the role to allow access to all kube resources.
+				r.SetKubeResources(
+					types.Allow,
+					[]types.KubernetesResource{
+						{
+							Kind:      types.Wildcard,
+							Name:      types.Wildcard,
+							Namespace: types.Wildcard,
+							Verbs:     []string{types.Wildcard},
+							APIGroup:  types.Wildcard,
+						},
+					},
+				)
+			},
+		},
+	)
+
+	userWithEnforceKubePodOrNamespace, _ := testCtx.CreateUserAndRole(
+		testCtx.Context,
+		t,
+		usernameWithEnforceKubePodOrNamespace,
+		RoleSpec{
+			Name:       usernameWithEnforceKubePodOrNamespace,
+			KubeUsers:  kubeUsers,
+			KubeGroups: kubeGroups,
+			SetupRoleFunc: func(role types.Role) {
+				// override the role to deny access to all kube resources.
+				role.SetKubernetesLabels(types.Allow, nil)
+				// set the role to allow searching as fullAccessRole.
+				role.SetSearchAsRoles(types.Allow, []string{fullAccessRole.GetName()})
+				// restrict querying to pods only
+				role.SetRequestKubernetesResources(types.Allow, []types.RequestKubernetesResource{{Kind: "namespaces"}, {Kind: "pods"}})
+			},
+		},
+	)
+
+	userWithEnforceKubeSecret, _ := testCtx.CreateUserAndRole(
+		testCtx.Context,
+		t,
+		usernameWithEnforceKubeSecret,
+		RoleSpec{
+			Name:       usernameWithEnforceKubeSecret,
+			KubeUsers:  kubeUsers,
+			KubeGroups: kubeGroups,
+			SetupRoleFunc: func(role types.Role) {
+				// override the role to deny access to all kube resources.
+				role.SetKubernetesLabels(types.Allow, nil)
+				// set the role to allow searching as fullAccessRole.
+				role.SetSearchAsRoles(types.Allow, []string{fullAccessRole.GetName()})
+				// restrict querying to secrets only
+				role.SetRequestKubernetesResources(types.Allow, []types.RequestKubernetesResource{{Kind: "secrets"}})
+
+			},
 		},
 	)
 
@@ -84,7 +150,7 @@ func TestListKubernetesResources(t *testing.T) {
 		testCtx.Context,
 		t,
 		usernameNoAccess,
-		kubeproxy.RoleSpec{
+		RoleSpec{
 			Name:       usernameNoAccess,
 			KubeUsers:  kubeUsers,
 			KubeGroups: kubeGroups,
@@ -99,6 +165,7 @@ func TestListKubernetesResources(t *testing.T) {
 	type args struct {
 		user           types.User
 		searchAsRoles  bool
+		resourceKind   string
 		namespace      string
 		searchKeywords []string
 		sortBy         *types.SortBy
@@ -115,8 +182,9 @@ func TestListKubernetesResources(t *testing.T) {
 			args: args{
 				user:          userWithFullAccess,
 				searchAsRoles: false,
+				resourceKind:  types.KindKubePod,
 			},
-			want: &proto.ListKubernetesResourcesResponse{
+			want: proto.ListKubernetesResourcesResponse_builder{
 				Resources: []*types.KubernetesResourceV1{
 					{
 						Kind:    "pod",
@@ -174,7 +242,7 @@ func TestListKubernetesResources(t *testing.T) {
 						},
 					},
 				},
-			},
+			}.Build(),
 			assertErr: require.NoError,
 		},
 		{
@@ -183,8 +251,9 @@ func TestListKubernetesResources(t *testing.T) {
 				user:          userWithFullAccess,
 				searchAsRoles: false,
 				namespace:     "dev",
+				resourceKind:  types.KindKubePod,
 			},
-			want: &proto.ListKubernetesResourcesResponse{
+			want: proto.ListKubernetesResourcesResponse_builder{
 				Resources: []*types.KubernetesResourceV1{
 					{
 						Kind: "pod",
@@ -205,7 +274,7 @@ func TestListKubernetesResources(t *testing.T) {
 						},
 					},
 				},
-			},
+			}.Build(),
 			assertErr: require.NoError,
 		},
 		{
@@ -214,6 +283,7 @@ func TestListKubernetesResources(t *testing.T) {
 				user:          userNoAccess,
 				searchAsRoles: false,
 				namespace:     "dev",
+				resourceKind:  types.KindKubePod,
 			},
 			assertErr: require.Error,
 		},
@@ -223,8 +293,9 @@ func TestListKubernetesResources(t *testing.T) {
 				user:          userNoAccess,
 				searchAsRoles: true,
 				namespace:     "dev",
+				resourceKind:  types.KindKubePod,
 			},
-			want: &proto.ListKubernetesResourcesResponse{
+			want: proto.ListKubernetesResourcesResponse_builder{
 				Resources: []*types.KubernetesResourceV1{
 					{
 						Kind: "pod",
@@ -245,7 +316,7 @@ func TestListKubernetesResources(t *testing.T) {
 						},
 					},
 				},
-			},
+			}.Build(),
 			assertErr: require.NoError,
 		},
 		{
@@ -255,8 +326,9 @@ func TestListKubernetesResources(t *testing.T) {
 				searchAsRoles:  true,
 				namespace:      "dev",
 				searchKeywords: []string{"nginx-1"},
+				resourceKind:   types.KindKubePod,
 			},
-			want: &proto.ListKubernetesResourcesResponse{
+			want: proto.ListKubernetesResourcesResponse_builder{
 				Resources: []*types.KubernetesResourceV1{
 					{
 						Kind: "pod",
@@ -268,7 +340,7 @@ func TestListKubernetesResources(t *testing.T) {
 						},
 					},
 				},
-			},
+			}.Build(),
 			assertErr: require.NoError,
 		},
 		{
@@ -281,8 +353,9 @@ func TestListKubernetesResources(t *testing.T) {
 					Field:  "name",
 					IsDesc: true,
 				},
+				resourceKind: types.KindKubePod,
 			},
-			want: &proto.ListKubernetesResourcesResponse{
+			want: proto.ListKubernetesResourcesResponse_builder{
 				TotalCount: 2,
 				Resources: []*types.KubernetesResourceV1{
 					{
@@ -304,7 +377,7 @@ func TestListKubernetesResources(t *testing.T) {
 						},
 					},
 				},
-			},
+			}.Build(),
 			assertErr: require.NoError,
 		},
 		{
@@ -317,9 +390,10 @@ func TestListKubernetesResources(t *testing.T) {
 					Field:  "name",
 					IsDesc: true,
 				},
-				startKey: "nginx-1",
+				startKey:     "nginx-1",
+				resourceKind: types.KindKubePod,
 			},
-			want: &proto.ListKubernetesResourcesResponse{
+			want: proto.ListKubernetesResourcesResponse_builder{
 				TotalCount: 2,
 				Resources: []*types.KubernetesResourceV1{
 					{
@@ -332,12 +406,195 @@ func TestListKubernetesResources(t *testing.T) {
 						},
 					},
 				},
+			}.Build(),
+			assertErr: require.NoError,
+		},
+		{
+			name: "user with no access, deny listing dev pod, with role that enforces secret",
+			args: args{
+				user:          userWithEnforceKubeSecret,
+				searchAsRoles: true,
+				namespace:     "dev",
+				resourceKind:  types.KindKubePod,
 			},
+			assertErr: require.Error,
+		},
+		{
+			name: "user with no access, allow listing dev secret, with role that enforces secret",
+			args: args{
+				user:          userWithEnforceKubeSecret,
+				searchAsRoles: true,
+				namespace:     "dev",
+				resourceKind:  types.KindKubeSecret,
+			},
+			want: proto.ListKubernetesResourcesResponse_builder{
+				Resources: []*types.KubernetesResourceV1{
+					{
+						Kind:    types.KindKubeSecret,
+						Version: "v1",
+						Metadata: types.Metadata{
+							Name: "secret-1",
+						},
+						Spec: types.KubernetesResourceSpecV1{
+							Namespace: "dev",
+						},
+					},
+					{
+						Kind:    types.KindKubeSecret,
+						Version: "v1",
+						Metadata: types.Metadata{
+							Name: "secret-2",
+						},
+						Spec: types.KubernetesResourceSpecV1{
+							Namespace: "dev",
+						},
+					},
+				},
+			}.Build(),
+			assertErr: require.NoError,
+		},
+		{
+			name: "user with no access, allow listing dev pod, with role that enforces namespace or pods",
+			args: args{
+				user:          userWithEnforceKubePodOrNamespace,
+				searchAsRoles: true,
+				namespace:     "dev",
+				resourceKind:  types.KindKubePod,
+			},
+			want: proto.ListKubernetesResourcesResponse_builder{
+				Resources: []*types.KubernetesResourceV1{
+					{
+						Kind: "pod",
+						Metadata: types.Metadata{
+							Name: "nginx-1",
+						},
+						Spec: types.KubernetesResourceSpecV1{
+							Namespace: "dev",
+						},
+					},
+					{
+						Kind: "pod",
+						Metadata: types.Metadata{
+							Name: "nginx-2",
+						},
+						Spec: types.KubernetesResourceSpecV1{
+							Namespace: "dev",
+						},
+					},
+				},
+			}.Build(),
+			assertErr: require.NoError,
+		},
+		{
+			name: "user with full access and listing secrets in all namespaces",
+			args: args{
+				user:          userWithFullAccess,
+				searchAsRoles: false,
+				resourceKind:  types.KindKubeSecret,
+			},
+			want: proto.ListKubernetesResourcesResponse_builder{
+				Resources: []*types.KubernetesResourceV1{
+					{
+						Kind:    types.KindKubeSecret,
+						Version: "v1",
+						Metadata: types.Metadata{
+							Name:      "secret-1",
+							Namespace: "default",
+						},
+						Spec: types.KubernetesResourceSpecV1{
+							Namespace: "default",
+						},
+					},
+					{
+						Kind:    types.KindKubeSecret,
+						Version: "v1",
+						Metadata: types.Metadata{
+							Name:      "secret-2",
+							Namespace: "default",
+						},
+						Spec: types.KubernetesResourceSpecV1{
+							Namespace: "default",
+						},
+					},
+					{
+						Kind:    types.KindKubeSecret,
+						Version: "v1",
+						Metadata: types.Metadata{
+							Name:      "test",
+							Namespace: "default",
+						},
+						Spec: types.KubernetesResourceSpecV1{
+							Namespace: "default",
+						},
+					},
+					{
+						Kind:    types.KindKubeSecret,
+						Version: "v1",
+						Metadata: types.Metadata{
+							Name:      "secret-1",
+							Namespace: "default",
+						},
+						Spec: types.KubernetesResourceSpecV1{
+							Namespace: "dev",
+						},
+					},
+					{
+						Kind:    types.KindKubeSecret,
+						Version: "v1",
+						Metadata: types.Metadata{
+							Name:      "secret-2",
+							Namespace: "default",
+						},
+						Spec: types.KubernetesResourceSpecV1{
+							Namespace: "dev",
+						},
+					},
+				},
+			}.Build(),
+			assertErr: require.NoError,
+		},
+		{
+			name: "user with full access and listing cluster roles",
+			args: args{
+				user:          userWithFullAccess,
+				searchAsRoles: false,
+				resourceKind:  types.KindKubeClusterRole,
+			},
+			want: proto.ListKubernetesResourcesResponse_builder{
+				Resources: []*types.KubernetesResourceV1{
+					{
+						Kind:    types.KindKubeClusterRole,
+						Version: "v1",
+						Metadata: types.Metadata{
+							Name:      "cr-nginx-1",
+							Namespace: "default",
+						},
+						Spec: types.KubernetesResourceSpecV1{},
+					},
+					{
+						Kind:    types.KindKubeClusterRole,
+						Version: "v1",
+						Metadata: types.Metadata{
+							Name:      "cr-nginx-2",
+							Namespace: "default",
+						},
+						Spec: types.KubernetesResourceSpecV1{},
+					},
+					{
+						Kind:    types.KindKubeClusterRole,
+						Version: "v1",
+						Metadata: types.Metadata{
+							Name:      "cr-test",
+							Namespace: "default",
+						},
+						Spec: types.KubernetesResourceSpecV1{},
+					},
+				},
+			}.Build(),
 			assertErr: require.NoError,
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			_, restCfg := testCtx.GenTestKubeClientTLSCert(t, tt.args.user.GetName(), "")
@@ -348,8 +605,8 @@ func TestListKubernetesResources(t *testing.T) {
 
 			rsp, err := kubeClient.ListKubernetesResources(
 				context.Background(),
-				&proto.ListKubernetesResourcesRequest{
-					ResourceType:        types.KindKubePod,
+				proto.ListKubernetesResourcesRequest_builder{
+					ResourceType:        tt.args.resourceKind,
 					Limit:               100,
 					KubernetesCluster:   kubeCluster,
 					TeleportCluster:     testCtx.ClusterName,
@@ -358,13 +615,14 @@ func TestListKubernetesResources(t *testing.T) {
 					SearchKeywords:      tt.args.searchKeywords,
 					SortBy:              tt.args.sortBy,
 					StartKey:            tt.args.startKey,
-				},
+				}.Build(),
 			)
 			tt.assertErr(t, err)
 			if tt.want != nil {
-				for _, want := range tt.want.Resources {
+				for _, want := range tt.want.GetResources() {
+					isClusterWide := slices.Contains(types.KubernetesClusterWideResourceKinds, want.Kind)
 					// fill in defaults
-					err := want.CheckAndSetDefaults()
+					err := want.CheckAndSetDefaults(!isClusterWide)
 					require.NoError(t, err)
 				}
 			}
@@ -374,9 +632,9 @@ func TestListKubernetesResources(t *testing.T) {
 }
 
 // initGRPCServer creates a grpc server serving on the provided listener.
-func initGRPCServer(t *testing.T, testCtx *kubeproxy.TestContext, listener net.Listener) {
+func initGRPCServer(t *testing.T, testCtx *TestContext, listener net.Listener) {
 	clusterName := testCtx.ClusterName
-	serverIdentity, err := auth.NewServerIdentity(testCtx.AuthServer, testCtx.HostID, types.RoleProxy)
+	serverIdentity, err := authtest.NewServerIdentity(testCtx.AuthServer, testCtx.HostID, types.RoleProxy)
 	require.NoError(t, err)
 	tlsConfig, err := serverIdentity.TLSConfig(nil)
 	require.NoError(t, err)
@@ -386,12 +644,14 @@ func initGRPCServer(t *testing.T, testCtx *kubeproxy.TestContext, listener net.L
 	// adds authentication information to the context
 	// and passes it to the API server
 	authMiddleware := &auth.Middleware{
-		ClusterName:   clusterName,
-		Limiter:       limiter,
-		AcceptedUsage: []string{teleport.UsageKubeOnly},
+		Middleware: authz.Middleware{
+			ClusterName:   clusterName,
+			AcceptedUsage: []string{teleport.UsageKubeOnly},
+		},
+		Limiter: limiter,
 	}
 
-	tlsConf := copyAndConfigureTLS(tlsConfig, logrus.New(), testCtx.AuthClient, clusterName)
+	tlsConf := copyAndConfigureTLS(tlsConfig, testCtx.AuthClient, clusterName)
 	creds, err := auth.NewTransportCredentials(auth.TransportCredentialsConfig{
 		TransportCredentials: credentials.NewTLS(tlsConf),
 		UserGetter:           authMiddleware,
@@ -399,27 +659,33 @@ func initGRPCServer(t *testing.T, testCtx *kubeproxy.TestContext, listener net.L
 	require.NoError(t, err)
 
 	grpcServer := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(
-			authMiddleware.UnaryInterceptor(),
-		),
-		grpc.ChainStreamInterceptor(
-			authMiddleware.StreamInterceptor(),
-		),
+		grpc.ChainUnaryInterceptor(authMiddleware.UnaryInterceptors()...),
+		grpc.ChainStreamInterceptor(authMiddleware.StreamInterceptors()...),
 		grpc.Creds(creds),
 	)
 	t.Cleanup(grpcServer.GracefulStop)
 	// Auth client, lock watcher and authorizer for Kube proxy.
-	proxyAuthClient, err := testCtx.TLSServer.NewClient(auth.TestBuiltin(types.RoleProxy))
+	proxyAuthClient, err := testCtx.TLSServer.NewClient(authtest.TestBuiltin(types.RoleProxy))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, proxyAuthClient.Close()) })
 
+	proxyTLSConfig, err := serverIdentity.TLSConfig(nil)
+	require.NoError(t, err)
+	require.Len(t, proxyTLSConfig.Certificates, 1)
+	require.NotNil(t, proxyTLSConfig.RootCAs)
+
 	server, err := New(
 		Config{
-			ClusterName:   testCtx.ClusterName,
-			Signer:        proxyAuthClient,
+			ClusterName: testCtx.ClusterName,
+			GetConnTLSCertificate: func() (*tls.Certificate, error) {
+				return &proxyTLSConfig.Certificates[0], nil
+			},
+			GetConnTLSRoots: func() (*x509.CertPool, error) {
+				return proxyTLSConfig.RootCAs, nil
+			},
 			AccessPoint:   proxyAuthClient,
 			Emitter:       testCtx.Emitter,
-			KubeProxyAddr: testCtx.KubeServiceAddress(),
+			KubeProxyAddr: testCtx.KubeProxyAddress(),
 			Authz:         testCtx.Authz,
 		},
 	)
@@ -439,7 +705,7 @@ func initGRPCServer(t *testing.T, testCtx *kubeproxy.TestContext, listener net.L
 
 // copyAndConfigureTLS can be used to copy and modify an existing *tls.Config
 // for Teleport application proxy servers.
-func copyAndConfigureTLS(config *tls.Config, log logrus.FieldLogger, accessPoint auth.AccessCache, clusterName string) *tls.Config {
+func copyAndConfigureTLS(config *tls.Config, accessPoint authclient.AccessCache, clusterName string) *tls.Config {
 	tlsConfig := config.Clone()
 
 	// Require clients to present a certificate
@@ -449,7 +715,7 @@ func copyAndConfigureTLS(config *tls.Config, log logrus.FieldLogger, accessPoint
 	// client's certificate to verify the chain presented. If the client does not
 	// pass in the cluster name, this functions pulls back all CA to try and
 	// match the certificate presented against any CA.
-	tlsConfig.GetConfigForClient = auth.WithClusterCAs(tlsConfig.Clone(), accessPoint, clusterName, log)
+	tlsConfig.GetConfigForClient = authclient.WithClusterCAs(tlsConfig.Clone(), accessPoint, clusterName, slog.Default())
 
 	return tlsConfig
 }

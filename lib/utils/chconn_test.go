@@ -1,24 +1,24 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
 	"io"
 	"net"
 	"os"
@@ -28,8 +28,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/gravitational/teleport/api/constants"
+	apissh "github.com/gravitational/teleport/api/ssh"
 	"github.com/gravitational/teleport/api/utils/sshutils"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 )
 
 // TestChConn validates that reads from the channel connection can be
@@ -45,13 +46,19 @@ func TestChConn(t *testing.T) {
 
 	go startSSHServer(t, listener, sshConnCh)
 
-	client, err := ssh.Dial("tcp", listener.Addr().String(), &ssh.ClientConfig{
+	client, err := apissh.Dial(t.Context(), "tcp", listener.Addr().String(), apissh.ClientConfig{
+		User: "alice",
+		PublicKeyAuth: apissh.PublicKeyAuthConfig{
+			Signers: func() ([]ssh.Signer, error) {
+				return []ssh.Signer{mockSigner{}}, nil
+			},
+		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         time.Second,
 	})
 	require.NoError(t, err)
 
-	_, _, err = client.OpenChannel("test", []byte("hello ssh"))
+	_, _, err = client.OpenChannel(t.Context(), "test", []byte("hello ssh"))
 	require.NoError(t, err)
 
 	select {
@@ -89,13 +96,10 @@ func startSSHServer(t *testing.T, listener net.Listener, sshConnCh chan<- sshCon
 	require.NoError(t, err)
 	t.Cleanup(func() { nConn.Close() })
 
-	privateKey, err := rsa.GenerateKey(rand.Reader, constants.RSAKeySize)
+	privateKey, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.Ed25519)
 	require.NoError(t, err)
 
-	_, private, err := MarshalPrivateKey(privateKey)
-	require.NoError(t, err)
-
-	signer, err := ssh.ParsePrivateKey(private)
+	signer, err := ssh.NewSignerFromSigner(privateKey)
 	require.NoError(t, err)
 
 	config := &ssh.ServerConfig{NoClientAuth: true}
@@ -116,4 +120,8 @@ func startSSHServer(t *testing.T, listener net.Listener, sshConnCh chan<- sshCon
 			}
 		}
 	}()
+}
+
+type mockSigner struct {
+	ssh.Signer
 }

@@ -17,11 +17,14 @@ limitations under the License.
 package types
 
 import (
+	"iter"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/gravitational/trace"
-	"golang.org/x/exp/slices"
+
+	"github.com/gravitational/teleport/api/utils"
 )
 
 // SessionRecordingConfig defines session recording configuration. This is
@@ -40,6 +43,25 @@ type SessionRecordingConfig interface {
 
 	// SetProxyChecksHostKeys sets if the proxy will check host keys.
 	SetProxyChecksHostKeys(bool)
+
+	// GetEncrypted gets if session recordings should be encrypted or not.
+	GetEncrypted() bool
+
+	// GetEncryptionConfig gets the encryption config from the session recording config.
+	GetEncryptionConfig() *SessionRecordingEncryptionConfig
+
+	// GetEncryptionKeys gets the encryption keys for the session recording config.
+	GetEncryptionKeys() []*AgeEncryptionKey
+
+	// SetEncryptionKeys sets the encryption keys for the session recording config.
+	// It returns true if there was a change applied and false otherwise.
+	SetEncryptionKeys(iter.Seq[*AgeEncryptionKey]) bool
+
+	// Clone returns a copy of the resource.
+	Clone() SessionRecordingConfig
+
+	// CheckAndSetDefaults verifies the constraints for a SessionRecordingConfig
+	CheckAndSetDefaults() error
 }
 
 // NewSessionRecordingConfigFromConfigFile is a convenience method to create
@@ -103,14 +125,14 @@ func (c *SessionRecordingConfigV2) GetMetadata() Metadata {
 	return c.Metadata
 }
 
-// GetResourceID returns resource ID.
-func (c *SessionRecordingConfigV2) GetResourceID() int64 {
-	return c.Metadata.ID
+// GetRevision returns the revision
+func (c *SessionRecordingConfigV2) GetRevision() string {
+	return c.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID.
-func (c *SessionRecordingConfigV2) SetResourceID(id int64) {
-	c.Metadata.ID = id
+// SetRevision sets the revision
+func (c *SessionRecordingConfigV2) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // Origin returns the origin value of the resource.
@@ -156,6 +178,73 @@ func (c *SessionRecordingConfigV2) GetProxyChecksHostKeys() bool {
 // SetProxyChecksHostKeys sets if the proxy will check host keys.
 func (c *SessionRecordingConfigV2) SetProxyChecksHostKeys(t bool) {
 	c.Spec.ProxyChecksHostKeys = NewBoolOption(t)
+}
+
+// GetEncrypted gets if session recordings should be encrypted or not.
+func (c *SessionRecordingConfigV2) GetEncrypted() bool {
+	encryption := c.GetEncryptionConfig()
+	return encryption != nil && encryption.Enabled
+}
+
+// GetEncryptionConfig gets the encryption config from the session recording config.
+func (c *SessionRecordingConfigV2) GetEncryptionConfig() *SessionRecordingEncryptionConfig {
+	if c == nil {
+		return nil
+	}
+
+	return c.Spec.Encryption
+}
+
+// GetEncryptionKeys gets the encryption keys for the session recording config.
+func (c *SessionRecordingConfigV2) GetEncryptionKeys() []*AgeEncryptionKey {
+	if c.Status != nil {
+		return c.Status.EncryptionKeys
+	}
+
+	return nil
+}
+
+// SetEncryptionKeys sets the encryption keys for the session recording config.
+// It returns true if there was a change applied and false otherwise.
+func (c *SessionRecordingConfigV2) SetEncryptionKeys(keys iter.Seq[*AgeEncryptionKey]) bool {
+	existingKeys := make(map[string]struct{})
+	for _, key := range c.GetEncryptionKeys() {
+		existingKeys[string(key.PublicKey)] = struct{}{}
+	}
+
+	var keysChanged bool
+	var newKeys []*AgeEncryptionKey
+	addedKeys := make(map[string]struct{})
+	for key := range keys {
+		if !keysChanged {
+			if _, exists := existingKeys[string(key.PublicKey)]; !exists {
+				keysChanged = true
+			}
+		}
+
+		if _, added := addedKeys[string(key.PublicKey)]; !added {
+			addedKeys[string(key.PublicKey)] = struct{}{}
+			newKeys = append(newKeys, key)
+		}
+
+	}
+
+	shouldUpdate := len(addedKeys) > 0 && (keysChanged || len(existingKeys) != len(addedKeys))
+	if !shouldUpdate {
+		return false
+	}
+
+	if c.Status == nil {
+		c.Status = &SessionRecordingConfigStatus{}
+	}
+	c.Status.EncryptionKeys = newKeys
+
+	return true
+}
+
+// Clone returns a copy of the resource.
+func (c *SessionRecordingConfigV2) Clone() SessionRecordingConfig {
+	return utils.CloneProtoMsg(c)
 }
 
 // setStaticFields sets static resource header and metadata fields.

@@ -1,24 +1,31 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package responsewriters
 
 import (
+	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
+	"sync"
 
 	"github.com/gravitational/trace"
 	"golang.org/x/sync/errgroup"
@@ -30,8 +37,14 @@ import (
 )
 
 const (
-	ContentTypeHeader  = "Content-Type"
-	DefaultContentType = "application/json"
+	// DefaultContentTypeHeader is the default content type header used by the Kubernetes API
+	ContentTypeHeader = "Content-Type"
+	// JSONContentType is the JSON content type used by the Kubernetes API
+	JSONContentType = "application/json"
+	// YAMLContentType is the YAML content type used by the Kubernetes API
+	YAMLContentType = "application/yaml"
+	// DefaultContentType is the default content type used by the Kubernetes API
+	DefaultContentType = JSONContentType
 )
 
 // WatcherResponseWriter satisfies the http.ResponseWriter interface and
@@ -41,6 +54,8 @@ const (
 // If the user is not allowed, the event is ignored.
 // If allowed, the event is encoded into the user's response.
 type WatcherResponseWriter struct {
+	// mtx protects target and ensures writes happen sequentially.
+	mtx sync.Mutex
 	// target is the user response writer.
 	// everything written will be received by the user.
 	target http.ResponseWriter
@@ -58,6 +73,12 @@ type WatcherResponseWriter struct {
 	negotiator runtime.ClientNegotiator
 	// filter hold the filtering rules to filter events.
 	filter FilterWrapper
+	// evtsChan is used to send fake events to target connection.
+	evtsChan chan *watch.Event
+	// closeChanGuard guards the closeChan close call
+	closeChanGuard sync.Once
+	// closeChan indicates if the watcher as been closed.
+	closeChan chan struct{}
 }
 
 // NewWatcherResponseWriter creates a new WatcherResponseWriter.
@@ -76,6 +97,8 @@ func NewWatcherResponseWriter(
 		pipeWriter: writer,
 		negotiator: negotiator,
 		filter:     filter,
+		closeChan:  make(chan struct{}),
+		evtsChan:   make(chan *watch.Event, 10),
 	}, nil
 }
 
@@ -101,13 +124,26 @@ func (w *WatcherResponseWriter) Header() http.Header {
 	return w.target.Header()
 }
 
+// PushVirtualEventToClient pushes a Teleport generated event to the target connection.
+// It's consumed by a goroutine spawn by watchDecoder.
+func (w *WatcherResponseWriter) PushVirtualEventToClient(ctx context.Context, evt *watch.Event) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-w.closeChan:
+		return
+		// wait until we can push the evts
+	case w.evtsChan <- evt:
+	}
+}
+
 // WriteHeader writes the status code and headers into the target http.ResponseWriter
 // and spins a go-routine that will wait for events received in w.pipeReader
 // and analyze if they must be forwarded to target.
 func (w *WatcherResponseWriter) WriteHeader(code int) {
 	w.status = code
 	w.target.WriteHeader(code)
-	contentType := GetContentHeader(w.Header())
+	contentType := GetContentTypeHeader(w.Header())
 	w.group.Go(
 		func() error {
 			switch {
@@ -150,6 +186,9 @@ func (w *WatcherResponseWriter) getStatus() int {
 // the spinned goroutine terminates.
 // After closes the writer pipe and flushes the response into target.
 func (w *WatcherResponseWriter) Close() error {
+	w.closeChanGuard.Do(func() {
+		close(w.closeChan)
+	})
 	w.pipeReader.CloseWithError(io.EOF)
 	err := w.group.Wait()
 	w.pipeWriter.CloseWithError(io.EOF)
@@ -159,6 +198,13 @@ func (w *WatcherResponseWriter) Close() error {
 
 // Flush flushes the response into the target and returns.
 func (w *WatcherResponseWriter) Flush() {
+	w.mtx.Lock()
+	defer w.mtx.Unlock()
+
+	w.flushLocked()
+}
+
+func (w *WatcherResponseWriter) flushLocked() {
 	if flusher, ok := w.target.(http.Flusher); ok {
 		flusher.Flush()
 	}
@@ -204,10 +250,47 @@ func (w *WatcherResponseWriter) watchDecoder(contentType string, writer io.Write
 			return trace.Wrap(err)
 		}
 	}
+
+	// watchEncoderGuard prevents multiple sources to push events at the same time.
+	// only one source is able to push and flush events to ensure proper json formatting.
+	writeEventAndFlush := func(evt *watch.Event) error {
+		w.mtx.Lock()
+		defer w.mtx.Unlock()
+		// encode the event into the target connection.
+		if err := watchEncoder.Encode(evt); err != nil {
+			return trace.Wrap(err)
+		}
+		// Stream the response into the target connection, as we are dealing with
+		// streaming events. However, the Kubernetes API does not include the
+		// content-type as chunked. As a result, the forwarder is unaware that
+		// the connection is chunked and delays the response writing by buffering
+		// to minimize the number of writes.
+		// In cases where the connection stream is busy with events, the user may
+		// not receive individual events as chunks, leading to incomplete data.
+		// This could result in the user receiving malformed JSON and triggering
+		// an abort.
+		// To avoid this, we flush the response after each event to ensure that
+		// the user receives the event as a chunk.
+		w.flushLocked()
+		return nil
+	}
+
+	w.group.Go(func() error {
+		for {
+			select {
+			case evt := <-w.evtsChan:
+				if err := writeEventAndFlush(evt); err != nil {
+					slog.WarnContext(context.Background(), "error pushing fake pod event", "err", err)
+				}
+			case <-w.closeChan:
+				return nil
+			}
+		}
+	})
 	// wait for events received from upstream until the connection is terminated.
 	for {
 		eventType, obj, err := w.decodeStreamingMessage(streamingDecoder, objectDecoder)
-		if errors.Is(err, io.EOF) {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
 			return nil
 		} else if err != nil {
 			return trace.Wrap(err)
@@ -222,20 +305,24 @@ func (w *WatcherResponseWriter) watchDecoder(contentType string, writer io.Write
 				err = encoder.Encode(obj, writer)
 				return trace.Wrap(err)
 			}
-			// encode the event into the target connection.
-			err = watchEncoder.Encode(
+			err := writeEventAndFlush(
 				&watch.Event{
 					Type:   eventType,
 					Object: obj,
 				},
 			)
-
 			return trace.Wrap(err)
 		default:
-			if filter != nil {
+			// Bookmarks are protocol signals (KEP-956, KEP-3157), not resources.
+			// The envelope carries only resourceVersion and an optional
+			// k8s.io/initial-events-end annotation, with empty name and namespace.
+			// Resource RBAC would silently drop them for any non-wildcard rule,
+			// which causes client-go v0.35+ WatchList informers to hang forever
+			// waiting for the terminating bookmark.
+			if filter != nil && eventType != watch.Bookmark {
 				// check if the event object matches the filtering criteria.
 				// If it does not match, ignore the event.
-				publish, err := filter.FilterObj(obj)
+				publish, _, err := filter.FilterObj(obj)
 				if err != nil {
 					return trace.Wrap(err)
 				}
@@ -243,14 +330,13 @@ func (w *WatcherResponseWriter) watchDecoder(contentType string, writer io.Write
 					continue
 				}
 			}
-			// encode the event into the target connection.
-			err = watchEncoder.Encode(
+
+			if err := writeEventAndFlush(
 				&watch.Event{
 					Type:   eventType,
 					Object: obj,
 				},
-			)
-			if err != nil {
+			); err != nil {
 				return trace.Wrap(err)
 			}
 		}

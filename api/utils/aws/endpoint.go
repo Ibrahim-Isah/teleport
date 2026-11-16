@@ -26,11 +26,40 @@ import (
 	"github.com/gravitational/trace"
 )
 
-// IsAWSEndpoint returns true if the input URI is an AWS endpoint.
+const maxEndpointLength = 4096
+
+// IsAWSEndpoint returns true if the input URI is an AWS endpoint under the
+// amazonaws.com domains. It deliberately excludes api.aws endpoints (see
+// IsAWSAPIEndpoint) because callers like the DynamoDB/OpenSearch endpoint
+// parsers only understand the amazonaws.com shapes and use this check to
+// decide whether a parse failure is a config error. Once those parsers learn
+// the api.aws endpoint shapes, this split may no longer be necessary.
 func IsAWSEndpoint(uri string) bool {
-	// Note that AWSCNEndpointSuffix contains AWSEndpointSuffix so there is no
-	// need to search for AWSCNEndpointSuffix explicitly.
-	return strings.Contains(uri, AWSEndpointSuffix)
+	hostname, err := removeSchemaAndPort(uri)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(hostname, AWSEndpointSuffix) || strings.HasSuffix(hostname, AWSCNEndpointSuffix)
+}
+
+// IsAWSAPIEndpoint returns true if the input URI is an AWS endpoint under the
+// api.aws domain, used for dualstack and newer AWS service endpoints.
+func IsAWSAPIEndpoint(uri string) bool {
+	hostname, err := removeSchemaAndPort(uri)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(hostname, AWSAPIEndpointSuffix)
+}
+
+// IsAWSOwnedEndpoint returns true if the input URI is under any AWS-owned
+// endpoint domain (amazonaws.com, amazonaws.com.cn, or api.aws). Use this for
+// trust and interception decisions. Use IsAWSEndpoint when deciding whether a
+// legacy endpoint parser should have understood the URI.
+//
+// https://docs.aws.amazon.com/general/latest/gr/rande.html
+func IsAWSOwnedEndpoint(uri string) bool {
+	return IsAWSEndpoint(uri) || IsAWSAPIEndpoint(uri)
 }
 
 // IsRDSEndpoint returns true if the input URI is an RDS endpoint.
@@ -58,7 +87,15 @@ func IsRedshiftServerlessEndpoint(uri string) bool {
 // IsElastiCacheEndpoint returns true if the input URI is an ElastiCache
 // endpoint.
 func IsElastiCacheEndpoint(uri string) bool {
-	return isAWSServiceEndpoint(uri, ElastiCacheServiceName)
+	_, err := ParseElastiCacheEndpoint(uri)
+	return err == nil
+}
+
+// IsElastiCacheServerlessEndpoint returns true if the input URI is an ElastiCacheServerless
+// endpoint.
+func IsElastiCacheServerlessEndpoint(uri string) bool {
+	_, err := ParseElastiCacheServerlessEndpoint(uri)
+	return err == nil
 }
 
 // IsMemoryDBEndpoint returns true if the input URI is an MemoryDB
@@ -72,6 +109,11 @@ func IsMemoryDBEndpoint(uri string) bool {
 func IsKeyspacesEndpoint(uri string) bool {
 	hasCassandraPrefix := strings.HasPrefix(uri, "cassandra.") || strings.HasPrefix(uri, "cassandra-fips.")
 	return hasCassandraPrefix && IsAWSEndpoint(uri)
+}
+
+// IsOpenSearchEndpoint returns true if input URI is an OpenSearch endpoint.
+func IsOpenSearchEndpoint(uri string) bool {
+	return isAWSServiceEndpoint(uri, OpenSearchServiceName)
 }
 
 // RDSEndpointDetails contains information about an RDS endpoint.
@@ -88,6 +130,12 @@ type RDSEndpointDetails struct {
 	ProxyCustomEndpointName string
 	// Region is the AWS region the database resides in.
 	Region string
+	// EndpointType specifies the type of the endpoint, if available.
+	//
+	// Note that the endpoint type of RDS Proxies are determined by their
+	// targets, so the endpoint type will be empty for RDS Proxies here as it
+	// cannot be decided by the endpoint URL itself.
+	EndpointType string
 }
 
 // IsProxy returns true if the RDS endpoint is an RDS Proxy.
@@ -97,8 +145,12 @@ func (d RDSEndpointDetails) IsProxy() bool {
 
 // ParseRDSEndpoint extracts the identifier and region from the provided RDS
 // endpoint.
-func ParseRDSEndpoint(endpoint string) (d *RDSEndpointDetails, err error) {
+func ParseRDSEndpoint(endpoint string) (*RDSEndpointDetails, error) {
+	if len(endpoint) > maxEndpointLength {
+		return nil, trace.BadParameter("invalid endpoint exceeds maximum length of %d", maxEndpointLength)
+	}
 	if strings.ContainsRune(endpoint, ':') {
+		var err error
 		endpoint, _, err = net.SplitHostPort(endpoint)
 		if err != nil {
 			return nil, trace.Wrap(err)
@@ -184,12 +236,21 @@ func parseRDSWithoutSuffixes(endpoint string, parts []string, region string) (*R
 			return &RDSEndpointDetails{
 				ClusterCustomEndpointName: parts[0],
 				Region:                    region,
+				EndpointType:              RDSEndpointTypeCustom,
+			}, nil
+
+		case strings.HasPrefix(parts[1], "cluster-ro-"):
+			return &RDSEndpointDetails{
+				ClusterID:    parts[0],
+				Region:       region,
+				EndpointType: RDSEndpointTypeReader,
 			}, nil
 
 		case strings.HasPrefix(parts[1], "cluster-"):
 			return &RDSEndpointDetails{
-				ClusterID: parts[0],
-				Region:    region,
+				ClusterID:    parts[0],
+				Region:       region,
+				EndpointType: RDSEndpointTypePrimary,
 			}, nil
 
 		case strings.HasPrefix(parts[1], "proxy-"):
@@ -200,8 +261,9 @@ func parseRDSWithoutSuffixes(endpoint string, parts []string, region string) (*R
 
 		default:
 			return &RDSEndpointDetails{
-				InstanceID: parts[0],
-				Region:     region,
+				InstanceID:   parts[0],
+				Region:       region,
+				EndpointType: RDSEndpointTypeInstance,
 			}, nil
 		}
 
@@ -222,6 +284,10 @@ func parseRDSWithoutSuffixes(endpoint string, parts []string, region string) (*R
 // ParseRedshiftEndpoint extracts cluster ID and region from the provided
 // Redshift endpoint.
 func ParseRedshiftEndpoint(endpoint string) (clusterID, region string, err error) {
+	if len(endpoint) > maxEndpointLength {
+		return "", "", trace.BadParameter("invalid endpoint exceeds maximum length of %d", maxEndpointLength)
+	}
+
 	if strings.ContainsRune(endpoint, ':') {
 		endpoint, _, err = net.SplitHostPort(endpoint)
 		if err != nil {
@@ -276,8 +342,13 @@ type RedshiftServerlessEndpointDetails struct {
 
 // ParseRedshiftServerlessEndpoint extracts name, AWS Account ID, and region
 // from the provided Redshift Serverless endpoint.
-func ParseRedshiftServerlessEndpoint(endpoint string) (details *RedshiftServerlessEndpointDetails, err error) {
+func ParseRedshiftServerlessEndpoint(endpoint string) (*RedshiftServerlessEndpointDetails, error) {
+	if len(endpoint) > maxEndpointLength {
+		return nil, trace.BadParameter("invalid endpoint exceeds maximum length of %d", maxEndpointLength)
+	}
+
 	if strings.ContainsRune(endpoint, ':') {
+		var err error
 		endpoint, _, err = net.SplitHostPort(endpoint)
 		if err != nil {
 			return nil, trace.Wrap(err)
@@ -352,6 +423,25 @@ const (
 	MemoryDBClusterEndpoint = "cluster"
 	// MemoryDBNodeEndpoint is the endpoint of an individual MemoryDB node.
 	MemoryDBNodeEndpoint = "node"
+
+	// OpenSearchDefaultEndpoint is the default endpoint for domain.
+	OpenSearchDefaultEndpoint = "default"
+	// OpenSearchCustomEndpoint is the custom endpoint configured for domain.
+	OpenSearchCustomEndpoint = "custom"
+	// OpenSearchVPCEndpoint is the VPC endpoint for domain.
+	OpenSearchVPCEndpoint = "vpc"
+
+	// RDSEndpointTypePrimary is the endpoint that specifies the connection for
+	// the primary instance of the RDS cluster.
+	RDSEndpointTypePrimary = "primary"
+	// RDSEndpointTypeReader is the endpoint that load-balances connections
+	// across the Aurora Replicas that are available in an RDS cluster.
+	RDSEndpointTypeReader = "reader"
+	// RDSEndpointTypeCustom is the endpoint that specifies one of the custom
+	// endpoints associated with the RDS cluster.
+	RDSEndpointTypeCustom = "custom"
+	// RDSEndpointTypeInstance is the endpoint of an RDS DB instance.
+	RDSEndpointTypeInstance = "instance"
 )
 
 // ParseElastiCacheEndpoint extracts the details from the provided
@@ -359,6 +449,10 @@ const (
 //
 // https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/GettingStarted.ConnectToCacheNode.html
 func ParseElastiCacheEndpoint(endpoint string) (*RedisEndpointInfo, error) {
+	if len(endpoint) > maxEndpointLength {
+		return nil, trace.BadParameter("invalid endpoint exceeds maximum length of %d", maxEndpointLength)
+	}
+
 	endpoint, err := removeSchemaAndPort(endpoint)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -454,9 +548,9 @@ func ParseElastiCacheEndpoint(endpoint string) (*RedisEndpointInfo, error) {
 		}
 
 		// Remove "-ro" from reader endpoint.
-		if strings.HasSuffix(parts[0], "-ro") {
+		if before, ok := strings.CutSuffix(parts[0], "-ro"); ok {
 			return &RedisEndpointInfo{
-				ID:                       strings.TrimSuffix(parts[0], "-ro"),
+				ID:                       before,
 				Region:                   region,
 				TransitEncryptionEnabled: false,
 				EndpointType:             ElastiCacheReaderEndpoint,
@@ -516,11 +610,71 @@ func trimElastiCacheShardAndNodeID(input string) string {
 	return strings.Join(parts, "-")
 }
 
+// ParseElastiCacheServerlessEndpoint extracts the details from the provided
+// ElastiCacheServerless Redis endpoint, which should be in the form
+// <cache_name>.serverless.<region>.cache.amazonaws.com:<port>
+func ParseElastiCacheServerlessEndpoint(endpoint string) (*RedisEndpointInfo, error) {
+	if len(endpoint) > maxEndpointLength {
+		return nil, trace.BadParameter("invalid endpoint exceeds maximum length of %d", maxEndpointLength)
+	}
+
+	endpoint, err := removeSchemaAndPort(endpoint)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Remove partition suffix. Note that endpoints for CN regions use the same
+	// format except they end with AWSCNEndpointSuffix.
+	endpointWithoutSuffix, _, err := removePartitionSuffix(endpoint)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Split into parts to extract details. They look like this in general:
+	//   <cache_name>.serverless.<short-region>.cache
+	//
+	// Note that ElastiCache uses short region codes like "use1".
+	const (
+		nameIdx = iota
+		serverlessIdx
+		shortRegionIdx
+		svcIdx
+		numParts
+	)
+	parts := strings.Split(endpointWithoutSuffix, ".")
+	if len(parts) != numParts || parts[serverlessIdx] != "serverless" || parts[svcIdx] != ElastiCacheServiceName {
+		return nil, trace.BadParameter("unknown ElastiCache Redis endpoint format %q", endpoint)
+	}
+
+	region, ok := ShortRegionToRegion(parts[shortRegionIdx])
+	if !ok {
+		return nil, trace.BadParameter("%v is not a valid region", parts[shortRegionIdx])
+	}
+
+	// Configuration endpoint for Redis with TLS disabled looks like:
+	// example-<randomhex>.serverless.cac1.cache.amazonaws.com:6379
+	info := &RedisEndpointInfo{
+		ID:                       parts[nameIdx],
+		Region:                   region,
+		TransitEncryptionEnabled: true,
+		EndpointType:             ElastiCacheConfigurationEndpoint,
+	}
+	nameParts := strings.Split(info.ID, "-")
+	if len(nameParts) > 1 {
+		info.ID = strings.Join(nameParts[:len(nameParts)-1], "-")
+	}
+	return info, nil
+}
+
 // ParseMemoryDBEndpoint extracts the details from the provided
 // MemoryDB endpoint.
 //
 // https://docs.aws.amazon.com/memorydb/latest/devguide/endpoints.html
 func ParseMemoryDBEndpoint(endpoint string) (*RedisEndpointInfo, error) {
+	if len(endpoint) > maxEndpointLength {
+		return nil, trace.BadParameter("invalid endpoint exceeds maximum length of %d", maxEndpointLength)
+	}
+
 	endpoint, err := removeSchemaAndPort(endpoint)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -589,8 +743,7 @@ func ParseMemoryDBEndpoint(endpoint string) (*RedisEndpointInfo, error) {
 // isAWSServiceEndpoint returns true if uri is a valid AWS endpoint and uri
 // contains the provided service name as a subdomain.
 func isAWSServiceEndpoint(uri, serviceName string) bool {
-	return strings.Contains(uri, fmt.Sprintf(".%s.", serviceName)) &&
-		IsAWSEndpoint(uri)
+	return IsAWSEndpoint(uri) && strings.Contains(uri, fmt.Sprintf(".%s.", serviceName))
 }
 
 func removeSchemaAndPort(endpoint string) (string, error) {
@@ -633,6 +786,12 @@ const (
 	// https://docs.amazonaws.cn/en_us/aws/latest/userguide/endpoints-arns.html
 	AWSCNEndpointSuffix = ".amazonaws.com.cn"
 
+	// AWSAPIEndpointSuffix is the endpoint suffix for AWS dualstack and newer
+	// service endpoints. The api.aws domain is owned and operated by AWS.
+	//
+	// https://docs.aws.amazon.com/general/latest/gr/rande.html#dual-stack-endpoints
+	AWSAPIEndpointSuffix = ".api.aws"
+
 	// RDSServiceName is the service name for AWS RDS.
 	RDSServiceName = "rds"
 
@@ -656,6 +815,9 @@ const (
 	DynamoDBStreamsServiceName = "streams.dynamodb"
 	// DAXServiceName is the AWS DynamoDB Accelerator service name.
 	DAXServiceName = "dax"
+
+	// OpenSearchServiceName is the AWS OpenSearch service name.
+	OpenSearchServiceName = "es"
 )
 
 // CassandraEndpointURLForRegion returns a Cassandra endpoint based on the provided region.
@@ -693,6 +855,10 @@ type DynamoDBEndpointInfo struct {
 
 // ParseDynamoDBEndpoint parses and extract info from the provided DynamoDB endpoint.
 func ParseDynamoDBEndpoint(endpoint string) (*DynamoDBEndpointInfo, error) {
+	if len(endpoint) > maxEndpointLength {
+		return nil, trace.BadParameter("invalid endpoint exceeds maximum length of %d", maxEndpointLength)
+	}
+
 	endpoint = strings.ToLower(endpoint)
 	parts, partition, err := extractAWSEndpointParts(endpoint)
 	if err != nil {
@@ -721,6 +887,63 @@ func ParseDynamoDBEndpoint(endpoint string) (*DynamoDBEndpointInfo, error) {
 	if info.Region == "" || info.Partition == "" {
 		return nil, trace.BadParameter("invalid DynamoDB endpoint %q", endpoint)
 	}
+	switch {
+	case info.Partition == AWSCNEndpointSuffix && IsCNRegion(info.Region):
+	case info.Partition == AWSEndpointSuffix && !IsCNRegion(info.Region):
+	default:
+		return nil, trace.BadParameter("invalid AWS region %q for AWS partition %q",
+			info.Region, info.Partition)
+	}
+	return info, nil
+}
+
+// OpenSearchEndpointInfo describes info extracted from an AWS endpoint.
+type OpenSearchEndpointInfo struct {
+	// Service is the service subdomain of the endpoint. Only "es" allowed for now.
+	Service string
+	// Region is the AWS region for the endpoint, for example "us-west-1".
+	Region string
+	// Partition is the AWS partition for the endpoint, for example ".amazonaws.com"
+	Partition string
+}
+
+// ParseOpensearchEndpoint parses and extract info from the provided OpenSearch endpoint.
+func ParseOpensearchEndpoint(endpoint string) (*OpenSearchEndpointInfo, error) {
+	if len(endpoint) > maxEndpointLength {
+		return nil, trace.BadParameter("invalid endpoint exceeds maximum length of %d", maxEndpointLength)
+	}
+
+	endpoint = strings.ToLower(endpoint)
+	parts, partition, err := extractAWSEndpointParts(endpoint)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if len(parts) != 3 {
+		return nil, trace.BadParameter("invalid OpenSearch endpoint %q, wrong number of parts %v", endpoint, len(parts))
+	}
+
+	info := &OpenSearchEndpointInfo{
+		Region:    parts[len(parts)-2],
+		Service:   parts[len(parts)-1],
+		Partition: partition,
+	}
+
+	// check for recognized service name.
+	if info.Service != OpenSearchServiceName {
+		return nil, trace.BadParameter("invalid OpenSearch endpoint %q, invalid service %q", endpoint, info.Service)
+	}
+
+	// check that the partition is valid for the region.
+	switch {
+	case info.Region == "" || info.Partition == "":
+		return nil, trace.BadParameter("invalid OpenSearch endpoint %q, empty partition and region", endpoint)
+	case info.Region == "":
+		return nil, trace.BadParameter("invalid OpenSearch endpoint %q, empty region", endpoint)
+	case info.Partition == "":
+		return nil, trace.BadParameter("invalid OpenSearch endpoint %q, empty partition", endpoint)
+	}
+
 	switch {
 	case info.Partition == AWSCNEndpointSuffix && IsCNRegion(info.Region):
 	case info.Partition == AWSEndpointSuffix && !IsCNRegion(info.Region):

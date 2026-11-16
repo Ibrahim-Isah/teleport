@@ -1,114 +1,206 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { Meta } from '@storybook/react-vite';
+import { useState } from 'react';
 
-    http://www.apache.org/licenses/LICENSE-2.0
+import { Box, Flex, H3, H4 } from 'design';
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+import Select, { Option } from '../Select';
 
-import React from 'react';
-import { Flex, Box } from 'design';
+type StoryProps = {
+  readOnly?: boolean;
+  isDisabled?: boolean;
+};
 
-import Select, { DarkStyledSelect } from '../Select';
-
-export default {
+const meta: Meta<StoryProps> = {
   title: 'Shared/Select',
+  component: Controls,
+  argTypes: {
+    readOnly: {
+      control: { type: 'boolean' },
+    },
+    isDisabled: {
+      control: { type: 'boolean' },
+    },
+  },
 };
+export default meta;
 
-export const Selects = () => {
-  return (
-    <Flex>
-      <SelectDefault {...props} />
-      <SelectDark {...props} />
-    </Flex>
+const options: Option[] = [
+  { value: 'access-role', label: 'access' },
+  { value: 'editor-role', label: 'editor' },
+  { value: 'auditor-role', label: 'auditor' },
+];
+
+export function Controls(props: StoryProps) {
+  const [selectedMulti, setSelectedMulti] = useState<readonly Option[]>(
+    options.slice(0, 2)
   );
-};
-
-const props = {
-  value: [
-    { value: 'admin', label: 'admin' },
-    { value: 'testrole', label: 'testrole' },
-  ],
-  onChange: () => null,
-  options: [
-    { value: 'Relupba', label: 'Relupba' },
-    { value: 'B', label: 'B' },
-    { value: 'Pilhibo', label: 'Pilhibo' },
-  ],
-};
-
-function SelectDefault({ value, onChange, options }) {
-  const [selected, setSelected] = React.useState([]);
+  const [selectedSingle, setSelectedSingle] = useState(options[0]);
 
   return (
-    <Flex flexDirection="column" width="330px" mr={5}>
-      <Box mb="200px">
-        <Select
-          value={value}
-          onChange={onChange}
-          options={options}
-          isMulti={true}
-        />
-      </Box>
-      <Box mb="200px">
-        <Select
-          value={selected}
-          onChange={(opt: any) => setSelected(opt)}
-          options={options}
-          placeholder="Click to select a role"
-        />
-      </Box>
+    <>
+      <Flex flexDirection="column" width="330px" gap={3} mb={3}>
+        <Box>
+          <H3>Multi</H3>
+          <Select
+            value={selectedMulti}
+            onChange={options => setSelectedMulti(options)}
+            options={options}
+            placeholder="Click to select a role"
+            isMulti={true}
+            isDisabled={props.isDisabled}
+            readOnly={props.readOnly}
+          />
+        </Box>
+        <Box>
+          <H3>Multi, clearable</H3>
+          <Select
+            value={selectedMulti}
+            onChange={options => setSelectedMulti(options)}
+            options={options}
+            placeholder="Click to select a role"
+            isMulti={true}
+            isClearable
+            isDisabled={props.isDisabled}
+            readOnly={props.readOnly}
+          />
+        </Box>
+        <Box>
+          <H3>Multi, empty</H3>
+          <Select
+            defaultValue={[]}
+            options={options}
+            placeholder="Click to select a role"
+            isMulti={true}
+            isDisabled={props.isDisabled}
+            readOnly={props.readOnly}
+          />
+        </Box>
+        <Box>
+          <H3>Single</H3>
+          <Select
+            value={selectedSingle}
+            onChange={option => setSelectedSingle(option)}
+            options={options}
+            placeholder="Click to select a role"
+            isDisabled={props.isDisabled}
+            readOnly={props.readOnly}
+          />
+        </Box>
+        <Box>
+          <H3>Single, empty</H3>
+          <Select
+            options={options}
+            placeholder="Click to select a role"
+            isDisabled={props.isDisabled}
+            readOnly={props.readOnly}
+          />
+        </Box>
+        <Box>
+          <H3>Error</H3>
+          <Select
+            value={selectedSingle}
+            onChange={option => setSelectedSingle(option)}
+            options={options}
+            placeholder="Click to select a role"
+            hasError
+            isDisabled={props.isDisabled}
+            readOnly={props.readOnly}
+          />
+        </Box>
+      </Flex>
+
       <Box>
-        <Select
-          isDisabled={true}
-          value={selected}
-          onChange={(opt: any) => setSelected(opt)}
-          options={options}
-          placeholder="Click to select a role"
-        />
+        <H3>Sizes</H3>
       </Box>
-    </Flex>
-  );
-}
-
-function SelectDark({ value, onChange, options }) {
-  const [selected, setSelected] = React.useState([]);
-
-  return (
-    <Flex flexDirection="column" width="330px">
-      <DarkStyledSelect mb="206px">
-        <Select
-          value={value}
-          onChange={onChange}
-          options={options}
-          isMulti={true}
-        />
-      </DarkStyledSelect>
-      <DarkStyledSelect mb="206px">
-        <Select
-          value={selected}
-          onChange={(opt: any) => setSelected(opt)}
-          options={options}
-          placeholder="Click to select a role"
-        />
-      </DarkStyledSelect>
-      <DarkStyledSelect>
-        <Select
-          isDisabled={true}
-          value={selected}
-          onChange={(opt: any) => setSelected(opt)}
-          options={options}
-          placeholder="Click to select a role"
-        />
-      </DarkStyledSelect>
-    </Flex>
+      <Flex gap={4} mb={4}>
+        <Flex flex="1" flexDirection="column" gap={3} mt={3}>
+          <H4>Large</H4>
+          <Select
+            size="large"
+            value={selectedSingle}
+            onChange={option => setSelectedSingle(option)}
+            options={options}
+            placeholder="Click to select a role"
+            isDisabled={props.isDisabled}
+            readOnly={props.readOnly}
+          />
+          <Select
+            size="large"
+            value={selectedMulti}
+            onChange={options => setSelectedMulti(options)}
+            options={options}
+            placeholder="Click to select a role"
+            isMulti={true}
+            isClearable={true}
+            isDisabled={props.isDisabled}
+            readOnly={props.readOnly}
+          />
+        </Flex>
+        <Flex flex="1" flexDirection="column" gap={3} mt={3}>
+          <H4>Medium</H4>
+          <Select
+            size="medium"
+            value={selectedSingle}
+            onChange={option => setSelectedSingle(option)}
+            options={options}
+            placeholder="Click to select a role"
+            isDisabled={props.isDisabled}
+            readOnly={props.readOnly}
+          />
+          <Select
+            size="medium"
+            value={selectedMulti}
+            onChange={options => setSelectedMulti(options)}
+            options={options}
+            placeholder="Click to select a role"
+            isMulti={true}
+            isClearable={true}
+            isDisabled={props.isDisabled}
+            readOnly={props.readOnly}
+          />
+        </Flex>
+        <Flex flex="1" flexDirection="column" gap={3} mt={3}>
+          <H4>Small</H4>
+          <Select
+            size="small"
+            value={selectedSingle}
+            onChange={option => setSelectedSingle(option)}
+            options={options}
+            placeholder="Click to select a role"
+            isDisabled={props.isDisabled}
+            readOnly={props.readOnly}
+          />
+          <Select
+            size="small"
+            value={selectedMulti}
+            onChange={options => setSelectedMulti(options)}
+            options={options}
+            placeholder="Click to select a role"
+            isMulti={true}
+            isClearable={true}
+            isDisabled={props.isDisabled}
+            readOnly={props.readOnly}
+          />
+        </Flex>
+      </Flex>
+    </>
   );
 }

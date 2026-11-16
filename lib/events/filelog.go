@@ -1,46 +1,52 @@
 /*
-Copyright 2018-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
-	apidefaults "github.com/gravitational/teleport/api/defaults"
+	auditlogpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/auditlog/v1"
+	"github.com/gravitational/teleport/api/internalutils/stream"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // FileLogConfig is a configuration for file log
@@ -101,9 +107,7 @@ func NewFileLog(cfg FileLogConfig) (*FileLog, error) {
 	}
 	f := &FileLog{
 		FileLogConfig: cfg,
-		Entry: log.WithFields(log.Fields{
-			trace.Component: teleport.ComponentAuditLog,
-		}),
+		logger:        slog.With(teleport.ComponentKey, teleport.ComponentAuditLog),
 	}
 	return f, nil
 }
@@ -111,7 +115,7 @@ func NewFileLog(cfg FileLogConfig) (*FileLog, error) {
 // FileLog is a file local audit events log,
 // logs all events to the local file in json encoded form
 type FileLog struct {
-	*log.Entry
+	logger *slog.Logger
 	FileLogConfig
 	// rw protects the file from rotation during concurrent
 	// event emission.
@@ -145,7 +149,7 @@ func (l *FileLog) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent
 		l.rw.Unlock()
 		l.rw.RLock()
 		if err != nil {
-			log.Error(err)
+			slog.ErrorContext(ctx, "failed to emit audit event", "error", err)
 		}
 	}
 
@@ -160,17 +164,11 @@ func (l *FileLog) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent
 	}
 
 	if len(line) > l.MaxScanTokenSize {
-		switch {
-		case canReduceMessageSize(event):
-			line, err = l.trimSizeAndMarshal(event)
-			if err != nil {
-				return trace.Wrap(err)
-			}
-		default:
-			fields := log.Fields{"event_type": event.GetType(), "event_size": len(line)}
-			l.WithFields(fields).Warnf("Got a event that exceeded max allowed size.")
-			return trace.BadParameter("event size %v exceeds max entry size %v", len(line), l.MaxScanTokenSize)
+		line, err = l.trimSizeAndMarshal(event)
+		if err != nil {
+			return trace.Wrap(err)
 		}
+		MetricStoredTrimmedEvents.Inc()
 	}
 
 	// log it to the main log file:
@@ -178,17 +176,8 @@ func (l *FileLog) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent
 	return trace.ConvertSystemError(err)
 }
 
-func canReduceMessageSize(event apievents.AuditEvent) bool {
-	_, ok := event.(messageSizeTrimmer)
-	return ok
-}
-
 func (l *FileLog) trimSizeAndMarshal(event apievents.AuditEvent) ([]byte, error) {
-	s, ok := event.(messageSizeTrimmer)
-	if !ok {
-		return nil, trace.BadParameter("invalid event type %T", event)
-	}
-	sEvent := s.TrimToMaxSize(l.MaxScanTokenSize)
+	sEvent := event.TrimToMaxSize(l.MaxScanTokenSize)
 	line, err := utils.FastMarshal(sEvent)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -199,10 +188,6 @@ func (l *FileLog) trimSizeAndMarshal(event apievents.AuditEvent) ([]byte, error)
 	return line, nil
 }
 
-type messageSizeTrimmer interface {
-	TrimToMaxSize(int) apievents.AuditEvent
-}
-
 // SearchEvents is a flexible way to find events.
 //
 // Event types to filter can be specified and pagination is handled by an iterator key that allows
@@ -211,17 +196,159 @@ type messageSizeTrimmer interface {
 // The only mandatory requirement is a date range (UTC).
 //
 // This function may never return more than 1 MiB of event data.
-func (l *FileLog) SearchEvents(fromUTC, toUTC time.Time, namespace string, eventTypes []string, limit int, order types.EventOrder, startAfter string) ([]apievents.AuditEvent, string, error) {
-	l.Debugf("SearchEvents(%v, %v, namespace=%v, eventType=%v, limit=%v)", fromUTC, toUTC, namespace, eventTypes, limit)
-	return l.searchEventsWithFilter(fromUTC, toUTC, namespace, limit, order, startAfter, searchEventsFilter{eventTypes: eventTypes})
+func (l *FileLog) SearchEvents(ctx context.Context, req SearchEventsRequest) ([]apievents.AuditEvent, string, error) {
+	if req.BeamID != "" {
+		return nil, "", trace.NotImplemented("the file audit backend does not support the beam ID filter")
+	}
+	l.logger.DebugContext(ctx, "SearchEvents", "from", req.From, "to", req.To, "event_type", req.EventTypes, "limit", req.Limit, "search", req.Search)
+	values, next, err := l.searchEventsWithFilter(ctx, req.From, req.To, req.Limit, req.Order, req.StartKey, searchEventsFilter{
+		eventTypes: req.EventTypes,
+		search:     req.Search,
+	})
+	if err != nil {
+		return nil, "", trace.Wrap(err)
+	}
+	// Convert the raw events to audit events.
+	evts, err := FromEventFieldsSlice(values)
+	if err != nil {
+		return nil, "", trace.Wrap(err)
+	}
+	return evts, next, nil
 }
 
-func (l *FileLog) searchEventsWithFilter(fromUTC, toUTC time.Time, namespace string, limit int, order types.EventOrder, startAfter string, filter searchEventsFilter) ([]apievents.AuditEvent, string, error) {
+func (l *FileLog) SearchUnstructuredEvents(ctx context.Context, req SearchEventsRequest) ([]*auditlogpb.EventUnstructured, string, error) {
+	if req.BeamID != "" {
+		return nil, "", trace.NotImplemented("the file audit backend does not support the beam ID filter")
+	}
+	l.logger.DebugContext(ctx, "SearchUnstructuredEvents", "from", req.From, "to", req.To, "event_type", req.EventTypes, "limit", req.Limit)
+	values, next, err := l.searchEventsWithFilter(ctx, req.From, req.To, req.Limit, req.Order, req.StartKey, searchEventsFilter{eventTypes: req.EventTypes})
+	if err != nil {
+		return nil, "", trace.Wrap(err)
+	}
+	// Convert the raw events to unstructured.
+	evts, err := FromEventFieldsSliceToUnstructured(values)
+	if err != nil {
+		return nil, "", trace.Wrap(err)
+	}
+	return evts, next, nil
+}
+
+// checkpointKey is a pointer to an event in the log. This is used to keep track
+// of the last processed event so the caller can resume querying from this event.
+type checkpointKey struct {
+	id        string
+	timestamp time.Time
+}
+
+// MarshalText marshals a checkpointKey into plain text.
+func (c checkpointKey) MarshalText() ([]byte, error) {
+	return []byte(c.String()), nil
+}
+
+// UnmarshalText unmarshals a checkpointKey from its text representation.
+func (c *checkpointKey) UnmarshalText(b []byte) error {
+	if len(b) == 0 {
+		return nil
+	}
+	id, rawTime, ok := bytes.Cut(b, []byte("/"))
+
+	c.id = string(id)
+	if ok {
+		ns, err := strconv.ParseInt(string(rawTime), 10, 64)
+		if err != nil {
+			return trace.BadParameter("failed to parse checkpoint timestamp: %v", err)
+		}
+		c.timestamp = time.Unix(ns/1e9, ns%1e9)
+	}
+	return nil
+}
+
+// String returns a sting representation of the checkpointKey.
+// Its result can be sent to the caller, or loaded back into a checkpointKey
+// using UnmarshalText.
+func (c checkpointKey) String() string {
+	if c.id == "" {
+		return ""
+	}
+	if c.timestamp.IsZero() {
+		return c.id
+	}
+	return c.id + "/" + strconv.FormatInt(c.timestamp.UnixNano(), 10)
+}
+
+// IsZero returns true if the checkpoint is not pointing to any event.
+func (c *checkpointKey) IsZero() bool {
+	return c.id == "" && c.timestamp.IsZero()
+}
+
+// matches returns true if two checkpoints are pointing to the same event.
+func (c checkpointKey) matches(d checkpointKey) bool {
+	return c.id == d.id
+}
+
+// shouldBeIgnored returns if the checkpoint should be ignored to answer the query.
+func (c checkpointKey) shouldBeIgnored(from, to time.Time, order types.EventOrder) bool {
+	// If the checkpointKey doesn't specify any timeframe, it was created by the
+	// old format. We can't know if the checkpoint is before or not, so we act
+	// like it is not and hope we match events.
+	if c.timestamp.IsZero() {
+		return false
+	}
+	if order == types.EventOrderAscending {
+		// The order is ascending and the checkpoint is before the timeframe.
+		// We can ignore the cursor because we know that all event we're going
+		// to read are older and should be returned.
+		return c.timestamp.Before(from)
+	}
+	// The order is descending and the checkpoint is after the timeframe.
+	// We can ignore the cursor because we know that all event we're going
+	// to read are older and should be returned.
+	return c.timestamp.After(to)
+}
+
+// shouldEarlyReturn returns true if the checkpoint is after (or before for
+// descending order) the requested timeframe and the query is bound to return
+// no event. This is an optimization.
+func (c checkpointKey) shouldEarlyReturn(from, to time.Time, order types.EventOrder) bool {
+	// If the checkpointKey doesn't specify any timeframe, it was created by the
+	// old format. We can't know if the checkpoint is before or not, so we act
+	// like it is not and hope we match events.
+	if c.timestamp.IsZero() {
+		return false
+	}
+	if order == types.EventOrderAscending {
+		// If the order is ascending and the checkpoint is after the timeframe.
+		// We know that no event should match the query and can early return.
+		return c.timestamp.After(to)
+	}
+	// If the order is descending and the checkpoint is before the timeframe.
+	// We know that no event should match the query and can early return.
+	return c.timestamp.Before(from)
+}
+
+func (l *FileLog) searchEventsWithFilter(ctx context.Context, fromUTC, toUTC time.Time, limit int, order types.EventOrder, startAfter string, filter searchEventsFilter) ([]EventFields, string, error) {
 	if limit <= 0 {
 		limit = defaults.EventsIterationLimit
 	}
 	if limit > defaults.EventsMaxIterationLimit {
 		return nil, "", trace.BadParameter("limit %v exceeds max iteration limit %v", limit, defaults.MaxIterationLimit)
+	}
+
+	var checkpoint checkpointKey
+	if err := checkpoint.UnmarshalText([]byte(startAfter)); err != nil {
+		return nil, "", trace.Wrap(err, "parsing startAfter")
+	}
+
+	if checkpoint.shouldEarlyReturn(fromUTC, toUTC, order) {
+		l.logger.DebugContext(ctx, "cursor is after the end of the window, skipping search", "cursor_time", checkpoint.timestamp, "from", fromUTC, "to", toUTC)
+		return nil, "", nil
+	}
+
+	// If the checkpoint is before the requested timeframe, we knoe that every
+	// event we'll read is valid. We must unset the checkpoint to avoid returning no event.
+	if checkpoint.shouldBeIgnored(fromUTC, toUTC, order) {
+		l.logger.WarnContext(ctx, "cursor is from before window start time, resetting cursor", "cursor_time", checkpoint.timestamp, "from", fromUTC, "to", toUTC)
+		checkpoint = checkpointKey{}
 	}
 
 	// how many days of logs to search?
@@ -261,21 +388,15 @@ func (l *FileLog) searchEventsWithFilter(fromUTC, toUTC time.Time, namespace str
 	}
 	sort.Sort(toSort)
 
-	events := make([]apievents.AuditEvent, 0, len(dynamicEvents))
+	events := make([]EventFields, 0, len(dynamicEvents))
 
 	// This is used as a flag to check if we have found the startAfter checkpoint or not.
-	foundStart := startAfter == ""
+	foundStart := checkpoint.IsZero()
 
 	totalSize := 0
 
 outer:
 	for _, dynamicEvent := range dynamicEvents {
-		// Convert the event from a dynamic representation to a typed representation.
-		event, err := FromEventFields(dynamicEvent)
-		if err != nil {
-			return nil, "", trace.Wrap(err)
-		}
-
 		size, err := estimateEventSize(dynamicEvent)
 		if err != nil {
 			return nil, "", trace.Wrap(err)
@@ -284,11 +405,11 @@ outer:
 		// Skip until we've found the start checkpoint and once more
 		// since it was the last key of the previous set.
 		if !foundStart {
-			checkpoint, err := getCheckpointFromEvent(event)
+			c, err := getCheckpointFromEvent(dynamicEvent)
 			if err != nil {
 				return nil, "", trace.Wrap(err)
 			}
-			if startAfter == checkpoint {
+			if checkpoint.matches(c) {
 				foundStart = true
 			}
 
@@ -298,11 +419,11 @@ outer:
 		// Skip until we've found the first event within the desired timeframe.
 		switch order {
 		case types.EventOrderAscending:
-			if event.GetTime().Before(fromUTC) {
+			if dynamicEvent.GetTime(EventTime).Before(fromUTC) {
 				continue outer
 			}
 		case types.EventOrderDescending:
-			if event.GetTime().After(toUTC) {
+			if dynamicEvent.GetTime(EventTime).After(toUTC) {
 				continue outer
 			}
 		}
@@ -312,35 +433,35 @@ outer:
 		// to the sort so we just break out here and consider the query as finished.
 		switch order {
 		case types.EventOrderAscending:
-			if event.GetTime().After(toUTC) {
+			if dynamicEvent.GetTime(EventTime).After(toUTC) {
 				break outer
 			}
 		case types.EventOrderDescending:
-			if event.GetTime().Before(fromUTC) {
+			if dynamicEvent.GetTime(EventTime).Before(fromUTC) {
 				break outer
 			}
 		}
 
 		if totalSize+size >= MaxEventBytesInResponse {
-			checkpoint, err := getCheckpointFromEvent(events[len(events)-1])
+			c, err := getCheckpointFromEvent(events[len(events)-1])
 			if err != nil {
 				return nil, "", trace.Wrap(err)
 			}
-			return events, checkpoint, nil
+			return events, c.String(), nil
 		}
 
-		events = append(events, event)
+		events = append(events, dynamicEvent)
 		totalSize += size
 
 		// Check if there is a limit and if so, check if we've hit it.
 		// In the event that we've hit the limit, we consider the query partially complete
 		// and return a checkpoint to continue it.
-		if len(events) >= limit && limit > 0 {
-			checkpoint, err := getCheckpointFromEvent(events[len(events)-1])
+		if len(events) >= limit {
+			c, err := getCheckpointFromEvent(events[len(events)-1])
 			if err != nil {
 				return nil, "", trace.Wrap(err)
 			}
-			return events, checkpoint, nil
+			return events, c.String(), nil
 		}
 	}
 
@@ -348,37 +469,58 @@ outer:
 	return events, "", nil
 }
 
-func getCheckpointFromEvent(event apievents.AuditEvent) (string, error) {
-	if event.GetID() == "" {
-		data, err := utils.FastMarshal(event)
-		if err != nil {
-			return "", trace.Wrap(err)
-		}
-
-		hash := sha256.Sum256(data)
-		return hex.EncodeToString(hash[:]), nil
+func getCheckpointFromEvent(event EventFields) (checkpointKey, error) {
+	if id := event.GetID(); id != "" {
+		return checkpointKey{id: id, timestamp: event.GetTimestamp()}, nil
 	}
 
-	return event.GetID(), nil
+	data, err := utils.FastMarshal(event)
+	if err != nil {
+		return checkpointKey{}, trace.Wrap(err)
+	}
+
+	hash := sha256.Sum256(data)
+	return checkpointKey{id: hex.EncodeToString(hash[:]), timestamp: event.GetTimestamp()}, nil
 }
 
-func (l *FileLog) SearchSessionEvents(fromUTC, toUTC time.Time, limit int, order types.EventOrder, startKey string, cond *types.WhereExpr, sessionID string) ([]apievents.AuditEvent, string, error) {
-	l.Debugf("SearchSessionEvents(%v, %v, order=%v, limit=%v, cond=%q)", fromUTC, toUTC, order, limit, cond)
-	filter := searchEventsFilter{eventTypes: []string{SessionEndEvent, WindowsDesktopSessionEndEvent}}
-	if cond != nil {
-		condFn, err := utils.ToFieldsCondition(cond)
+func (l *FileLog) SearchSessionEvents(ctx context.Context, req SearchSessionEventsRequest) ([]apievents.AuditEvent, string, error) {
+	var whereExp types.WhereExpr
+	if req.Cond != nil {
+		whereExp = *req.Cond.Expr
+	}
+	l.logger.DebugContext(ctx, "SearchSessionEvents", "from", req.From, "to", req.To, "order", req.Order, "limit", req.Limit, "cond", logutils.StringerAttr(whereExp))
+	filter := searchEventsFilter{eventTypes: SessionRecordingEvents}
+	if req.Cond != nil {
+		condFn, err := utils.ToFieldsCondition(*req.Cond)
 		if err != nil {
 			return nil, "", trace.Wrap(err)
 		}
 		filter.condition = condFn
 	}
-	events, lastKey, err := l.searchEventsWithFilter(fromUTC, toUTC, apidefaults.Namespace, limit, order, startKey, filter)
-	return events, lastKey, trace.Wrap(err)
+	events, lastKey, err := l.searchEventsWithFilter(ctx, req.From, req.To, req.Limit, req.Order, req.StartKey, filter)
+	if err != nil {
+		return nil, "", trace.Wrap(err)
+	}
+	// Convert the raw events to audit events.
+	evts, err := FromEventFieldsSlice(events)
+	if err != nil {
+		return nil, "", trace.Wrap(err)
+	}
+	return evts, lastKey, nil
+}
+
+func (l *FileLog) ExportUnstructuredEvents(ctx context.Context, req *auditlogpb.ExportUnstructuredEventsRequest) stream.Stream[*auditlogpb.ExportEventUnstructured] {
+	return stream.Fail[*auditlogpb.ExportEventUnstructured](trace.NotImplemented("FileLog does not implement ExportUnstructuredEvents"))
+}
+
+func (l *FileLog) GetEventExportChunks(ctx context.Context, req *auditlogpb.GetEventExportChunksRequest) stream.Stream[*auditlogpb.EventExportChunk] {
+	return stream.Fail[*auditlogpb.EventExportChunk](trace.NotImplemented("FileLog does not implement GetEventExportChunks"))
 }
 
 type searchEventsFilter struct {
 	eventTypes []string
 	condition  utils.FieldsCondition
+	search     string
 }
 
 // Close closes the audit log, which includes closing all file handles and
@@ -395,19 +537,10 @@ func (l *FileLog) Close() error {
 	return err
 }
 
-func (l *FileLog) GetSessionChunk(namespace string, sid session.ID, offsetBytes, maxBytes int) ([]byte, error) {
-	return nil, trace.NotImplemented("not implemented")
-}
-
-func (l *FileLog) GetSessionEvents(namespace string, sid session.ID, after int, fetchPrintEvents bool) ([]EventFields, error) {
-	return nil, trace.NotImplemented("not implemented")
-}
-
 // mightNeedRotation checks if the current log file looks older than a given duration,
 // used by rotateLog to decide if it should acquire a write lock.  Must be called under
 // read lock.
 func (l *FileLog) mightNeedRotation() bool {
-
 	if l.file == nil {
 		return true
 	}
@@ -421,7 +554,6 @@ func (l *FileLog) mightNeedRotation() bool {
 // rotateLog checks if the current log file is older than a given duration,
 // and if it is, closes it and opens a new one.  Must be called under write lock.
 func (l *FileLog) rotateLog() (err error) {
-
 	// determine the timestamp for the current log file rounded to the day.
 	fileTime := l.Clock.Now().UTC().Truncate(24 * time.Hour)
 
@@ -429,9 +561,9 @@ func (l *FileLog) rotateLog() (err error) {
 		fileTime.Format(defaults.AuditLogTimeFormat)+LogfileExt)
 
 	openLogFile := func() error {
-		l.file, err = os.OpenFile(logFilename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
+		l.file, err = os.OpenFile(logFilename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o640)
 		if err != nil {
-			log.Error(err)
+			l.logger.ErrorContext(context.Background(), "failed to open log file", "error", err, "file", logFilename)
 		}
 		l.fileTime = fileTime
 		return trace.Wrap(err)
@@ -498,9 +630,9 @@ func (l *FileLog) matchingFiles(fromUTC, toUTC time.Time, order types.EventOrder
 			if fi.IsDir() || filepath.Ext(fi.Name()) != LogfileExt {
 				continue
 			}
-			fd, err := parseFileTime(fi.Name())
+			fd, err := ParseFileTime(fi.Name())
 			if err != nil {
-				l.Warningf("Failed to parse audit log file %q format: %v", fi.Name(), err)
+				l.logger.WarnContext(context.Background(), "Failed to parse audit log file format", "file", fi.Name(), "error", err)
 				continue
 			}
 			// File rounding in current logs is non-deterministic,
@@ -532,15 +664,15 @@ func (l *FileLog) matchingFiles(fromUTC, toUTC time.Time, order types.EventOrder
 	return filtered, nil
 }
 
-// parseFileTime parses file's timestamp encoded into filename
-func parseFileTime(filename string) (time.Time, error) {
+// ParseFileTime parses file's timestamp encoded into filename
+func ParseFileTime(filename string) (time.Time, error) {
 	base := strings.TrimSuffix(filename, filepath.Ext(filename))
 	return time.Parse(defaults.AuditLogTimeFormat, base)
 }
 
 // findInFile scans a given log file and returns events that fit the criteria.
 func (l *FileLog) findInFile(path string, filter searchEventsFilter) ([]EventFields, error) {
-	l.Debugf("Called findInFile(%s, %+v).", path, filter)
+	l.logger.DebugContext(context.Background(), "Called findInFile", "path", path, "filter", filter)
 
 	// open the log file:
 	lf, err := os.OpenFile(path, os.O_RDONLY, 0)
@@ -577,22 +709,20 @@ func (l *FileLog) findInFile(path string, filter searchEventsFilter) ([]EventFie
 		// in the query:
 		var ef EventFields
 		if err := utils.FastUnmarshal(scanner.Bytes(), &ef); err != nil {
-			l.Warnf("invalid JSON in %s line %d", path, lineNo)
+			l.logger.WarnContext(context.Background(), "invalid JSON in line found", "file", path, "line_number", lineNo)
 			continue
 		}
-		accepted := len(filter.eventTypes) == 0
-		for _, eventType := range filter.eventTypes {
-			if ef.GetString(EventType) == eventType {
-				accepted = true
-				break
-			}
-		}
+		accepted := len(filter.eventTypes) == 0 || slices.Contains(filter.eventTypes, ef.GetString(EventType))
 		if !accepted {
 			continue
 		}
 		// Check that the filter condition is satisfied.
 		if filter.condition != nil {
 			accepted = accepted && filter.condition(utils.Fields(ef))
+		}
+		// Check if search filter matches.
+		if accepted && filter.search != "" {
+			accepted = MatchSearch(filter.search, string(scanner.Bytes()))
 		}
 
 		if accepted {
@@ -603,25 +733,14 @@ func (l *FileLog) findInFile(path string, filter searchEventsFilter) ([]EventFie
 	if err := scanner.Err(); err != nil {
 		switch {
 		case errors.Is(err, bufio.ErrTooLong):
-			fields := log.Fields{"path": path, "line": lineNo}
-			l.WithFields(fields).
-				Warnf("FileLog contains very large entries. Scan operation will return partial result.")
+			l.logger.WarnContext(context.Background(), "FileLog contains very large entries. Scan operation will return partial result.", "path", path, "line", lineNo)
 		default:
-			l.WithError(err).Errorf("Failed to scan AuditLog.")
+			l.logger.ErrorContext(context.Background(), "Failed to scan AuditLog.", "error", err)
 
 		}
 	}
 
 	return retval, nil
-}
-
-// StreamSessionEvents streams all events from a given session recording. An error is returned on the first
-// channel if one is encountered. Otherwise the event channel is closed when the stream ends.
-// The event channel is not closed on error to prevent race conditions in downstream select statements.
-func (l *FileLog) StreamSessionEvents(ctx context.Context, sessionID session.ID, startIndex int64) (chan apievents.AuditEvent, chan error) {
-	c, e := make(chan apievents.AuditEvent), make(chan error, 1)
-	e <- trace.NotImplemented("not implemented")
-	return c, e
 }
 
 type eventFile struct {
@@ -658,8 +777,26 @@ func (f ByTimeAndIndex) Swap(i, j int) {
 	f[i], f[j] = f[j], f[i]
 }
 
+// MatchSearch returns true if all whitespace-delimited search terms are present
+// in text, using case-insensitive substring matching.
+func MatchSearch(search, text string) bool {
+	terms := strings.Fields(strings.ToLower(search))
+	if len(terms) == 0 {
+		return true
+	}
+
+	text = strings.ToLower(text)
+	for _, term := range terms {
+		if !strings.Contains(text, term) {
+			return false
+		}
+	}
+
+	return true
+}
+
 // getTime converts json time to string
-func getTime(v interface{}) time.Time {
+func getTime(v any) time.Time {
 	sval, ok := v.(string)
 	if !ok {
 		return time.Time{}
@@ -671,7 +808,7 @@ func getTime(v interface{}) time.Time {
 	return t
 }
 
-func getEventIndex(v interface{}) float64 {
+func getEventIndex(v any) float64 {
 	switch val := v.(type) {
 	case float64:
 		return val

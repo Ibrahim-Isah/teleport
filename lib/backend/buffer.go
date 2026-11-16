@@ -1,25 +1,28 @@
 /*
-Copyright 2018-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package backend
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -27,16 +30,18 @@ import (
 	radix "github.com/armon/go-radix"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/backend/backendmetrics"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 type bufferConfig struct {
-	gracePeriod time.Duration
-	capacity    int
-	clock       clockwork.Clock
+	gracePeriod         time.Duration
+	creationGracePeriod time.Duration
+	capacity            int
+	clock               clockwork.Clock
 }
 
 type BufferOption func(*bufferConfig)
@@ -59,6 +64,16 @@ func BacklogGracePeriod(d time.Duration) BufferOption {
 	}
 }
 
+// CreationGracePeriod sets the amount of time delay after watcher creation before
+// it will be considered for removal due to backlog.
+func CreationGracePeriod(d time.Duration) BufferOption {
+	return func(cfg *bufferConfig) {
+		if d > 0 {
+			cfg.creationGracePeriod = d
+		}
+	}
+}
+
 // BufferClock sets a custom clock for the buffer (used in tests).
 func BufferClock(c clockwork.Clock) BufferOption {
 	return func(cfg *bufferConfig) {
@@ -72,7 +87,7 @@ func BufferClock(c clockwork.Clock) BufferOption {
 // of predefined size, that is capable of fan-out of the backend events.
 type CircularBuffer struct {
 	sync.Mutex
-	*log.Entry
+	logger       *slog.Logger
 	cfg          bufferConfig
 	init, closed bool
 	watchers     *watcherTree
@@ -81,17 +96,16 @@ type CircularBuffer struct {
 // NewCircularBuffer returns a new uninitialized instance of circular buffer.
 func NewCircularBuffer(opts ...BufferOption) *CircularBuffer {
 	cfg := bufferConfig{
-		gracePeriod: DefaultBacklogGracePeriod,
-		capacity:    DefaultBufferCapacity,
-		clock:       clockwork.NewRealClock(),
+		gracePeriod:         DefaultBacklogGracePeriod,
+		creationGracePeriod: DefaultCreationGracePeriod,
+		capacity:            DefaultBufferCapacity,
+		clock:               clockwork.NewRealClock(),
 	}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 	return &CircularBuffer{
-		Entry: log.WithFields(log.Fields{
-			trace.Component: teleport.ComponentBuffer,
-		}),
+		logger:   slog.With(teleport.ComponentKey, teleport.ComponentBuffer),
 		cfg:      cfg,
 		watchers: newWatcherTree(),
 	}
@@ -143,7 +157,7 @@ func (c *CircularBuffer) SetInit() {
 	})
 
 	for _, watcher := range watchersToDelete {
-		c.Warningf("Closing %v, failed to send init event.", watcher)
+		c.logger.WarnContext(context.Background(), "Closing watcher, failed to send init event.", "watcher", logutils.StringerAttr(watcher))
 		watcher.closeWatcher()
 		c.watchers.rm(watcher)
 	}
@@ -189,9 +203,9 @@ func (c *CircularBuffer) emit(r Event) {
 
 func (c *CircularBuffer) fanOutEvent(r Event) {
 	var watchersToDelete []*BufferWatcher
-	c.watchers.walkPath(string(r.Item.Key), func(watcher *BufferWatcher) {
+	c.watchers.walkPath(r.Item.Key.String(), func(watcher *BufferWatcher) {
 		if watcher.MetricComponent != "" {
-			watcherQueues.WithLabelValues(watcher.MetricComponent).Set(float64(len(watcher.eventsC)))
+			backendmetrics.WatcherQueues.WithLabelValues(watcher.MetricComponent).Set(float64(len(watcher.eventsC)))
 		}
 		if !watcher.emit(r) {
 			watchersToDelete = append(watchersToDelete, watcher)
@@ -199,25 +213,26 @@ func (c *CircularBuffer) fanOutEvent(r Event) {
 	})
 
 	for _, watcher := range watchersToDelete {
-		c.Warningf("Closing %v, buffer overflow at %v (backlog=%v).", watcher, len(watcher.eventsC), watcher.backlogLen())
+		c.logger.WarnContext(context.Background(), "Closing watcher, buffer overflow", "watcher", logutils.StringerAttr(watcher), "events", len(watcher.eventsC), "backlog", watcher.backlogLen())
 		watcher.closeWatcher()
 		c.watchers.rm(watcher)
 	}
 }
 
-func removeRedundantPrefixes(prefixes [][]byte) [][]byte {
+// RemoveRedundantPrefixes will remove redundant prefixes from the given prefix list.
+func RemoveRedundantPrefixes(prefixes []Key) []Key {
 	if len(prefixes) == 0 {
 		return prefixes
 	}
 	// group adjacent prefixes together
 	sort.Slice(prefixes, func(i, j int) bool {
-		return bytes.Compare(prefixes[i], prefixes[j]) == -1
+		return prefixes[i].Compare(prefixes[j]) == -1
 	})
 	// j increments only for values with non-redundant prefixes
 	j := 0
 	for i := 1; i < len(prefixes); i++ {
 		// skip keys that have first key as a prefix
-		if bytes.HasPrefix(prefixes[i], prefixes[j]) {
+		if prefixes[i].HasPrefix(prefixes[j]) {
 			continue
 		}
 		j++
@@ -243,11 +258,11 @@ func (c *CircularBuffer) NewWatcher(ctx context.Context, watch Watch) (Watcher, 
 	if len(watch.Prefixes) == 0 {
 		// if watcher has no prefixes, assume it will match anything
 		// starting from the separator (what includes all keys in backend invariant, see Keys function)
-		watch.Prefixes = append(watch.Prefixes, []byte{Separator})
+		watch.Prefixes = append(watch.Prefixes, Key{})
 	} else {
 		// if watcher's prefixes are redundant, keep only shorter prefixes
 		// to avoid double fan out
-		watch.Prefixes = removeRedundantPrefixes(watch.Prefixes)
+		watch.Prefixes = RemoveRedundantPrefixes(watch.Prefixes)
 	}
 
 	closeCtx, cancel := context.WithCancel(ctx)
@@ -255,14 +270,15 @@ func (c *CircularBuffer) NewWatcher(ctx context.Context, watch Watch) (Watcher, 
 		buffer:   c,
 		Watch:    watch,
 		eventsC:  make(chan Event, watch.QueueSize),
+		created:  c.cfg.clock.Now(),
 		ctx:      closeCtx,
 		cancel:   cancel,
 		capacity: watch.QueueSize,
 	}
-	c.Debugf("Add %v.", w)
+	c.logger.DebugContext(ctx, "Adding watcher", "watcher", logutils.StringerAttr(w))
 	if c.init {
 		if ok := w.init(); !ok {
-			c.Warningf("Closing %v, failed to send init event.", w)
+			c.logger.WarnContext(ctx, "Closing watcher, failed to send init event.", "watcher", logutils.StringerAttr(w))
 			return nil, trace.BadParameter("failed to send init event")
 		}
 	}
@@ -271,16 +287,17 @@ func (c *CircularBuffer) NewWatcher(ctx context.Context, watch Watch) (Watcher, 
 }
 
 func (c *CircularBuffer) removeWatcherWithLock(watcher *BufferWatcher) {
+	ctx := context.Background()
 	c.Lock()
 	defer c.Unlock()
 	if watcher == nil {
-		c.Warningf("Internal logic error: %v.", trace.DebugReport(trace.BadParameter("empty watcher")))
+		c.logger.WarnContext(ctx, "Internal logic error, empty watcher")
 		return
 	}
-	c.Debugf("Removing watcher %p via external close.", watcher)
+	c.logger.DebugContext(ctx, "Removing watcher via external close.", "watcher", logutils.StringerAttr(watcher))
 	found := c.watchers.rm(watcher)
 	if !found {
-		c.Debugf("Could not find watcher %v.", watcher)
+		c.logger.DebugContext(ctx, "Could not find watcher", "watcher", watcher.Name)
 	}
 }
 
@@ -294,6 +311,7 @@ type BufferWatcher struct {
 	bmu          sync.Mutex
 	backlog      []Event
 	backlogSince time.Time
+	created      time.Time
 
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -305,7 +323,7 @@ type BufferWatcher struct {
 // String returns user-friendly representation
 // of the buffer watcher
 func (w *BufferWatcher) String() string {
-	return fmt.Sprintf("Watcher(name=%v, prefixes=%v, capacity=%v, size=%v)", w.Name, string(bytes.Join(w.Prefixes, []byte(", "))), w.capacity, len(w.eventsC))
+	return fmt.Sprintf("Watcher(name=%v, prefixes=%v, capacity=%v, size=%v)", w.Name, w.Prefixes, w.capacity, len(w.eventsC))
 }
 
 // Events returns events channel.  This method performs internal work and should be re-called after each event
@@ -349,7 +367,7 @@ func (w *BufferWatcher) emit(e Event) (ok bool) {
 	defer w.bmu.Unlock()
 
 	if !w.flushBacklog() {
-		if w.buffer.cfg.clock.Now().After(w.backlogSince.Add(w.buffer.cfg.gracePeriod)) {
+		if now := w.buffer.cfg.clock.Now(); now.After(w.backlogSince.Add(w.buffer.cfg.gracePeriod)) && now.After(w.created.Add(w.buffer.cfg.creationGracePeriod)) {
 			// backlog has existed for longer than grace period,
 			// this watcher needs to be removed.
 			return false
@@ -432,7 +450,7 @@ type watcherTree struct {
 // add adds buffer watcher to the tree
 func (t *watcherTree) add(w *BufferWatcher) {
 	for _, p := range w.Prefixes {
-		prefix := string(p)
+		prefix := p.String()
 		val, ok := t.Tree.Get(prefix)
 		var watchers []*BufferWatcher
 		if ok {
@@ -450,7 +468,7 @@ func (t *watcherTree) rm(w *BufferWatcher) bool {
 	}
 	var found bool
 	for _, p := range w.Prefixes {
-		prefix := string(p)
+		prefix := p.String()
 		val, ok := t.Tree.Get(prefix)
 		if !ok {
 			continue
@@ -459,7 +477,7 @@ func (t *watcherTree) rm(w *BufferWatcher) bool {
 		prevLen := len(buffers)
 		for i := range buffers {
 			if buffers[i] == w {
-				buffers = append(buffers[:i], buffers[i+1:]...)
+				buffers = slices.Delete(buffers, i, i+1)
 				found = true
 				break
 			}
@@ -479,7 +497,7 @@ type walkFn func(w *BufferWatcher)
 // walkPath walks the tree above the longest matching prefix
 // and calls fn callback for every buffer watcher
 func (t *watcherTree) walkPath(key string, fn walkFn) {
-	t.Tree.WalkPath(key, func(prefix string, val interface{}) bool {
+	t.Tree.WalkPath(key, func(prefix string, val any) bool {
 		watchers := val.([]*BufferWatcher)
 		for _, w := range watchers {
 			fn(w)
@@ -490,7 +508,7 @@ func (t *watcherTree) walkPath(key string, fn walkFn) {
 
 // walk calls fn for every matching leaf of the tree
 func (t *watcherTree) walk(fn walkFn) {
-	t.Tree.Walk(func(prefix string, val interface{}) bool {
+	t.Tree.Walk(func(prefix string, val any) bool {
 		watchers := val.([]*BufferWatcher)
 		for _, w := range watchers {
 			fn(w)

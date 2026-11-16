@@ -1,52 +1,55 @@
-/*
-Copyright 2021-2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { useState } from 'react';
 
-    http://www.apache.org/licenses/LICENSE-2.0
+import { Box } from 'design';
+import { NewFlow, StepSlider } from 'design/StepSlider';
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+import { OnboardCard } from 'teleport/components/Onboard';
+import OSSRecoveryCodes from 'teleport/components/RecoveryCodes';
+import cfg from 'teleport/config';
+import { loginFlows } from 'teleport/Welcome/NewCredentials/constants';
 
-import React, { useState } from 'react';
-import { Card } from 'design';
-import { PrimaryAuthType } from 'shared/services';
-
-import { NewFlow, StepComponentProps, StepSlider } from 'design/StepSlider';
-
-import RecoveryCodes from 'teleport/components/RecoveryCodes';
-import { PrivateKeyLoginDisabledCard } from 'teleport/components/PrivateKeyPolicy';
-
-import useToken, { State } from '../useToken';
-
+import useToken from '../useToken';
 import { Expired } from './Expired';
 import { RegisterSuccess } from './Success';
-import { NewMfaDevice } from './NewMfaDevice';
-import { NewPasswordlessDevice } from './NewPasswordlessDevice';
-import { NewPassword } from './NewPassword';
+import { LoginFlow, NewCredentialsProps } from './types';
 
-export type LoginFlow = Extract<PrimaryAuthType, 'passwordless' | 'local'>;
-export type SliderProps = StepComponentProps & {
-  changeFlow(f: NewFlow<LoginFlow>): void;
-};
-
-const loginFlows = {
-  local: [NewPassword, NewMfaDevice],
-  passwordless: [NewPasswordlessDevice],
-};
-
+/**
+ *
+ * @remarks
+ * This container component is duplicated in Enterprise for Enterprise onboarding. If you are making edits to this file, check to see if the
+ * equivalent change should be applied in Enterprise
+ *
+ */
 export function Container({ tokenId = '', resetMode = false }) {
   const state = useToken(tokenId);
-  return <NewCredentials {...state} resetMode={resetMode} />;
+  return (
+    <NewCredentials
+      {...state}
+      resetMode={resetMode}
+      isDashboard={cfg.isDashboard}
+    />
+  );
 }
 
-export function NewCredentials(props: State & Props) {
+export function NewCredentials(props: NewCredentialsProps) {
   const {
     fetchAttempt,
     recoveryCodes,
@@ -56,45 +59,12 @@ export function NewCredentials(props: State & Props) {
     primaryAuthType,
     success,
     finishedRegister,
-    privateKeyPolicyEnabled,
+    isDashboard,
+    displayInviteCollaborators = false,
+    setDisplayInviteCollaborators = null,
+    InviteCollaborators = undefined,
+    RecoveryCodes,
   } = props;
-
-  if (fetchAttempt.status === 'failed') {
-    return <Expired resetMode={resetMode} />;
-  }
-
-  if (fetchAttempt.status !== 'success') {
-    return null;
-  }
-
-  if (success && privateKeyPolicyEnabled) {
-    return (
-      <PrivateKeyLoginDisabledCard
-        title={resetMode ? 'Reset Complete' : 'Registration Complete'}
-      />
-    );
-  }
-
-  if (success) {
-    return (
-      <RegisterSuccess
-        redirect={redirect}
-        resetMode={resetMode}
-        username={resetToken.user}
-      />
-    );
-  }
-
-  if (recoveryCodes) {
-    return (
-      <RecoveryCodes
-        recoveryCodes={recoveryCodes}
-        onContinue={finishedRegister}
-        isNewCodes={resetMode}
-        username={resetToken.user}
-      />
-    );
-  }
 
   // Check which flow to render as default.
   const [password, setPassword] = useState('');
@@ -105,6 +75,55 @@ export function NewCredentials(props: State & Props) {
     }
     return 'passwordless';
   });
+
+  if (fetchAttempt.status === 'failed') {
+    return <Expired resetMode={resetMode} />;
+  }
+
+  if (fetchAttempt.status !== 'success') {
+    return null;
+  }
+
+  if (
+    success &&
+    !resetMode &&
+    displayInviteCollaborators &&
+    setDisplayInviteCollaborators &&
+    InviteCollaborators
+  ) {
+    return (
+      <OnboardCard>
+        <InviteCollaborators
+          onSubmit={() => setDisplayInviteCollaborators(false)}
+        />
+      </OnboardCard>
+    );
+  }
+
+  if (success) {
+    return (
+      <RegisterSuccess
+        redirect={redirect}
+        resetMode={resetMode}
+        username={resetToken.user}
+        isDashboard={isDashboard}
+      />
+    );
+  }
+
+  if (recoveryCodes) {
+    // TODO(bl-nero): Remove OSSRecoveryCodes once the enterprise code passes
+    // the RecoveryCodesComponent through props.
+    const Component = RecoveryCodes || OSSRecoveryCodes;
+    return (
+      <Component
+        recoveryCodes={recoveryCodes}
+        onContinue={finishedRegister}
+        isNewCodes={resetMode}
+        username={resetToken.user}
+      />
+    );
+  }
 
   function onSwitchFlow(flow: LoginFlow) {
     setFlow(flow);
@@ -119,7 +138,7 @@ export function NewCredentials(props: State & Props) {
   }
 
   return (
-    <Card as="form" bg="primary.light" my={5} mx="auto" width={464}>
+    <Box as="form">
       <StepSlider<typeof loginFlows>
         flows={loginFlows}
         currFlow={flow}
@@ -130,11 +149,6 @@ export function NewCredentials(props: State & Props) {
         password={password}
         updatePassword={updatePassword}
       />
-    </Card>
+    </Box>
   );
 }
-
-export type Props = State & {
-  resetMode?: boolean;
-  currFlow?: LoginFlow;
-};

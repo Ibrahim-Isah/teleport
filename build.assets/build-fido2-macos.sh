@@ -11,17 +11,24 @@
 # Written mainly for macOS builders.
 set -eu
 
-readonly MACOS_VERSION_MIN=10.13
+readonly MACOS_VERSION_MIN=11.0
+
+# Cross-architecture building
+# Set C_ARCH to $(uname -m) if unset, and validate supported architecture
+if ! [[ "${C_ARCH:=$(uname -m)}" =~ ^(x86_64|arm64)$ ]]; then
+  echo "unknown or unsupported build architecture: $C_ARCH" >&2
+  exit 1
+fi
 
 # Note: versions are the same as the corresponding git tags for each repo.
-readonly CBOR_VERSION=v0.10.2
-readonly CBOR_COMMIT=efa6c0886bae46bdaef9b679f61f4b9d8bc296ae
-readonly CRYPTO_VERSION=OpenSSL_1_1_1t
-readonly CRYPTO_COMMIT=830bf8e1e4749ad65c51b6a1d0d769ae689404ba
-readonly FIDO2_VERSION=1.12.0
-readonly FIDO2_COMMIT=659a02679f99fd34a44e06e35dce90794f6ecc86
+readonly CBOR_VERSION=v0.11.0
+readonly CBOR_COMMIT=170bee2b82cdb7b2ed25af301f62cb6efdd40ec1
+readonly CRYPTO_VERSION=openssl-3.0.19
+readonly CRYPTO_COMMIT=a22063cd69a077cc68bb4c10e9f351f75899b194
+readonly FIDO2_VERSION=1.15.0
+readonly FIDO2_COMMIT=f87c19c9487c0131531314d9ccb475ea5325794e
 
-readonly LIB_CACHE="/tmp/teleport-fido2-cache"
+readonly LIB_CACHE="/tmp/teleport-fido2-cache-$C_ARCH"
 readonly PKGFILE_DIR="$LIB_CACHE/fido2-${FIDO2_VERSION}_cbor-${CBOR_VERSION}_crypto-${CRYPTO_VERSION}"
 
 # Library cache paths, implicitly matched by fetch_and_build.
@@ -82,6 +89,8 @@ cbor_build() {
   cd "$src"
 
   cmake \
+    -DCMAKE_OSX_ARCHITECTURES="$C_ARCH" \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$dest" \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_VERSION_MIN" \
@@ -105,10 +114,11 @@ crypto_build() {
   echo 'crypto: building' >&2
   cd "$src"
 
-  ./config \
+  ./Configure \
+    "darwin64-$C_ARCH-cc" \
+    -fPIC \
     -mmacosx-version-min="$MACOS_VERSION_MIN" \
     --prefix="$dest" \
-    --openssldir="$dest/openssl@1.1" \
     no-shared \
     no-zlib
   # Build and copy only what we need instead of 'make && make install'.
@@ -138,11 +148,14 @@ fido2_build() {
     -DBUILD_EXAMPLES=OFF \
     -DBUILD_MANPAGES=OFF \
     -DBUILD_TOOLS=OFF \
+    -DCMAKE_OSX_ARCHITECTURES="$C_ARCH" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$dest" \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_VERSION_MIN" \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -G "Unix Makefiles" \
     .
+  grep 'CRYPTO_VERSION:INTERNAL=3\.0\.' CMakeCache.txt # double-check OpenSSL
   make
   make install
 }
@@ -172,6 +185,7 @@ EOF
   # Word splitting desired for pkg-config.
   #shellcheck disable=SC2046
   gcc \
+    -arch "$C_ARCH" \
     $(pkg-config --cflags --libs libfido2-static) \
     -o "$toydir/toy.bin" \
     "$toydir/toy.c"

@@ -1,21 +1,26 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package touchid
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/base64"
@@ -25,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -34,10 +40,11 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/protocol/webauthncose"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 
-	wanlib "github.com/gravitational/teleport/lib/auth/webauthn"
+	"github.com/gravitational/teleport"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
 	"github.com/gravitational/teleport/lib/darwin"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 var (
@@ -48,6 +55,8 @@ var (
 	PromptPlatformMessage = "Using platform authenticator, follow the OS prompt"
 	// PromptWriter is the writer used for prompt messages.
 	PromptWriter io.Writer = os.Stderr
+
+	logger = logutils.NewPackageLogger(teleport.ComponentKey, "TouchID")
 )
 
 func promptPlatform() {
@@ -108,6 +117,16 @@ type DiagResult struct {
 	// IsAvailable is true if Touch ID is considered functional.
 	// It means enough of the preceding tests to enable the feature.
 	IsAvailable bool
+
+	// isClamshellFailure is set when it's likely that clamshell mode is the sole
+	// culprit of Touch ID unavailability.
+	isClamshellFailure bool
+}
+
+// IsClamshellFailure returns true if the lack of touch ID availability could be
+// due to clamshell mode.
+func (d *DiagResult) IsClamshellFailure() bool {
+	return d.isClamshellFailure
 }
 
 // CredentialInfo holds information about a Secure Enclave credential.
@@ -153,7 +172,7 @@ func IsAvailable() bool {
 		var err error
 		cachedDiag, err = Diag()
 		if err != nil {
-			log.WithError(err).Warn("Touch ID self-diagnostics failed")
+			logger.WarnContext(context.Background(), "self-diagnostics failed", "error", err)
 			return false
 		}
 	}
@@ -175,7 +194,7 @@ func Diag() (*DiagResult, error) {
 // Confirm may replace equivalent keys with the new key, at the implementation's
 // discretion.
 type Registration struct {
-	CCR *wanlib.CredentialCreationResponse
+	CCR *wantypes.CredentialCreationResponse
 
 	credentialID string
 
@@ -207,7 +226,7 @@ func (r *Registration) Rollback() error {
 // Callers are encouraged to either explicitly Confirm or Rollback the returned
 // registration.
 // See Registration.
-func Register(origin string, cc *wanlib.CredentialCreation) (*Registration, error) {
+func Register(origin string, cc *wantypes.CredentialCreation) (*Registration, error) {
 	if !IsAvailable() {
 		return nil, ErrNotAvailable
 	}
@@ -261,10 +280,14 @@ func Register(origin string, cc *wanlib.CredentialCreation) (*Registration, erro
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	x := make([]byte, 32) // x and y must have exactly 32 bytes in EC2PublicKeyData.
-	y := make([]byte, 32)
-	pubKey.X.FillBytes(x)
-	pubKey.Y.FillBytes(y)
+
+	pubKeyBytes, err := pubKey.Bytes()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// First byte is the 0x04 prefix, which can be skipped. The rest are the x and y coordinates.
+	x, y := pubKeyBytes[1:33], pubKeyBytes[33:]
 
 	pubKeyCBOR, err := cbor.Marshal(
 		&webauthncose.EC2PublicKeyData{
@@ -300,7 +323,7 @@ func Register(origin string, cc *wanlib.CredentialCreation) (*Registration, erro
 	attObj, err := cbor.Marshal(protocol.AttestationObject{
 		RawAuthData: attData.rawAuthData,
 		Format:      "packed",
-		AttStatement: map[string]interface{}{
+		AttStatement: map[string]any{
 			"alg": int64(webauthncose.AlgES256),
 			"sig": sig,
 		},
@@ -309,16 +332,16 @@ func Register(origin string, cc *wanlib.CredentialCreation) (*Registration, erro
 		return nil, trace.Wrap(err)
 	}
 
-	ccr := &wanlib.CredentialCreationResponse{
-		PublicKeyCredential: wanlib.PublicKeyCredential{
-			Credential: wanlib.Credential{
+	ccr := &wantypes.CredentialCreationResponse{
+		PublicKeyCredential: wantypes.PublicKeyCredential{
+			Credential: wantypes.Credential{
 				ID:   credentialID,
 				Type: string(protocol.PublicKeyCredentialType),
 			},
 			RawID: []byte(credentialID),
 		},
-		AttestationResponse: wanlib.AuthenticatorAttestationResponse{
-			AuthenticatorResponse: wanlib.AuthenticatorResponse{
+		AttestationResponse: wantypes.AuthenticatorAttestationResponse{
+			AuthenticatorResponse: wantypes.AuthenticatorResponse{
 				ClientDataJSON: attData.ccdJSON,
 			},
 			AttestationObject: attObj,
@@ -342,7 +365,7 @@ func HasCredentials(rpid, user string) bool {
 	}
 	creds, err := native.FindCredentials(rpid, user)
 	if err != nil {
-		log.WithError(err).Debug("Touch ID: Could not find credentials")
+		logger.DebugContext(context.Background(), "Could not find credentials", "error", err)
 		return false
 	}
 	return len(creds) > 0
@@ -423,7 +446,7 @@ type CredentialPicker interface {
 // Login authenticates using a Secure Enclave-backed biometric credential.
 // It returns the assertion response and the user that owns the credential to
 // sign it.
-func Login(origin, user string, assertion *wanlib.CredentialAssertion, picker CredentialPicker) (*wanlib.CredentialAssertionResponse, string, error) {
+func Login(origin, user string, assertion *wantypes.CredentialAssertion, picker CredentialPicker) (*wantypes.CredentialAssertionResponse, string, error) {
 	if !IsAvailable() {
 		return nil, "", ErrNotAvailable
 	}
@@ -480,7 +503,7 @@ func Login(origin, user string, assertion *wanlib.CredentialAssertion, picker Cr
 	if err != nil {
 		return nil, "", trace.Wrap(err)
 	}
-	log.Debugf("Touch ID: using credential %q", cred.CredentialID)
+	logger.DebugContext(context.Background(), "using credential", "credential_id", cred.CredentialID)
 
 	attData, err := makeAttestationData(protocol.AssertCeremony, origin, rpID, assertion.Response.Challenge, nil /* cred */)
 	if err != nil {
@@ -493,16 +516,16 @@ func Login(origin, user string, assertion *wanlib.CredentialAssertion, picker Cr
 		return nil, "", trace.Wrap(err)
 	}
 
-	return &wanlib.CredentialAssertionResponse{
-		PublicKeyCredential: wanlib.PublicKeyCredential{
-			Credential: wanlib.Credential{
+	return &wantypes.CredentialAssertionResponse{
+		PublicKeyCredential: wantypes.PublicKeyCredential{
+			Credential: wantypes.Credential{
 				ID:   cred.CredentialID,
 				Type: string(protocol.PublicKeyCredentialType),
 			},
 			RawID: []byte(cred.CredentialID),
 		},
-		AssertionResponse: wanlib.AuthenticatorAssertionResponse{
-			AuthenticatorResponse: wanlib.AuthenticatorResponse{
+		AssertionResponse: wantypes.AuthenticatorAssertionResponse{
+			AuthenticatorResponse: wantypes.AuthenticatorResponse{
 				ClientDataJSON: attData.ccdJSON,
 			},
 			AuthenticatorData: attData.rawAuthData,
@@ -514,7 +537,7 @@ func Login(origin, user string, assertion *wanlib.CredentialAssertion, picker Cr
 
 func pickCredential(
 	actx AuthContext,
-	infos []CredentialInfo, allowedCredentials []protocol.CredentialDescriptor,
+	infos []CredentialInfo, allowedCredentials []wantypes.CredentialDescriptor,
 	picker CredentialPicker, promptOnce func(), userRequested bool,
 ) (*CredentialInfo, error) {
 	// Handle early exits.
@@ -569,10 +592,8 @@ func pickCredential(
 	// Is choice a pointer within the slice?
 	// We could work around this requirement, but it seems better to constrain the
 	// picker API from the start.
-	for _, c := range deduped {
-		if c == choice {
-			return choice, nil
-		}
+	if slices.Contains(deduped, choice) {
+		return choice, nil
 	}
 	return nil, fmt.Errorf("picker returned invalid credential: %#v", choice)
 }
@@ -595,7 +616,7 @@ func ListCredentials() ([]CredentialInfo, error) {
 		info := &infos[i]
 		key, err := darwin.ECDSAPublicKeyFromRaw(info.publicKeyRaw)
 		if err != nil {
-			log.Warnf("Failed to convert public key: %v", err)
+			logger.WarnContext(context.Background(), "Failed to convert public key", "error", err)
 		}
 		info.PublicKey = key // this is OK, even if it's nil
 		info.publicKeyRaw = nil

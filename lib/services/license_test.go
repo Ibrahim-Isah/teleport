@@ -1,18 +1,20 @@
 /*
-Copyright 2018-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
@@ -24,6 +26,7 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 
+	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
 )
 
@@ -34,12 +37,12 @@ func TestLicenseUnmarshal(t *testing.T) {
 		description string
 		input       string
 		expected    types.License
-		err         error
+		err         any
 	}
 	testCases := []testCase{
 		{
 			description: "simple case",
-			input:       `{"kind": "license", "version": "v3", "metadata": {"name": "Teleport Commercial"}, "spec": {"account_id": "accountID", "usage": true, "k8s": true, "app": true, "db": true, "desktop": true, "aws_account": "123", "aws_pid": "4"}}`,
+			input:       `{"kind": "license", "version": "v3", "metadata": {"name": "Teleport Commercial"}, "spec": {"account_id": "accountID", "usage": true, "k8s": true, "app": true, "db": true, "desktop": true, "feature_hiding": false, "aws_account": "123", "aws_pid": "4", "custom_theme": "cool-theme"}}`,
 			expected: MustNew("Teleport Commercial", types.LicenseSpecV3{
 				ReportsUsage:              types.NewBool(true),
 				SupportsKubernetes:        types.NewBool(true),
@@ -47,14 +50,16 @@ func TestLicenseUnmarshal(t *testing.T) {
 				SupportsDatabaseAccess:    types.NewBool(true),
 				SupportsDesktopAccess:     types.NewBool(true),
 				Cloud:                     types.NewBool(false),
+				SupportsFeatureHiding:     types.NewBool(false),
 				AWSAccountID:              "123",
 				AWSProductID:              "4",
 				AccountID:                 "accountID",
+				CustomTheme:               "cool-theme",
 			}),
 		},
 		{
 			description: "simple case with string booleans",
-			input:       `{"kind": "license", "version": "v3", "metadata": {"name": "license"}, "spec": {"account_id": "accountID", "usage": "yes", "k8s": "yes", "app": "yes", "db": "yes", "desktop": "yes", "aws_account": "123", "aws_pid": "4"}}`,
+			input:       `{"kind": "license", "version": "v3", "metadata": {"name": "license"}, "spec": {"account_id": "accountID", "usage": "yes", "k8s": "yes", "app": "yes", "db": "yes", "desktop": "yes", "feature_hiding": "no", "aws_account": "123", "aws_pid": "4", "custom_theme": "cool-theme"}}`,
 			expected: MustNew("license", types.LicenseSpecV3{
 				ReportsUsage:              types.NewBool(true),
 				SupportsKubernetes:        types.NewBool(true),
@@ -62,9 +67,11 @@ func TestLicenseUnmarshal(t *testing.T) {
 				SupportsDatabaseAccess:    types.NewBool(true),
 				SupportsDesktopAccess:     types.NewBool(true),
 				Cloud:                     types.NewBool(false),
+				SupportsFeatureHiding:     types.NewBool(false),
 				AWSAccountID:              "123",
 				AWSProductID:              "4",
 				AccountID:                 "accountID",
+				CustomTheme:               "cool-theme",
 			}),
 		},
 		{
@@ -84,12 +91,12 @@ func TestLicenseUnmarshal(t *testing.T) {
 		{
 			description: "failed validation - unknown version",
 			input:       `{"kind": "license", "version": "v2", "metadata": {"name": "license"}, "spec": {"usage": "yes", "k8s": "yes", "aws_account": "123", "aws_pid": "4"}}`,
-			err:         trace.BadParameter(""),
+			err:         &trace.BadParameterError{},
 		},
 		{
 			description: "failed validation, bad types",
 			input:       `{"kind": "license", "version": "v3", "metadata": {"name": "license"}, "spec": {"usage": 1, "k8s": "yes", "aws_account": 14, "aws_pid": "4"}}`,
-			err:         trace.BadParameter(""),
+			err:         &trace.BadParameterError{},
 		},
 	}
 	for _, tc := range testCases {
@@ -104,8 +111,56 @@ func TestLicenseUnmarshal(t *testing.T) {
 			require.NoError(t, err, comment)
 			require.Empty(t, cmp.Diff(tc.expected, out2))
 		} else {
-			require.IsType(t, err, tc.err, comment)
+			require.ErrorAs(t, err, &tc.err, comment)
 		}
+	}
+}
+
+func TestIsDashboard(t *testing.T) {
+	tt := []struct {
+		name     string
+		features proto.Features
+		expected bool
+	}{
+		{
+			name: "not cloud nor recovery codes is not dashboard",
+			features: proto.Features{
+				Cloud:         false,
+				RecoveryCodes: false,
+			},
+			expected: false,
+		},
+		{
+			name: "not cloud, with recovery codes is dashboard",
+			features: proto.Features{
+				Cloud:         false,
+				RecoveryCodes: true,
+			},
+			expected: true,
+		},
+		{
+			name: "cloud, with recovery codes is not dashboard",
+			features: proto.Features{
+				Cloud:         true,
+				RecoveryCodes: true,
+			},
+			expected: false,
+		},
+		{
+			name: "cloud, without recovery codes is not dashboard",
+			features: proto.Features{
+				Cloud:         true,
+				RecoveryCodes: false,
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			result := IsDashboard(tc.features)
+			require.Equal(t, tc.expected, result)
+		})
 	}
 }
 

@@ -1,21 +1,20 @@
 /*
-
- Copyright 2022 Gravitational, Inc.
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package protocol
 
@@ -26,15 +25,15 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/go-redis/redis/v9"
 	"github.com/gravitational/trace"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
 
 func TestWriteCmd(t *testing.T) {
 	tests := []struct {
 		name     string
-		val      interface{}
+		val      any
 		expected []byte
 		wantErr  bool
 	}{
@@ -70,7 +69,7 @@ func TestWriteCmd(t *testing.T) {
 		},
 		{
 			name:     "[]nil",
-			val:      []interface{}{nil},
+			val:      []any{nil},
 			expected: []byte("*1\r\n$-1\r\n"),
 		},
 		{
@@ -101,7 +100,6 @@ func TestWriteCmd(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -141,27 +139,27 @@ func TestMakeUnknownCommandErrorForCmd(t *testing.T) {
 	ctx := context.Background()
 	tests := []struct {
 		name          string
-		command       []interface{}
+		command       []any
 		expectedError redis.RedisError
 	}{
 		{
 			name:          "HELLO",
-			command:       []interface{}{"HELLO", 3, "user", "TOKEN"},
-			expectedError: "ERR unknown command 'HELLO', with args beginning with: '3' 'user' 'TOKEN'",
+			command:       []any{"HELLO", 3, "AUTH", "user", "TOKEN"},
+			expectedError: "ERR unknown command 'HELLO', with args beginning with: '3' 'AUTH' 'user' 'TOKEN'",
 		},
 		{
 			name:          "no extra args",
-			command:       []interface{}{"abcdef"},
+			command:       []any{"abcdef"},
 			expectedError: "ERR unknown command 'abcdef', with args beginning with: ",
 		},
 		{
 			name:          "cluster",
-			command:       []interface{}{"cluster", "aaa", "bbb"},
+			command:       []any{"cluster", "aaa", "bbb"},
 			expectedError: "ERR unknown subcommand 'aaa'. Try CLUSTER HELP.",
 		},
 		{
 			name:          "command",
-			command:       []interface{}{"command", "aaa", "bbb"},
+			command:       []any{"command", "aaa", "bbb"},
 			expectedError: "ERR unknown subcommand 'aaa'. Try COMMAND HELP.",
 		},
 	}

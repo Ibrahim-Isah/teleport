@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/api/utils"
 )
 
 // StaticTokens define a list of static []ProvisionToken used to provision a
@@ -33,6 +35,8 @@ type StaticTokens interface {
 	SetStaticTokens([]ProvisionToken)
 	// GetStaticTokens gets the list of static tokens used to provision nodes.
 	GetStaticTokens() []ProvisionToken
+	// Clone creats a copy of the tokens.
+	Clone() StaticTokens
 }
 
 // NewStaticTokens is a convenience wrapper to create a StaticTokens resource.
@@ -71,14 +75,14 @@ func (c *StaticTokensV2) SetSubKind(sk string) {
 	c.SubKind = sk
 }
 
-// GetResourceID returns resource ID
-func (c *StaticTokensV2) GetResourceID() int64 {
-	return c.Metadata.ID
+// GetRevision returns the revision
+func (c *StaticTokensV2) GetRevision() string {
+	return c.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (c *StaticTokensV2) SetResourceID(id int64) {
-	c.Metadata.ID = id
+// SetRevision sets the revision
+func (c *StaticTokensV2) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // GetName returns the name of the StaticTokens resource.
@@ -113,7 +117,7 @@ func (c *StaticTokensV2) SetStaticTokens(s []ProvisionToken) {
 
 // GetStaticTokens gets the list of static tokens used to provision nodes.
 func (c *StaticTokensV2) GetStaticTokens() []ProvisionToken {
-	return ProvisionTokensFromV1(c.Spec.StaticTokens)
+	return ProvisionTokensFromStatic(c.Spec.StaticTokens)
 }
 
 // setStaticFields sets static resource header and metadata fields.
@@ -135,4 +139,8 @@ func (c *StaticTokensV2) CheckAndSetDefaults() error {
 // String represents a human readable version of static provisioning tokens.
 func (c *StaticTokensV2) String() string {
 	return fmt.Sprintf("StaticTokens(%v)", c.Spec.StaticTokens)
+}
+
+func (c *StaticTokensV2) Clone() StaticTokens {
+	return utils.CloneProtoMsg(c)
 }

@@ -1,24 +1,29 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
 import (
 	"context"
+	"fmt"
+	"maps"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,10 +33,33 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
+	presencev1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/presence/v1"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	testingkubemock "github.com/gravitational/teleport/lib/kube/proxy/testing/kube_server"
+	"github.com/gravitational/teleport/lib/scopes"
 	"github.com/gravitational/teleport/lib/services"
 )
+
+type mockAuthClient struct {
+	authclient.ClientI
+	deleteCh chan string
+}
+
+func newMockAuthClient() *mockAuthClient {
+	return &mockAuthClient{
+		deleteCh: make(chan string, 1),
+	}
+}
+
+func (m *mockAuthClient) DeleteKubeServer(ctx context.Context, req *presencev1.DeleteKubeServerRequest) error {
+	select {
+	case m.deleteCh <- scopes.MakeResourceCursor(req.GetScope(), req.GetName()):
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("failed to signal kube server deletion")
+	}
+	return m.ClientI.DeleteKubeServer(ctx, req)
+}
 
 // TestWatcher verifies that kubernetes agent properly detects and applies
 // changes to kube_cluster resources.
@@ -43,6 +71,8 @@ func TestWatcher(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	reconcileCh := make(chan types.KubeClusters)
+
+	authClient := newMockAuthClient()
 	// Setup kubernetes server that proxies one static kube cluster and
 	// watches for kube_clusters with label group=a.
 	testCtx := SetupTestContext(ctx, t, TestConfig{
@@ -59,6 +89,10 @@ func TestWatcher(t *testing.T) {
 				return
 			}
 		},
+		WrapAuthClient: func(client authclient.ClientI) authclient.ClientI {
+			authClient.ClientI = client
+			return authClient
+		},
 	})
 
 	require.Len(t, testCtx.KubeServer.fwd.kubeClusters(), 1)
@@ -69,7 +103,7 @@ func TestWatcher(t *testing.T) {
 	case a := <-reconcileCh:
 		sort.Sort(a)
 		require.Empty(t, cmp.Diff(types.KubeClusters{kube0}, a,
-			cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 		))
 	case <-time.After(time.Second):
 		t.Fatal("Didn't receive reconcile event after 1s.")
@@ -86,7 +120,7 @@ func TestWatcher(t *testing.T) {
 	case a := <-reconcileCh:
 		sort.Sort(a)
 		require.Empty(t, cmp.Diff(types.KubeClusters{kube0, kube1}, a,
-			cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 		))
 	case <-time.After(time.Second):
 		t.Fatal("Didn't receive reconcile event after 1s.")
@@ -103,7 +137,7 @@ func TestWatcher(t *testing.T) {
 	case a := <-reconcileCh:
 		sort.Sort(a)
 		require.Empty(t, cmp.Diff(types.KubeClusters{kube0, kube1}, a,
-			cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 		))
 	case <-time.After(time.Second):
 		t.Fatal("Didn't receive reconcile event after 1s.")
@@ -120,7 +154,7 @@ func TestWatcher(t *testing.T) {
 	case a := <-reconcileCh:
 		sort.Sort(a)
 		require.Empty(t, cmp.Diff(types.KubeClusters{kube0, kube1}, a,
-			cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 		))
 	case <-time.After(time.Second):
 		t.Fatal("Didn't receive reconcile event after 1s.")
@@ -136,7 +170,7 @@ func TestWatcher(t *testing.T) {
 	case a := <-reconcileCh:
 		sort.Sort(a)
 		require.Empty(t, cmp.Diff(types.KubeClusters{kube0, kube1, kube2}, a,
-			cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 		))
 	case <-time.After(time.Second):
 		t.Fatal("Didn't receive reconcile event after 1s.")
@@ -144,7 +178,7 @@ func TestWatcher(t *testing.T) {
 
 	// Update kube2 expiry so it gets re-registered.
 	kube2.SetExpiry(time.Now().Add(1 * time.Hour))
-	kube2.SetKubeconfig(newKubeConfig(t, "random", "https://api.cluster.com"))
+	kube2.SetKubeconfig(newKubeConfig(t, "random", kubeMock.URL))
 	err = testCtx.AuthServer.UpdateKubernetesCluster(ctx, kube2)
 	require.NoError(t, err)
 
@@ -153,10 +187,10 @@ func TestWatcher(t *testing.T) {
 	case a := <-reconcileCh:
 		sort.Sort(a)
 		require.Empty(t, cmp.Diff(types.KubeClusters{kube0, kube1, kube2}, a,
-			cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 		))
 		// make sure credentials were updated as well.
-		require.Equal(t, "api.cluster.com:443", testCtx.KubeServer.fwd.clusterDetails["kube2"].kubeCreds.getTargetAddr())
+		require.Equal(t, strings.TrimPrefix(kubeMock.URL, "https://"), testCtx.KubeServer.fwd.clusterDetails["kube2"].kubeCreds.getTargetAddr())
 	case <-time.After(time.Second):
 		t.Fatal("Didn't receive reconcile event after 1s.")
 	}
@@ -171,24 +205,185 @@ func TestWatcher(t *testing.T) {
 	case a := <-reconcileCh:
 		sort.Sort(a)
 		require.Empty(t, cmp.Diff(types.KubeClusters{kube0, kube2}, a,
-			cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 		))
 	case <-time.After(time.Second):
 		t.Fatal("Didn't receive reconcile event after 1s.")
 	}
+	select {
+	case deleted := <-authClient.deleteCh:
+		require.Equal(t, services.GetCursorForKubeCluster(kube1), deleted)
+	case <-time.After(time.Second):
+		t.Fatal("Kube server wasn't deleted after 1s.")
+	}
 
 	// Remove kube2.
-	err = testCtx.AuthServer.DeleteKubernetesCluster(ctx, kube2.GetName())
+	err = testCtx.AuthServer.DeleteKubeCluster(ctx, presencev1.DeleteKubeClusterRequest_builder{
+		Name:  kube2.GetName(),
+		Scope: kube2.GetScope(),
+	}.Build())
 	require.NoError(t, err)
 
 	// Only static kube_cluster should remain.
 	select {
 	case a := <-reconcileCh:
 		require.Empty(t, cmp.Diff(types.KubeClusters{kube0}, a,
-			cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 		))
 	case <-time.After(time.Second):
 		t.Fatal("Didn't receive reconcile event after 1s.")
+	}
+	select {
+	case deleted := <-authClient.deleteCh:
+		require.Equal(t, services.GetCursorForKubeCluster(kube2), deleted)
+	case <-time.After(time.Second):
+		t.Fatal("Kube server wasn't deleted after 1s.")
+	}
+}
+
+// TestScopedWatcher verifies that kubernetes agent properly detects and applies
+// changes to scoped kube_cluster resources.
+func TestScopedWatcher(t *testing.T) {
+	kubeMock, err := testingkubemock.NewKubeAPIMock()
+	require.NoError(t, err)
+	t.Cleanup(func() { kubeMock.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	reconcileCh := make(chan types.KubeClusters)
+
+	const scope = "/aa"
+	authClient := newMockAuthClient()
+	// Setup kubernetes server that proxies one static kube cluster and
+	// watches for kube_clusters with label group=a.
+	testCtx := SetupTestContext(ctx, t, TestConfig{
+		Clusters: []KubeClusterConfig{{"kube0", kubeMock.URL}},
+		ResourceMatchers: []services.ResourceMatcher{
+			{Labels: types.Labels{
+				"group": []string{"a"},
+			}},
+		},
+		OnReconcile: func(kcs types.KubeClusters) {
+			select {
+			case reconcileCh <- kcs:
+			case <-ctx.Done():
+				return
+			}
+		},
+		WrapAuthClient: func(client authclient.ClientI) authclient.ClientI {
+			authClient.ClientI = client
+			return authClient
+		},
+		Scope: scope,
+		ScopesFeatures: scopes.Features{
+			Enabled:         true,
+			AgentPinEnabled: true,
+		},
+	})
+
+	require.Len(t, testCtx.KubeServer.fwd.kubeClusters(), 1)
+	kube0 := testCtx.KubeServer.fwd.kubeClusters()[0]
+
+	// Only kube0 should be registered initially.
+	select {
+	case a := <-reconcileCh:
+		sort.Sort(a)
+		require.Empty(t, cmp.Diff(types.KubeClusters{kube0}, a,
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+		))
+	case <-time.After(time.Second):
+		t.Fatal("Didn't receive reconcile event after 1s.")
+	}
+
+	// Create an unscoped kube1 with label group=a
+	kube1, err := makeDynamicKubeCluster(t, "kube1", kubeMock.URL, map[string]string{"group": "a"})
+	require.NoError(t, err)
+	err = testCtx.AuthServer.CreateKubernetesCluster(ctx, kube1)
+	require.NoError(t, err)
+
+	// It should NOT be registered due to scope mismatch
+	select {
+	case <-reconcileCh:
+		require.FailNow(t, "unexpected reconcile event for an unscoped kube cluster")
+	case <-time.After(time.Second):
+	}
+
+	// Create kube_cluster with label group=a and scope=/aa
+	kube2, err := makeDynamicKubeCluster(t, "kube2", kubeMock.URL, map[string]string{"group": "a"})
+	require.NoError(t, err)
+	kube2.Scope = scope
+	err = testCtx.AuthServer.CreateKubernetesCluster(ctx, kube2)
+	require.NoError(t, err)
+
+	// It should be registered.
+	select {
+	case a := <-reconcileCh:
+		sort.Sort(a)
+		require.Empty(t, cmp.Diff(types.KubeClusters{kube0, kube2}, a,
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+		))
+	case <-time.After(time.Second):
+		t.Fatal("Didn't receive reconcile event after 1s.")
+	}
+
+	// Create kube_cluster with label group=b in scope=/aa
+	kube3, err := makeDynamicKubeCluster(t, "kube3", kubeMock.URL, map[string]string{"group": "b"})
+	require.NoError(t, err)
+	kube3.Scope = scope
+	err = testCtx.AuthServer.CreateKubernetesCluster(ctx, kube3)
+	require.NoError(t, err)
+
+	// It shouldn't be registered.
+	select {
+	case a := <-reconcileCh:
+		sort.Sort(a)
+		require.Empty(t, cmp.Diff(types.KubeClusters{kube0, kube2}, a,
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+		))
+	case <-time.After(time.Second):
+		t.Fatal("Didn't receive reconcile event after 1s.")
+	}
+
+	// Update kube3 labels so it matches.
+	kube3.SetStaticLabels(map[string]string{"group": "a", types.OriginLabel: types.OriginDynamic})
+	err = testCtx.AuthServer.UpdateKubernetesCluster(ctx, kube3)
+	require.NoError(t, err)
+
+	// kube0, kube2, and kube3 should be registered now.
+	select {
+	case a := <-reconcileCh:
+		sort.Sort(a)
+		require.Empty(t, cmp.Diff(types.KubeClusters{kube0, kube2, kube3}, a,
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+		))
+	case <-time.After(time.Second):
+		t.Fatal("Didn't receive reconcile event after 1s.")
+	}
+
+	// Remove kube2.
+	err = testCtx.AuthServer.DeleteKubeCluster(ctx, presencev1.DeleteKubeClusterRequest_builder{
+		Name:  kube2.GetName(),
+		Scope: kube2.GetScope(),
+	}.Build())
+	require.NoError(t, err)
+
+	// Only kube0 and kube3 should remain.
+	select {
+	case a := <-reconcileCh:
+		sort.Sort(a)
+		require.Empty(t, cmp.Diff(types.KubeClusters{kube0, kube3}, a,
+			cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+		))
+	case <-time.After(time.Second):
+		t.Fatal("Didn't receive reconcile event after 1s.")
+	}
+
+	// Confirm delete event is received
+	select {
+	case deleted := <-authClient.deleteCh:
+		require.Equal(t, services.GetCursorForKubeCluster(kube2), deleted)
+	case <-time.After(time.Second):
+		t.Fatal("Kube server wasn't deleted after 1s.")
 	}
 }
 
@@ -202,9 +397,7 @@ func makeKubeCluster(t *testing.T, name string, url string, labels map[string]st
 	if labels == nil {
 		labels = make(map[string]string)
 	}
-	for k, v := range additionalLabels {
-		labels[k] = v
-	}
+	maps.Copy(labels, additionalLabels)
 	return types.NewKubernetesClusterV3(types.Metadata{
 		Name:   name,
 		Labels: labels,

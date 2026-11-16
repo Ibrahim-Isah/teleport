@@ -1,60 +1,32 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"testing"
 
-	"github.com/coreos/go-oidc/jose"
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 )
-
-// TestOIDCRoleMapping verifies basic mapping from OIDC claims to roles.
-func TestOIDCRoleMapping(t *testing.T) {
-	// create a connector
-	oidcConnector, err := types.NewOIDCConnector("example", types.OIDCConnectorSpecV3{
-		IssuerURL:     "https://www.exmaple.com",
-		ClientID:      "example-client-id",
-		ClientSecret:  "example-client-secret",
-		Display:       "sign in with example.com",
-		Scope:         []string{"foo", "bar"},
-		ClaimsToRoles: []types.ClaimMapping{{Claim: "roles", Value: "teleport-user", Roles: []string{"user"}}},
-		RedirectURLs:  []string{"https://localhost:3080/v1/webapi/oidc/callback"},
-	})
-	require.NoError(t, err)
-
-	// create some claims
-	var claims = make(jose.Claims)
-	claims.Add("roles", "teleport-user")
-	claims.Add("email", "foo@example.com")
-	claims.Add("nickname", "foo")
-	claims.Add("full_name", "foo bar")
-
-	traits := OIDCClaimsToTraits(claims)
-	require.Len(t, traits, 4)
-
-	_, roles := TraitsToRoles(oidcConnector.GetTraitMappings(), traits)
-	require.Len(t, roles, 1)
-	require.Equal(t, "user", roles[0])
-}
 
 // TestOIDCUnmarshal tests UnmarshalOIDCConnector
 func TestOIDCUnmarshal(t *testing.T) {
@@ -107,6 +79,7 @@ func TestOIDCUnmarshal(t *testing.T) {
 				},
 				"spec": {
 					"client_id": "id-from-google.apps.googleusercontent.com",
+					"client_secret": "secret-key-from-google",
 					"claims_to_roles": [
 						{
 							"claim": "roles",
@@ -123,12 +96,32 @@ func TestOIDCUnmarshal(t *testing.T) {
 			}`,
 			expectSpec: types.OIDCConnectorSpecV3{
 				ClientID:      "id-from-google.apps.googleusercontent.com",
+				ClientSecret:  "secret-key-from-google",
 				ClaimsToRoles: []types.ClaimMapping{{Claim: "roles", Value: "teleport-user", Roles: []string{"dictator"}}},
 				RedirectURLs: []string{
 					"https://localhost:3080/v1/webapi/oidc/callback",
 					"https://proxy.example.com/v1/webapi/oidc/callback",
 					"https://other.proxy.example.com/v1/webapi/oidc/callback",
 				},
+			},
+		}, {
+			desc: "no claims_to_roles",
+			input: `{
+				"version": "v3",
+				"kind": "oidc",
+				"metadata": {
+					"name": "google"
+				},
+				"spec": {
+					"client_id": "id-from-google.apps.googleusercontent.com",
+					"client_secret": "secret-key-from-google",
+					"redirect_url": ["https://other.proxy.example.com/v1/webapi/oidc/callback"]
+				}
+			}`,
+			expectSpec: types.OIDCConnectorSpecV3{
+				ClientID:     "id-from-google.apps.googleusercontent.com",
+				ClientSecret: "secret-key-from-google",
+				RedirectURLs: []string{"https://other.proxy.example.com/v1/webapi/oidc/callback"},
 			},
 		},
 	} {
@@ -157,6 +150,7 @@ func TestOIDCCheckAndSetDefaults(t *testing.T) {
 			desc: "basic spec and defaults",
 			spec: types.OIDCConnectorSpecV3{
 				ClientID:      "id-from-google.apps.googleusercontent.com",
+				ClientSecret:  "some-client-secret",
 				ClaimsToRoles: []types.ClaimMapping{{Claim: "roles", Value: "teleport-user", Roles: []string{"dictator"}}},
 				RedirectURLs:  []string{"https://localhost:3080/v1/webapi/oidc/callback"},
 			},
@@ -173,6 +167,7 @@ func TestOIDCCheckAndSetDefaults(t *testing.T) {
 			desc: "omit prompt",
 			spec: types.OIDCConnectorSpecV3{
 				ClientID:      "id-from-google.apps.googleusercontent.com",
+				ClientSecret:  "some-client-secret",
 				ClaimsToRoles: []types.ClaimMapping{{Claim: "roles", Value: "teleport-user", Roles: []string{"dictator"}}},
 				RedirectURLs: []string{
 					"https://localhost:3080/v1/webapi/oidc/callback",
@@ -183,12 +178,13 @@ func TestOIDCCheckAndSetDefaults(t *testing.T) {
 			},
 			expect: func(t *testing.T, c types.OIDCConnector, err error) {
 				require.NoError(t, err)
-				require.Equal(t, "", c.GetPrompt())
+				require.Empty(t, c.GetPrompt())
 			},
 		}, {
 			desc: "invalid claims to roles",
 			spec: types.OIDCConnectorSpecV3{
 				ClientID:      "id-from-google.apps.googleusercontent.com",
+				ClientSecret:  "some-client-secret",
 				ClaimsToRoles: []types.ClaimMapping{{Claim: "roles", Value: "teleport-user"}},
 				RedirectURLs: []string{
 					"https://localhost:3080/v1/webapi/oidc/callback",
@@ -213,6 +209,7 @@ func TestOIDCCheckAndSetDefaults(t *testing.T) {
 func TestOIDCGetRedirectURL(t *testing.T) {
 	conn, err := types.NewOIDCConnector("oidc", types.OIDCConnectorSpecV3{
 		ClientID:      "id-from-google.apps.googleusercontent.com",
+		ClientSecret:  "some-client-secret",
 		ClaimsToRoles: []types.ClaimMapping{{Claim: "roles", Value: "teleport-user", Roles: []string{"dictator"}}},
 		RedirectURLs: []string{
 			"https://proxy.example.com/v1/webapi/oidc/callback",

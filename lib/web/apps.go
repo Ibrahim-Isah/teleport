@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package web implements web proxy handler that provides
 // web interface to view and connect to teleport nodes
@@ -20,74 +22,107 @@ package web
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"math/rand/v2"
 	"net/http"
 
 	"github.com/gravitational/trace"
 	"github.com/julienschmidt/httprouter"
 
-	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
-	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/httplib"
-	"github.com/gravitational/teleport/lib/reversetunnel"
-	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/web/app"
-	"github.com/gravitational/teleport/lib/web/ui"
 )
 
-// clusterAppsGet returns a list of applications in a form the UI can present.
-func (h *Handler) clusterAppsGet(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
-	identity, err := sctx.GetIdentity()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+type GetAppDetailsRequest ResolveAppParams
 
-	// Get a list of application servers and their proxied apps.
-	clt, err := sctx.GetUserClient(r.Context(), site)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	resp, err := listResources(clt, r, types.KindAppServer)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	appServers, err := types.ResourcesWithLabels(resp.Resources).AsAppServers()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	var apps types.Apps
-	for _, server := range appServers {
-		apps = append(apps, server.GetApp())
-	}
-
-	return listResourcesGetResponse{
-		Items: ui.MakeApps(ui.MakeAppsConfig{
-			LocalClusterName:  h.auth.clusterName,
-			LocalProxyDNSName: h.proxyDNSName(),
-			AppClusterName:    site.GetName(),
-			Identity:          identity,
-			Apps:              apps,
-		}),
-		StartKey:   resp.NextKey,
-		TotalCount: resp.TotalCount,
-	}, nil
-}
-
-type GetAppFQDNRequest resolveAppParams
-
-type GetAppFQDNResponse struct {
+type GetAppDetailsResponse struct {
 	// FQDN is application FQDN.
 	FQDN string `json:"fqdn"`
+	// RequiredAppFQDNs is a list of required app fqdn
+	RequiredAppFQDNs []string `json:"requiredAppFQDNs"`
 }
 
-type CreateAppSessionRequest resolveAppParams
+// getAppDetails resolves the input params to a known application and returns
+// its app details.
+//
+// GET /v1/webapi/apps/:fqdnHint/:clusterName/:publicAddr
+func (h *Handler) getAppDetails(w http.ResponseWriter, r *http.Request, p httprouter.Params, ctx *SessionContext) (any, error) {
+	values := r.URL.Query()
 
+	isRedirectFlow := values.Get("required-apps") != ""
+	clusterName := p.ByName("clusterName")
+
+	req := GetAppDetailsRequest{
+		FQDNHint:    p.ByName("fqdnHint"),
+		ClusterName: clusterName,
+		PublicAddr:  p.ByName("publicAddr"),
+	}
+
+	// Use the information the caller provided to attempt to resolve to an
+	// application running within either the root or leaf cluster.
+	result, err := h.resolveApp(r.Context(), ctx, ResolveAppParams(req))
+	if err != nil {
+		return nil, trace.Wrap(err, "unable to resolve FQDN: %v", req.FQDNHint)
+	}
+
+	resp := &GetAppDetailsResponse{
+		FQDN: result.FQDN,
+	}
+
+	requiredAppNames := result.App.GetRequiredAppNames()
+
+	if !isRedirectFlow {
+		// TODO (avatus) this would be nice if the string in the RequiredApps spec was the fqdn of the required app
+		// so we could skip the resolution step all together but this would break existing configs.
+
+		// if clusterName is not supplied in the params, the initial app must have been fetched with fqdn hint only.
+		// We can use the clusterName of the initially resolved app
+		if clusterName == "" {
+			clusterName = result.ClusterName
+		}
+		// TODO (williamo/scopes): Scoped apps currently won't support required_apps.
+		if scope := result.App.GetScope(); scope != "" && len(requiredAppNames) > 0 {
+			return nil, trace.AccessDenied("scoped apps do not support required app redirects")
+		}
+		for _, requiredAppName := range requiredAppNames {
+			if result.App.GetUseAnyProxyPublicAddr() {
+				proxyDNSName := utils.FindMatchingProxyDNS(req.FQDNHint, h.proxyDNSNames())
+				requiredAppFQDN := fmt.Sprintf("%s.%s", requiredAppName, proxyDNSName)
+				resp.RequiredAppFQDNs = append(resp.RequiredAppFQDNs, requiredAppFQDN)
+				continue
+			}
+			res, err := h.resolveApp(r.Context(), ctx, ResolveAppParams{ClusterName: clusterName, AppName: requiredAppName})
+			if err != nil {
+				h.logger.ErrorContext(r.Context(), "Error getting app details for associated required app", "required_app", requiredAppName, "app", result.App.GetName(), "error", err)
+				continue
+			}
+			resp.RequiredAppFQDNs = append(resp.RequiredAppFQDNs, res.FQDN)
+		}
+		// append self to end of required apps so that it can be the final entry in the redirect "chain".
+		resp.RequiredAppFQDNs = append(resp.RequiredAppFQDNs, result.FQDN)
+	}
+
+	return resp, nil
+}
+
+// CreateAppSessionResponse is a request to POST /v1/webapi/sessions/app
+type CreateAppSessionRequest struct {
+	// ResolveAppParams contains info used to resolve an application
+	ResolveAppParams
+	// AWSRole is the AWS role ARN when accessing AWS management console.
+	AWSRole string `json:"arn,omitempty"`
+	// MFAResponse is an optional MFA response used to create an MFA verified app session.
+	MFAResponse client.MFAChallengeResponse `json:"mfaResponse"`
+}
+
+// CreateAppSessionResponse is a response to POST /v1/webapi/sessions/app
 type CreateAppSessionResponse struct {
 	// CookieValue is the application session cookie value.
 	CookieValue string `json:"cookie_value"`
@@ -97,79 +132,41 @@ type CreateAppSessionResponse struct {
 	FQDN string `json:"fqdn"`
 }
 
-// getAppFQDN resolves the input params to a known application and returns
-// its valid FQDN.
-//
-// GET /v1/webapi/apps/:fqdnHint/:clusterName/:publicAddr
-func (h *Handler) getAppFQDN(w http.ResponseWriter, r *http.Request, p httprouter.Params, ctx *SessionContext) (interface{}, error) {
-	req := GetAppFQDNRequest{
-		FQDNHint:    p.ByName("fqdnHint"),
-		ClusterName: p.ByName("clusterName"),
-		PublicAddr:  p.ByName("publicAddr"),
-	}
-
-	// Get an auth client connected with the user's identity.
-	authClient, err := ctx.GetClient()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// Get a reverse tunnel proxy aware of the user's permissions.
-	proxy, err := h.ProxyWithRoles(ctx)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// Use the information the caller provided to attempt to resolve to an
-	// application running within either the root or leaf cluster.
-	result, err := h.resolveApp(r.Context(), authClient, proxy, resolveAppParams(req))
-	if err != nil {
-		return nil, trace.Wrap(err, "unable to resolve FQDN: %v", req.FQDNHint)
-	}
-
-	return &GetAppFQDNResponse{
-		FQDN: result.FQDN,
-	}, nil
-}
-
 // createAppSession creates a new application session.
 //
 // POST /v1/webapi/sessions/app
-func (h *Handler) createAppSession(w http.ResponseWriter, r *http.Request, p httprouter.Params, ctx *SessionContext) (interface{}, error) {
-	var req resolveAppParams
-	if err := httplib.ReadJSON(r, &req); err != nil {
+func (h *Handler) createAppSession(w http.ResponseWriter, r *http.Request, p httprouter.Params, ctx *SessionContext) (any, error) {
+	var req CreateAppSessionRequest
+	if err := httplib.ReadResourceJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	// Get an auth client connected with the user's identity.
-	authClient, err := ctx.GetClient()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// Get a reverse tunnel proxy aware of the user's permissions.
-	proxy, err := h.ProxyWithRoles(ctx)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// Use the information the caller provided to attempt to resolve to an
-	// application running within either the root or leaf cluster.
-	result, err := h.resolveApp(r.Context(), authClient, proxy, req)
+	result, err := h.resolveApp(r.Context(), ctx, req.ResolveAppParams)
 	if err != nil {
 		return nil, trace.Wrap(err, "unable to resolve FQDN: %v", req.FQDNHint)
 	}
 
-	h.log.Debugf("Creating application web session for %v in %v.", result.App.GetPublicAddr(), result.ClusterName)
+	h.logger.DebugContext(r.Context(), "Creating application web session", "app_public_addr", result.App.GetPublicAddr(), "cluster", result.ClusterName)
 
 	// Ensuring proxy can handle the connection is only done when the request is
 	// coming from the WebUI.
 	if h.healthCheckAppServer != nil && !app.HasClientCert(r) {
-		h.log.Debugf("Ensuring proxy can handle requests requests for application %q.", result.App.GetName())
-		err := h.healthCheckAppServer(r.Context(), result.App.GetPublicAddr(), result.ClusterName)
+		h.logger.DebugContext(r.Context(), "Ensuring proxy can handle requests for application", "app", result.App.GetName())
+		err := h.healthCheckAppServer(r.Context(), result.App.GetName(), result.App.GetPublicAddr(), result.ClusterName)
 		if err != nil {
 			return nil, trace.ConnectionProblem(err, "Unable to serve application requests. Please try again. If the issue persists, verify if the Application Services are connected to Teleport.")
 		}
+	}
+
+	mfaResponse, err := req.MFAResponse.GetOptionalMFAResponseProtoReq()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Get an auth client connected with the user's identity.
+	authClient, err := ctx.GetClient()
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
 
 	// Create an application web session.
@@ -180,66 +177,18 @@ func (h *Handler) createAppSession(w http.ResponseWriter, r *http.Request, p htt
 	//
 	// PublicAddr and ClusterName will get encoded within the certificate and
 	// used for request routing.
-	ws, err := authClient.CreateAppSession(r.Context(), types.CreateAppSessionRequest{
+	ws, err := authClient.CreateAppSession(r.Context(), &proto.CreateAppSessionRequest{
 		Username:    ctx.GetUser(),
 		PublicAddr:  result.App.GetPublicAddr(),
 		ClusterName: result.ClusterName,
 		AWSRoleARN:  req.AWSRole,
+		MFAResponse: mfaResponse,
+		AppName:     result.App.GetName(),
+		URI:         result.App.GetURI(),
+		ClientAddr:  r.RemoteAddr,
+		Scope:       result.App.GetScope(),
 	})
 	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// Block and wait a few seconds for the session that was created to show up
-	// in the cache. If this request is not blocked here, it can get stuck in a
-	// racy session creation loop.
-	err = h.waitForAppSession(r.Context(), ws.GetName(), ctx.GetUser())
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// Extract the identity of the user.
-	certificate, err := tlsca.ParseCertificatePEM(ws.GetTLSCert())
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	identity, err := tlsca.FromSubject(certificate.Subject, certificate.NotAfter)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	userMetadata := identity.GetUserMetadata()
-	userMetadata.User = ws.GetUser()
-	userMetadata.AWSRoleARN = req.AWSRole
-
-	// Now that the certificate has been issued, emit a "new session created"
-	// for all events associated with this certificate.
-	appSessionStartEvent := &apievents.AppSessionStart{
-		Metadata: apievents.Metadata{
-			Type:        events.AppSessionStartEvent,
-			Code:        events.AppSessionStartCode,
-			ClusterName: identity.RouteToApp.ClusterName,
-		},
-		ServerMetadata: apievents.ServerMetadata{
-			ServerID:        h.cfg.HostUUID,
-			ServerNamespace: apidefaults.Namespace,
-		},
-		SessionMetadata: apievents.SessionMetadata{
-			SessionID: identity.RouteToApp.SessionID,
-			WithMFA:   identity.MFAVerified,
-		},
-		UserMetadata: userMetadata,
-		ConnectionMetadata: apievents.ConnectionMetadata{
-			RemoteAddr: r.RemoteAddr,
-		},
-		PublicAddr: identity.RouteToApp.PublicAddr,
-		AppMetadata: apievents.AppMetadata{
-			AppURI:        result.App.GetURI(),
-			AppPublicAddr: result.App.GetPublicAddr(),
-			AppName:       result.App.GetName(),
-		},
-	}
-	if err := h.cfg.Emitter.EmitAuditEvent(h.cfg.Context, appSessionStartEvent); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -250,24 +199,18 @@ func (h *Handler) createAppSession(w http.ResponseWriter, r *http.Request, p htt
 	}, nil
 }
 
-// waitForAppSession will block until the requested application session shows up in the
-// cache or a timeout occurs.
-func (h *Handler) waitForAppSession(ctx context.Context, sessionID, user string) error {
-	return auth.WaitForAppSession(ctx, sessionID, user, h.cfg.AccessPoint)
-}
-
-type resolveAppParams struct {
+type ResolveAppParams struct {
 	// FQDNHint indicates (tentatively) the fully qualified domain name of the application.
-	FQDNHint string `json:"fqdn"`
+	FQDNHint string `json:"fqdn,omitempty"`
 
 	// PublicAddr is the public address of the application.
-	PublicAddr string `json:"public_addr"`
+	PublicAddr string `json:"public_addr,omitempty"`
 
 	// ClusterName is the cluster within which this application is running.
-	ClusterName string `json:"cluster_name"`
+	ClusterName string `json:"cluster_name,omitempty"`
 
-	// AWSRole is the AWS role ARN when accessing AWS management console.
-	AWSRole string `json:"arn,omitempty"`
+	// AppName is the name of the application
+	AppName string `json:"app_name,omitempty"`
 }
 
 type resolveAppResult struct {
@@ -282,21 +225,33 @@ type resolveAppResult struct {
 	App types.Application
 }
 
-func (h *Handler) resolveApp(ctx context.Context, clt app.Getter, proxy reversetunnel.Tunnel, params resolveAppParams) (*resolveAppResult, error) {
+// Use the information the caller provided to attempt to resolve to an
+// application running within either the root or leaf cluster.
+func (h *Handler) resolveApp(ctx context.Context, scx *SessionContext, params ResolveAppParams) (*resolveAppResult, error) {
+	// Get a reverse tunnel proxy aware of the user's permissions.
+	proxy, err := h.ProxyWithRoles(ctx, scx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	var (
 		server         types.AppServer
 		appClusterName string
-		err            error
 	)
 
 	// If the request contains a public address and cluster name (for example, if it came
 	// from the application launcher in the Web UI) then directly exactly resolve the
 	// application that the caller is requesting. If it does not, do best effort FQDN resolution.
 	switch {
-	case params.PublicAddr != "" && params.ClusterName != "":
-		server, appClusterName, err = h.resolveDirect(ctx, proxy, params.PublicAddr, params.ClusterName)
+	case params.ClusterName != "" && (params.AppName != "" || params.PublicAddr != ""):
+		server, appClusterName, err = h.resolveAppForCluster(ctx, proxy, params.AppName, params.PublicAddr, params.ClusterName)
 	case params.FQDNHint != "":
-		server, appClusterName, err = h.resolveFQDN(ctx, clt, proxy, params.FQDNHint)
+		// Multiple apps can have the same FQDN - prefer those the user
+		// can actually access.
+		var canAccess func(types.Application) bool
+		if canAccess, err = h.userAppAccessFilter(ctx, scx); err == nil {
+			server, appClusterName, err = app.ResolveFQDN(ctx, proxy, h.auth.clusterName, h.proxyDNSNames(), params.FQDNHint, canAccess)
+		}
 	default:
 		err = trace.BadParameter("no inputs to resolve application")
 	}
@@ -304,7 +259,11 @@ func (h *Handler) resolveApp(ctx context.Context, clt app.Getter, proxy reverset
 		return nil, trace.Wrap(err)
 	}
 
-	fqdn := ui.AssembleAppFQDN(h.auth.clusterName, h.proxyDNSName(), appClusterName, server.GetApp())
+	proxyDNSName := h.proxyDNSName()
+	if server.GetApp().GetUseAnyProxyPublicAddr() {
+		proxyDNSName = utils.FindMatchingProxyDNS(params.FQDNHint, h.proxyDNSNames())
+	}
+	fqdn := utils.AssembleAppFQDN(h.auth.clusterName, proxyDNSName, appClusterName, server.GetApp())
 
 	return &resolveAppResult{
 		ServerID:    server.GetName(),
@@ -314,35 +273,53 @@ func (h *Handler) resolveApp(ctx context.Context, clt app.Getter, proxy reverset
 	}, nil
 }
 
-// resolveDirect takes a public address and cluster name and exactly resolves
-// the application and the server on which it is running.
-func (h *Handler) resolveDirect(ctx context.Context, proxy reversetunnel.Tunnel, publicAddr string, clusterName string) (types.AppServer, string, error) {
-	clusterClient, err := proxy.GetSite(clusterName)
+// userAppAccessFilter returns a filter that checks whether the current user session
+// is allowed to access an application.
+//
+// Per-session MFA and device trust requirements are treated as "accessible" here
+// since the user is allowed, they'll just be asked for an extra factor when the connection
+// is actually established.
+func (h *Handler) userAppAccessFilter(ctx context.Context, scx *SessionContext) (func(types.Application) bool, error) {
+	checker, err := scx.GetUserAccessChecker()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	authPref, err := h.cfg.AccessPoint.GetAuthPreference(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	state := checker.GetAccessState(authPref)
+	return func(app types.Application) bool {
+		err := checker.CheckAccess(app, state)
+		return err == nil ||
+			errors.Is(err, services.ErrSessionMFARequired) ||
+			errors.Is(err, services.ErrTrustedDeviceRequired)
+	}, nil
+}
+
+// resolveAppForCluster will take a cluster name, public address, and optional app name in order to
+// locate the application and the server on which it is running.
+// The app name, if provided, is used to disambiguate multiple apps with the same public addr.
+func (h *Handler) resolveAppForCluster(
+	ctx context.Context,
+	clusterGetter reversetunnelclient.ClusterGetter,
+	appName, publicAddr, clusterName string,
+) (types.AppServer, string, error) {
+	clusterClient, err := clusterGetter.Cluster(ctx, clusterName)
 	if err != nil {
 		return nil, "", trace.Wrap(err)
 	}
 
-	authClient, err := clusterClient.GetClient()
-	if err != nil {
-		return nil, "", trace.Wrap(err)
-	}
-
-	servers, err := app.Match(ctx, authClient, app.MatchPublicAddr(publicAddr))
+	servers, err := app.MatchUnshuffled(ctx, clusterClient, app.MatchAppServerForRoute(appName, publicAddr))
 	if err != nil {
 		return nil, "", trace.Wrap(err)
 	}
 
 	if len(servers) == 0 {
-		return nil, "", trace.NotFound("failed to match applications with public addr %s", publicAddr)
+		return nil, "", trace.NotFound("failed to match applications with addr %s and name %q", publicAddr, appName)
 	}
 
-	return servers[0], clusterName, nil
-}
-
-// resolveFQDN makes a best effort attempt to resolve FQDN to an application
-// running within a root or leaf cluster.
-func (h *Handler) resolveFQDN(ctx context.Context, clt app.Getter, proxy reversetunnel.Tunnel, fqdn string) (types.AppServer, string, error) {
-	return app.ResolveFQDN(ctx, clt, proxy, h.proxyDNSNames(), fqdn)
+	return servers[rand.N(len(servers))], clusterName, nil
 }
 
 // proxyDNSName is a DNS name the HTTP proxy is available at, where

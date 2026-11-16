@@ -1,17 +1,19 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import { ipcMain, ipcRenderer } from 'electron';
@@ -20,20 +22,42 @@ import {
   FileStorageEventChannel,
   FileStorageEventType,
 } from '../../mainProcess/types';
-
 import { FileStorage } from './fileStorage';
 
+const APP_STATE_FIELDS_MODIFIABLE_FROM_RENDERER = ['state'];
+
+// TODO(ravicious): The main process should not expose the whole interface of FileStorage to the
+// renderer, only what's absolutely needed by the renderer. FileStorage at the moment includes a
+// bunch of functions that are used only in the main process (and should be used only there).
+// https://github.com/gravitational/teleport/issues/24380
 export function subscribeToFileStorageEvents(configService: FileStorage): void {
   ipcMain.on(
     FileStorageEventChannel,
     (event, eventType: FileStorageEventType, item) => {
       switch (eventType) {
         case FileStorageEventType.Get:
-          return (event.returnValue = configService.get(item.path));
+          return (event.returnValue = configService.get(item.key));
         case FileStorageEventType.Put:
-          return configService.put(item.path, item.json);
-        case FileStorageEventType.PutAllSync:
-          return configService.putAllSync();
+          if (!APP_STATE_FIELDS_MODIFIABLE_FROM_RENDERER.includes(item.key)) {
+            throw new Error(
+              `Could not update "${item.key}". This field is readonly in the renderer process.`
+            );
+          }
+          return configService.put(item.key, item.json);
+        case FileStorageEventType.Write:
+          return configService.write();
+        case FileStorageEventType.Replace:
+          throw new Error(
+            'Replacing state is not allowed in the renderer process.'
+          );
+        case FileStorageEventType.GetFilePath:
+          return configService.getFilePath();
+        case FileStorageEventType.GetFileName:
+          return configService.getFileName();
+        case FileStorageEventType.GetFileLoadingError:
+          return configService.getFileLoadingError();
+        default:
+          eventType satisfies never;
       }
     }
   );
@@ -41,19 +65,41 @@ export function subscribeToFileStorageEvents(configService: FileStorage): void {
 
 export function createFileStorageClient(): FileStorage {
   return {
-    get: path =>
+    get: key =>
       ipcRenderer.sendSync(FileStorageEventChannel, FileStorageEventType.Get, {
-        path,
+        key,
       }),
-    put: (path, json) =>
+    put: (key, json) =>
       ipcRenderer.send(FileStorageEventChannel, FileStorageEventType.Put, {
-        path,
+        key,
         json,
       }),
-    putAllSync: () =>
-      ipcRenderer.send(
+    write: () =>
+      ipcRenderer.invoke(
         FileStorageEventChannel,
-        FileStorageEventType.PutAllSync,
+        FileStorageEventType.Write,
+        {}
+      ),
+    replace: json =>
+      ipcRenderer.send(FileStorageEventChannel, FileStorageEventType.Replace, {
+        json,
+      }),
+    getFilePath: () =>
+      ipcRenderer.sendSync(
+        FileStorageEventChannel,
+        FileStorageEventType.GetFilePath,
+        {}
+      ),
+    getFileName: () =>
+      ipcRenderer.sendSync(
+        FileStorageEventChannel,
+        FileStorageEventType.GetFileName,
+        {}
+      ),
+    getFileLoadingError: () =>
+      ipcRenderer.sendSync(
+        FileStorageEventChannel,
+        FileStorageEventType.GetFileLoadingError,
         {}
       ),
   };

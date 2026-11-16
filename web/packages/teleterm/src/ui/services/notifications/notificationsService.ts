@@ -1,63 +1,120 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { useStore } from 'shared/libs/stores';
+import type {
+  ToastNotificationItem,
+  ToastNotificationItemContent,
+} from 'shared/components/ToastNotification';
 
 import { ImmutableStore } from 'teleterm/ui/services/immutableStore';
 import { unique } from 'teleterm/ui/utils/uid';
 
-import type {
-  NotificationItem,
-  NotificationItemContent,
-} from 'shared/components/Notification';
+export type NotificationContent = ToastNotificationItemContent & {
+  key?: NotificationKey;
+};
+export type NotificationKey = string | (string | number)[];
 
-export class NotificationsService extends ImmutableStore<NotificationItem[]> {
-  state: NotificationItem[] = [];
+type State = Map<string, ToastNotificationItem>;
 
-  notifyError(content: NotificationItemContent): string {
-    return this.notify({ severity: 'error', content });
+export class NotificationsService extends ImmutableStore<State> {
+  state: State = new Map();
+
+  /**
+   * Adds a notification with error severity.
+   *
+   * If key is passed, replaces any previous notification with equal key. If an array is passed as
+   * a key, the array is joined with '-'.
+   */
+  notifyError(rawContent: NotificationContent): string {
+    const severity = 'error';
+    if (typeof rawContent === 'string') {
+      return this.notify({ severity, content: rawContent });
+    }
+
+    const { key, ...content } = rawContent;
+    return this.notify({ severity, content, key });
   }
 
-  notifyWarning(content: NotificationItemContent): string {
-    return this.notify({ severity: 'warn', content });
+  /**
+   * Adds a notification with warn severity.
+   *
+   * If key is passed, replaces any previous notification with equal key. If an array is passed as
+   * a key, the array is joined with '-'.
+   */
+  notifyWarning(rawContent: NotificationContent): string {
+    const severity = 'warn';
+    if (typeof rawContent === 'string') {
+      return this.notify({ severity, content: rawContent });
+    }
+
+    const { key, ...content } = rawContent;
+    return this.notify({ severity, content, key });
   }
 
-  notifyInfo(content: NotificationItemContent): string {
-    return this.notify({ severity: 'info', content });
+  /**
+   * Adds a notification with info severity.
+   *
+   * If key is passed, replaces any previous notification with equal key. If an array is passed as
+   * a key, the array is joined with '-'.
+   */
+  notifyInfo(rawContent: NotificationContent): string {
+    const severity = 'info';
+    if (typeof rawContent === 'string') {
+      return this.notify({ severity, content: rawContent });
+    }
+
+    const { key, ...content } = rawContent;
+    return this.notify({ severity, content, key });
   }
 
   removeNotification(id: string): void {
-    this.setState(draftState =>
-      draftState.filter(stateItem => stateItem.id !== id)
-    );
-  }
+    if (!id) {
+      return;
+    }
 
-  getNotifications(): NotificationItem[] {
-    return this.state;
-  }
-
-  useState(): NotificationItem[] {
-    return useStore(this).state;
-  }
-
-  private notify(options: Omit<NotificationItem, 'id'>): string {
-    const id = unique();
+    if (this.state.size === 0) {
+      return;
+    }
 
     this.setState(draftState => {
-      draftState.push({
+      draftState.delete(id);
+    });
+  }
+
+  getNotifications(): ToastNotificationItem[] {
+    return [...this.state.values()];
+  }
+
+  hasNotification(id: string): boolean {
+    return this.state.has(id);
+  }
+
+  private notify(
+    options: Omit<ToastNotificationItem, 'id'> & { key?: NotificationKey }
+  ): string {
+    const id = options.key
+      ? typeof options.key === 'string'
+        ? options.key
+        : options.key.join('-')
+      : unique();
+
+    this.setState(draftState => {
+      draftState.set(id, {
         severity: options.severity,
         content: options.content,
         id,

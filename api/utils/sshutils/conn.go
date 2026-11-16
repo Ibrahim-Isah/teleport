@@ -19,7 +19,6 @@ package sshutils
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 
 	"github.com/gravitational/trace"
@@ -45,13 +44,13 @@ func ConnectProxyTransport(sconn ssh.Conn, req *DialReq, exclusive bool) (conn *
 		return nil, false, trace.Wrap(err)
 	}
 
-	channel, discard, err := sconn.OpenChannel(constants.ChanTransport, nil)
+	channel, reqC, err := sconn.OpenChannel(constants.ChanTransport, nil)
 	if err != nil {
 		return nil, true, trace.Wrap(err)
 	}
 
 	// DiscardRequests will return when the channel or underlying connection is closed.
-	go ssh.DiscardRequests(discard)
+	go ssh.DiscardRequests(reqC)
 
 	// Send a special SSH out-of-band request called "teleport-transport"
 	// the agent on the other side will create a new TCP/IP connection to
@@ -68,10 +67,11 @@ func ConnectProxyTransport(sconn ssh.Conn, req *DialReq, exclusive bool) (conn *
 		// passed to us via stderr.
 		errMessageBytes, _ := io.ReadAll(channel.Stderr())
 		errMessage := string(bytes.TrimSpace(errMessageBytes))
-		if len(errMessage) == 0 {
-			errMessage = fmt.Sprintf("failed connecting to %v [%v]", req.Address, req.ServerID)
+		if errMessage != "" {
+			return nil, false, trace.Errorf("%s", errMessage)
 		}
-		return nil, false, trace.Errorf(errMessage)
+
+		return nil, false, trace.Errorf("failed connecting to %v [%v]", req.Address, req.ServerID)
 	}
 
 	if exclusive {
@@ -94,9 +94,6 @@ type DialReq struct {
 	// ConnType is the type of connection requested, either node or application.
 	ConnType types.TunnelType `json:"conn_type"`
 
-	// TeleportVersion shows what teleport version is the node that we're trying to dial
-	TeleportVersion string `json:"teleport_version,omitempty"`
-
 	// ClientSrcAddr is the original observed client address, it is used to propagate
 	// correct client IP through indirect connections inside teleport
 	ClientSrcAddr string `json:"client_src_addr,omitempty"`
@@ -104,6 +101,12 @@ type DialReq struct {
 	// ClientDstAddr is the original client's destination address, it is used to propagate
 	// correct client point of contact through indirect connections inside teleport
 	ClientDstAddr string `json:"client_dst_addr,omitempty"`
+
+	// IsAgentlessNode specifies whether the target is an agentless node.
+	IsAgentlessNode bool `json:"is_agentless_node,omitempty"`
+
+	// TargetScope is the scope the target server must belong to.
+	TargetScope string `json:"target_scope,omitempty"`
 }
 
 // CheckAndSetDefaults verifies all the values are valid.

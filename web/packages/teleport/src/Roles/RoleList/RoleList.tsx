@@ -1,77 +1,122 @@
-/*
-Copyright 2019-2021 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
 import Table, { Cell } from 'design/DataTable';
 import { MenuButton, MenuItem } from 'shared/components/MenuAction';
+import { SearchPanel } from 'shared/components/Search';
 
-import { State as ResourceState } from 'teleport/components/useResources';
+import { SeversidePagination } from 'teleport/components/hooks/useServersidePagination';
+import { RoleResource } from 'teleport/services/resources';
+import { Access } from 'teleport/services/user';
 
-import { State as RolesState } from '../useRoles';
-
-export default function RoleList({
-  items = [],
-  pageSize = 20,
+export function RoleList({
   onEdit,
   onDelete,
-}: Props) {
+  onSearchChange,
+  search,
+  serversidePagination,
+  rolesAcl,
+}: {
+  onEdit(id: string): void;
+  onDelete(id: string): void;
+  onSearchChange(search: string): void;
+  search: string;
+  serversidePagination: SeversidePagination<RoleResource>;
+  rolesAcl: Access;
+}) {
+  const canView = rolesAcl.list && rolesAcl.read;
+  const canEdit = rolesAcl.edit;
+  const canDelete = rolesAcl.remove;
+
   return (
     <Table
-      data={items}
+      data={serversidePagination.fetchedData.agents}
+      fetching={{
+        fetchStatus: serversidePagination.fetchStatus,
+        onFetchNext: serversidePagination.fetchNext,
+        onFetchPrev: serversidePagination.fetchPrev,
+      }}
+      serversideProps={{
+        sort: undefined,
+        setSort: () => undefined,
+        serversideSearchPanel: (
+          <SearchPanel
+            updateSearch={onSearchChange}
+            updateQuery={null}
+            hideAdvancedSearch={true}
+            filter={{ search }}
+            disableSearch={serversidePagination.attempt.status === 'processing'}
+          />
+        ),
+      }}
       columns={[
         {
           key: 'name',
           headerText: 'Name',
         },
         {
+          key: 'description',
+          headerText: 'Description',
+        },
+        {
           altKey: 'options-btn',
-          render: ({ id }) => (
-            <ActionCell id={id} onEdit={onEdit} onDelete={onDelete} />
+          render: (role: RoleResource) => (
+            <ActionCell
+              canView={canView}
+              canDelete={canDelete}
+              canEdit={canEdit}
+              onEdit={() => onEdit(role.id)}
+              onDelete={() => onDelete(role.id)}
+            />
           ),
         },
       ]}
+      row={{
+        getKey: role => role.id,
+      }}
       emptyText="No Roles Found"
-      pagination={{ pageSize }}
       isSearchable
     />
   );
 }
 
-const ActionCell = ({
-  id,
-  onEdit,
-  onDelete,
-}: {
-  id: string;
-  onEdit: (id: string) => void;
-  onDelete: (id: string) => void;
+const ActionCell = (props: {
+  canView: boolean;
+  canEdit: boolean;
+  canDelete: boolean;
+  onEdit(): void;
+  onDelete(): void;
 }) => {
+  if (!(props.canView || props.canDelete)) {
+    return <Cell align="right" />;
+  }
   return (
     <Cell align="right">
       <MenuButton>
-        <MenuItem onClick={() => onEdit(id)}>Edit...</MenuItem>
-        <MenuItem onClick={() => onDelete(id)}>Delete...</MenuItem>
+        {props.canView && (
+          <MenuItem onClick={props.onEdit}>
+            {props.canEdit ? 'Edit' : 'View Details'}
+          </MenuItem>
+        )}
+        {props.canDelete && (
+          <MenuItem onClick={props.onDelete}>Delete</MenuItem>
+        )}
       </MenuButton>
     </Cell>
   );
-};
-
-type Props = {
-  items: RolesState['items'];
-  onEdit: ResourceState['edit'];
-  onDelete: ResourceState['remove'];
-  pageSize?: number;
 };

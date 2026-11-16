@@ -1,38 +1,43 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import { createGlobalStyle, css } from 'styled-components';
-import { getPlatform } from 'design/theme/utils';
+import { createGlobalStyle } from 'styled-components';
 
 const GlobalStyle = createGlobalStyle`
 
   html {
     font-family: ${props => props.theme.font};
-    ${props => props.theme.typography.body1};
+    ${props => props.theme.typography.body2};
   }
 
   body {
     margin: 0;
-    background-color: ${props => props.theme.colors.primary.darker};
-    color: ${props => props.theme.colors.light};
+    background-color: ${props => props.theme.colors.levels.sunken};
+    color: ${props => props.theme.colors.text.main};
     padding: 0;
   }
 
   input, textarea {
     font-family: ${props => props.theme.font};
+  }
+
+  input {
+    accent-color: ${props => props.theme.colors.brand};
   }
 
   // remove dotted Firefox outline
@@ -44,21 +49,16 @@ const GlobalStyle = createGlobalStyle`
     }
   }
 
-  ${() => !getPlatform().isMac && customScrollbar}
-`;
-
-const customScrollbar = css`
-  ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
-  }
-
-  ::-webkit-scrollbar-thumb {
-    background: #757575;
-  }
-
-  ::-webkit-scrollbar-corner {
-    background: rgba(0, 0, 0, 0.5);
+  b, strong {
+    // Overrides the default useragent style of  font-weight: bolder which results in the bold font
+    // not being bold enough. That's because if the regular font-weight is set to 300, "bolder"
+    // means it'll go to just 400.
+    // https://developer.mozilla.org/en-US/docs/Web/CSS/font-weight#meaning_of_relative_weights
+    //
+    // The Web UI uses <Text bold> to render bold text which always explicitly sets the weight to
+    // theme.fontWeights.bold (600), whereas Connect mostly uses <strong> which by default uses the
+    // useragent style.
+    font-weight: ${props => props.theme.fontWeights.bold};
   }
 `;
 

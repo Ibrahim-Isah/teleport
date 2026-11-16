@@ -1,27 +1,35 @@
 /*
-Copyright 2016-2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package client
 
 import (
+	"net/url"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/profile"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/wrappers"
+	"github.com/gravitational/teleport/lib/services"
 )
 
 func newTestFSProfileStore(t *testing.T) *FSProfileStore {
@@ -49,15 +57,17 @@ func TestProfileStore(t *testing.T) {
 		}
 		profiles := []*profile.Profile{
 			{
-				WebProxyAddr: "proxy1.example.com",
-				Username:     "test-user",
-				SiteName:     "root",
-				Dir:          dir,
+				WebProxyAddr:   "proxy1.example.com",
+				Username:       "test-user",
+				SiteName:       "root",
+				Dir:            dir,
+				SSHDialTimeout: 10 * time.Second,
 			}, {
-				WebProxyAddr: "proxy2.example.com",
-				Username:     "test-user",
-				SiteName:     "root",
-				Dir:          dir,
+				WebProxyAddr:   "proxy2.example.com",
+				Username:       "test-user",
+				SiteName:       "root",
+				Dir:            dir,
+				SSHDialTimeout: 1 * time.Second,
 			},
 		}
 
@@ -83,4 +93,110 @@ func TestProfileStore(t *testing.T) {
 		}
 		require.ElementsMatch(t, profiles, retProfiles)
 	})
+}
+
+func TestProfileNameFromProxyAddress(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemProfileStore()
+	require.NoError(t, store.SaveProfile(&profile.Profile{
+		WebProxyAddr: "proxy1.example.com:443",
+		Username:     "test-user",
+		SiteName:     "root",
+	}, true))
+
+	t.Run("current profile", func(t *testing.T) {
+		profileName, err := ProfileNameFromProxyAddress(store, "")
+		require.NoError(t, err)
+		require.Equal(t, "proxy1.example.com", profileName)
+	})
+	t.Run("proxy host", func(t *testing.T) {
+		profileName, err := ProfileNameFromProxyAddress(store, "proxy2.example.com:443")
+		require.NoError(t, err)
+		require.Equal(t, "proxy2.example.com", profileName)
+	})
+	t.Run("invalid proxy address", func(t *testing.T) {
+		_, err := ProfileNameFromProxyAddress(store, ":443")
+		require.Error(t, err)
+	})
+}
+
+func TestProfileStatusAccessInfo(t *testing.T) {
+	allowedResourceAccessIDs := []types.ResourceAccessID{{
+		Id: types.ResourceID{
+			ClusterName: "cluster",
+			Kind:        types.KindNode,
+			Name:        "uuid",
+		},
+	}}
+	traits := wrappers.Traits{
+		"trait1": {"value1", "value2"},
+		"trait2": {"value3", "value4"},
+	}
+
+	wantAccessInfo := &services.AccessInfo{
+		Username:                 "alice",
+		Roles:                    []string{"role1", "role2"},
+		Traits:                   traits,
+		AllowedResourceAccessIDs: allowedResourceAccessIDs,
+		DelegationSessionID:      "delegation-session-1234",
+	}
+
+	profileStatus := ProfileStatus{
+		Username:                 "alice",
+		Roles:                    []string{"role1", "role2"},
+		Traits:                   traits,
+		AllowedResourceAccessIDs: allowedResourceAccessIDs,
+		DelegationSessionID:      "delegation-session-1234",
+	}
+
+	require.Equal(t, wantAccessInfo, profileStatus.AccessInfo())
+}
+
+func Test_profileStatusFromKeyRing(t *testing.T) {
+	auth := newTestAuthority(t)
+	idx := KeyRingIndex{
+		ProxyHost:   "proxy.example.com",
+		ClusterName: "root",
+		Username:    "test-user",
+	}
+	profile := &profile.Profile{
+		WebProxyAddr: idx.ProxyHost + ":3080",
+		SiteName:     idx.ClusterName,
+		Username:     idx.Username,
+	}
+	keyRing := auth.makeSignedKeyRing(t, idx, false)
+	profileStatus, err := profileStatusFromKeyRing(keyRing, profileOptions{
+		ProfileName:       profile.Name(),
+		WebProxyAddr:      profile.WebProxyAddr,
+		ProfileDir:        "",
+		Username:          profile.Username,
+		SiteName:          profile.SiteName,
+		KubeProxyAddr:     profile.KubeProxyAddr,
+		IsVirtual:         true,
+		TLSRoutingEnabled: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, &ProfileStatus{
+		Name:    "proxy.example.com",
+		Cluster: "root",
+		ProxyURL: url.URL{
+			Scheme: "https",
+			Host:   "proxy.example.com:3080",
+		},
+		Username: "test-user",
+		Logins:   []string{"test-user", "root"},
+		Extensions: []string{
+			teleport.CertExtensionPermitPortForwarding,
+			teleport.CertExtensionPermitPTY,
+		},
+		ValidUntil: time.Unix(auth.clock.Now().Add(20*time.Minute).Unix(), 0),
+		IsVirtual:  true,
+		GitHubIdentity: &GitHubIdentity{
+			UserID:   "1234567",
+			Username: "github-username",
+		},
+		CriticalOptions:   map[string]string{},
+		TLSRoutingEnabled: true,
+	}, profileStatus)
 }

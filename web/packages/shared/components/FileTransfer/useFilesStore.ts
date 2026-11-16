@@ -1,17 +1,19 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import { useCallback, useMemo, useReducer, useRef } from 'react';
@@ -98,49 +100,52 @@ export const useFilesStore = () => {
   const [state, dispatch] = useReducer(reducer, initialState);
   const abortControllers = useRef(new Map<string, AbortController>());
 
-  const start = async (options: {
-    name: string;
-    runFileTransfer(
-      abortController: AbortController
-    ): Promise<FileTransferListeners>;
-  }) => {
-    const abortController = new AbortController();
-    const fileTransfer = await options.runFileTransfer(abortController);
-
-    if (!fileTransfer) {
-      return;
-    }
-
-    const id = new Date().getTime() + options.name;
-
-    dispatch({ type: 'add', payload: { id, name: options.name } });
-    abortControllers.current.set(id, abortController);
-
-    fileTransfer.onProgress(progress => {
-      updateTransferState(id, {
-        type: 'processing',
-        progress,
-      });
-    });
-    fileTransfer.onError(error => {
-      updateTransferState(id, {
-        type: 'error',
-        progress: undefined,
-        error,
-      });
-    });
-    fileTransfer.onComplete(() => {
-      updateTransferState(id, {
-        type: 'completed',
-      });
-    });
-  };
-
   const updateTransferState = useCallback(
     (id: string, transferState: TransferState) => {
       dispatch({ type: 'updateTransferState', payload: { id, transferState } });
     },
     []
+  );
+
+  const start = useCallback(
+    async (options: {
+      name: string;
+      runFileTransfer(
+        abortController: AbortController
+      ): Promise<FileTransferListeners>;
+    }) => {
+      const abortController = new AbortController();
+      const fileTransfer = await options.runFileTransfer(abortController);
+
+      if (!fileTransfer) {
+        return;
+      }
+
+      const id = new Date().getTime() + options.name;
+
+      dispatch({ type: 'add', payload: { id, name: options.name } });
+      abortControllers.current.set(id, abortController);
+
+      fileTransfer.onProgress(progress => {
+        updateTransferState(id, {
+          type: 'processing',
+          progress,
+        });
+      });
+      fileTransfer.onError(error => {
+        updateTransferState(id, {
+          type: 'error',
+          progress: undefined,
+          error,
+        });
+      });
+      fileTransfer.onComplete(() => {
+        updateTransferState(id, {
+          type: 'completed',
+        });
+      });
+    },
+    [updateTransferState]
   );
 
   const cancel = useCallback((id: string) => {
@@ -164,3 +169,5 @@ export const useFilesStore = () => {
     isAnyTransferInProgress,
   };
 };
+
+export type FilesStore = ReturnType<typeof useFilesStore>;

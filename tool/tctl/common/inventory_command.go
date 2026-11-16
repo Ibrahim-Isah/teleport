@@ -1,45 +1,52 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
+	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/gravitational/kingpin"
+	"github.com/alecthomas/kingpin/v2"
+	"github.com/dustin/go-humanize"
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/client/proto"
-	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/asciitable"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/service"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/utils"
 	vc "github.com/gravitational/teleport/lib/versioncontrol"
+	commonclient "github.com/gravitational/teleport/tool/tctl/common/client"
+	tctlcfg "github.com/gravitational/teleport/tool/tctl/common/config"
 )
 
 // InventoryCommand implements the `tctl inventory` family of commands.
 type InventoryCommand struct {
-	config *service.Config
+	config *servicecfg.Config
 
 	serverID string
 
@@ -51,7 +58,14 @@ type InventoryCommand struct {
 
 	version string
 
+	olderThan string
+	newerThan string
+
 	services string
+
+	upgrader    string
+	updateGroup string
+	sort        string
 
 	inventoryStatus *kingpin.CmdClause
 	inventoryList   *kingpin.CmdClause
@@ -59,105 +73,245 @@ type InventoryCommand struct {
 }
 
 // Initialize allows AccessRequestCommand to plug itself into the CLI parser
-func (c *InventoryCommand) Initialize(app *kingpin.Application, config *service.Config) {
+func (c *InventoryCommand) Initialize(app *kingpin.Application, _ *tctlcfg.GlobalCLIFlags, config *servicecfg.Config) {
 	c.config = config
-	inventory := app.Command("inventory", "Manage Teleport instance inventory").Hidden()
+	inventory := app.Command("inventory", "Manage Teleport instance inventory.").Hidden()
 
-	c.inventoryStatus = inventory.Command("status", "Show inventory status summary")
+	c.inventoryStatus = inventory.Command("status", "Show inventory status summary.")
 	c.inventoryStatus.Flag("connected", "Show locally connected instances summary").BoolVar(&c.getConnected)
+	c.inventoryStatus.Flag("format", "Output format.").Default(teleport.Text).EnumVar(&c.format, teleport.Text, teleport.JSON, teleport.YAML)
 
-	c.inventoryList = inventory.Command("list", "List teleport instance inventory").Alias("ls")
-	c.inventoryList.Flag("version", "Filter output by version").StringVar(&c.version)
+	c.inventoryList = inventory.Command("list", "List Teleport instance inventory.").Alias("ls")
+	c.inventoryList.Flag("older-than", "Filter for older teleport versions").StringVar(&c.olderThan)
+	c.inventoryList.Flag("newer-than", "Filter for newer teleport versions").StringVar(&c.newerThan)
+	c.inventoryList.Flag("exact-version", "Filter output by teleport version").StringVar(&c.version)
 	c.inventoryList.Flag("services", "Filter output by service (node,kube,proxy,etc)").StringVar(&c.services)
-	c.inventoryList.Flag("format", "Output format, 'text' or 'json'").Default(teleport.Text).StringVar(&c.format)
+	c.inventoryList.Flag("format", "Output format.").Default(teleport.Text).EnumVar(&c.format, teleport.Text, teleport.JSON)
+	c.inventoryList.Flag("upgrader", "Filter output by upgrader (kube,unit,none)").StringVar(&c.upgrader)
+	c.inventoryList.Flag("update-group", "Filter output by update group").StringVar(&c.updateGroup)
+	c.inventoryList.Flag("sort", "Sort output by column. Supported: audit-queue (largest audit queue backlog first, including dead-letter and corrupt events).").EnumVar(&c.sort, "", "audit-queue")
 
-	c.inventoryPing = inventory.Command("ping", "Ping locally connected instance")
+	c.inventoryPing = inventory.Command("ping", "Ping locally connected instance.")
 	c.inventoryPing.Arg("server-id", "ID of target server").Required().StringVar(&c.serverID)
 	c.inventoryPing.Flag("control-log", "Use control log for ping").Hidden().BoolVar(&c.controlLog)
 }
 
 // TryRun takes the CLI command as an argument (like "inventory status") and executes it.
-func (c *InventoryCommand) TryRun(ctx context.Context, cmd string, client auth.ClientI) (match bool, err error) {
+func (c *InventoryCommand) TryRun(ctx context.Context, cmd string, clientFunc commonclient.InitFunc) (match bool, err error) {
+	var commandFunc func(ctx context.Context, client *authclient.Client) error
 	switch cmd {
 	case c.inventoryStatus.FullCommand():
-		err = c.Status(ctx, client)
+		commandFunc = c.Status
 	case c.inventoryList.FullCommand():
-		err = c.List(ctx, client)
+		commandFunc = c.List
 	case c.inventoryPing.FullCommand():
-		err = c.Ping(ctx, client)
+		commandFunc = c.Ping
 	default:
 		return false, nil
 	}
+	client, closeFn, err := clientFunc(ctx)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+	err = commandFunc(ctx, client)
+	closeFn(ctx)
+
 	return true, trace.Wrap(err)
 }
 
-func (c *InventoryCommand) Status(ctx context.Context, client auth.ClientI) error {
-	if !c.getConnected {
-		// intention is for the status command to eventually display cluster-wide inventory
-		// info by default, but we only have access to info specific to this auth right now,
-		// so we can only display the locally connected instances. in order to avoid confusion
-		// we simply don't support any default output right now.
-		fmt.Println("Nothing to display.\n\nhint: try using the --connected flag to see a summary of locally connected instances.")
-		return nil
-	}
-	rsp, err := client.GetInventoryStatus(ctx, proto.InventoryStatusRequest{
+func (c *InventoryCommand) Status(ctx context.Context, client *authclient.Client) error {
+	rsp, err := client.GetInventoryStatus(ctx, proto.InventoryStatusRequest_builder{
 		Connected: c.getConnected,
-	})
+	}.Build())
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if c.getConnected {
-		table := asciitable.MakeTable([]string{"ServerID", "Services", "Version"})
-		for _, h := range rsp.Connected {
-			services := make([]string, 0, len(h.Services))
-			for _, s := range h.Services {
-				services = append(services, string(s))
+
+	switch c.format {
+	case teleport.Text:
+		if c.getConnected {
+			table := asciitable.MakeTable([]string{"Server ID", "Services", "Version", "Upgrader"})
+			for _, h := range rsp.GetConnected() {
+				table.AddRow([]string{
+					h.GetServerID(),
+					strings.Join(h.GetServices(), ","),
+					h.GetVersion(),
+					cmp.Or(h.GetExternalUpgrader(), "none"),
+				})
 			}
-			table.AddRow([]string{h.ServerID, strings.Join(services, ","), h.Version})
+
+			_, err := table.AsBuffer().WriteTo(os.Stdout)
+			return trace.Wrap(err)
 		}
 
-		_, err := table.AsBuffer().WriteTo(os.Stdout)
-		return trace.Wrap(err)
+		printHierarchicalData(map[string]any{
+			"Versions":        toAnyMap(rsp.GetVersionCounts()),
+			"Upgraders":       toAnyMap(rsp.GetUpgraderCounts()),
+			"Services":        toAnyMap(rsp.GetServiceCounts()),
+			"Total Instances": rsp.GetInstanceCount(),
+		}, "  ", 0)
+	case teleport.JSON:
+		output, err := json.Marshal(rsp)
+		if err != nil {
+			return trace.Wrap(err, "marshaling inventory status to json")
+		}
+		fmt.Println(string(output))
+	case teleport.YAML:
+		if err := utils.WriteYAML(os.Stdout, rsp); err != nil {
+			return trace.Wrap(err, "marshaling inventory status to yaml")
+		}
+	default:
+		return trace.BadParameter("unknown format %q", c.format)
 	}
+
 	return nil
 }
 
-func (c *InventoryCommand) List(ctx context.Context, client auth.ClientI) error {
+// toAnyMap converts a mapping with a concrete value type to an 'any' value type.
+func toAnyMap[T any](m map[string]T) map[string]any {
+	n := make(map[string]any, len(m))
+	for key, val := range m {
+		n[key] = val
+	}
+
+	return n
+}
+
+// printHierarchicalData is a helper for displaying nested mappings of data.
+func printHierarchicalData(data map[string]any, indent string, depth int) {
+	var longestKey int
+	for key := range data {
+		if longestKey == 0 || len(key) > longestKey {
+			longestKey = len(key)
+		}
+	}
+
+	for key, val := range data {
+		if m, ok := val.(map[string]any); ok {
+			if len(m) != 0 {
+				fmt.Printf("%s%s:\n", strings.Repeat(indent, depth), key)
+				printHierarchicalData(m, indent, depth+1)
+				continue
+			} else {
+				val = "none"
+			}
+		}
+
+		fmt.Printf("%s%s: %s%v\n",
+			strings.Repeat(indent, depth),
+			key,
+			strings.Repeat(" ", longestKey-len(key)),
+			val,
+		)
+	}
+}
+
+func (c *InventoryCommand) List(ctx context.Context, client *authclient.Client) error {
 	var services []types.SystemRole
 	var err error
+	var omitControlPlane bool
 	if c.services != "" {
 		services, err = types.ParseTeleportRoles(c.services)
 		if err != nil {
 			return trace.Wrap(err)
 		}
+	} else {
+		resp, err := client.Ping(ctx)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		omitControlPlane = resp.GetServerFeatures().GetCloud()
+	}
+
+	upgrader := c.upgrader
+	var noUpgrader bool
+	if upgrader == "none" {
+		// explicitly match instances with no upgrader defined
+		upgrader = ""
+		noUpgrader = true
 	}
 
 	instances := client.GetInstances(ctx, types.InstanceFilter{
-		Services: services,
-		Version:  vc.Normalize(c.version),
+		Services:         services,
+		Version:          vc.Normalize(c.version),
+		OlderThanVersion: vc.Normalize(c.olderThan),
+		NewerThanVersion: vc.Normalize(c.newerThan),
+		ExternalUpgrader: upgrader,
+		NoExtUpgrader:    noUpgrader,
+		UpdateGroup:      c.updateGroup,
 	})
 
 	switch c.format {
 	case teleport.Text:
-		table := asciitable.MakeTable([]string{"ServerID", "Hostname", "Services", "Version", "Status"})
-		now := time.Now().UTC()
+		type instanceRow struct {
+			cells             []string
+			auditQueueBacklog int64
+		}
+		var rows []instanceRow
 		for instances.Next() {
 			instance := instances.Item()
+
+			// The auth and proxy services should be omitted from the inventory list
+			// on Managed Teleport Enterprise (Cloud-Hosted) instances.
+			if omitControlPlane && (instance.HasService(types.RoleAuth) || instance.HasService(types.RoleProxy)) {
+				continue
+			}
+
 			services := make([]string, 0, len(instance.GetServices()))
 			for _, s := range instance.GetServices() {
 				services = append(services, string(s))
 			}
-			table.AddRow([]string{
-				instance.GetName(),
-				instance.GetHostname(),
-				strings.Join(services, ","),
-				instance.GetTeleportVersion(),
-				makeInstanceStatus(now, instance),
+
+			upgrader := instance.GetExternalUpgrader()
+			if upgrader == "" {
+				upgrader = "none"
+			}
+
+			upgraderVersion := instance.GetExternalUpgraderVersion()
+			if upgraderVersion == "" {
+				upgraderVersion = "none"
+			}
+
+			var updateGroup string
+			if updateInfo := instance.GetUpdaterInfo(); updateInfo != nil {
+				updateGroup = updateInfo.UpdateGroup
+			}
+
+			var auditQueueBacklog int64
+			auditQueue := formatAuditQueue(instance.GetAuditQueueStatus())
+			if aq := instance.GetAuditQueueStatus(); aq != nil {
+				auditQueueBacklog = aq.PendingCount + aq.DeadLetterCount + aq.CorruptCount
+			}
+
+			rows = append(rows, instanceRow{
+				auditQueueBacklog: auditQueueBacklog,
+				cells: []string{
+					instance.GetName(),
+					instance.GetHostname(),
+					strings.Join(services, ","),
+					instance.GetTeleportVersion(),
+					upgrader,
+					upgraderVersion,
+					updateGroup,
+					auditQueue,
+				},
 			})
 		}
 
 		if err := instances.Done(); err != nil {
 			return trace.Wrap(err)
+		}
+
+		if c.sort == "audit-queue" {
+			slices.SortStableFunc(rows, func(a, b instanceRow) int {
+				// Largest audit queue backlog first.
+				return cmp.Compare(b.auditQueueBacklog, a.auditQueueBacklog)
+			})
+		}
+
+		table := asciitable.MakeTable([]string{"Server ID", "Hostname", "Services", "Agent Version", "Upgrader", "Upgrader Version", "Update Group", "Audit Queue"})
+		for _, row := range rows {
+			table.AddRow(row.cells)
 		}
 
 		_, err := table.AsBuffer().WriteTo(os.Stdout)
@@ -169,31 +323,42 @@ func (c *InventoryCommand) List(ctx context.Context, client auth.ClientI) error 
 		fmt.Fprintf(os.Stdout, "\n")
 		return nil
 	default:
-		return trace.BadParameter("unknown format %q, must be one of [%q, %q]", c.format, teleport.Text, teleport.JSON)
+		return trace.BadParameter("unknown format %q", c.format)
 	}
 }
 
-// makeInstanceStatus builds the instance status string. This currently distinguishes online/offline, but the
-// plan is to eventually use the status field to give users insight at a glance into the current status of
-// ongoing upgrades as well.  Ex:
-//
-// Status
-// -----------------------------------------------
-// online (1m7s ago)
-// installing -> v1.2.3 (17s ago)
-// online, upgrade recommended -> v1.2.3 (20s ago)
-// churned during install -> v1.2.3 (6m ago)
-// online, install soon -> v1.2.3 (46s ago)
-func makeInstanceStatus(now time.Time, instance types.Instance) string {
-	status := "offline"
-	if instance.GetLastSeen().Add(apidefaults.ServerAnnounceTTL).After(now) {
-		status = "online"
-	}
+const minDisplayedAuditQueueAge = 5 * time.Minute
 
-	return fmt.Sprintf("%s (%s ago)", status, now.Sub(instance.GetLastSeen()).Round(time.Second))
+func formatAuditQueue(aq *types.AuditQueueStatus) string {
+	if aq == nil {
+		return ""
+	}
+	minAge := int64(minDisplayedAuditQueueAge.Seconds())
+	out := fmt.Sprintf("%d", aq.PendingCount)
+	if aq.OldestPendingAgeSeconds >= minAge {
+		out += fmt.Sprintf(" (oldest %s)", formatAge(aq.OldestPendingAgeSeconds))
+	}
+	if aq.DeadLetterCount > 0 {
+		out += fmt.Sprintf(" (%d DL", aq.DeadLetterCount)
+		if aq.OldestDeadLetterAgeSeconds >= minAge {
+			out += fmt.Sprintf(", oldest %s", formatAge(aq.OldestDeadLetterAgeSeconds))
+		}
+		out += ")"
+	}
+	if aq.CorruptCount > 0 {
+		out += fmt.Sprintf(" (%d corrupt)", aq.CorruptCount)
+	}
+	return out
 }
 
-func (c *InventoryCommand) Ping(ctx context.Context, client auth.ClientI) error {
+// formatAge renders an age in seconds as a coarse duration, e.g. "5 minutes"
+// or "1 hour".
+func formatAge(seconds int64) string {
+	base := time.Unix(0, 0)
+	return strings.TrimSpace(humanize.RelTime(base, base.Add(time.Duration(seconds)*time.Second), "", ""))
+}
+
+func (c *InventoryCommand) Ping(ctx context.Context, client *authclient.Client) error {
 	rsp, err := client.PingInventory(ctx, proto.InventoryPingRequest{
 		ServerID:   c.serverID,
 		ControlLog: c.controlLog,

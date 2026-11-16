@@ -1,0 +1,20 @@
+suite: Test RoleBinding
+templates:
+  - rolebinding.yaml
+# Override chart version so snapshots are stable across releases.
+chart:
+  version: "99.0.0"
+  appVersion: "99.0.0"
+tests:
+  - it: should match the snapshot (simple)
+    template: rolebinding.yaml
+    values:
+      - ../.lint/simple.yaml
+    asserts:
+      - matchSnapshot: {}
+  - it: should match the snapshot (full)
+    template: rolebinding.yaml
+    values:
+      - ../.lint/full.yaml
+    asserts:
+      - matchSnapshot: {}

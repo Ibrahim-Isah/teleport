@@ -1,42 +1,46 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
+	"context"
+	"log/slog"
+
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/postgresql/armpostgresqlflexibleservers"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/cloud/azure"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
 // newAzurePostgresFlexServerFetcher creates a fetcher for Azure PostgreSQL Flexible server.
 func newAzurePostgresFlexServerFetcher(config azureFetcherConfig) (common.Fetcher, error) {
-	return newAzureFetcher[*armpostgresqlflexibleservers.Server, azure.PostgresFlexServersClient](config, &azurePostgresFlexServerFetcher{})
+	return newAzureFetcher(config, &azurePostgresFlexServerFetcher{})
 }
 
 // newAzurePostgresFlexServerFetcher implements azureFetcherPlugin for Azure PostgreSQL Flexible server.
-type azurePostgresFlexServerFetcher struct {
-}
+type azurePostgresFlexServerFetcher struct{}
 
 // GetListClient returns a server-listing client for Azure PostgreSQL Flexible server.
-func (f *azurePostgresFlexServerFetcher) GetListClient(cfg *azureFetcherConfig, subID string) (azure.PostgresFlexServersClient, error) {
-	client, err := cfg.AzureClients.GetAzurePostgresFlexServersClient(subID)
+func (f *azurePostgresFlexServerFetcher) GetListClient(ctx context.Context, cfg *azureFetcherConfig, subID string) (azure.PostgresFlexServersClient, error) {
+	client, err := cfg.AzureClients.GetPostgresFlexServersClient(ctx, subID)
 	return client, trace.Wrap(err)
 }
 
@@ -46,17 +50,20 @@ func (f *azurePostgresFlexServerFetcher) GetServerLocation(server *armpostgresql
 }
 
 // NewDatabaseFromServer converts an Azure PostgreSQL server to a Teleport database.
-func (f *azurePostgresFlexServerFetcher) NewDatabaseFromServer(server *armpostgresqlflexibleservers.Server, log logrus.FieldLogger) types.Database {
-	if !f.isAvailable(server, log) {
-		log.Debugf("The current status of Azure PostgreSQL Flexible server %q is %q. Skipping.",
+func (f *azurePostgresFlexServerFetcher) NewDatabaseFromServer(ctx context.Context, server *armpostgresqlflexibleservers.Server, logger *slog.Logger) types.Database {
+	if !f.isAvailable(server, logger) {
+		logger.DebugContext(ctx, "Skipping unavailable Azure PostgreSQL Flexible server",
 			azure.StringVal(server.Name),
 			azure.StringVal(server.Properties.State))
 		return nil
 	}
 
-	database, err := services.NewDatabaseFromAzurePostgresFlexServer(server)
+	database, err := common.NewDatabaseFromAzurePostgresFlexServer(server)
 	if err != nil {
-		log.Warnf("Could not convert Azure PostgreSQL server %q to database resource: %v.", azure.StringVal(server.Name), err)
+		logger.WarnContext(ctx, "Could not convert Azure PostgreSQL server to database resource",
+			"server", azure.StringVal(server.Name),
+			"error", err,
+		)
 		return nil
 	}
 	return database
@@ -64,7 +71,7 @@ func (f *azurePostgresFlexServerFetcher) NewDatabaseFromServer(server *armpostgr
 
 // isAvailable checks the status of the server and returns true if the server
 // is available.
-func (f *azurePostgresFlexServerFetcher) isAvailable(server *armpostgresqlflexibleservers.Server, log logrus.FieldLogger) bool {
+func (f *azurePostgresFlexServerFetcher) isAvailable(server *armpostgresqlflexibleservers.Server, logger *slog.Logger) bool {
 	state := armpostgresqlflexibleservers.ServerState(azure.StringVal(server.Properties.State))
 	switch state {
 	case armpostgresqlflexibleservers.ServerStateReady, armpostgresqlflexibleservers.ServerStateUpdating:
@@ -77,8 +84,9 @@ func (f *azurePostgresFlexServerFetcher) isAvailable(server *armpostgresqlflexib
 		// server state is known and it's not available.
 		return false
 	}
-	log.Warnf("Unknown status type: %q. Assuming Azure PostgreSQL Flexible server %q is available.",
-		state,
-		azure.StringVal(server.Name))
+	logger.WarnContext(context.Background(), "Assuming Azure PostgreSQL Flexible server with unknown status is available",
+		"status", state,
+		"server", azure.StringVal(server.Name),
+	)
 	return true
 }

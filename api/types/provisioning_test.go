@@ -17,24 +17,29 @@ limitations under the License.
 package types
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/gogo/protobuf/types"
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/fixtures"
 )
 
 func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 	testcases := []struct {
-		desc        string
-		token       *ProvisionTokenV2
-		expected    *ProvisionTokenV2
-		expectedErr error
+		desc     string
+		token    *ProvisionTokenV2
+		expected *ProvisionTokenV2
+		wantErr  bool
 	}{
 		{
-			desc:        "empty",
-			token:       &ProvisionTokenV2{},
-			expectedErr: &trace.BadParameterError{},
+			desc:    "empty",
+			token:   &ProvisionTokenV2{},
+			wantErr: true,
 		},
 		{
 			desc: "missing roles",
@@ -43,7 +48,7 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					Name: "test",
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
 		},
 		{
 			desc: "invalid role",
@@ -55,7 +60,7 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					Roles: []SystemRole{RoleNode, "not a role"},
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
 		},
 		{
 			desc: "simple token",
@@ -156,7 +161,7 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					JoinMethod: "ec2",
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
 		},
 		{
 			desc: "ec2 method with aws_arn",
@@ -175,7 +180,7 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					},
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
 		},
 		{
 			desc: "ec2 method empty rule",
@@ -189,7 +194,7 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					Allow:      []*TokenRule{{}},
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
 		},
 		{
 			desc: "iam method",
@@ -235,7 +240,7 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					},
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
 		},
 		{
 			desc: "iam method with aws_regions",
@@ -254,7 +259,46 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					},
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
+		},
+		{
+			desc: "iam method with aws_organization_id",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: "iam",
+					Allow: []*TokenRule{
+						{
+							AWSOrganizationID: "o-123abcd",
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "iam method with aws_organization_id and organizational unit matchers",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: "iam",
+					Allow: []*TokenRule{
+						{
+							AWSOrganizationID: "o-123abcd",
+							AWSOrganizationalUnits: &AWSOrganizationUnitsMatcher{
+								Include: []string{"*"},
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
 		},
 		{
 			desc: "github valid",
@@ -269,6 +313,44 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 						Allow: []*ProvisionTokenSpecV2GitHub_Rule{
 							{
 								Sub: "foo",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "github valid enterprise only",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGitHub,
+					GitHub: &ProvisionTokenSpecV2GitHub{
+						Allow: []*ProvisionTokenSpecV2GitHub_Rule{
+							{
+								Enterprise: "my-enterprise",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "github valid enterprise_id only",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGitHub,
+					GitHub: &ProvisionTokenSpecV2GitHub{
+						Allow: []*ProvisionTokenSpecV2GitHub_Rule{
+							{
+								EnterpriseID: "123456",
 							},
 						},
 					},
@@ -314,7 +396,29 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					},
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
+		},
+		{
+			desc: "github slug and ghes set",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGitHub,
+					GitHub: &ProvisionTokenSpecV2GitHub{
+						EnterpriseServerHost: "example.com",
+						EnterpriseSlug:       "slug",
+						Allow: []*ProvisionTokenSpecV2GitHub_Rule{
+							{
+								Sub: "foo",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
 		},
 		{
 			desc: "circleci valid",
@@ -351,7 +455,7 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					},
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
 		},
 		{
 			desc: "circleci and no org id",
@@ -371,7 +475,7 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					},
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
 		},
 		{
 			desc: "circleci allow rule blank",
@@ -389,10 +493,10 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					},
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
 		},
 		{
-			desc: "kubernetes valid",
+			desc: "kubernetes: in_cluster defaults",
 			token: &ProvisionTokenV2{
 				Metadata: Metadata{
 					Name: "test",
@@ -409,9 +513,115 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					},
 				},
 			},
+			expected: &ProvisionTokenV2{
+				Kind:    "token",
+				Version: "v2",
+				Metadata: Metadata{
+					Name:      "test",
+					Namespace: "default",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Type: KubernetesJoinTypeInCluster,
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccount: "namespace:my-service-account",
+							},
+						},
+					},
+				},
+			},
 		},
 		{
-			desc: "kubernetes wrong service account name",
+			desc: "kubernetes: valid in_cluster",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Type: KubernetesJoinTypeInCluster,
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccount: "namespace:my-service-account",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "kubernetes: valid static_jwks",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Type: KubernetesJoinTypeStaticJWKS,
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccount: "namespace:my-service-account",
+							},
+						},
+						StaticJWKS: &ProvisionTokenSpecV2Kubernetes_StaticJWKSConfig{
+							JWKS: `{"keys":[{"use":"sig","kty":"RSA","kid":"-snip-","alg":"RS256","n":"-snip-","e":"-snip-"}]}`,
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "kubernetes: missing static_jwks",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Type: KubernetesJoinTypeStaticJWKS,
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccount: "namespace:my-service-account",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "kubernetes: missing static_jwks.jwks",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Type: KubernetesJoinTypeStaticJWKS,
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccount: "namespace:my-service-account",
+							},
+						},
+						StaticJWKS: &ProvisionTokenSpecV2Kubernetes_StaticJWKSConfig{},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "kubernetes: wrong service account name",
 			token: &ProvisionTokenV2{
 				Metadata: Metadata{
 					Name: "test",
@@ -428,10 +638,30 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					},
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
 		},
 		{
-			desc: "kubernetes allow rule blank",
+			desc: "kubernetes: too many parts in service account name",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccount: "too:many:parts",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "kubernetes: allow rule blank",
 			token: &ProvisionTokenV2{
 				Metadata: Metadata{
 					Name: "test",
@@ -446,23 +676,1396 @@ func TestProvisionTokenV2_CheckAndSetDefaults(t *testing.T) {
 					},
 				},
 			},
-			expectedErr: &trace.BadParameterError{},
+			wantErr: true,
+		},
+		{
+			desc: "kubernetes: valid service_account_name and service_account_namespace",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccountName:      "my-sa",
+								ServiceAccountNamespace: "my-ns",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "kubernetes: valid service_account, service_account_name, and service_account_namespace",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccount:          "my-ns:my-sa",
+								ServiceAccountName:      "my-sa",
+								ServiceAccountNamespace: "my-ns",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "kubernetes: service_account_name without service_account_namespace",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccountName: "my-sa",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "kubernetes: service_account_namespace without service_account_name",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccountNamespace: "my-ns",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "kubernetes: oidc must have valid issuer",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Type: KubernetesJoinTypeOIDC,
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccount: "namespace:my-service-account",
+							},
+						},
+						OIDC: &ProvisionTokenSpecV2Kubernetes_OIDCConfig{
+							Issuer: "https://example.com",
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "kubernetes: http issuers not allowed without override",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Type: KubernetesJoinTypeOIDC,
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccount: "namespace:my-service-account",
+							},
+						},
+						OIDC: &ProvisionTokenSpecV2Kubernetes_OIDCConfig{
+							Issuer: "http://example.com",
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "kubernetes: http issuers are allowed with override",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodKubernetes,
+					Kubernetes: &ProvisionTokenSpecV2Kubernetes{
+						Type: KubernetesJoinTypeOIDC,
+						Allow: []*ProvisionTokenSpecV2Kubernetes_Rule{
+							{
+								ServiceAccount: "namespace:my-service-account",
+							},
+						},
+						OIDC: &ProvisionTokenSpecV2Kubernetes_OIDCConfig{
+							Issuer:                  "http://example.com",
+							InsecureAllowHTTPIssuer: true,
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "gitlab empty allow rules",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGitLab,
+					GitLab: &ProvisionTokenSpecV2GitLab{
+						Allow: []*ProvisionTokenSpecV2GitLab_Rule{},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "gitlab missing config",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGitLab,
+					GitLab:     nil,
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "gitlab empty allow rule",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGitLab,
+					GitLab: &ProvisionTokenSpecV2GitLab{
+						Allow: []*ProvisionTokenSpecV2GitLab_Rule{
+							{},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "gitlab defaults",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGitLab,
+					GitLab: &ProvisionTokenSpecV2GitLab{
+						Allow: []*ProvisionTokenSpecV2GitLab_Rule{
+							{
+								Sub: "asub",
+							},
+						},
+					},
+				},
+			},
+			expected: &ProvisionTokenV2{
+				Kind:    KindToken,
+				Version: V2,
+				Metadata: Metadata{
+					Name:      "test",
+					Namespace: defaults.Namespace,
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGitLab,
+					GitLab: &ProvisionTokenSpecV2GitLab{
+						Allow: []*ProvisionTokenSpecV2GitLab_Rule{
+							{
+								Sub: "asub",
+							},
+						},
+						Domain: defaultGitLabDomain,
+					},
+				},
+			},
+		},
+		{
+			desc: "overridden domain",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGitLab,
+					GitLab: &ProvisionTokenSpecV2GitLab{
+						Allow: []*ProvisionTokenSpecV2GitLab_Rule{
+							{
+								Sub: "asub",
+							},
+						},
+						Domain: "gitlab.example.com",
+					},
+				},
+			},
+			expected: &ProvisionTokenV2{
+				Kind:    KindToken,
+				Version: V2,
+				Metadata: Metadata{
+					Name:      "test",
+					Namespace: defaults.Namespace,
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGitLab,
+					GitLab: &ProvisionTokenSpecV2GitLab{
+						Allow: []*ProvisionTokenSpecV2GitLab_Rule{
+							{
+								Sub: "asub",
+							},
+						},
+						Domain: "gitlab.example.com",
+					},
+				},
+			},
+		},
+		{
+			desc: "invalid overridden domain",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGitLab,
+					GitLab: &ProvisionTokenSpecV2GitLab{
+						Allow: []*ProvisionTokenSpecV2GitLab_Rule{
+							{
+								Sub: "asub",
+							},
+						},
+						Domain: "http://gitlab.example.com",
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "spacelift",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodSpacelift,
+					Spacelift: &ProvisionTokenSpecV2Spacelift{
+						Hostname: "example.app.spacelift.io",
+						Allow: []*ProvisionTokenSpecV2Spacelift_Rule{
+							{
+								SpaceID: "foo",
+							},
+						},
+					},
+				},
+			},
+			expected: &ProvisionTokenV2{
+				Kind:    "token",
+				Version: "v2",
+				Metadata: Metadata{
+					Name:      "test",
+					Namespace: "default",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodSpacelift,
+					Spacelift: &ProvisionTokenSpecV2Spacelift{
+						Hostname: "example.app.spacelift.io",
+						Allow: []*ProvisionTokenSpecV2Spacelift_Rule{
+							{
+								SpaceID: "foo",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "spacelift empty allow rules",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodSpacelift,
+					Spacelift: &ProvisionTokenSpecV2Spacelift{
+						Hostname: "example.app.spacelift.io",
+						Allow:    []*ProvisionTokenSpecV2Spacelift_Rule{},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "spacelift rule missing fields",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodSpacelift,
+					Spacelift: &ProvisionTokenSpecV2Spacelift{
+						Hostname: "example.app.spacelift.io",
+						Allow:    []*ProvisionTokenSpecV2Spacelift_Rule{{}},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "spacelift missing hostname",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodSpacelift,
+					Spacelift: &ProvisionTokenSpecV2Spacelift{
+						Allow: []*ProvisionTokenSpecV2Spacelift_Rule{
+							{
+								SpaceID: "foo",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "spacelift incorrect hostname",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodSpacelift,
+					Spacelift: &ProvisionTokenSpecV2Spacelift{
+						Hostname: "https://example.app.spacelift.io",
+						Allow: []*ProvisionTokenSpecV2Spacelift_Rule{
+							{
+								SpaceID: "foo",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "gcp method",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: "gcp",
+					GCP: &ProvisionTokenSpecV2GCP{
+						Allow: []*ProvisionTokenSpecV2GCP_Rule{
+							{
+								ProjectIDs: []string{"p1"},
+								Locations:  []string{"us-west1-b"},
+							},
+						},
+					},
+				},
+			},
+			expected: &ProvisionTokenV2{
+				Kind:    "token",
+				Version: "v2",
+				Metadata: Metadata{
+					Name:      "test",
+					Namespace: "default",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: "gcp",
+					GCP: &ProvisionTokenSpecV2GCP{
+						Allow: []*ProvisionTokenSpecV2GCP_Rule{
+							{
+								ProjectIDs: []string{"p1"},
+								Locations:  []string{"us-west1-b"},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "gcp method no project ids",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: "gcp",
+					GCP: &ProvisionTokenSpecV2GCP{
+						Allow: []*ProvisionTokenSpecV2GCP_Rule{
+							{
+								Locations: []string{"us-west1-b"},
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "tpm success with CA",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodTPM,
+					TPM: &ProvisionTokenSpecV2TPM{
+						EKCertAllowedCAs: []string{fixtures.TLSCACertPEM},
+						Allow: []*ProvisionTokenSpecV2TPM_Rule{
+							{
+								Description:  "my description",
+								EKPublicHash: "d4b45864d9d6fabfc568d74f26c35ababde2105337d7af9a6605e1c56c891aa6",
+							},
+							{
+								EKCertificateSerial: "73:df:dc:bd:af:ef:8a:d8:15:2e:96:71:7a:3e:7f:a4",
+							},
+							{
+								EKPublicHash:        "d4b45864d9d6fabfc568d74f26c35ababde2105337d7af9a6605e1c56c891aa6",
+								EKCertificateSerial: "73:df:dc:bd:af:ef:8a:d8:15:2e:96:71:7a:3e:7f:a4",
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "tpm success without CA",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodTPM,
+					TPM: &ProvisionTokenSpecV2TPM{
+						Allow: []*ProvisionTokenSpecV2TPM_Rule{
+							{
+								Description:  "my description",
+								EKPublicHash: "d4b45864d9d6fabfc568d74f26c35ababde2105337d7af9a6605e1c56c891aa6",
+							},
+							{
+								EKCertificateSerial: "73:df:dc:bd:af:ef:8a:d8:15:2e:96:71:7a:3e:7f:a4",
+							},
+							{
+								EKPublicHash:        "d4b45864d9d6fabfc568d74f26c35ababde2105337d7af9a6605e1c56c891aa6",
+								EKCertificateSerial: "73:df:dc:bd:af:ef:8a:d8:15:2e:96:71:7a:3e:7f:a4",
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "tpm corrupt CA",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodTPM,
+					TPM: &ProvisionTokenSpecV2TPM{
+						EKCertAllowedCAs: []string{"corrupt"},
+						Allow: []*ProvisionTokenSpecV2TPM_Rule{
+							{
+								Description:  "my description",
+								EKPublicHash: "d4b45864d9d6fabfc568d74f26c35ababde2105337d7af9a6605e1c56c891aa6",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "tpm missing rules",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodTPM,
+					TPM: &ProvisionTokenSpecV2TPM{
+						EKCertAllowedCAs: []string{},
+						Allow:            []*ProvisionTokenSpecV2TPM_Rule{},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "tpm rule without ekpubhash or ekcertserial",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodTPM,
+					TPM: &ProvisionTokenSpecV2TPM{
+						EKCertAllowedCAs: []string{},
+						Allow: []*ProvisionTokenSpecV2TPM_Rule{
+							{
+								Description: "my description",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "terraform",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodTerraformCloud,
+					TerraformCloud: &ProvisionTokenSpecV2TerraformCloud{
+						Allow: []*ProvisionTokenSpecV2TerraformCloud_Rule{
+							{
+								OrganizationName: "foo",
+								OrganizationID:   "foo-id",
+								ProjectName:      "bar",
+								ProjectID:        "bar-id",
+								WorkspaceName:    "baz",
+								WorkspaceID:      "baz-id",
+								RunPhase:         "apply",
+							},
+						},
+					},
+				},
+			},
+			expected: &ProvisionTokenV2{
+				Kind:    "token",
+				Version: "v2",
+				Metadata: Metadata{
+					Name:      "test",
+					Namespace: "default",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodTerraformCloud,
+					TerraformCloud: &ProvisionTokenSpecV2TerraformCloud{
+						Allow: []*ProvisionTokenSpecV2TerraformCloud_Rule{
+							{
+								OrganizationName: "foo",
+								OrganizationID:   "foo-id",
+								ProjectName:      "bar",
+								ProjectID:        "bar-id",
+								WorkspaceName:    "baz",
+								WorkspaceID:      "baz-id",
+								RunPhase:         "apply",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			desc: "terraform missing organization (id)",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodTerraformCloud,
+					TerraformCloud: &ProvisionTokenSpecV2TerraformCloud{
+						Allow: []*ProvisionTokenSpecV2TerraformCloud_Rule{
+							{
+								WorkspaceName: "foo",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "terraform missing specific resource",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodTerraformCloud,
+					TerraformCloud: &ProvisionTokenSpecV2TerraformCloud{
+						Allow: []*ProvisionTokenSpecV2TerraformCloud_Rule{
+							{
+								OrganizationName: "foo",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "terraform only names",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodTerraformCloud,
+					TerraformCloud: &ProvisionTokenSpecV2TerraformCloud{
+						Allow: []*ProvisionTokenSpecV2TerraformCloud_Rule{
+							{
+								OrganizationName: "foo",
+								ProjectName:      "bar",
+								WorkspaceName:    "baz",
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "terraform only ids",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodTerraformCloud,
+					TerraformCloud: &ProvisionTokenSpecV2TerraformCloud{
+						Allow: []*ProvisionTokenSpecV2TerraformCloud_Rule{
+							{
+								OrganizationID: "foo",
+								ProjectID:      "bar",
+								WorkspaceID:    "baz",
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "terraform missing rules",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodTerraformCloud,
+					TerraformCloud: &ProvisionTokenSpecV2TerraformCloud{
+						Allow: []*ProvisionTokenSpecV2TerraformCloud_Rule{},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "bitbucket only workspace",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodBitbucket,
+					Bitbucket: &ProvisionTokenSpecV2Bitbucket{
+						Audience:            "foo",
+						IdentityProviderURL: "https://example.com",
+						Allow: []*ProvisionTokenSpecV2Bitbucket_Rule{
+							{
+								WorkspaceUUID: "{foo}",
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "bitbucket only repository",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodBitbucket,
+					Bitbucket: &ProvisionTokenSpecV2Bitbucket{
+						Audience:            "foo",
+						IdentityProviderURL: "https://example.com",
+						Allow: []*ProvisionTokenSpecV2Bitbucket_Rule{
+							{
+								RepositoryUUID: "{foo}",
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "bitbucket missing audience",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodBitbucket,
+					Bitbucket: &ProvisionTokenSpecV2Bitbucket{
+						IdentityProviderURL: "https://example.com",
+						Allow: []*ProvisionTokenSpecV2Bitbucket_Rule{
+							{
+								WorkspaceUUID: "{foo}",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "bitbucket missing identity provider",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodBitbucket,
+					Bitbucket: &ProvisionTokenSpecV2Bitbucket{
+						Audience: "foo",
+						Allow: []*ProvisionTokenSpecV2Bitbucket_Rule{
+							{
+								WorkspaceUUID: "{foo}",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "bitbucket missing workspace or repository",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodBitbucket,
+					Bitbucket: &ProvisionTokenSpecV2Bitbucket{
+						Audience:            "foo",
+						IdentityProviderURL: "https://example.com",
+						Allow: []*ProvisionTokenSpecV2Bitbucket_Rule{
+							{
+								DeploymentEnvironmentUUID: "{foo}",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "azure success with subscription",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodAzure,
+					Azure: &ProvisionTokenSpecV2Azure{
+						Allow: []*ProvisionTokenSpecV2Azure_Rule{
+							{
+								Subscription: "00000000-0000-0000-0000-000000000001",
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "azure success with tenant only",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodAzure,
+					Azure: &ProvisionTokenSpecV2Azure{
+						Allow: []*ProvisionTokenSpecV2Azure_Rule{
+							{
+								Tenant: "00000000-0000-0000-0000-000000000002",
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "azure missing subscription and tenant",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodAzure,
+					Azure: &ProvisionTokenSpecV2Azure{
+						Allow: []*ProvisionTokenSpecV2Azure_Rule{
+							{},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "azure devops success",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodAzureDevops,
+					AzureDevops: &ProvisionTokenSpecV2AzureDevops{
+						OrganizationID: "0000-0000-0000-0000",
+						Allow: []*ProvisionTokenSpecV2AzureDevops_Rule{
+							{
+								ProjectName: "my-project",
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "azure devops missing spec",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodAzureDevops,
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "azure devops missing org id",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodAzureDevops,
+					AzureDevops: &ProvisionTokenSpecV2AzureDevops{
+						Allow: []*ProvisionTokenSpecV2AzureDevops_Rule{
+							{
+								ProjectName: "my-project",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "azure devops missing allow rules",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodAzureDevops,
+					AzureDevops: &ProvisionTokenSpecV2AzureDevops{
+						OrganizationID: "0000-0000-0000-0000",
+						Allow:          []*ProvisionTokenSpecV2AzureDevops_Rule{},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "azure devops allow rule missing key field",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodAzureDevops,
+					AzureDevops: &ProvisionTokenSpecV2AzureDevops{
+						OrganizationID: "0000-0000-0000-0000",
+						Allow: []*ProvisionTokenSpecV2AzureDevops_Rule{
+							{
+								RepositoryVersion: "aaabbccddeefgghhjjiii",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "minimal bound keypair with pregenerated key",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodBoundKeypair,
+					BoundKeypair: &ProvisionTokenSpecV2BoundKeypair{
+						Onboarding: &ProvisionTokenSpecV2BoundKeypair_OnboardingSpec{
+							InitialPublicKey: "asdf",
+						},
+					},
+				},
+			},
+			expected: &ProvisionTokenV2{
+				Kind:    "token",
+				Version: "v2",
+				Metadata: Metadata{
+					Name:      "test",
+					Namespace: "default",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodBoundKeypair,
+					BoundKeypair: &ProvisionTokenSpecV2BoundKeypair{
+						Onboarding: &ProvisionTokenSpecV2BoundKeypair_OnboardingSpec{
+							InitialPublicKey: "asdf",
+						},
+						Recovery: &ProvisionTokenSpecV2BoundKeypair_RecoverySpec{
+							Limit: 1,
+							Mode:  "",
+						},
+					},
+				},
+			},
+		},
+		{
+			// note: missing onboarding config is allowed; we'll generate some
+			// fields at creation/upsert time.
+			desc: "bound keypair missing onboarding config",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:        []SystemRole{RoleNode},
+					JoinMethod:   JoinMethodBoundKeypair,
+					BoundKeypair: &ProvisionTokenSpecV2BoundKeypair{},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "env0 success",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodEnv0,
+					Env0: &ProvisionTokenSpecV2Env0{
+						Allow: []*ProvisionTokenSpecV2Env0_Rule{
+							{
+								OrganizationID:  "organization-id",
+								ProjectID:       "project-id",
+								ProjectName:     "project-name",
+								TemplateID:      "template-id",
+								TemplateName:    "template-name",
+								EnvironmentID:   "environment-id",
+								EnvironmentName: "environment-name",
+								WorkspaceName:   "workspace-name",
+								DeploymentType:  "deployment-type",
+								DeployerEmail:   "deployer-email",
+								Env0Tag:         "custom-tag",
+							},
+						},
+					},
+				},
+			},
+			expected: &ProvisionTokenV2{
+				Kind:    "token",
+				Version: "v2",
+				Metadata: Metadata{
+					Name:      "test",
+					Namespace: "default",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodEnv0,
+					Env0: &ProvisionTokenSpecV2Env0{
+						Allow: []*ProvisionTokenSpecV2Env0_Rule{
+							{
+								OrganizationID:  "organization-id",
+								ProjectID:       "project-id",
+								ProjectName:     "project-name",
+								TemplateID:      "template-id",
+								TemplateName:    "template-name",
+								EnvironmentID:   "environment-id",
+								EnvironmentName: "environment-name",
+								WorkspaceName:   "workspace-name",
+								DeploymentType:  "deployment-type",
+								DeployerEmail:   "deployer-email",
+								Env0Tag:         "custom-tag",
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "env0 multiple rules - success",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodEnv0,
+					Env0: &ProvisionTokenSpecV2Env0{
+						Allow: []*ProvisionTokenSpecV2Env0_Rule{
+							{
+								OrganizationID: "organization-id",
+								ProjectID:      "project-id",
+							},
+							{
+								OrganizationID: "organization-id",
+								ProjectName:    "project-name",
+							},
+						},
+					},
+				},
+			},
+			expected: &ProvisionTokenV2{
+				Kind:    "token",
+				Version: "v2",
+				Metadata: Metadata{
+					Name:      "test",
+					Namespace: "default",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodEnv0,
+					Env0: &ProvisionTokenSpecV2Env0{
+						Allow: []*ProvisionTokenSpecV2Env0_Rule{
+							{
+								OrganizationID: "organization-id",
+								ProjectID:      "project-id",
+							},
+							{
+								OrganizationID: "organization-id",
+								ProjectName:    "project-name",
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "env0 missing organization",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodEnv0,
+					Env0: &ProvisionTokenSpecV2Env0{
+						Allow: []*ProvisionTokenSpecV2Env0_Rule{
+							{
+								ProjectName:  "test",
+								TemplateName: "test",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "env0 missing project",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodEnv0,
+					Env0: &ProvisionTokenSpecV2Env0{
+						Allow: []*ProvisionTokenSpecV2Env0_Rule{
+							{
+								OrganizationID: "test",
+								TemplateName:   "test",
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "oracle too many instance IDs",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodOracle,
+					Oracle: &ProvisionTokenSpecV2Oracle{
+						Allow: []*ProvisionTokenSpecV2Oracle_Rule{
+							{
+								Tenancy:   "ocid.tenancy.oc1..mytentant",
+								Instances: genOCIDs(101),
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "generic oidc success",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGenericOIDC,
+					GenericOIDC: &ProvisionTokenSpecV2GenericOIDC{
+						Issuer:                  "https://example.teleport.sh",
+						InsecureAllowHTTPIssuer: false,
+						Audience:                "example.teleport.sh",
+						StaticJWKS:              "asdf",
+						TLSCA:                   "zxcv",
+						MustMatchFields: NewStructFromGogoValues(map[string]*types.Value{
+							"foo": {
+								Kind: &types.Value_StringValue{
+									StringValue: "bar",
+								},
+							},
+						}),
+						AllowAny: []*ProvisionTokenSpecV2GenericOIDC_Rule{
+							{
+								Expression: "claims.foo == \"bar\"",
+							},
+							{
+								Conditions: []*ProvisionTokenSpecV2GenericOIDC_Condition{
+									{
+										Attribute: "foo",
+										Eq:        &ProvisionTokenSpecV2GenericOIDC_ConditionEq{Value: "bar"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			desc: "generic oidc failure with no rules",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGenericOIDC,
+					GenericOIDC: &ProvisionTokenSpecV2GenericOIDC{
+						Issuer:                  "https://example.teleport.sh",
+						InsecureAllowHTTPIssuer: false,
+						Audience:                "example.teleport.sh",
+						StaticJWKS:              "asdf",
+						TLSCA:                   "zxcv",
+						MustMatchFields:         NewStructFromGogoValues(map[string]*types.Value{}),
+						AllowAny:                []*ProvisionTokenSpecV2GenericOIDC_Rule{},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "generic oidc failure with invalid issuer",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGenericOIDC,
+					GenericOIDC: &ProvisionTokenSpecV2GenericOIDC{
+						Issuer:                  "invalid",
+						InsecureAllowHTTPIssuer: false,
+						Audience:                "example.teleport.sh",
+						StaticJWKS:              "asdf",
+						TLSCA:                   "zxcv",
+						MustMatchFields:         NewStructFromGogoValues(map[string]*types.Value{}),
+						AllowAny: []*ProvisionTokenSpecV2GenericOIDC_Rule{
+							{Expression: "claims.foo == \"bar\""},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "generic oidc failure with http issuer without opt-in",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGenericOIDC,
+					GenericOIDC: &ProvisionTokenSpecV2GenericOIDC{
+						Issuer:                  "http://invalid.com",
+						InsecureAllowHTTPIssuer: false,
+						Audience:                "example.teleport.sh",
+						StaticJWKS:              "asdf",
+						TLSCA:                   "zxcv",
+						MustMatchFields:         NewStructFromGogoValues(map[string]*types.Value{}),
+						AllowAny: []*ProvisionTokenSpecV2GenericOIDC_Rule{
+							{Expression: "claims.foo == \"bar\""},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			desc: "generic oidc success with http issuer with opt-in",
+			token: &ProvisionTokenV2{
+				Metadata: Metadata{
+					Name: "test",
+				},
+				Spec: ProvisionTokenSpecV2{
+					Roles:      []SystemRole{RoleNode},
+					JoinMethod: JoinMethodGenericOIDC,
+					GenericOIDC: &ProvisionTokenSpecV2GenericOIDC{
+						Issuer:                  "http://invalid.com",
+						InsecureAllowHTTPIssuer: true,
+						Audience:                "example.teleport.sh",
+						StaticJWKS:              "asdf",
+						TLSCA:                   "zxcv",
+						MustMatchFields:         NewStructFromGogoValues(map[string]*types.Value{}),
+						AllowAny: []*ProvisionTokenSpecV2GenericOIDC_Rule{
+							{Expression: "claims.foo == \"bar\""},
+						},
+					},
+				},
+			},
+			wantErr: false,
 		},
 	}
 
 	for _, tc := range testcases {
 		t.Run(tc.desc, func(t *testing.T) {
 			err := tc.token.CheckAndSetDefaults()
-			if tc.expectedErr != nil {
-				require.ErrorAs(t, err, &tc.expectedErr)
+			if tc.wantErr {
+				require.Error(t, err)
+				require.True(t,
+					trace.IsBadParameter(err),
+					"want BadParameter, got %v (%T)", err, trace.Unwrap(err))
 				return
 			}
 			require.NoError(t, err)
+
 			if tc.expected != nil {
-				require.Equal(t, tc.token, tc.expected)
+				require.Equal(t, tc.expected, tc.token)
 			}
 		})
 	}
+}
+
+func genOCIDs(count int) []string {
+	out := make([]string, count)
+	for i := range count {
+		out[i] = fmt.Sprintf("ocid.instance.oc1.region.%d", i)
+	}
+	return out
 }
 
 func TestProvisionTokenV2_GetSafeName(t *testing.T) {
@@ -494,4 +2097,28 @@ func TestProvisionTokenV2_GetSafeName(t *testing.T) {
 		got := tok.GetSafeName()
 		require.Equal(t, "12345678", got)
 	})
+}
+
+func TestProvisionTokenV2_CaseInsensitiveRoles(t *testing.T) {
+	t.Parallel()
+	t.Run("via constructor", func(t *testing.T) {
+		tok, err := NewProvisionToken("token", SystemRoles{"nOde", "AuTh"}, time.Now())
+		require.NoError(t, err)
+		require.Equal(t, SystemRoles{RoleNode, RoleAuth}, tok.GetRoles())
+	})
+	t.Run("via struct", func(t *testing.T) {
+		tok := &ProvisionTokenV2{
+			Spec: ProvisionTokenSpecV2{
+				Roles: []SystemRole{"nOdE", "AuTh"},
+			},
+		}
+		require.Equal(t, SystemRoles{RoleNode, RoleAuth}, tok.GetRoles())
+	})
+}
+
+func TestProvisionTokenV2_SignupRole(t *testing.T) {
+	t.Parallel()
+	tok, err := NewProvisionToken("token", SystemRoles{RoleSignup}, time.Now())
+	require.NoError(t, err)
+	require.Equal(t, SystemRoles{RoleSignup}, tok.GetRoles())
 }

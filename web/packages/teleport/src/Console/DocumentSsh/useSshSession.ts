@@ -1,30 +1,30 @@
-/*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import { context, trace } from '@opentelemetry/api';
+import { useEffect, useRef, useState } from 'react';
 
 import cfg from 'teleport/config';
-import { TermEvent } from 'teleport/lib/term/enums';
-import Tty from 'teleport/lib/term/tty';
 import ConsoleContext from 'teleport/Console/consoleContext';
 import { useConsoleContext } from 'teleport/Console/consoleContextProvider';
 import { DocumentSsh } from 'teleport/Console/stores';
-
+import { TermEvent } from 'teleport/lib/term/enums';
+import Tty from 'teleport/lib/term/tty';
 import type {
   ParticipantMode,
   Session,
@@ -36,17 +36,16 @@ const tracer = trace.getTracer('TTY');
 export default function useSshSession(doc: DocumentSsh) {
   const { clusterId, sid, serverId, login, mode } = doc;
   const ctx = useConsoleContext();
-  const ttyRef = React.useRef<Tty>(null);
+  const ttyRef = useRef<Tty>(null);
   const tty = ttyRef.current as ReturnType<typeof ctx.createTty>;
-  const [session, setSession] = React.useState<Session>(null);
-  const [status, setStatus] = React.useState<Status>('loading');
+  const [session, setSession] = useState<Session>(null);
+  const [status, setStatus] = useState<Status>('loading');
 
   function closeDocument() {
     ctx.closeTab(doc);
   }
 
-  React.useEffect(() => {
-    // initializes tty instances
+  useEffect(() => {
     function initTty(session, mode?: ParticipantMode) {
       tracer.startActiveSpan(
         'initTTY',
@@ -66,7 +65,18 @@ export default function useSshSession(doc: DocumentSsh) {
             const data = JSON.parse(payload);
             data.session.kind = 'ssh';
             data.session.resourceName = data.session.server_hostname;
+            setSession(data.session);
             handleTtyConnect(ctx, data.session, doc.id);
+          });
+
+          tty.on(TermEvent.LATENCY, payload => {
+            const stats = JSON.parse(payload);
+            ctx.updateSshDocument(doc.id, {
+              latency: {
+                client: stats.ws,
+                server: stats.ssh,
+              },
+            });
           });
 
           // assign tty reference so it can be passed down to xterm
@@ -77,26 +87,23 @@ export default function useSshSession(doc: DocumentSsh) {
         }
       );
     }
-
-    // cleanup by unsubscribing from tty
-    function cleanup() {
-      ttyRef.current && ttyRef.current.removeAllListeners();
-    }
-
     initTty(
       {
+        kind: 'ssh',
         login,
         serverId,
         clusterId,
         sid,
+        kubeExec: doc.kubeExec,
       },
       mode
     );
 
-    return cleanup;
+    function teardownTty() {
+      ttyRef.current && ttyRef.current.removeAllListeners();
+    }
 
-    // Only run this once on the initial render.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return teardownTty;
   }, []);
 
   return {

@@ -1,46 +1,142 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import cfg from 'teleport/config';
 import api from 'teleport/services/api';
 
-import { RecordingsQuery, RecordingsResponse } from './types';
 import { makeRecording } from './makeRecording';
+import type {
+  RecordingsQuery,
+  RecordingsResponse,
+  RecordingType,
+  SessionRecordingThumbnail,
+} from './types';
+
+const maxFetchLimit = 5000;
 
 export default class RecordingsService {
-  maxFetchLimit = 5000;
-
+  /**
+   * @deprecated Use standalone `fetchRecordings` function defined below this class instead.
+   */
   fetchRecordings(
     clusterId: string,
     params: RecordingsQuery
   ): Promise<RecordingsResponse> {
-    const start = params.from.toISOString();
-    const end = params.to.toISOString();
+    return fetchRecordings({ clusterId, params });
+  }
 
-    const url = cfg.getClusterEventsRecordingsUrl(clusterId, {
-      start,
-      end,
-      limit: this.maxFetchLimit,
-      startKey: params.startKey || undefined,
-    });
-
-    return api.get(url).then(json => {
-      const events = json.events || [];
-
-      return { recordings: events.map(makeRecording), startKey: json.startKey };
+  /**
+   * @deprecated Use `fetchSessionRecordingDuration` instead.
+   */
+  fetchRecordingDuration(
+    clusterId: string,
+    sessionId: string
+  ): Promise<{ durationMs: number; recordingType: string }> {
+    return fetchSessionRecordingDuration({
+      clusterId,
+      sessionId,
     });
   }
 }
+
+interface FetchSessionRecordingDurationVariables {
+  clusterId: string;
+  sessionId: string;
+}
+
+interface FetchSessionRecordingDurationResponse {
+  durationMs: number;
+  recordingType: RecordingType;
+}
+
+export async function fetchSessionRecordingDuration({
+  clusterId,
+  sessionId,
+}: FetchSessionRecordingDurationVariables): Promise<FetchSessionRecordingDurationResponse> {
+  const url = cfg.getSessionDurationUrl(clusterId, sessionId);
+  const response = await api.get(url);
+
+  if (!response) {
+    throw new Error('Failed to fetch session recording duration');
+  }
+
+  return response;
+}
+
+interface FetchRecordingsVariables {
+  clusterId: string;
+  params: RecordingsQuery;
+}
+
+export async function fetchRecordings(
+  { clusterId, params }: FetchRecordingsVariables,
+  signal?: AbortSignal
+): Promise<RecordingsResponse> {
+  const start = params.from.toISOString();
+  const end = params.to.toISOString();
+
+  const url = cfg.getClusterEventsRecordingsUrl(clusterId, {
+    start,
+    end,
+    limit: maxFetchLimit,
+    startKey: params.startKey || undefined,
+  });
+
+  const json = await api.get(url, signal);
+
+  const events = json.events || [];
+
+  return { recordings: events.map(makeRecording), startKey: json.startKey };
+}
+
+interface FetchRecordingThumbnailVariables {
+  clusterId: string;
+  sessionId: string;
+}
+
+export async function fetchRecordingThumbnail(
+  { clusterId, sessionId }: FetchRecordingThumbnailVariables,
+  signal?: AbortSignal
+): Promise<SessionRecordingThumbnail> {
+  const url = cfg.getSessionRecordingThumbnailUrl(clusterId, sessionId);
+  const response = await api.get(url, signal);
+
+  if (!response) {
+    throw new Error('Failed to fetch recording thumbnail');
+  }
+
+  return response as SessionRecordingThumbnail;
+}
+
+export const RECORDING_TYPES_WITH_THUMBNAILS: RecordingType[] = [
+  'ssh',
+  'k8s',
+  'desktop',
+];
+export const RECORDING_TYPES_WITH_METADATA: RecordingType[] = [
+  'ssh',
+  'k8s',
+  'desktop',
+];
+
+export const VALID_RECORDING_TYPES: RecordingType[] = [
+  'ssh',
+  'k8s',
+  'desktop',
+  'database',
+];

@@ -1,24 +1,28 @@
 /*
-Copyright 2022-2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -26,7 +30,6 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/utils/retryutils"
 	"github.com/gravitational/teleport/lib/utils"
@@ -46,7 +49,7 @@ type waitFlags struct {
 }
 
 func onWaitDuration(flags waitFlags) error {
-	utils.InitLogger(utils.LoggingForCLI, log.DebugLevel)
+	utils.InitLogger(utils.LoggingForCLI, slog.LevelDebug)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, os.Interrupt)
 	defer cancel()
 
@@ -54,7 +57,7 @@ func onWaitDuration(flags waitFlags) error {
 }
 
 func onWaitNoResolve(flags waitFlags) error {
-	utils.InitLogger(utils.LoggingForCLI, log.DebugLevel)
+	utils.InitLogger(utils.LoggingForCLI, slog.LevelDebug)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, os.Interrupt)
 	defer cancel()
 
@@ -89,6 +92,8 @@ func waitNoResolve(ctx context.Context, domain string, period, timeout time.Dura
 	if timeout == 0 {
 		return trace.BadParameter("no timeout provided")
 	}
+	log := slog.With("domain", domain)
+	log.InfoContext(ctx, "waiting until the domain stops resolving to ensure that every auth server running the previous major version has been updated/terminated")
 
 	var err error
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -100,7 +105,7 @@ func waitNoResolve(ctx context.Context, domain string, period, timeout time.Dura
 	periodic := interval.New(interval.Config{
 		Duration:      period,
 		FirstDuration: time.Millisecond,
-		Jitter:        retryutils.NewSeventhJitter(),
+		Jitter:        retryutils.SeventhJitter,
 	})
 	defer periodic.Stop()
 
@@ -121,44 +126,60 @@ func waitNoResolve(ctx context.Context, domain string, period, timeout time.Dura
 			return trace.Wrap(err)
 
 		case <-periodic.Next():
-			exit, err = checkDomainNoResolve(domain)
+			exit, err = checkDomainNoResolve(ctx, domain, log)
 			if err != nil {
 				return trace.Wrap(err)
 			}
 		}
 	}
 
-	log.Info("no endpoints found, exiting with success code")
+	log.InfoContext(ctx, "no endpoints found, exiting with success code")
 	return nil
 }
 
-func checkDomainNoResolve(domainName string) (exit bool, err error) {
-	endpoints, err := countEndpoints(domainName)
+func checkDomainNoResolve(ctx context.Context, domainName string, log *slog.Logger) (exit bool, err error) {
+	endpoints, err := resolveEndpoints(domainName)
 	if err != nil {
-		dnsErr, ok := trace.Unwrap(err).(*net.DNSError)
-		if !ok {
-			log.Errorf("unexpected error when resolving domain %s : %s", domainName, err)
+		var dnsErr *net.DNSError
+		if !errors.As(trace.Unwrap(err), &dnsErr) {
+			log.ErrorContext(ctx, "unexpected error when resolving domain", "error", err)
 			return false, trace.Wrap(err)
 		}
-		if dnsErr.Temporary() {
-			log.Warnf("temporary error when resolving domain %s : %s", domainName, err)
-			return false, nil
-		}
+
 		if dnsErr.IsNotFound {
-			log.Infof("domain %s not found", domainName)
+			log.InfoContext(ctx, "domain not found")
 			return true, nil
 		}
-		log.Errorf("error when resolving domain %s : %s", domainName, err)
+
+		// Creating a new logger because the linter doesn't want both key/value and slog.Attr in the same log write.
+		log := log.With(slog.Group("dns_error",
+			"name", dnsErr.Name,
+			"server", dnsErr.Server,
+			"is_timeout", dnsErr.IsTimeout,
+			"is_temporary", dnsErr.IsTemporary,
+			"is_not_found", dnsErr.IsNotFound,
+			// Logging the error type can help understanding where the error comes from
+			"wrapped_error_type", fmt.Sprintf("%T", dnsErr.Unwrap()),
+		))
+		if dnsErr.Temporary() {
+			log.WarnContext(ctx, "temporary error when resolving domain", "error", err)
+			return false, nil
+		}
+		log.ErrorContext(ctx, "error when resolving domain", "error", err)
 		return false, nil
 	}
-	log.Infof("%d endpoints found when resolving domain %s", endpoints, domainName)
-	return endpoints == 0, nil
+	if len(endpoints) == 0 {
+		log.InfoContext(ctx, "domain found and resolution returned no endpoints")
+		return true, nil
+	}
+	log.InfoContext(ctx, "endpoints found when resolving domain", "endpoints", endpoints)
+	return false, nil
 }
 
-func countEndpoints(serviceName string) (int, error) {
+func resolveEndpoints(serviceName string) ([]net.IP, error) {
 	ips, err := net.LookupIP(serviceName)
 	if err != nil {
-		return 0, trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	return len(ips), nil
+	return ips, nil
 }

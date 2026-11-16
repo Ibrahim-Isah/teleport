@@ -1,16 +1,64 @@
 app_service:
-    # Turns 'app' role on. Default is 'no'
-    enabled: yes
-    # Teleport contains a small debug app that can be used to make sure
-    # Application Access is working correctly. The app outputs JWTs so it can
+    # Turns 'app' role on. Default is false
+    enabled: true
+    # Teleport contains a small debug app that can be used to make sure the
+    # Application Service is working correctly. The app outputs JWTs so it can
     # be useful when extending your application.
     debug_app: true
+    # Enables the builtin Teleport demo MCP server that shows current user and
+    # session information. To access it, this MCP server uses the app label
+    # "teleport.internal/resource-type" with the value "demo".
+    mcp_demo_server: true
+
+    # Optional list of IP addresses or CIDR ranges that application targets
+    # are allowed to resolve to. When set, the Application Service blocks
+    # target dials to any IP outside this list. Mutually exclusive
+    # with denied_hosts.
+    #
+    # These restrictions apply to the targets of TCP, HTTP, and MCP apps. They
+    # do NOT apply to AWS, Azure, or GCP console/API apps or to LLM apps, whose
+    # egress goes to provider-controlled endpoints. They are also incompatible
+    # with an HTTP(S) proxy configured via the HTTP_PROXY/HTTPS_PROXY
+    # environment variables: because the policy enforces restrictions on the
+    # resolved target IP, which a forward proxy hides, the Application Service
+    # refuses to start if both are set.
+    #
+    # Entries must be plain IPv4/IPv6 addresses or canonical CIDR ranges;
+    # IPv4-in-IPv6 notation (e.g. ::ffff:169.254.0.0/112), IPv6 zone
+    # identifiers, and non-canonical CIDRs (host bits set) are rejected.
+    allowed_hosts:
+      - 10.10.0.0/16
+
+    # Optional list of IP addresses or CIDR ranges that application targets
+    # are not allowed to resolve to. When set, the Application Service blocks
+    # only target dials to matching IPs. Mutually exclusive with allowed_hosts.
+    # The coverage and formatting notes for allowed_hosts above apply here as
+    # well.
+    denied_hosts:
+      - 169.254.0.0/16
+      - 127.0.0.0/8
+      - ::1/128
+
+    # Matchers for dynamic application resources
+    #
+    # All application resources have a predefined "teleport.dev/origin" label with
+    # one of the following values:
+    # "dynamic": application resources created via an Auth Service API 
+    # client like `tctl` or the Teleport Terraform provider
+    # "config": application resources defined in the "apps" array below
+    resources:
+      - labels:
+          "*": "*"
+
     apps:
     - name: "kubernetes-dashboard"
       # Optional: For access to cloud provider APIs, specify the cloud
       # provider. Allowed values are "AWS", "Azure", and "GCP".
       cloud: ""
-      # URI and Port of Application.
+      # Optional: Free-form description of the application.
+      description: "Kubernetes Dashboard to development cluster"
+      # URI of Application. For TCP applications
+      # use tcp, ex: tcp://localhost:5432.
       uri: "http://10.0.1.27:8000"
       # Optionally skip TLS verification. default false
       # insecure_skip_verify: true
@@ -20,6 +68,48 @@ app_service:
       # to limit access to applications
       labels:
          env: "prod"
+
+      # # Optional list of Teleport application names that require a session for this app to function correctly.
+      # # When launching this app, any app listed here will also be launched, and a session will be created.
+      # # These sessions follow their respective RBAC policies.
+      # required_apps:
+      #   - "my-api"
+      #   - "prod-database"
+      #   # Add more required app names as needed
+
+      # # Optional CORS policy is used for preflight requests only. It does not overwrite the contained
+      # # app's CORS policy per route but is used by Teleport to respond to unauthenticated OPTION requests.
+      # # Important Notes:
+      # # - Each field in the CORS spec is optional.
+      # # - The allowed_headers field accepts wildcard entries. However, in requests with "allow_credentials: true",
+      # #   a wildcard is treated as the literal header name "*" without special semantics.
+      # # - The Authorization header can't be set with a wildcard and always needs to be listed explicitly.
+      # cors:
+      #   # Specifies which origins are allowed to make cross-origin requests.
+      #   allowed_origins:
+      #     - "https://example.com"
+      #     - "https://app.example.com"
+      #   # HTTP methods that are allowed when accessing the resource.
+      #   allowed_methods:
+      #     - "GET"
+      #     - "POST"
+      #     - "PUT"
+      #     - "DELETE"
+      #     - "OPTIONS"
+      #   # HTTP headers that can be used during the actual request.
+      #   allowed_headers:
+      #     - "Content-Type"
+      #     - "Authorization"
+      #     - "X-Custom-Header"
+      #   # Headers that browsers are allowed to access.
+      #   exposed_headers:
+      #     - "Content-Type"
+      #     - "X-Custom-Response-Header"
+      #   # Indicates whether the request can include credentials.
+      #   allow_credentials: true
+      #   # Indicates how long (in seconds) the results of a preflight request can be cached.
+      #   max_age: 3600
+
       # Optional Dynamic Labels
       commands:
       - name: "os"
@@ -37,4 +127,21 @@ app_service:
         # headers:
         #   For example:
         #   - "Host: jenkins.example.com"
+        ## Optional rewrite to remove parts of the JWT token.
+        ## Can be one of three options:
+        ## - roles-and-traits: include both roles and traits in the JWT token
+        ## - roles: include only roles in the JWT token
+        ## - traits: include only traits in the JWT token
+        ## - none: include neither roles nor traits in the JWT token
+        ## Default: roles-and-traits
+        # jwt_claims: roles-and-traits
 
+      # Contains MCP server-related configurations.
+      mcp:
+        # Command to launch stdio-based MCP servers.
+        command: "docker"
+        # Args to execute with the command.
+        args: ["run", "-i", "--rm", "mcp/everything"]
+        # Name of the host user account under which the command will be
+        # executed. Required for stdio-based MCP servers.
+        run_as_host_user: "docker"

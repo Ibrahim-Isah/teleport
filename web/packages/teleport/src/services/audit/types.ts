@@ -1,31 +1,22 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-// eventGroupTypes contains a map of events that were grouped under the same
-// event type but have different event codes. This is used to filter out duplicate
-// event types when listing event filters and provide modified description of event.
-export const eventGroupTypes = {
-  'db.session.start': 'Database Session Start',
-  exec: 'Command Execution',
-  port: 'Port Forwarding',
-  scp: 'SCP',
-  sftp: 'SFTP',
-  subsystem: 'Subsystem Request',
-  'user.login': 'User Logins',
-};
+import { SortDir } from '../agents';
 
 /**
  * eventCodes is a map of event codes.
@@ -34,11 +25,8 @@ export const eventGroupTypes = {
  *  1: Define fields from JSON response in `RawEvents` object (in this file)
  *  2: Define formatter in `makeEvent.ts` file which defines *events types and
  *     defines short and long event definitions
- *  * Some events can have same event "type" but have unique "code".
- *    These duplicated event types needs to be defined in `eventGroupTypes` object
  *  3: Define icons for events under `EventTypeCell.tsx` file
  *  4: Add an actual JSON event to the fixtures file in `src/Audit/fixtures/index.ts`.
- *  5: Check fixture is rendered in storybook, then update snapshot for `Audit.story.test.tsx`
  */
 export const eventCodes = {
   ACCESS_REQUEST_CREATED: 'T5000I',
@@ -46,10 +34,18 @@ export const eventCodes = {
   ACCESS_REQUEST_UPDATED: 'T5001I',
   ACCESS_REQUEST_DELETED: 'T5003I',
   ACCESS_REQUEST_RESOURCE_SEARCH: 'T5004I',
+  ACCESS_REQUEST_EXPIRED: 'T5005I',
   APP_SESSION_CHUNK: 'T2008I',
   APP_SESSION_START: 'T2007I',
+  APP_SESSION_START_FAILURE: 'T2007E',
   APP_SESSION_END: 'T2011I',
+  APP_SESSION_TARGET_DIAL_DENIED: 'T2019E',
   APP_SESSION_DYNAMODB_REQUEST: 'T2013I',
+  APP_SESSION_HTTP_REQUEST: 'T2015I',
+  APP_SESSION_HTTP_REQUEST_BODY_CHUNK: 'T2016I',
+  APP_SESSION_HTTP_RESPONSE: 'T2017I',
+  APP_SESSION_HTTP_RESPONSE_BODY_CHUNK: 'T2018I',
+  APP_SESSION_REQUEST_DENIED: 'T2020E',
   APP_CREATED: 'TAP03I',
   APP_UPDATED: 'TAP04I',
   APP_DELETED: 'TAP05I',
@@ -65,6 +61,11 @@ export const eventCodes = {
   DATABASE_SESSION_STARTED_FAILURE: 'TDB00W',
   DATABASE_SESSION_STARTED: 'TDB00I',
   DATABASE_SESSION_MALFORMED_PACKET: 'TDB06I',
+  DATABASE_SESSION_PERMISSIONS_UPDATE: 'TDB07I',
+  DATABASE_SESSION_USER_CREATE: 'TDB08I',
+  DATABASE_SESSION_USER_CREATE_FAILURE: 'TDB08W',
+  DATABASE_SESSION_USER_DEACTIVATE: 'TDB09I',
+  DATABASE_SESSION_USER_DEACTIVATE_FAILURE: 'TDB09W',
   DATABASE_CREATED: 'TDB03I',
   DATABASE_UPDATED: 'TDB04I',
   DATABASE_DELETED: 'TDB05I',
@@ -93,6 +94,9 @@ export const eventCodes = {
   CASSANDRA_EXECUTE_EVENT: 'TCA03I',
   CASSANDRA_REGISTER_EVENT: 'TCA04I',
   ELASTICSEARCH_REQUEST: 'TES00I',
+  ELASTICSEARCH_REQUEST_FAILURE: 'TES00E',
+  OPENSEARCH_REQUEST: 'TOS00I',
+  OPENSEARCH_REQUEST_FAILURE: 'TOS00E',
   DYNAMODB_REQUEST: 'TDY01I',
   DYNAMODB_REQUEST_FAILURE: 'TDY01E',
   DESKTOP_SESSION_STARTED: 'TDP00I',
@@ -106,16 +110,28 @@ export const eventCodes = {
   DESKTOP_SHARED_DIRECTORY_READ_FAILURE: 'TDP05W',
   DESKTOP_SHARED_DIRECTORY_WRITE: 'TDP06I',
   DESKTOP_SHARED_DIRECTORY_WRITE_FAILURE: 'TDP06W',
+  LINUX_DESKTOP_SESSION_STARTED: 'TDP07I',
+  LINUX_DESKTOP_SESSION_STARTED_FAILED: 'TDP07W',
+  LINUX_DESKTOP_SESSION_ENDED: 'TDP08I',
   DEVICE_CREATE: 'TV001I',
   DEVICE_DELETE: 'TV002I',
   DEVICE_ENROLL_TOKEN_CREATE: 'TV003I',
   DEVICE_ENROLL_TOKEN_SPENT: 'TV004I',
   DEVICE_ENROLL: 'TV005I',
   DEVICE_AUTHENTICATE: 'TV006I',
+  DEVICE_UPDATE: 'TV007I',
+  DEVICE_WEB_TOKEN_CREATE: 'TV008I',
+  DEVICE_AUTHENTICATE_CONFIRM: 'TV009I',
+  DEVICE_ENROLL_PAIRING_REQUEST: 'TV010I',
+  DEVICE_ENROLL_PAIRING_REQUEST_FAILURE: 'TV010W',
+  DEVICE_ENROLL_PAIRING_APPROVE: 'TV011I',
+  DEVICE_ENROLL_PAIRING_APPROVE_FAILURE: 'TV011W',
+  DEVICE_ENROLL_PAIRING_DENY: 'TV012W',
   EXEC_FAILURE: 'T3002E',
   EXEC: 'T3002I',
   GITHUB_CONNECTOR_CREATED: 'T8000I',
   GITHUB_CONNECTOR_DELETED: 'T8001I',
+  GITHUB_CONNECTOR_UPDATED: 'T80002I', // extra 0 is intentional
   KUBE_REQUEST: 'T3009I',
   KUBE_CREATED: 'T3010I',
   KUBE_UPDATED: 'T3011I',
@@ -126,7 +142,9 @@ export const eventCodes = {
   MFA_DEVICE_DELETE: 'T1007I',
   OIDC_CONNECTOR_CREATED: 'T8100I',
   OIDC_CONNECTOR_DELETED: 'T8101I',
+  OIDC_CONNECTOR_UPDATED: 'T8102I',
   PORTFORWARD_FAILURE: 'T3003E',
+  PORTFORWARD_STOP: 'T3003S',
   PORTFORWARD: 'T3003I',
   RECOVERY_TOKEN_CREATED: 'T6001I',
   PRIVILEGE_TOKEN_CREATED: 'T6002I',
@@ -136,28 +154,19 @@ export const eventCodes = {
   RESET_PASSWORD_TOKEN_CREATED: 'T6000I',
   ROLE_CREATED: 'T9000I',
   ROLE_DELETED: 'T9001I',
+  ROLE_UPDATED: 'T9002I',
   SAML_CONNECTOR_CREATED: 'T8200I',
   SAML_CONNECTOR_DELETED: 'T8201I',
+  SAML_CONNECTOR_UPDATED: 'T8202I',
   SCP_DOWNLOAD_FAILURE: 'T3004E',
   SCP_DOWNLOAD: 'T3004I',
   SCP_UPLOAD_FAILURE: 'T3005E',
   SCP_UPLOAD: 'T3005I',
+  SCP_DISALLOWED: 'T3010E',
   SFTP_OPEN_FAILURE: 'TS001E',
   SFTP_OPEN: 'TS001I',
-  SFTP_CLOSE_FAILURE: 'TS002E',
-  SFTP_CLOSE: 'TS002I',
-  SFTP_READ_FAILURE: 'TS003E',
-  SFTP_READ: 'TS003I',
-  SFTP_WRITE_FAILURE: 'TS004E',
-  SFTP_WRITE: 'TS004I',
-  SFTP_LSTAT_FAILURE: 'TS005E',
-  SFTP_LSTAT: 'TS005I',
-  SFTP_FSTAT_FAILURE: 'TS006E',
-  SFTP_FSTAT: 'TS006I',
   SFTP_SETSTAT_FAILURE: 'TS007E',
   SFTP_SETSTAT: 'TS007I',
-  SFTP_FSETSTAT_FAILURE: 'TS008E',
-  SFTP_FSETSTAT: 'TS008I',
   SFTP_OPENDIR_FAILURE: 'TS009E',
   SFTP_OPENDIR: 'TS009I',
   SFTP_READDIR_FAILURE: 'TS010E',
@@ -168,16 +177,14 @@ export const eventCodes = {
   SFTP_MKDIR: 'TS012I',
   SFTP_RMDIR_FAILURE: 'TS013E',
   SFTP_RMDIR: 'TS013I',
-  SFTP_REALPATH_FAILURE: 'TS014E',
-  SFTP_REALPATH: 'TS014I',
-  SFTP_STAT_FAILURE: 'TS015E',
-  SFTP_STAT: 'TS015I',
   SFTP_RENAME_FAILURE: 'TS016E',
   SFTP_RENAME: 'TS016I',
-  SFTP_READLINK_FAILURE: 'TS017E',
-  SFTP_READLINK: 'TS017I',
   SFTP_SYMLINK_FAILURE: 'TS018E',
   SFTP_SYMLINK: 'TS018I',
+  SFTP_LINK: 'TS019I',
+  SFTP_LINK_FAILURE: 'TS019E',
+  SFTP_DISALLOWED: 'TS020E',
+  SFTP_SUMMARY: 'TS021I',
   SESSION_COMMAND: 'T4000I',
   SESSION_DATA: 'T2006I',
   SESSION_DISK: 'T4001I',
@@ -193,12 +200,15 @@ export const eventCodes = {
   SESSION_RECORDING_ACCESS: 'T2012I',
   SSMRUN_FAIL: 'TDS00W',
   SSMRUN_SUCCESS: 'TDS00I',
+  AZURERUN_FAIL: 'TDA00W',
+  AZURERUN_SUCCESS: 'TDA00I',
   SUBSYSTEM_FAILURE: 'T3001E',
   SUBSYSTEM: 'T3001I',
   TERMINAL_RESIZE: 'T2002I',
   TRUSTED_CLUSTER_CREATED: 'T7000I',
   TRUSTED_CLUSTER_DELETED: 'T7001I',
   TRUSTED_CLUSTER_TOKEN_CREATED: 'T7002I',
+  PROVISION_TOKEN_CREATED: 'TJT00I',
   UNKNOWN: 'TCC00E',
   USER_CREATED: 'T1002I',
   USER_DELETED: 'T1004I',
@@ -209,15 +219,200 @@ export const eventCodes = {
   USER_SSO_LOGINFAILURE: 'T1001W',
   USER_SSO_TEST_FLOW_LOGIN: 'T1010I',
   USER_SSO_TEST_FLOW_LOGINFAILURE: 'T1011W',
+  USER_HEADLESS_LOGIN_REQUESTED: 'T1012I',
+  USER_HEADLESS_LOGIN_APPROVED: 'T1013I',
+  USER_HEADLESS_LOGIN_APPROVEDFAILURE: 'T1013W',
+  USER_HEADLESS_LOGIN_REJECTED: 'T1014W',
+  CREATE_MFA_AUTH_CHALLENGE: 'T1015I',
+  VALIDATE_MFA_AUTH_RESPONSE: 'T1016I',
+  VALIDATE_MFA_AUTH_RESPONSEFAILURE: 'T1016W',
   USER_UPDATED: 'T1003I',
   X11_FORWARD: 'T3008I',
   X11_FORWARD_FAILURE: 'T3008W',
+  AGENT_FORWARD: 'T3013I',
+  AGENT_FORWARD_FAILURE: 'T3013W',
   CERTIFICATE_CREATED: 'TC000I',
   UPGRADE_WINDOW_UPDATED: 'TUW01I',
+  ENVIRONMENT_PROFILE_UPDATED: 'TEP01I',
   BOT_JOIN: 'TJ001I',
+  BOT_JOIN_FAILURE: 'TJ001E',
+  BOT_JOIN_LIMIT: 'TJ001L',
   INSTANCE_JOIN: 'TJ002I',
+  INSTANCE_JOIN_FAILURE: 'TJ002E',
+  INSTANCE_JOIN_LIMIT: 'TJ002L',
+  BOT_CREATED: 'TB001I',
+  BOT_UPDATED: 'TB002I',
+  BOT_DELETED: 'TB003I',
+  WORKLOAD_IDENTITY_CREATE: `WID001I`,
+  WORKLOAD_IDENTITY_UPDATE: `WID002I`,
+  WORKLOAD_IDENTITY_DELETE: `WID003I`,
+  WORKLOAD_IDENTITY_X509_ISSUER_OVERRIDE_CREATE: `WID007I`,
+  WORKLOAD_IDENTITY_X509_ISSUER_OVERRIDE_DELETE: `WID008I`,
+  SIGSTORE_POLICY_CREATE: `TSSP001I`,
+  SIGSTORE_POLICY_UPDATE: `TSSP002I`,
+  SIGSTORE_POLICY_DELETE: `TSSP003I`,
   LOGIN_RULE_CREATE: 'TLR00I',
   LOGIN_RULE_DELETE: 'TLR01I',
+  SAML_IDP_AUTH_ATTEMPT: 'TSI000I',
+  SAML_IDP_SERVICE_PROVIDER_CREATE: 'TSI001I',
+  SAML_IDP_SERVICE_PROVIDER_CREATE_FAILURE: 'TSI001W',
+  SAML_IDP_SERVICE_PROVIDER_UPDATE: 'TSI002I',
+  SAML_IDP_SERVICE_PROVIDER_UPDATE_FAILURE: 'TSI002W',
+  SAML_IDP_SERVICE_PROVIDER_DELETE: 'TSI003I',
+  SAML_IDP_SERVICE_PROVIDER_DELETE_FAILURE: 'TSI003W',
+  SAML_IDP_SERVICE_PROVIDER_DELETE_ALL: 'TSI004I',
+  SAML_IDP_SERVICE_PROVIDER_DELETE_ALL_FAILURE: 'TSI004W',
+  OKTA_GROUPS_UPDATE: 'TOK001I',
+  OKTA_APPLICATIONS_UPDATE: 'TOK002I',
+  OKTA_SYNC_FAILURE: 'TOK003E',
+  OKTA_ASSIGNMENT_PROCESS: 'TOK004I',
+  OKTA_ASSIGNMENT_PROCESS_FAILURE: 'TOK004E',
+  OKTA_ASSIGNMENT_CLEANUP: 'TOK005I',
+  OKTA_ASSIGNMENT_CLEANUP_FAILURE: 'TOK005E',
+  OKTA_ACCESS_LIST_SYNC: 'TOK006I',
+  OKTA_ACCESS_LIST_SYNC_FAILURE: 'TOK006E',
+  OKTA_USER_SYNC: 'TOK007I',
+  OKTA_USER_SYNC_FAILURE: 'TOK007E',
+  ACCESS_LIST_CREATE: 'TAL001I',
+  ACCESS_LIST_CREATE_FAILURE: 'TAL001E',
+  ACCESS_LIST_UPDATE: 'TAL002I',
+  ACCESS_LIST_UPDATE_FAILURE: 'TAL002E',
+  ACCESS_LIST_DELETE: 'TAL003I',
+  ACCESS_LIST_DELETE_FAILURE: 'TAL003E',
+  ACCESS_LIST_REVIEW: 'TAL004I',
+  ACCESS_LIST_REVIEW_FAILURE: 'TAL004E',
+  ACCESS_LIST_MEMBER_CREATE: 'TAL005I',
+  ACCESS_LIST_MEMBER_CREATE_FAILURE: 'TAL005E',
+  ACCESS_LIST_MEMBER_UPDATE: 'TAL006I',
+  ACCESS_LIST_MEMBER_UPDATE_FAILURE: 'TAL006E',
+  ACCESS_LIST_MEMBER_DELETE: 'TAL007I',
+  ACCESS_LIST_MEMBER_DELETE_FAILURE: 'TAL007E',
+  ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST: 'TAL008I',
+  ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST_FAILURE: 'TAL008E',
+  USER_LOGIN_INVALID_ACCESS_LIST: 'TAL009W',
+  SECURITY_REPORT_AUDIT_QUERY_RUN: 'SRE001I',
+  SECURITY_REPORT_RUN: 'SRE002I',
+  EXTERNAL_AUDIT_STORAGE_ENABLE: 'TEA001I',
+  EXTERNAL_AUDIT_STORAGE_DISABLE: 'TEA002I',
+  SPIFFE_SVID_ISSUED: 'TSPIFFE000I',
+  SPIFFE_SVID_ISSUED_FAILURE: 'TSPIFFE000E',
+  SPIFFE_FEDERATION_CREATE: 'TSPIFFE001I',
+  SPIFFE_FEDERATION_DELETE: 'TSPIFFE002I',
+  AUTH_PREFERENCE_UPDATE: 'TCAUTH001I',
+  CLUSTER_NETWORKING_CONFIG_UPDATE: 'TCNET002I',
+  SESSION_RECORDING_CONFIG_UPDATE: 'TCREC003I',
+  ACCESS_GRAPH_PATH_CHANGED: 'TAG001I',
+  ACCESS_GRAPH_SETTINGS_UPDATE: 'TCAGC003I',
+  SPANNER_RPC: 'TSPN001I',
+  SPANNER_RPC_DENIED: 'TSPN001W',
+  DISCOVERY_CONFIG_CREATE: 'DC001I',
+  DISCOVERY_CONFIG_UPDATE: 'DC002I',
+  DISCOVERY_CONFIG_DELETE: 'DC003I',
+  DISCOVERY_CONFIG_DELETE_ALL: 'DC004I',
+  INTEGRATION_CREATE: 'IG001I',
+  INTEGRATION_UPDATE: 'IG002I',
+  INTEGRATION_DELETE: 'IG003I',
+  STATIC_HOST_USER_CREATE: 'SHU001I',
+  STATIC_HOST_USER_UPDATE: 'SHU002I',
+  STATIC_HOST_USER_DELETE: 'SHU003I',
+  CROWN_JEWEL_CREATE: 'CJ001I',
+  CROWN_JEWEL_UPDATE: 'CJ002I',
+  CROWN_JEWEL_DELETE: 'CJ003I',
+  USER_TASK_CREATE: 'UT001I',
+  USER_TASK_UPDATE: 'UT002I',
+  USER_TASK_DELETE: 'UT003I',
+  PLUGIN_CREATE: 'PG001I',
+  PLUGIN_UPDATE: 'PG002I',
+  PLUGIN_DELETE: 'PG003I',
+  CONTACT_CREATE: 'TCTC001I',
+  CONTACT_DELETE: 'TCTC002I',
+  GIT_COMMAND: 'TGIT001I',
+  GIT_COMMAND_FAILURE: 'TGIT001E',
+  STABLE_UNIX_USER_CREATE: 'TSUU001I',
+  AWS_IC_RESOURCE_SYNC_SUCCESS: 'TAIC001I',
+  AWS_IC_RESOURCE_SYNC_FAILURE: 'TAIC001E',
+  AUTOUPDATE_CONFIG_CREATE: 'AUC001I',
+  AUTOUPDATE_CONFIG_UPDATE: 'AUC002I',
+  AUTOUPDATE_CONFIG_DELETE: 'AUC003I',
+  AUTOUPDATE_VERSION_CREATE: 'AUV001I',
+  AUTOUPDATE_VERSION_UPDATE: 'AUV002I',
+  AUTOUPDATE_VERSION_DELETE: 'AUV003I',
+  HEALTH_CHECK_CONFIG_CREATE: 'THCC001I',
+  HEALTH_CHECK_CONFIG_UPDATE: 'THCC002I',
+  HEALTH_CHECK_CONFIG_DELETE: 'THCC003I',
+  AUTOUPDATE_AGENT_ROLLOUT_TRIGGER: 'AUAR001I',
+  AUTOUPDATE_AGENT_ROLLOUT_FORCE_DONE: 'AUAR002I',
+  AUTOUPDATE_AGENT_ROLLOUT_ROLLBACK: 'AUAR003I',
+  MCP_SESSION_START: 'TMCP001I',
+  MCP_SESSION_END: 'TMCP002I',
+  MCP_SESSION_END_FAILURE: 'TMCP002E',
+  MCP_SESSION_REQUEST: 'TMCP003I',
+  MCP_SESSION_REQUEST_FAILURE: 'TMCP003E',
+  MCP_SESSION_NOTIFICATION: 'TMCP004I',
+  MCP_SESSION_NOTIFICATION_FAILURE: 'TMCP004E',
+  MCP_SESSION_LISTEN_SSE_STREAM: 'TMCP005I',
+  MCP_SESSION_LISTEN_SSE_STREAM_FAILURE: 'TMCP005E',
+  MCP_SESSION_INVALID_HTTP_REQUEST: 'TMCP006E',
+  BOUND_KEYPAIR_RECOVERY: 'TBK001I',
+  BOUND_KEYPAIR_ROTATION: 'TBK002I',
+  BOUND_KEYPAIR_JOIN_STATE_VERIFICATION_FAILED: 'TBK003W',
+  SCIM_RESOURCE_CREATE: 'TSCIM001I',
+  SCIM_RESOURCE_CREATE_FAILURE: 'TSCIM001E',
+  SCIM_RESOURCE_UPDATE: 'TSCIM002I',
+  SCIM_RESOURCE_UPDATE_FAILURE: 'TSCIM002E',
+  SCIM_RESOURCE_DELETE: 'TSCIM003I',
+  SCIM_RESOURCE_DELETE_FAILURE: 'TSCIM003E',
+  SCIM_RESOURCE_GET: 'TSCIM004I',
+  SCIM_RESOURCE_GET_FAILURE: 'TSCIM004E',
+  SCIM_RESOURCE_LIST: 'TSCIM005I',
+  SCIM_RESOURCE_LIST_FAILURE: 'TSCIM005E',
+  SCIM_RESOURCE_PATCH: 'TSCIM006I',
+  SCIM_RESOURCE_PATCH_FAILURE: 'TSCIM006E',
+  CLIENT_IP_RESTRICTIONS_UPDATE: 'CIR001I',
+  VNET_CONFIG_CREATE: 'TVNET001I',
+  VNET_CONFIG_UPDATE: 'TVNET002I',
+  VNET_CONFIG_DELETE: 'TVNET003I',
+  BEAMS_CONFIG_CREATE: 'TBEAM001I',
+  BEAMS_CONFIG_UPDATE: 'TBEAM002I',
+  BEAMS_CONFIG_DELETE: 'TBEAM003I',
+  WORKLOAD_CLUSTER_CREATE: 'WC001I',
+  WORKLOAD_CLUSTER_CREATE_FAILURE: 'WC001E',
+  WORKLOAD_CLUSTER_UPDATE: 'WC002I',
+  WORKLOAD_CLUSTER_UPDATE_FAILURE: 'WC002E',
+  WORKLOAD_CLUSTER_DELETE: 'WC003I',
+  WORKLOAD_CLUSTER_DELETE_FAILURE: 'WC003E',
+  INFERENCE_MODEL_CREATE: 'INF001I',
+  INFERENCE_MODEL_UPDATE: 'INF002I',
+  INFERENCE_MODEL_DELETE: 'INF003I',
+  INFERENCE_SECRET_CREATE: 'INF004I',
+  INFERENCE_SECRET_UPDATE: 'INF005I',
+  INFERENCE_SECRET_DELETE: 'INF006I',
+  INFERENCE_POLICY_CREATE: 'INF007I',
+  INFERENCE_POLICY_UPDATE: 'INF008I',
+  INFERENCE_POLICY_DELETE: 'INF009I',
+  SESSION_SUMMARIZED: 'INF010I',
+  SESSION_SUMMARIZED_FAILURE: 'INF010E',
+  RETRIEVAL_MODEL_CREATE: 'INF011I',
+  RETRIEVAL_MODEL_UPDATE: 'INF012I',
+  RETRIEVAL_MODEL_DELETE: 'INF013I',
+  CLASSIFIER_CREATE: 'INF014I',
+  CLASSIFIER_CREATE_FAILURE: 'INF014E',
+  CLASSIFIER_UPDATE: 'INF015I',
+  CLASSIFIER_UPDATE_FAILURE: 'INF015E',
+  CLASSIFIER_DELETE: 'INF016I',
+  CLASSIFIER_DELETE_FAILURE: 'INF016E',
+  CERT_AUTH_OVERRIDE_CREATE: 'TCO01I',
+  CERT_AUTH_OVERRIDE_UPDATE: 'TCO02I',
+  CERT_AUTH_OVERRIDE_UPSERT: 'TCO03I',
+  CERT_AUTH_OVERRIDE_DELETE: 'TCO04I',
+  SCOPED_TOKEN_CREATE: 'TST000I',
+  SCOPED_TOKEN_CREATE_FAILURE: 'TST000E',
+  SCOPED_TOKEN_UPSERT: 'TST001I',
+  SCOPED_TOKEN_UPSERT_FAILURE: 'TST001E',
+  SCOPED_TOKEN_UPDATE: 'TST002I',
+  SCOPED_TOKEN_UPDATE_FAILURE: 'TST002E',
+  SCOPED_TOKEN_DELETE: 'TST003I',
+  SCOPED_TOKEN_DELETE_FAILURE: 'TST003E',
 } as const;
 
 /**
@@ -238,7 +433,10 @@ export type RawEvents = {
   >;
   [eventCodes.ACCESS_REQUEST_RESOURCE_SEARCH]: RawEvent<
     typeof eventCodes.ACCESS_REQUEST_RESOURCE_SEARCH,
-    { resource_type: string; search_as_roles: string }
+    { resource_type: string; search_as_roles: string[] }
+  >;
+  [eventCodes.ACCESS_REQUEST_EXPIRED]: RawEventAccess<
+    typeof eventCodes.ACCESS_REQUEST_EXPIRED
   >;
   [eventCodes.AUTH_ATTEMPT_FAILURE]: RawEventAuthFailure<
     typeof eventCodes.AUTH_ATTEMPT_FAILURE
@@ -270,11 +468,15 @@ export type RawEvents = {
     {
       proto: 'kube';
       kubernetes_cluster: string;
+      sid: string;
     }
   >;
   [eventCodes.EXEC_FAILURE]: RawEvent<
     typeof eventCodes.EXEC_FAILURE,
-    { exitError: string }
+    {
+      exitError: string;
+      sid: string;
+    }
   >;
   [eventCodes.BILLING_CARD_CREATE]: RawEvent<
     typeof eventCodes.BILLING_CARD_CREATE
@@ -294,13 +496,20 @@ export type RawEvents = {
   [eventCodes.GITHUB_CONNECTOR_DELETED]: RawEventConnector<
     typeof eventCodes.GITHUB_CONNECTOR_DELETED
   >;
+  [eventCodes.GITHUB_CONNECTOR_UPDATED]: RawEventConnector<
+    typeof eventCodes.GITHUB_CONNECTOR_UPDATED
+  >;
   [eventCodes.OIDC_CONNECTOR_CREATED]: RawEventConnector<
     typeof eventCodes.OIDC_CONNECTOR_CREATED
   >;
   [eventCodes.OIDC_CONNECTOR_DELETED]: RawEventConnector<
     typeof eventCodes.OIDC_CONNECTOR_DELETED
   >;
+  [eventCodes.OIDC_CONNECTOR_UPDATED]: RawEventConnector<
+    typeof eventCodes.OIDC_CONNECTOR_UPDATED
+  >;
   [eventCodes.PORTFORWARD]: RawEvent<typeof eventCodes.PORTFORWARD>;
+  [eventCodes.PORTFORWARD_STOP]: RawEvent<typeof eventCodes.PORTFORWARD_STOP>;
   [eventCodes.PORTFORWARD_FAILURE]: RawEvent<
     typeof eventCodes.PORTFORWARD_FAILURE,
     {
@@ -312,6 +521,9 @@ export type RawEvents = {
   >;
   [eventCodes.SAML_CONNECTOR_DELETED]: RawEventConnector<
     typeof eventCodes.SAML_CONNECTOR_DELETED
+  >;
+  [eventCodes.SAML_CONNECTOR_UPDATED]: RawEventConnector<
+    typeof eventCodes.SAML_CONNECTOR_UPDATED
   >;
   [eventCodes.SCP_DOWNLOAD]: RawEvent<
     typeof eventCodes.SCP_DOWNLOAD,
@@ -339,37 +551,19 @@ export type RawEvents = {
       exitError: string;
     }
   >;
+  [eventCodes.SCP_DISALLOWED]: RawEvent<
+    typeof eventCodes.SCP_DISALLOWED,
+    {
+      user: string;
+    }
+  >;
   [eventCodes.SFTP_OPEN]: RawEventSFTP<typeof eventCodes.SFTP_OPEN>;
   [eventCodes.SFTP_OPEN_FAILURE]: RawEventSFTP<
     typeof eventCodes.SFTP_OPEN_FAILURE
   >;
-  [eventCodes.SFTP_CLOSE]: RawEventSFTP<typeof eventCodes.SFTP_CLOSE>;
-  [eventCodes.SFTP_CLOSE_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_CLOSE_FAILURE
-  >;
-  [eventCodes.SFTP_READ]: RawEventSFTP<typeof eventCodes.SFTP_READ>;
-  [eventCodes.SFTP_READ_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_READ_FAILURE
-  >;
-  [eventCodes.SFTP_WRITE]: RawEventSFTP<typeof eventCodes.SFTP_WRITE>;
-  [eventCodes.SFTP_WRITE_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_WRITE_FAILURE
-  >;
-  [eventCodes.SFTP_LSTAT]: RawEventSFTP<typeof eventCodes.SFTP_LSTAT>;
-  [eventCodes.SFTP_LSTAT_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_LSTAT_FAILURE
-  >;
-  [eventCodes.SFTP_FSTAT]: RawEventSFTP<typeof eventCodes.SFTP_FSTAT>;
-  [eventCodes.SFTP_FSTAT_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_FSTAT_FAILURE
-  >;
   [eventCodes.SFTP_SETSTAT]: RawEventSFTP<typeof eventCodes.SFTP_SETSTAT>;
   [eventCodes.SFTP_SETSTAT_FAILURE]: RawEventSFTP<
     typeof eventCodes.SFTP_SETSTAT_FAILURE
-  >;
-  [eventCodes.SFTP_FSETSTAT]: RawEventSFTP<typeof eventCodes.SFTP_FSETSTAT>;
-  [eventCodes.SFTP_FSETSTAT_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_FSETSTAT_FAILURE
   >;
   [eventCodes.SFTP_OPENDIR]: RawEventSFTP<typeof eventCodes.SFTP_OPENDIR>;
   [eventCodes.SFTP_OPENDIR_FAILURE]: RawEventSFTP<
@@ -391,26 +585,19 @@ export type RawEvents = {
   [eventCodes.SFTP_RMDIR_FAILURE]: RawEventSFTP<
     typeof eventCodes.SFTP_RMDIR_FAILURE
   >;
-  [eventCodes.SFTP_REALPATH]: RawEventSFTP<typeof eventCodes.SFTP_REALPATH>;
-  [eventCodes.SFTP_REALPATH_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_REALPATH_FAILURE
-  >;
-  [eventCodes.SFTP_STAT]: RawEventSFTP<typeof eventCodes.SFTP_STAT>;
-  [eventCodes.SFTP_STAT_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_STAT_FAILURE
-  >;
   [eventCodes.SFTP_RENAME]: RawEventSFTP<typeof eventCodes.SFTP_RENAME>;
   [eventCodes.SFTP_RENAME_FAILURE]: RawEventSFTP<
     typeof eventCodes.SFTP_RENAME_FAILURE
-  >;
-  [eventCodes.SFTP_READLINK]: RawEventSFTP<typeof eventCodes.SFTP_READLINK>;
-  [eventCodes.SFTP_READLINK_FAILURE]: RawEventSFTP<
-    typeof eventCodes.SFTP_READLINK_FAILURE
   >;
   [eventCodes.SFTP_SYMLINK]: RawEventSFTP<typeof eventCodes.SFTP_SYMLINK>;
   [eventCodes.SFTP_SYMLINK_FAILURE]: RawEventSFTP<
     typeof eventCodes.SFTP_SYMLINK_FAILURE
   >;
+  [eventCodes.SFTP_LINK]: RawEventSFTP<typeof eventCodes.SFTP_LINK>;
+  [eventCodes.SFTP_LINK_FAILURE]: RawEventSFTP<
+    typeof eventCodes.SFTP_LINK_FAILURE
+  >;
+  [eventCodes.SFTP_DISALLOWED]: RawEventSFTP<typeof eventCodes.SFTP_DISALLOWED>;
   [eventCodes.SESSION_COMMAND]: RawEventCommand<
     typeof eventCodes.SESSION_COMMAND
   >;
@@ -461,6 +648,11 @@ export type RawEvents = {
     typeof eventCodes.SESSION_START,
     {
       sid: string;
+      kubernetes_cluster: string;
+      proto: string;
+      server_hostname: string;
+      server_addr: string;
+      server_id: string;
     }
   >;
   [eventCodes.SESSION_REJECT]: RawEvent<
@@ -485,11 +677,57 @@ export type RawEvents = {
       app_name: string;
     }
   >;
+  [eventCodes.APP_SESSION_START_FAILURE]: RawEvent<
+    typeof eventCodes.APP_SESSION_START_FAILURE,
+    {
+      app_name: string;
+      error: string;
+      message: string;
+    }
+  >;
   [eventCodes.APP_SESSION_END]: RawEvent<
     typeof eventCodes.APP_SESSION_END,
     {
       sid: string;
       app_name: string;
+    }
+  >;
+  [eventCodes.APP_SESSION_HTTP_REQUEST]: RawEvent<
+    typeof eventCodes.APP_SESSION_HTTP_REQUEST,
+    {
+      method: string;
+      url: string;
+    }
+  >;
+  [eventCodes.APP_SESSION_HTTP_REQUEST_BODY_CHUNK]: RawEvent<
+    typeof eventCodes.APP_SESSION_HTTP_REQUEST_BODY_CHUNK,
+    {
+      request_id: string;
+    }
+  >;
+  [eventCodes.APP_SESSION_HTTP_RESPONSE]: RawEvent<
+    typeof eventCodes.APP_SESSION_HTTP_RESPONSE,
+    {
+      status_code: number;
+    }
+  >;
+  [eventCodes.APP_SESSION_HTTP_RESPONSE_BODY_CHUNK]: RawEvent<
+    typeof eventCodes.APP_SESSION_HTTP_RESPONSE_BODY_CHUNK,
+    {
+      request_id: string;
+    }
+  >;
+  [eventCodes.APP_SESSION_TARGET_DIAL_DENIED]: RawEvent<
+    typeof eventCodes.APP_SESSION_TARGET_DIAL_DENIED,
+    {
+      sid: string;
+      app_name: string;
+      target_host: string;
+      target_port: string;
+      resolved_ips: string[];
+      policy: string;
+      blocked_ip: string;
+      blocked_prefix: string;
     }
   >;
   [eventCodes.APP_SESSION_CHUNK]: RawEvent<
@@ -505,6 +743,16 @@ export type RawEvents = {
     {
       target: string;
       app_name: string;
+    }
+  >;
+  [eventCodes.APP_SESSION_REQUEST_DENIED]: RawEvent<
+    typeof eventCodes.APP_SESSION_REQUEST_DENIED,
+    {
+      app_name: string;
+      method: string;
+      path: string;
+      deny_kind: string;
+      server_version?: string;
     }
   >;
   [eventCodes.SUBSYSTEM]: RawEvent<
@@ -557,8 +805,24 @@ export type RawEvents = {
       error: string;
     }
   >;
+  [eventCodes.USER_HEADLESS_LOGIN_REQUESTED]: RawEvent<
+    typeof eventCodes.USER_HEADLESS_LOGIN_REQUESTED
+  >;
+  [eventCodes.USER_HEADLESS_LOGIN_APPROVED]: RawEvent<
+    typeof eventCodes.USER_HEADLESS_LOGIN_APPROVED
+  >;
+  [eventCodes.USER_HEADLESS_LOGIN_APPROVEDFAILURE]: RawEvent<
+    typeof eventCodes.USER_HEADLESS_LOGIN_APPROVEDFAILURE,
+    {
+      error: string;
+    }
+  >;
+  [eventCodes.USER_HEADLESS_LOGIN_REJECTED]: RawEvent<
+    typeof eventCodes.USER_HEADLESS_LOGIN_REJECTED
+  >;
   [eventCodes.ROLE_CREATED]: RawEvent<typeof eventCodes.ROLE_CREATED, HasName>;
   [eventCodes.ROLE_DELETED]: RawEvent<typeof eventCodes.ROLE_DELETED, HasName>;
+  [eventCodes.ROLE_UPDATED]: RawEvent<typeof eventCodes.ROLE_UPDATED, HasName>;
   [eventCodes.TRUSTED_CLUSTER_TOKEN_CREATED]: RawEvent<
     typeof eventCodes.TRUSTED_CLUSTER_TOKEN_CREATED
   >;
@@ -572,6 +836,13 @@ export type RawEvents = {
     typeof eventCodes.TRUSTED_CLUSTER_DELETED,
     {
       name: string;
+    }
+  >;
+  [eventCodes.PROVISION_TOKEN_CREATED]: RawEvent<
+    typeof eventCodes.PROVISION_TOKEN_CREATED,
+    {
+      roles: string[];
+      join_method: string;
     }
   >;
   [eventCodes.KUBE_REQUEST]: RawEvent<
@@ -608,6 +879,7 @@ export type RawEvents = {
       db_service: string;
       db_name: string;
       db_user: string;
+      db_roles: string[];
     }
   >;
   [eventCodes.DATABASE_SESSION_STARTED_FAILURE]: RawEvent<
@@ -617,6 +889,7 @@ export type RawEvents = {
       db_service: string;
       db_name: string;
       db_user: string;
+      db_roles: string[];
     }
   >;
   [eventCodes.DATABASE_SESSION_ENDED]: RawEvent<
@@ -654,6 +927,47 @@ export type RawEvents = {
       name: string;
       db_service: string;
       db_name: string;
+    }
+  >;
+  [eventCodes.DATABASE_SESSION_PERMISSIONS_UPDATE]: RawEvent<
+    typeof eventCodes.DATABASE_SESSION_PERMISSIONS_UPDATE,
+    {
+      name: string;
+      db_service: string;
+      db_name: string;
+      db_user: string;
+      permission_summary: {
+        permission: string;
+        counts: { [key: string]: number };
+      }[];
+    }
+  >;
+  [eventCodes.DATABASE_SESSION_USER_CREATE]: RawDatabaseSessionEvent<
+    typeof eventCodes.DATABASE_SESSION_USER_CREATE,
+    {
+      roles: string[];
+    }
+  >;
+  [eventCodes.DATABASE_SESSION_USER_CREATE_FAILURE]: RawDatabaseSessionEvent<
+    typeof eventCodes.DATABASE_SESSION_USER_CREATE_FAILURE,
+    {
+      error: string;
+      message: string;
+      roles: string[];
+    }
+  >;
+  [eventCodes.DATABASE_SESSION_USER_DEACTIVATE]: RawDatabaseSessionEvent<
+    typeof eventCodes.DATABASE_SESSION_USER_DEACTIVATE,
+    {
+      delete: boolean;
+    }
+  >;
+  [eventCodes.DATABASE_SESSION_USER_DEACTIVATE_FAILURE]: RawDatabaseSessionEvent<
+    typeof eventCodes.DATABASE_SESSION_USER_DEACTIVATE_FAILURE,
+    {
+      error: string;
+      message: string;
+      delete: boolean;
     }
   >;
   [eventCodes.DATABASE_CREATED]: RawEvent<
@@ -881,6 +1195,42 @@ export type RawEvents = {
       path: string;
     }
   >;
+  [eventCodes.ELASTICSEARCH_REQUEST_FAILURE]: RawEvent<
+    typeof eventCodes.ELASTICSEARCH_REQUEST_FAILURE,
+    {
+      name: string;
+      db_service: string;
+      db_name: string;
+      category: number;
+      target: string;
+      query: string;
+      path: string;
+    }
+  >;
+  [eventCodes.OPENSEARCH_REQUEST]: RawEvent<
+    typeof eventCodes.OPENSEARCH_REQUEST,
+    {
+      name: string;
+      db_service: string;
+      db_name: string;
+      category: number;
+      target: string;
+      query: string;
+      path: string;
+    }
+  >;
+  [eventCodes.OPENSEARCH_REQUEST_FAILURE]: RawEvent<
+    typeof eventCodes.OPENSEARCH_REQUEST_FAILURE,
+    {
+      name: string;
+      db_service: string;
+      db_name: string;
+      category: number;
+      target: string;
+      query: string;
+      path: string;
+    }
+  >;
   [eventCodes.DYNAMODB_REQUEST]: RawEvent<
     typeof eventCodes.DYNAMODB_REQUEST,
     {
@@ -938,6 +1288,8 @@ export type RawEvents = {
     typeof eventCodes.DESKTOP_SESSION_STARTED,
     {
       desktop_addr: string;
+      desktop_name: string;
+      sid: string;
       windows_user: string;
       windows_domain: string;
     }
@@ -946,6 +1298,7 @@ export type RawEvents = {
     typeof eventCodes.DESKTOP_SESSION_STARTED_FAILED,
     {
       desktop_addr: string;
+      desktop_name: string;
       windows_user: string;
       windows_domain: string;
     }
@@ -954,8 +1307,37 @@ export type RawEvents = {
     typeof eventCodes.DESKTOP_SESSION_ENDED,
     {
       desktop_addr: string;
+      desktop_name: string;
+      sid: string;
       windows_user: string;
       windows_domain: string;
+    }
+  >;
+  [eventCodes.LINUX_DESKTOP_SESSION_STARTED]: RawEvent<
+    typeof eventCodes.LINUX_DESKTOP_SESSION_STARTED,
+    {
+      desktop_addr: string;
+      desktop_name: string;
+      sid: string;
+      linux_user: string;
+    }
+  >;
+  [eventCodes.LINUX_DESKTOP_SESSION_STARTED_FAILED]: RawEvent<
+    typeof eventCodes.LINUX_DESKTOP_SESSION_STARTED_FAILED,
+    {
+      desktop_addr: string;
+      desktop_name: string;
+      sid: string;
+      linux_user: string;
+    }
+  >;
+  [eventCodes.LINUX_DESKTOP_SESSION_ENDED]: RawEvent<
+    typeof eventCodes.LINUX_DESKTOP_SESSION_ENDED,
+    {
+      desktop_addr: string;
+      desktop_name: string;
+      sid: string;
+      linux_user: string;
     }
   >;
   [eventCodes.DESKTOP_CLIPBOARD_RECEIVE]: RawEvent<
@@ -964,6 +1346,7 @@ export type RawEvents = {
       desktop_addr: string;
       length: number;
       windows_domain: string;
+      desktop_name: string;
     }
   >;
   [eventCodes.DESKTOP_CLIPBOARD_SEND]: RawEvent<
@@ -972,6 +1355,7 @@ export type RawEvents = {
       desktop_addr: string;
       length: number;
       windows_domain: string;
+      desktop_name: string;
     }
   >;
   [eventCodes.DESKTOP_SHARED_DIRECTORY_START]: RawEvent<
@@ -980,6 +1364,7 @@ export type RawEvents = {
       desktop_addr: string;
       directory_name: string;
       windows_domain: string;
+      desktop_name: string;
     }
   >;
   [eventCodes.DESKTOP_SHARED_DIRECTORY_START_FAILURE]: RawEvent<
@@ -988,6 +1373,7 @@ export type RawEvents = {
       desktop_addr: string;
       directory_name: string;
       windows_domain: string;
+      desktop_name: string;
     }
   >;
   [eventCodes.DESKTOP_SHARED_DIRECTORY_READ]: RawEvent<
@@ -998,6 +1384,7 @@ export type RawEvents = {
       windows_domain: string;
       file_path: string;
       length: number;
+      desktop_name: string;
     }
   >;
   [eventCodes.DESKTOP_SHARED_DIRECTORY_READ_FAILURE]: RawEvent<
@@ -1008,6 +1395,7 @@ export type RawEvents = {
       windows_domain: string;
       file_path: string;
       length: number;
+      desktop_name: string;
     }
   >;
   [eventCodes.DESKTOP_SHARED_DIRECTORY_WRITE]: RawEvent<
@@ -1018,6 +1406,7 @@ export type RawEvents = {
       windows_domain: string;
       file_path: string;
       length: number;
+      desktop_name: string;
     }
   >;
   [eventCodes.DESKTOP_SHARED_DIRECTORY_WRITE_FAILURE]: RawEvent<
@@ -1028,6 +1417,7 @@ export type RawEvents = {
       windows_domain: string;
       file_path: string;
       length: number;
+      desktop_name: string;
     }
   >;
   [eventCodes.DEVICE_CREATE]: RawDeviceEvent<typeof eventCodes.DEVICE_CREATE>;
@@ -1042,6 +1432,33 @@ export type RawEvents = {
   [eventCodes.DEVICE_AUTHENTICATE]: RawDeviceEvent<
     typeof eventCodes.DEVICE_AUTHENTICATE
   >;
+  [eventCodes.DEVICE_UPDATE]: RawDeviceEvent<typeof eventCodes.DEVICE_UPDATE>;
+  [eventCodes.DEVICE_WEB_TOKEN_CREATE]: RawDeviceEvent<
+    typeof eventCodes.DEVICE_WEB_TOKEN_CREATE
+  >;
+  [eventCodes.DEVICE_AUTHENTICATE_CONFIRM]: RawDeviceEvent<
+    typeof eventCodes.DEVICE_AUTHENTICATE_CONFIRM
+  >;
+  [eventCodes.DEVICE_ENROLL_PAIRING_REQUEST]: RawDeviceEvent<
+    typeof eventCodes.DEVICE_ENROLL_PAIRING_REQUEST
+  >;
+  // The failure event carries no user (the pairing lookup that resolves the user
+  // is what failed) and surfaces the failure reason via the error field.
+  [eventCodes.DEVICE_ENROLL_PAIRING_REQUEST_FAILURE]: RawEvent<
+    typeof eventCodes.DEVICE_ENROLL_PAIRING_REQUEST_FAILURE,
+    Merge<DeviceEventFields, { error?: string }>
+  >;
+  [eventCodes.DEVICE_ENROLL_PAIRING_APPROVE]: RawDeviceEvent<
+    typeof eventCodes.DEVICE_ENROLL_PAIRING_APPROVE
+  >;
+  [eventCodes.DEVICE_ENROLL_PAIRING_APPROVE_FAILURE]: RawEvent<
+    typeof eventCodes.DEVICE_ENROLL_PAIRING_APPROVE_FAILURE,
+    Merge<DeviceEventFields, { error?: string }>
+  >;
+  [eventCodes.DEVICE_ENROLL_PAIRING_DENY]: RawEvent<
+    typeof eventCodes.DEVICE_ENROLL_PAIRING_DENY,
+    Merge<DeviceEventFields, { error?: string }>
+  >;
   [eventCodes.UNKNOWN]: RawEvent<
     typeof eventCodes.UNKNOWN,
     {
@@ -1054,6 +1471,10 @@ export type RawEvents = {
   [eventCodes.X11_FORWARD_FAILURE]: RawEvent<
     typeof eventCodes.X11_FORWARD_FAILURE
   >;
+  [eventCodes.AGENT_FORWARD]: RawEvent<typeof eventCodes.AGENT_FORWARD>;
+  [eventCodes.AGENT_FORWARD_FAILURE]: RawEvent<
+    typeof eventCodes.AGENT_FORWARD_FAILURE
+  >;
   [eventCodes.SESSION_CONNECT]: RawEvent<
     typeof eventCodes.SESSION_CONNECT,
     { server_addr: string }
@@ -1062,7 +1483,7 @@ export type RawEvents = {
     typeof eventCodes.CERTIFICATE_CREATED,
     {
       cert_type: 'user';
-      identity: { user: string };
+      identity: { user: string; usage?: string[] };
     }
   >;
   [eventCodes.UPGRADE_WINDOW_UPDATED]: RawEvent<
@@ -1071,11 +1492,18 @@ export type RawEvents = {
       upgrade_window_start: string;
     }
   >;
+  [eventCodes.ENVIRONMENT_PROFILE_UPDATED]: RawEvent<
+    typeof eventCodes.ENVIRONMENT_PROFILE_UPDATED,
+    {
+      environment_profile: string;
+    }
+  >;
   [eventCodes.SESSION_RECORDING_ACCESS]: RawEvent<
     typeof eventCodes.SESSION_RECORDING_ACCESS,
     {
       sid: string;
       user: string;
+      session_type?: string;
     }
   >;
   [eventCodes.SSMRUN_SUCCESS]: RawEvent<
@@ -1100,11 +1528,63 @@ export type RawEvents = {
       exit_code: number;
     }
   >;
+  [eventCodes.AZURERUN_SUCCESS]: RawEvent<
+    typeof eventCodes.AZURERUN_SUCCESS,
+    {
+      subscription_id: string;
+      resource_group: string;
+      vm_id: string;
+      vm_name: string;
+      resource_id: string;
+      region: string;
+      exit_code: number;
+      execution_state: string;
+      stdout: string;
+      stderr: string;
+      api_error?: string;
+      status?: string;
+    }
+  >;
+  [eventCodes.AZURERUN_FAIL]: RawEvent<
+    typeof eventCodes.AZURERUN_FAIL,
+    {
+      subscription_id: string;
+      resource_group: string;
+      vm_id: string;
+      vm_name: string;
+      resource_id: string;
+      region: string;
+      exit_code: number;
+      execution_state: string;
+      stdout: string;
+      stderr: string;
+      api_error?: string;
+      status?: string;
+    }
+  >;
   [eventCodes.BOT_JOIN]: RawEvent<
     typeof eventCodes.BOT_JOIN,
     {
       bot_name: string;
       method: string;
+      token_name: string;
+      scope: string;
+    }
+  >;
+  [eventCodes.BOT_JOIN_FAILURE]: RawEvent<
+    typeof eventCodes.BOT_JOIN_FAILURE,
+    {
+      bot_name: string;
+      method: string;
+      token_name: string;
+    }
+  >;
+  [eventCodes.BOT_JOIN_LIMIT]: RawEvent<
+    typeof eventCodes.BOT_JOIN_LIMIT,
+    {
+      bot_name: string;
+      method: string;
+      token_name: string;
     }
   >;
   [eventCodes.INSTANCE_JOIN]: RawEvent<
@@ -1113,7 +1593,64 @@ export type RawEvents = {
       node_name: string;
       method: string;
       role: string;
+      roles: string[];
+      scope: string;
     }
+  >;
+  [eventCodes.INSTANCE_JOIN_FAILURE]: RawEvent<
+    typeof eventCodes.INSTANCE_JOIN_FAILURE,
+    {
+      node_name: string;
+      method: string;
+      role: string;
+      roles: string[];
+      scope: string;
+    }
+  >;
+  [eventCodes.INSTANCE_JOIN_LIMIT]: RawEvent<
+    typeof eventCodes.INSTANCE_JOIN_LIMIT,
+    {
+      node_name: string;
+      method: string;
+      role: string;
+      roles: string[];
+      scope: string;
+    }
+  >;
+  [eventCodes.BOT_CREATED]: RawEvent<typeof eventCodes.BOT_CREATED, HasName>;
+  [eventCodes.BOT_UPDATED]: RawEvent<typeof eventCodes.BOT_UPDATED, HasName>;
+  [eventCodes.BOT_DELETED]: RawEvent<typeof eventCodes.BOT_DELETED, HasName>;
+  [eventCodes.WORKLOAD_IDENTITY_CREATE]: RawEvent<
+    typeof eventCodes.WORKLOAD_IDENTITY_CREATE,
+    HasName
+  >;
+  [eventCodes.WORKLOAD_IDENTITY_UPDATE]: RawEvent<
+    typeof eventCodes.WORKLOAD_IDENTITY_UPDATE,
+    HasName
+  >;
+  [eventCodes.WORKLOAD_IDENTITY_DELETE]: RawEvent<
+    typeof eventCodes.WORKLOAD_IDENTITY_DELETE,
+    HasName
+  >;
+  [eventCodes.WORKLOAD_IDENTITY_X509_ISSUER_OVERRIDE_CREATE]: RawEvent<
+    typeof eventCodes.WORKLOAD_IDENTITY_X509_ISSUER_OVERRIDE_CREATE,
+    HasName
+  >;
+  [eventCodes.WORKLOAD_IDENTITY_X509_ISSUER_OVERRIDE_DELETE]: RawEvent<
+    typeof eventCodes.WORKLOAD_IDENTITY_X509_ISSUER_OVERRIDE_DELETE,
+    HasName
+  >;
+  [eventCodes.SIGSTORE_POLICY_CREATE]: RawEvent<
+    typeof eventCodes.SIGSTORE_POLICY_CREATE,
+    HasName
+  >;
+  [eventCodes.SIGSTORE_POLICY_UPDATE]: RawEvent<
+    typeof eventCodes.SIGSTORE_POLICY_UPDATE,
+    HasName
+  >;
+  [eventCodes.SIGSTORE_POLICY_DELETE]: RawEvent<
+    typeof eventCodes.SIGSTORE_POLICY_DELETE,
+    HasName
   >;
   [eventCodes.LOGIN_RULE_CREATE]: RawEvent<
     typeof eventCodes.LOGIN_RULE_CREATE,
@@ -1123,12 +1660,895 @@ export type RawEvents = {
     typeof eventCodes.LOGIN_RULE_DELETE,
     HasName
   >;
+  [eventCodes.SAML_IDP_AUTH_ATTEMPT]: RawEvent<
+    typeof eventCodes.SAML_IDP_AUTH_ATTEMPT,
+    {
+      success: boolean;
+      service_provider_entity_id: string;
+      service_provider_shortcut: string;
+    }
+  >;
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_CREATE]: RawEvent<
+    typeof eventCodes.SAML_IDP_SERVICE_PROVIDER_CREATE,
+    {
+      name: string;
+      updated_by: string;
+      service_provider_entity_id: string;
+    }
+  >;
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_CREATE_FAILURE]: RawEvent<
+    typeof eventCodes.SAML_IDP_SERVICE_PROVIDER_CREATE_FAILURE,
+    {
+      name: string;
+      updated_by: string;
+      service_provider_entity_id: string;
+    }
+  >;
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_UPDATE]: RawEvent<
+    typeof eventCodes.SAML_IDP_SERVICE_PROVIDER_UPDATE,
+    {
+      name: string;
+      updated_by: string;
+      service_provider_entity_id: string;
+    }
+  >;
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_UPDATE_FAILURE]: RawEvent<
+    typeof eventCodes.SAML_IDP_SERVICE_PROVIDER_UPDATE_FAILURE,
+    {
+      name: string;
+      updated_by: string;
+      service_provider_entity_id: string;
+    }
+  >;
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_DELETE]: RawEvent<
+    typeof eventCodes.SAML_IDP_SERVICE_PROVIDER_DELETE,
+    {
+      name: string;
+      updated_by: string;
+      service_provider_entity_id: string;
+    }
+  >;
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_DELETE_FAILURE]: RawEvent<
+    typeof eventCodes.SAML_IDP_SERVICE_PROVIDER_DELETE_FAILURE,
+    {
+      name: string;
+      updated_by: string;
+      service_provider_entity_id: string;
+    }
+  >;
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_DELETE_ALL]: RawEvent<
+    typeof eventCodes.SAML_IDP_SERVICE_PROVIDER_DELETE_ALL,
+    {
+      name: string;
+      updated_by: string;
+    }
+  >;
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_DELETE_ALL_FAILURE]: RawEvent<
+    typeof eventCodes.SAML_IDP_SERVICE_PROVIDER_DELETE_ALL_FAILURE,
+    {
+      name: string;
+      updated_by: string;
+    }
+  >;
+  [eventCodes.OKTA_GROUPS_UPDATE]: RawEvent<
+    typeof eventCodes.OKTA_GROUPS_UPDATE,
+    {
+      added: number;
+      updated: number;
+      deleted: number;
+    }
+  >;
+  [eventCodes.OKTA_APPLICATIONS_UPDATE]: RawEvent<
+    typeof eventCodes.OKTA_APPLICATIONS_UPDATE,
+    {
+      added: number;
+      updated: number;
+      deleted: number;
+    }
+  >;
+  [eventCodes.OKTA_SYNC_FAILURE]: RawEvent<typeof eventCodes.OKTA_SYNC_FAILURE>;
+  [eventCodes.OKTA_ASSIGNMENT_PROCESS]: RawEvent<
+    typeof eventCodes.OKTA_ASSIGNMENT_PROCESS,
+    {
+      name: string;
+      source: string;
+    }
+  >;
+  [eventCodes.OKTA_ASSIGNMENT_PROCESS_FAILURE]: RawEvent<
+    typeof eventCodes.OKTA_ASSIGNMENT_PROCESS_FAILURE,
+    {
+      name: string;
+      source: string;
+    }
+  >;
+  [eventCodes.OKTA_ASSIGNMENT_CLEANUP]: RawEvent<
+    typeof eventCodes.OKTA_ASSIGNMENT_CLEANUP,
+    {
+      name: string;
+      source: string;
+    }
+  >;
+  [eventCodes.OKTA_ASSIGNMENT_CLEANUP_FAILURE]: RawEvent<
+    typeof eventCodes.OKTA_ASSIGNMENT_CLEANUP_FAILURE,
+    {
+      name: string;
+      source: string;
+    }
+  >;
+  [eventCodes.OKTA_USER_SYNC]: RawEvent<
+    typeof eventCodes.OKTA_USER_SYNC,
+    {
+      num_users_created: number;
+      num_users_modified: number;
+      num_users_deleted: number;
+    }
+  >;
+  [eventCodes.OKTA_USER_SYNC_FAILURE]: RawEvent<
+    typeof eventCodes.OKTA_USER_SYNC_FAILURE
+  >;
+  [eventCodes.OKTA_ACCESS_LIST_SYNC]: RawEvent<
+    typeof eventCodes.OKTA_ACCESS_LIST_SYNC
+  >;
+  [eventCodes.OKTA_ACCESS_LIST_SYNC_FAILURE]: RawEvent<
+    typeof eventCodes.OKTA_ACCESS_LIST_SYNC_FAILURE
+  >;
+  [eventCodes.ACCESS_LIST_CREATE]: RawEvent<
+    typeof eventCodes.ACCESS_LIST_CREATE,
+    {
+      name: string;
+      access_list_title: string;
+      updated_by: string;
+    }
+  >;
+  [eventCodes.ACCESS_LIST_CREATE_FAILURE]: RawEvent<
+    typeof eventCodes.ACCESS_LIST_CREATE_FAILURE,
+    {
+      name: string;
+      access_list_title: string;
+      updated_by: string;
+    }
+  >;
+  [eventCodes.ACCESS_LIST_UPDATE]: RawEvent<
+    typeof eventCodes.ACCESS_LIST_UPDATE,
+    {
+      name: string;
+      access_list_title: string;
+      updated_by: string;
+    }
+  >;
+  [eventCodes.ACCESS_LIST_UPDATE_FAILURE]: RawEvent<
+    typeof eventCodes.ACCESS_LIST_UPDATE_FAILURE,
+    {
+      name: string;
+      access_list_title: string;
+      updated_by: string;
+    }
+  >;
+  [eventCodes.ACCESS_LIST_DELETE]: RawEvent<
+    typeof eventCodes.ACCESS_LIST_DELETE,
+    {
+      name: string;
+      access_list_title: string;
+      updated_by: string;
+    }
+  >;
+  [eventCodes.ACCESS_LIST_DELETE_FAILURE]: RawEvent<
+    typeof eventCodes.ACCESS_LIST_DELETE_FAILURE,
+    {
+      name: string;
+      access_list_title: string;
+      updated_by: string;
+    }
+  >;
+  [eventCodes.ACCESS_LIST_REVIEW]: RawEvent<
+    typeof eventCodes.ACCESS_LIST_REVIEW,
+    {
+      name: string;
+      access_list_title: string;
+      updated_by: string;
+    }
+  >;
+  [eventCodes.ACCESS_LIST_REVIEW_FAILURE]: RawEvent<
+    typeof eventCodes.ACCESS_LIST_REVIEW_FAILURE,
+    {
+      name: string;
+      access_list_title: string;
+      updated_by: string;
+    }
+  >;
+  [eventCodes.ACCESS_LIST_MEMBER_CREATE]: RawEventAccessList<
+    typeof eventCodes.ACCESS_LIST_MEMBER_CREATE
+  >;
+  [eventCodes.ACCESS_LIST_MEMBER_CREATE_FAILURE]: RawEventAccessList<
+    typeof eventCodes.ACCESS_LIST_MEMBER_CREATE_FAILURE
+  >;
+  [eventCodes.ACCESS_LIST_MEMBER_UPDATE]: RawEventAccessList<
+    typeof eventCodes.ACCESS_LIST_MEMBER_UPDATE
+  >;
+  [eventCodes.ACCESS_LIST_MEMBER_UPDATE_FAILURE]: RawEventAccessList<
+    typeof eventCodes.ACCESS_LIST_MEMBER_UPDATE_FAILURE
+  >;
+  [eventCodes.ACCESS_LIST_MEMBER_DELETE]: RawEventAccessList<
+    typeof eventCodes.ACCESS_LIST_MEMBER_DELETE
+  >;
+  [eventCodes.ACCESS_LIST_MEMBER_DELETE_FAILURE]: RawEventAccessList<
+    typeof eventCodes.ACCESS_LIST_MEMBER_DELETE_FAILURE
+  >;
+  [eventCodes.ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST]: RawEvent<
+    typeof eventCodes.ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST,
+    {
+      access_list_name: string;
+      access_list_title: string;
+      updated_by: string;
+    }
+  >;
+  [eventCodes.ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST_FAILURE]: RawEvent<
+    typeof eventCodes.ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST_FAILURE,
+    {
+      access_list_name: string;
+      access_list_title: string;
+      updated_by: string;
+    }
+  >;
+  [eventCodes.USER_LOGIN_INVALID_ACCESS_LIST]: RawEvent<
+    typeof eventCodes.USER_LOGIN_INVALID_ACCESS_LIST,
+    {
+      access_list_name: string;
+      access_list_title: string;
+      user: string;
+      missing_roles: string[];
+    }
+  >;
+  [eventCodes.SECURITY_REPORT_AUDIT_QUERY_RUN]: RawEvent<
+    typeof eventCodes.SECURITY_REPORT_AUDIT_QUERY_RUN,
+    {
+      query: string;
+      total_execution_time_in_millis: string;
+      total_data_scanned_in_bytes: string;
+    }
+  >;
+  [eventCodes.SECURITY_REPORT_RUN]: RawEvent<
+    typeof eventCodes.SECURITY_REPORT_RUN,
+    {
+      name: string;
+      total_execution_time_in_millis: string;
+      total_data_scanned_in_bytes: string;
+    }
+  >;
+  [eventCodes.EXTERNAL_AUDIT_STORAGE_ENABLE]: RawEvent<
+    typeof eventCodes.EXTERNAL_AUDIT_STORAGE_ENABLE,
+    {
+      updated_by: string;
+    }
+  >;
+  [eventCodes.EXTERNAL_AUDIT_STORAGE_DISABLE]: RawEvent<
+    typeof eventCodes.EXTERNAL_AUDIT_STORAGE_DISABLE,
+    {
+      updated_by: string;
+    }
+  >;
+  [eventCodes.CREATE_MFA_AUTH_CHALLENGE]: RawEvent<
+    typeof eventCodes.CREATE_MFA_AUTH_CHALLENGE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.VALIDATE_MFA_AUTH_RESPONSE]: RawEvent<
+    typeof eventCodes.VALIDATE_MFA_AUTH_RESPONSE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.VALIDATE_MFA_AUTH_RESPONSEFAILURE]: RawEvent<
+    typeof eventCodes.VALIDATE_MFA_AUTH_RESPONSEFAILURE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.SPIFFE_SVID_ISSUED]: RawEvent<
+    typeof eventCodes.SPIFFE_SVID_ISSUED,
+    {
+      spiffe_id: string;
+      workload_identity_scope?: string;
+    }
+  >;
+  [eventCodes.SPIFFE_SVID_ISSUED_FAILURE]: RawEvent<
+    typeof eventCodes.SPIFFE_SVID_ISSUED_FAILURE,
+    {
+      spiffe_id: string;
+      workload_identity_scope?: string;
+    }
+  >;
+  [eventCodes.SPIFFE_FEDERATION_CREATE]: RawEvent<
+    typeof eventCodes.SPIFFE_FEDERATION_CREATE,
+    HasName
+  >;
+  [eventCodes.SPIFFE_FEDERATION_DELETE]: RawEvent<
+    typeof eventCodes.SPIFFE_FEDERATION_DELETE,
+    HasName
+  >;
+  [eventCodes.AUTH_PREFERENCE_UPDATE]: RawEvent<
+    typeof eventCodes.AUTH_PREFERENCE_UPDATE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.CLUSTER_NETWORKING_CONFIG_UPDATE]: RawEvent<
+    typeof eventCodes.CLUSTER_NETWORKING_CONFIG_UPDATE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.SESSION_RECORDING_CONFIG_UPDATE]: RawEvent<
+    typeof eventCodes.SESSION_RECORDING_CONFIG_UPDATE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.ACCESS_GRAPH_PATH_CHANGED]: RawEvent<
+    typeof eventCodes.ACCESS_GRAPH_PATH_CHANGED,
+    {
+      change_id: string;
+      affected_resource_name: string;
+      affected_resource_source: string;
+      affected_resource_kind: string;
+    }
+  >;
+  [eventCodes.ACCESS_GRAPH_SETTINGS_UPDATE]: RawEvent<
+    typeof eventCodes.ACCESS_GRAPH_SETTINGS_UPDATE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.SPANNER_RPC]: RawSpannerRPCEvent<typeof eventCodes.SPANNER_RPC>;
+  [eventCodes.SPANNER_RPC_DENIED]: RawSpannerRPCEvent<
+    typeof eventCodes.SPANNER_RPC_DENIED
+  >;
+  [eventCodes.DISCOVERY_CONFIG_CREATE]: RawEvent<
+    typeof eventCodes.DISCOVERY_CONFIG_CREATE,
+    HasName
+  >;
+  [eventCodes.DISCOVERY_CONFIG_UPDATE]: RawEvent<
+    typeof eventCodes.DISCOVERY_CONFIG_UPDATE,
+    HasName
+  >;
+  [eventCodes.DISCOVERY_CONFIG_DELETE]: RawEvent<
+    typeof eventCodes.DISCOVERY_CONFIG_DELETE,
+    HasName
+  >;
+  [eventCodes.DISCOVERY_CONFIG_DELETE_ALL]: RawEvent<
+    typeof eventCodes.DISCOVERY_CONFIG_DELETE_ALL
+  >;
+  [eventCodes.INTEGRATION_CREATE]: RawEvent<
+    typeof eventCodes.INTEGRATION_CREATE,
+    HasName
+  >;
+  [eventCodes.INTEGRATION_UPDATE]: RawEvent<
+    typeof eventCodes.INTEGRATION_UPDATE,
+    HasName
+  >;
+  [eventCodes.INTEGRATION_DELETE]: RawEvent<
+    typeof eventCodes.INTEGRATION_DELETE,
+    HasName
+  >;
+  [eventCodes.STATIC_HOST_USER_CREATE]: RawEvent<
+    typeof eventCodes.STATIC_HOST_USER_CREATE,
+    HasName
+  >;
+  [eventCodes.STATIC_HOST_USER_UPDATE]: RawEvent<
+    typeof eventCodes.STATIC_HOST_USER_UPDATE,
+    HasName
+  >;
+  [eventCodes.STATIC_HOST_USER_DELETE]: RawEvent<
+    typeof eventCodes.STATIC_HOST_USER_DELETE,
+    HasName
+  >;
+  [eventCodes.CROWN_JEWEL_CREATE]: RawEvent<
+    typeof eventCodes.CROWN_JEWEL_CREATE,
+    HasName
+  >;
+  [eventCodes.CROWN_JEWEL_UPDATE]: RawEvent<
+    typeof eventCodes.CROWN_JEWEL_UPDATE,
+    HasName
+  >;
+  [eventCodes.CROWN_JEWEL_DELETE]: RawEvent<
+    typeof eventCodes.CROWN_JEWEL_DELETE,
+    HasName
+  >;
+  [eventCodes.USER_TASK_CREATE]: RawEvent<
+    typeof eventCodes.USER_TASK_CREATE,
+    HasName
+  >;
+  [eventCodes.USER_TASK_UPDATE]: RawEvent<
+    typeof eventCodes.USER_TASK_UPDATE,
+    HasName
+  >;
+  [eventCodes.USER_TASK_DELETE]: RawEvent<
+    typeof eventCodes.USER_TASK_DELETE,
+    HasName
+  >;
+  [eventCodes.PLUGIN_CREATE]: RawEvent<
+    typeof eventCodes.PLUGIN_CREATE,
+    Merge<HasName, { plugin_type: string }>
+  >;
+  [eventCodes.PLUGIN_UPDATE]: RawEvent<
+    typeof eventCodes.PLUGIN_UPDATE,
+    Merge<HasName, { plugin_type: string }>
+  >;
+  [eventCodes.PLUGIN_DELETE]: RawEvent<
+    typeof eventCodes.PLUGIN_DELETE,
+    Merge<HasName, { user: string }>
+  >;
+  [eventCodes.SFTP_SUMMARY]: RawEvent<
+    typeof eventCodes.SFTP_SUMMARY,
+    {
+      user: string;
+      server_hostname: string;
+    }
+  >;
+  [eventCodes.CONTACT_CREATE]: RawEvent<
+    typeof eventCodes.CONTACT_CREATE,
+    {
+      email: string;
+      contact_type: number;
+    }
+  >;
+  [eventCodes.CONTACT_DELETE]: RawEvent<
+    typeof eventCodes.CONTACT_DELETE,
+    {
+      email: string;
+      contact_type: number;
+    }
+  >;
+  [eventCodes.GIT_COMMAND]: RawEvent<
+    typeof eventCodes.GIT_COMMAND,
+    {
+      service: string;
+      path: string;
+      actions?: {
+        action: string;
+        reference: string;
+        new?: string;
+        old?: string;
+      }[];
+    }
+  >;
+  [eventCodes.GIT_COMMAND_FAILURE]: RawEvent<
+    typeof eventCodes.GIT_COMMAND_FAILURE,
+    {
+      service: string;
+      path: string;
+      exitError: string;
+    }
+  >;
+  [eventCodes.STABLE_UNIX_USER_CREATE]: RawEvent<
+    typeof eventCodes.STABLE_UNIX_USER_CREATE,
+    {
+      stable_unix_user: {
+        username: string;
+        uid: number;
+      };
+    }
+  >;
+  [eventCodes.AWS_IC_RESOURCE_SYNC_SUCCESS]: RawEventAwsIcResourceSync<
+    typeof eventCodes.AWS_IC_RESOURCE_SYNC_SUCCESS
+  >;
+  [eventCodes.AWS_IC_RESOURCE_SYNC_FAILURE]: RawEventAwsIcResourceSync<
+    typeof eventCodes.AWS_IC_RESOURCE_SYNC_FAILURE
+  >;
+  [eventCodes.AUTOUPDATE_CONFIG_CREATE]: RawEvent<
+    typeof eventCodes.AUTOUPDATE_CONFIG_CREATE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.AUTOUPDATE_CONFIG_UPDATE]: RawEvent<
+    typeof eventCodes.AUTOUPDATE_CONFIG_UPDATE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.AUTOUPDATE_CONFIG_DELETE]: RawEvent<
+    typeof eventCodes.AUTOUPDATE_CONFIG_DELETE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.AUTOUPDATE_VERSION_CREATE]: RawEvent<
+    typeof eventCodes.AUTOUPDATE_VERSION_CREATE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.AUTOUPDATE_VERSION_UPDATE]: RawEvent<
+    typeof eventCodes.AUTOUPDATE_VERSION_UPDATE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.AUTOUPDATE_VERSION_DELETE]: RawEvent<
+    typeof eventCodes.AUTOUPDATE_VERSION_DELETE,
+    {
+      user: string;
+    }
+  >;
+  [eventCodes.HEALTH_CHECK_CONFIG_CREATE]: RawEvent<
+    typeof eventCodes.HEALTH_CHECK_CONFIG_CREATE,
+    HasName
+  >;
+  [eventCodes.HEALTH_CHECK_CONFIG_UPDATE]: RawEvent<
+    typeof eventCodes.HEALTH_CHECK_CONFIG_UPDATE,
+    HasName
+  >;
+  [eventCodes.HEALTH_CHECK_CONFIG_DELETE]: RawEvent<
+    typeof eventCodes.HEALTH_CHECK_CONFIG_DELETE,
+    HasName
+  >;
+  [eventCodes.AUTOUPDATE_AGENT_ROLLOUT_TRIGGER]: RawEvent<
+    typeof eventCodes.AUTOUPDATE_AGENT_ROLLOUT_TRIGGER,
+    {
+      user: string;
+      groups: string[];
+    }
+  >;
+  [eventCodes.AUTOUPDATE_AGENT_ROLLOUT_FORCE_DONE]: RawEvent<
+    typeof eventCodes.AUTOUPDATE_AGENT_ROLLOUT_FORCE_DONE,
+    {
+      user: string;
+      groups: string[];
+    }
+  >;
+  [eventCodes.AUTOUPDATE_AGENT_ROLLOUT_ROLLBACK]: RawEvent<
+    typeof eventCodes.AUTOUPDATE_AGENT_ROLLOUT_ROLLBACK,
+    {
+      user: string;
+      groups: string[];
+    }
+  >;
+  [eventCodes.MCP_SESSION_START]: RawEvent<
+    typeof eventCodes.MCP_SESSION_START,
+    {
+      sid: string;
+      app_name: string;
+    }
+  >;
+  [eventCodes.MCP_SESSION_END]: RawEvent<
+    typeof eventCodes.MCP_SESSION_END,
+    {
+      sid: string;
+      app_name: string;
+    }
+  >;
+  [eventCodes.MCP_SESSION_END_FAILURE]: RawEvent<
+    typeof eventCodes.MCP_SESSION_END_FAILURE,
+    {
+      app_name: string;
+    }
+  >;
+  [eventCodes.MCP_SESSION_REQUEST]: RawEvent<
+    typeof eventCodes.MCP_SESSION_REQUEST,
+    {
+      app_name: string;
+      message: {
+        method: string;
+        params?: {
+          name?: string;
+        };
+      };
+    }
+  >;
+  [eventCodes.MCP_SESSION_REQUEST_FAILURE]: RawEvent<
+    typeof eventCodes.MCP_SESSION_REQUEST_FAILURE,
+    {
+      app_name: string;
+      message: {
+        method: string;
+        params?: {
+          name?: string;
+        };
+      };
+    }
+  >;
+  [eventCodes.MCP_SESSION_NOTIFICATION]: RawEvent<
+    typeof eventCodes.MCP_SESSION_NOTIFICATION,
+    {
+      app_name: string;
+      message: {
+        method: string;
+      };
+    }
+  >;
+  [eventCodes.MCP_SESSION_NOTIFICATION_FAILURE]: RawEvent<
+    typeof eventCodes.MCP_SESSION_NOTIFICATION_FAILURE,
+    {
+      app_name: string;
+      message: {
+        method: string;
+      };
+    }
+  >;
+  [eventCodes.MCP_SESSION_LISTEN_SSE_STREAM]: RawEvent<
+    typeof eventCodes.MCP_SESSION_LISTEN_SSE_STREAM,
+    {
+      app_name: string;
+    }
+  >;
+  [eventCodes.MCP_SESSION_LISTEN_SSE_STREAM_FAILURE]: RawEvent<
+    typeof eventCodes.MCP_SESSION_LISTEN_SSE_STREAM_FAILURE,
+    {
+      app_name: string;
+    }
+  >;
+  [eventCodes.MCP_SESSION_INVALID_HTTP_REQUEST]: RawEvent<
+    typeof eventCodes.MCP_SESSION_INVALID_HTTP_REQUEST,
+    {
+      app_name: string;
+    }
+  >;
+  [eventCodes.BOUND_KEYPAIR_RECOVERY]: RawEvent<
+    typeof eventCodes.BOUND_KEYPAIR_RECOVERY,
+    {
+      token_name: string;
+      bot_name: string;
+      success: boolean;
+      error: string;
+      recovery_count: number;
+    }
+  >;
+  [eventCodes.BOUND_KEYPAIR_ROTATION]: RawEvent<
+    typeof eventCodes.BOUND_KEYPAIR_ROTATION,
+    {
+      token_name: string;
+      bot_name: string;
+      success: boolean;
+      error: string;
+    }
+  >;
+  [eventCodes.BOUND_KEYPAIR_JOIN_STATE_VERIFICATION_FAILED]: RawEvent<
+    typeof eventCodes.BOUND_KEYPAIR_JOIN_STATE_VERIFICATION_FAILED,
+    {
+      token_name: string;
+      bot_name: string;
+      success: boolean;
+      error: string;
+    }
+  >;
+  [eventCodes.SCIM_RESOURCE_LIST]: RawSCIMListingEvent<
+    typeof eventCodes.SCIM_RESOURCE_LIST
+  >;
+  [eventCodes.SCIM_RESOURCE_LIST_FAILURE]: RawSCIMListingEvent<
+    typeof eventCodes.SCIM_RESOURCE_LIST_FAILURE
+  >;
+  [eventCodes.SCIM_RESOURCE_GET]: RawSCIMResourceEvent<
+    typeof eventCodes.SCIM_RESOURCE_GET
+  >;
+  [eventCodes.SCIM_RESOURCE_GET_FAILURE]: RawSCIMResourceEvent<
+    typeof eventCodes.SCIM_RESOURCE_GET_FAILURE
+  >;
+  [eventCodes.SCIM_RESOURCE_CREATE]: RawSCIMResourceEvent<
+    typeof eventCodes.SCIM_RESOURCE_CREATE
+  >;
+  [eventCodes.SCIM_RESOURCE_CREATE_FAILURE]: RawSCIMResourceEvent<
+    typeof eventCodes.SCIM_RESOURCE_CREATE_FAILURE
+  >;
+  [eventCodes.SCIM_RESOURCE_UPDATE]: RawSCIMResourceEvent<
+    typeof eventCodes.SCIM_RESOURCE_UPDATE
+  >;
+  [eventCodes.SCIM_RESOURCE_UPDATE_FAILURE]: RawSCIMResourceEvent<
+    typeof eventCodes.SCIM_RESOURCE_UPDATE_FAILURE
+  >;
+  [eventCodes.SCIM_RESOURCE_PATCH]: RawSCIMResourceEvent<
+    typeof eventCodes.SCIM_RESOURCE_PATCH
+  >;
+  [eventCodes.SCIM_RESOURCE_PATCH_FAILURE]: RawSCIMResourceEvent<
+    typeof eventCodes.SCIM_RESOURCE_PATCH_FAILURE
+  >;
+  [eventCodes.SCIM_RESOURCE_DELETE]: RawSCIMResourceEvent<
+    typeof eventCodes.SCIM_RESOURCE_DELETE
+  >;
+  [eventCodes.SCIM_RESOURCE_DELETE_FAILURE]: RawSCIMResourceEvent<
+    typeof eventCodes.SCIM_RESOURCE_DELETE_FAILURE
+  >;
+  [eventCodes.CLIENT_IP_RESTRICTIONS_UPDATE]: RawEvent<
+    typeof eventCodes.CLIENT_IP_RESTRICTIONS_UPDATE,
+    {
+      client_ip_restrictions: string[];
+      success: boolean;
+      mode?: string;
+      enforcement_expires?: string;
+    }
+  >;
+  [eventCodes.VNET_CONFIG_CREATE]: RawEvent<
+    typeof eventCodes.VNET_CONFIG_CREATE,
+    HasName
+  >;
+  [eventCodes.VNET_CONFIG_UPDATE]: RawEvent<
+    typeof eventCodes.VNET_CONFIG_UPDATE,
+    HasName
+  >;
+  [eventCodes.VNET_CONFIG_DELETE]: RawEvent<
+    typeof eventCodes.VNET_CONFIG_DELETE,
+    HasName
+  >;
+  [eventCodes.BEAMS_CONFIG_CREATE]: RawEvent<
+    typeof eventCodes.BEAMS_CONFIG_CREATE,
+    HasName
+  >;
+  [eventCodes.BEAMS_CONFIG_UPDATE]: RawEvent<
+    typeof eventCodes.BEAMS_CONFIG_UPDATE,
+    HasName
+  >;
+  [eventCodes.BEAMS_CONFIG_DELETE]: RawEvent<
+    typeof eventCodes.BEAMS_CONFIG_DELETE,
+    HasName
+  >;
+  [eventCodes.WORKLOAD_CLUSTER_CREATE]: RawEvent<
+    typeof eventCodes.WORKLOAD_CLUSTER_CREATE,
+    HasName
+  >;
+  [eventCodes.WORKLOAD_CLUSTER_CREATE_FAILURE]: RawEvent<
+    typeof eventCodes.WORKLOAD_CLUSTER_CREATE_FAILURE,
+    HasName
+  >;
+  [eventCodes.WORKLOAD_CLUSTER_UPDATE]: RawEvent<
+    typeof eventCodes.WORKLOAD_CLUSTER_UPDATE,
+    HasName
+  >;
+  [eventCodes.WORKLOAD_CLUSTER_UPDATE_FAILURE]: RawEvent<
+    typeof eventCodes.WORKLOAD_CLUSTER_UPDATE_FAILURE,
+    HasName
+  >;
+  [eventCodes.WORKLOAD_CLUSTER_DELETE]: RawEvent<
+    typeof eventCodes.WORKLOAD_CLUSTER_DELETE,
+    HasName
+  >;
+  [eventCodes.WORKLOAD_CLUSTER_DELETE_FAILURE]: RawEvent<
+    typeof eventCodes.WORKLOAD_CLUSTER_DELETE_FAILURE,
+    HasName
+  >;
+  [eventCodes.INFERENCE_MODEL_CREATE]: RawEvent<
+    typeof eventCodes.INFERENCE_MODEL_CREATE,
+    HasName
+  >;
+  [eventCodes.INFERENCE_MODEL_UPDATE]: RawEvent<
+    typeof eventCodes.INFERENCE_MODEL_UPDATE,
+    HasName
+  >;
+  [eventCodes.INFERENCE_MODEL_DELETE]: RawEvent<
+    typeof eventCodes.INFERENCE_MODEL_DELETE,
+    HasName
+  >;
+  [eventCodes.INFERENCE_SECRET_CREATE]: RawEvent<
+    typeof eventCodes.INFERENCE_SECRET_CREATE,
+    HasName
+  >;
+  [eventCodes.INFERENCE_SECRET_UPDATE]: RawEvent<
+    typeof eventCodes.INFERENCE_SECRET_UPDATE,
+    HasName
+  >;
+  [eventCodes.INFERENCE_SECRET_DELETE]: RawEvent<
+    typeof eventCodes.INFERENCE_SECRET_DELETE,
+    HasName
+  >;
+  [eventCodes.INFERENCE_POLICY_CREATE]: RawEvent<
+    typeof eventCodes.INFERENCE_POLICY_CREATE,
+    HasName
+  >;
+  [eventCodes.INFERENCE_POLICY_UPDATE]: RawEvent<
+    typeof eventCodes.INFERENCE_POLICY_UPDATE,
+    HasName
+  >;
+  [eventCodes.INFERENCE_POLICY_DELETE]: RawEvent<
+    typeof eventCodes.INFERENCE_POLICY_DELETE,
+    HasName
+  >;
+  [eventCodes.RETRIEVAL_MODEL_CREATE]: RawEvent<
+    typeof eventCodes.RETRIEVAL_MODEL_CREATE,
+    HasName
+  >;
+  [eventCodes.RETRIEVAL_MODEL_UPDATE]: RawEvent<
+    typeof eventCodes.RETRIEVAL_MODEL_UPDATE,
+    HasName
+  >;
+  [eventCodes.RETRIEVAL_MODEL_DELETE]: RawEvent<
+    typeof eventCodes.RETRIEVAL_MODEL_DELETE,
+    HasName
+  >;
+  [eventCodes.CLASSIFIER_CREATE]: RawEvent<
+    typeof eventCodes.CLASSIFIER_CREATE,
+    HasName
+  >;
+  [eventCodes.CLASSIFIER_CREATE_FAILURE]: RawEvent<
+    typeof eventCodes.CLASSIFIER_CREATE_FAILURE,
+    HasName
+  >;
+  [eventCodes.CLASSIFIER_UPDATE]: RawEvent<
+    typeof eventCodes.CLASSIFIER_UPDATE,
+    HasName
+  >;
+  [eventCodes.CLASSIFIER_UPDATE_FAILURE]: RawEvent<
+    typeof eventCodes.CLASSIFIER_UPDATE_FAILURE,
+    HasName
+  >;
+  [eventCodes.CLASSIFIER_DELETE]: RawEvent<
+    typeof eventCodes.CLASSIFIER_DELETE,
+    HasName
+  >;
+  [eventCodes.CLASSIFIER_DELETE_FAILURE]: RawEvent<
+    typeof eventCodes.CLASSIFIER_DELETE_FAILURE,
+    HasName
+  >;
+  [eventCodes.SESSION_SUMMARIZED]: RawEvent<
+    typeof eventCodes.SESSION_SUMMARIZED,
+    {
+      sid: string;
+      session_type?: string;
+      model_name?: string;
+      risk_level?: string;
+      short_description?: string;
+    }
+  >;
+  [eventCodes.SESSION_SUMMARIZED_FAILURE]: RawEvent<
+    typeof eventCodes.SESSION_SUMMARIZED_FAILURE,
+    {
+      sid: string;
+      session_type?: string;
+      model_name?: string;
+      risk_level?: string;
+      short_description?: string;
+    }
+  >;
+  [eventCodes.CERT_AUTH_OVERRIDE_CREATE]: RawCertAuthOverrideEvent<
+    typeof eventCodes.CERT_AUTH_OVERRIDE_CREATE
+  >;
+  [eventCodes.CERT_AUTH_OVERRIDE_UPDATE]: RawCertAuthOverrideEvent<
+    typeof eventCodes.CERT_AUTH_OVERRIDE_UPDATE
+  >;
+  [eventCodes.CERT_AUTH_OVERRIDE_UPSERT]: RawCertAuthOverrideEvent<
+    typeof eventCodes.CERT_AUTH_OVERRIDE_UPSERT
+  >;
+  [eventCodes.CERT_AUTH_OVERRIDE_DELETE]: RawCertAuthOverrideEvent<
+    typeof eventCodes.CERT_AUTH_OVERRIDE_DELETE
+  >;
+  [eventCodes.SCOPED_TOKEN_CREATE]: RawScopedTokenEvent<
+    typeof eventCodes.SCOPED_TOKEN_CREATE
+  >;
+  [eventCodes.SCOPED_TOKEN_CREATE_FAILURE]: RawScopedTokenEvent<
+    typeof eventCodes.SCOPED_TOKEN_CREATE_FAILURE
+  >;
+  [eventCodes.SCOPED_TOKEN_UPSERT]: RawScopedTokenEvent<
+    typeof eventCodes.SCOPED_TOKEN_UPSERT
+  >;
+  [eventCodes.SCOPED_TOKEN_UPSERT_FAILURE]: RawScopedTokenEvent<
+    typeof eventCodes.SCOPED_TOKEN_UPSERT_FAILURE
+  >;
+  [eventCodes.SCOPED_TOKEN_UPDATE]: RawScopedTokenEvent<
+    typeof eventCodes.SCOPED_TOKEN_UPDATE
+  >;
+  [eventCodes.SCOPED_TOKEN_UPDATE_FAILURE]: RawScopedTokenEvent<
+    typeof eventCodes.SCOPED_TOKEN_UPDATE_FAILURE
+  >;
+  [eventCodes.SCOPED_TOKEN_DELETE]: RawEvent<
+    typeof eventCodes.SCOPED_TOKEN_DELETE,
+    {
+      name: string;
+      scope: string;
+    }
+  >;
+  [eventCodes.SCOPED_TOKEN_DELETE_FAILURE]: RawEvent<
+    typeof eventCodes.SCOPED_TOKEN_DELETE_FAILURE,
+    {
+      name: string;
+      scope: string;
+      error: string;
+    }
+  >;
 };
 
 /**
  * Event Code
  */
-export type EventCode = typeof eventCodes[keyof typeof eventCodes];
+export type EventCode = (typeof eventCodes)[keyof typeof eventCodes];
 
 type HasName = {
   name: string;
@@ -1167,14 +2587,15 @@ type RawEventData<T extends EventCode> = RawEvent<
   }
 >;
 
-type RawDeviceEvent<T extends EventCode> = RawEvent<
-  T,
-  {
-    device: { asset_tag: string; device_id: string; os_type: number };
-    status: { success: boolean };
-    user: { user: string };
-  }
->;
+type DeviceEventFields = {
+  device: { asset_tag: string; device_id: string; os_type: number };
+  success?: boolean;
+  user?: string;
+  // status from "legacy" event format.
+  status?: { success: boolean };
+};
+
+type RawDeviceEvent<T extends EventCode> = RawEvent<T, DeviceEventFields>;
 
 type RawEventCommand<T extends EventCode> = RawEvent<
   T,
@@ -1238,6 +2659,35 @@ type RawDiskEvent<T extends EventCode> = RawEvent<
   }
 >;
 
+// EventResourceId mirrors the JSON encoding of events.ResourceID.
+type EventResourceId = {
+  cluster: string;
+  kind: string;
+  name: string;
+  sub_resource?: string;
+};
+
+// EventResourceConstraints mirrors the JSON encoding of the oneof constraints
+// field in events.ResourceAccessID. Exactly one variant will be present.
+type EventResourceConstraints = {
+  unknown_constraints?: Record<string, never>;
+  aws_console?: {
+    role_arns_count: number;
+    role_arns_preview?: string[];
+  };
+  ssh?: {
+    logins_count: string[];
+    logins_preview?: string[];
+  };
+};
+
+// EventResourceAccessId mirrors the JSON encoding of events.ResourceAccessId.
+type EventResourceAccessId = {
+  id: EventResourceId;
+  // constraints is the JSON key produced by the Go oneof field encoding.
+  constraints?: EventResourceConstraints;
+};
+
 type RawEventAccess<T extends EventCode> = RawEvent<
   T,
   {
@@ -1246,6 +2696,7 @@ type RawEventAccess<T extends EventCode> = RawEvent<
     roles: string[];
     state: string;
     reviewer: string;
+    RequestedResourceAccessIDs?: EventResourceAccessId[];
   }
 >;
 
@@ -1254,6 +2705,16 @@ type RawEventUserToken<T extends EventCode> = RawEvent<
   {
     name: string;
     ttl: string;
+  }
+>;
+
+type RawEventAccessList<T extends EventCode> = RawEvent<
+  T,
+  {
+    access_list_name: string;
+    members: { member_name: string }[];
+    updated_by: string;
+    access_list_title: string;
   }
 >;
 
@@ -1288,18 +2749,117 @@ type RawEventSFTP<T extends EventCode> = RawEvent<
   }
 >;
 
+type RawDatabaseSessionEvent<T extends EventCode, K = unknown> = Merge<
+  RawEvent<
+    T,
+    {
+      name: string;
+      db_service: string;
+      db_name: string;
+      db_user: string;
+      username: string;
+    }
+  >,
+  K
+>;
+
+type RawSpannerRPCEvent<T extends EventCode> = RawEvent<
+  T,
+  {
+    procedure: string;
+    db_service: string;
+    db_name: string;
+    args: { sql?: string };
+  }
+>;
+
+/**
+ * RawEventAwsIcResourceSync extends RawEvent with custom fields
+ * present in the AWS Identity Center resource sync event.
+ */
+type RawEventAwsIcResourceSync<T extends EventCode> = RawEvent<
+  T,
+  {
+    total_accounts: number;
+    total_account_assignments: number;
+    total_user_groups: number;
+    total_permission_sets: number;
+    status: boolean;
+    /* message contains user message for both success and failed status */
+    message: string;
+  }
+>;
+
+type RawSCIMListingEvent<T extends EventCode> = RawEvent<
+  T,
+  {
+    resource_type: string;
+    integration: string;
+  }
+>;
+
+type RawSCIMResourceEvent<T extends EventCode> = RawEvent<
+  T,
+  {
+    resource_type: string;
+    teleport_id: string;
+    external_id: string;
+    integration: string;
+    display: string;
+  }
+>;
+
+type RawCertAuthOverrideEvent<T extends EventCode> = RawEvent<
+  T,
+  HasName & {
+    ca_override?: {
+      ca_type?: string;
+      cluster_name?: string;
+      certificate_overrides?: {
+        certificate?: {
+          issuer?: string;
+          subject?: string;
+          serial_number?: string;
+          public_key_hash?: string;
+        };
+        chain?: {
+          issuer?: string;
+          subject?: string;
+          serial_number?: string;
+          public_key_hash?: string;
+        }[];
+        disabled?: boolean;
+      }[];
+    };
+    success?: boolean;
+    user?: string;
+  }
+>;
+
+type RawScopedTokenEvent<T extends EventCode> = RawEvent<
+  T,
+  HasName & {
+    scope: string;
+    assigned_scope: string;
+    roles: string[];
+    join_method: string;
+    success: boolean;
+    error?: string;
+  }
+>;
+
 /**
  * A map of event formatters that provide short and long description
  */
 export type Formatters = {
   [key in EventCode]: {
     type: string;
-    desc: string;
+    desc: string | ((json: RawEvents[key]) => string);
     format: (json: RawEvents[key]) => string;
   };
 };
 
-export type Events = {
+type Events = {
   [key in EventCode]: {
     id: string;
     time: Date;
@@ -1313,14 +2873,14 @@ export type Events = {
 
 export type Event = Events[EventCode];
 
-export type SessionEnd = Events[typeof eventCodes.SESSION_END];
-
 export type EventQuery = {
   from: Date;
   to: Date;
   limit?: number;
   startKey?: string;
   filterBy?: string;
+  search?: string;
+  order: SortDir;
 };
 
 export type EventResponse = {

@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
@@ -25,7 +27,6 @@ import (
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/limiter"
-	"github.com/gravitational/teleport/lib/srv/db/mysql"
 )
 
 func TestProxyConnectionLimiting(t *testing.T) {
@@ -78,7 +79,6 @@ func TestProxyConnectionLimiting(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 
 		t.Run(tt.name, func(t *testing.T) {
 			// Keep close functions to all connections. Call and release all active connection at the end of test.
@@ -91,7 +91,7 @@ func TestProxyConnectionLimiting(t *testing.T) {
 			})
 
 			t.Run("limit can be hit", func(t *testing.T) {
-				for i := 0; i < connLimitNumber; i++ {
+				for range connLimitNumber {
 					// Try to connect to the database.
 					dbConn, err := tt.connect()
 					require.NoError(t, err)
@@ -108,7 +108,7 @@ func TestProxyConnectionLimiting(t *testing.T) {
 			// When a connection is released a new can be established
 			t.Run("reconnect one", func(t *testing.T) {
 				// Get one open connection.
-				require.GreaterOrEqual(t, len(connsClosers), 1)
+				require.NotEmpty(t, connsClosers)
 				oneConn := connsClosers[len(connsClosers)-1]
 				connsClosers = connsClosers[:len(connsClosers)-1]
 
@@ -205,7 +205,6 @@ func TestProxyRateLimiting(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 
 		t.Run(tt.name, func(t *testing.T) {
 			// Keep close functions to all connections. Call and release all active connection at the end of test.
@@ -217,7 +216,7 @@ func TestProxyRateLimiting(t *testing.T) {
 				}
 			})
 
-			for i := 0; i < connLimitNumber; i++ {
+			for range connLimitNumber {
 				// Try to connect to the database.
 				pgConn, err := tt.connect()
 				if err == nil {
@@ -247,7 +246,7 @@ func TestProxyRateLimiting(t *testing.T) {
 func TestProxyMySQLVersion(t *testing.T) {
 	ctx := context.Background()
 	testCtx := setupTestContext(ctx, t,
-		withSelfHostedMySQL("mysql", mysql.WithServerVersion("8.0.12")),
+		withSelfHostedMySQL("mysql", withMySQLServerVersion("8.0.12")),
 	)
 
 	go testCtx.startHandlingConnections()

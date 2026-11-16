@@ -1,51 +1,62 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import React, { ReactNode, type JSX } from 'react';
 
-import { Text, Indicator, Box } from 'design';
+import { Box, Flex, Indicator, P1, Text } from 'design';
 import * as Icons from 'design/Icon';
 
-import { StyledTable, StyledPanel } from './StyledTable';
-import { TableProps } from './types';
 import { SortHeaderCell, TextCell } from './Cells';
-import { ClientSidePager, ServerSidePager } from './Pager';
 import InputSearch from './InputSearch';
-import useTable, { State } from './useTable';
+import { ClientSidePager, ServerSidePager } from './Pager';
+import { StyledPanel, StyledTable } from './StyledTable';
+import {
+  BasicTableProps,
+  PagedTableProps,
+  PagerPosition,
+  SearchableBasicTableProps,
+  ServersideTableProps,
+  SortDir,
+  TableProps,
+} from './types';
+import useTable from './useTable';
 
-export default function Container<T>(props: TableProps<T>) {
-  const tableProps = useTable(props);
-  return <Table<T> {...tableProps} />;
-}
+export default function Table<T>(props: TableProps<T>) {
+  const {
+    columns,
+    state,
+    onSort,
+    emptyText,
+    emptyHint,
+    emptyButton,
+    nextPage,
+    prevPage,
+    setSearchValue,
+    isSearchable,
+    fetching,
+    className,
+    hideEmptyIcon,
+    style,
+    serversideProps,
+    customSort,
+    row,
+  } = useTable(props);
 
-export function Table<T>({
-  columns,
-  state,
-  onSort,
-  emptyText,
-  nextPage,
-  prevPage,
-  setSearchValue,
-  isSearchable,
-  fetching,
-  className,
-  style,
-  serversideProps,
-  customSort,
-}: State<T>) {
   const renderHeaders = () => {
     const headers = columns.flatMap(column => {
       if (column.isNonRender) {
@@ -54,15 +65,15 @@ export function Table<T>({
 
       const headerText = column.headerText || '';
 
-      let dir;
+      let dir: SortDir | undefined;
       if (customSort) {
-        dir = customSort.fieldName == column.key ? customSort.dir : null;
+        dir = customSort.fieldName == column.key ? customSort.dir : undefined;
       } else {
         dir =
           state.sort?.key === column.key ||
           state.sort?.key === column.altSortKey
             ? state.sort?.dir
-            : null;
+            : undefined;
       }
 
       const $cell = column.isSortable ? (
@@ -92,37 +103,78 @@ export function Table<T>({
   };
 
   const renderBody = (data: T[]) => {
-    const rows = [];
+    const rows: ReactNode[] = [];
 
-    if (fetching?.fetchStatus === 'loading') {
+    if (
+      fetching?.fetchStatus === 'loading' &&
+      !fetching.disableLoadingIndicator
+    ) {
       return <LoadingIndicator colSpan={columns.length} />;
     }
-    data.map((item, rowIdx) => {
-      const cells = columns.flatMap((column, columnIdx) => {
-        if (column.isNonRender) {
-          return []; // does not include this column.
-        }
+    data.forEach((item, rowIdx) => {
+      const customRow = row?.customRow?.(item);
+      const renderAfter = row?.renderAfter?.(item);
+      const rowKey = row?.getKey?.(item) ?? rowIdx;
 
-        const $cell = column.render ? (
-          column.render(item)
-        ) : (
-          <TextCell data={item[column.key]} />
-        );
+      const trContent = customRow
+        ? customRow
+        : columns.flatMap((column, columnIdx) => {
+            if (column.isNonRender) {
+              return []; // does not include this column.
+            }
 
-        return (
-          <React.Fragment key={`${rowIdx} ${columnIdx}`}>
-            {$cell}
-          </React.Fragment>
+            const $cell = column.render ? (
+              column.render(item)
+            ) : (
+              <TextCell data={column.key ? item[column.key] : undefined} />
+            );
+
+            return (
+              <React.Fragment key={`${rowKey} ${columnIdx}`}>
+                {$cell}
+              </React.Fragment>
+            );
+          });
+
+      rows.push(
+        <tr
+          key={rowKey}
+          onClick={() => row?.onClick?.(item)}
+          style={row?.getStyle?.(item)}
+        >
+          {trContent}
+        </tr>
+      );
+
+      if (renderAfter) {
+        rows.push(
+          <React.Fragment key={`${rowKey}-after`}>{renderAfter}</React.Fragment>
         );
-      });
-      rows.push(<tr key={rowIdx}>{cells}</tr>);
+      }
     });
 
     if (rows.length) {
       return <tbody>{rows}</tbody>;
     }
 
-    return <EmptyIndicator emptyText={emptyText} colSpan={columns.length} />;
+    // if we provide infiniteScrollProps, we want to not render anything if
+    // the fetch status is loading. this is so that the existing items dont dissapear
+    // during the fetch, but also, we dont want the empty text to show while fetching
+    // and lastly, the infinite scroll page will usually provide its own loading
+    // indicator at the bottom of the component
+    if (props.infiniteScrollProps?.fetchStatus === 'loading') {
+      return <tbody></tbody>;
+    }
+
+    return (
+      <EmptyIndicator
+        emptyText={emptyText}
+        hideIcon={hideEmptyIcon}
+        emptyHint={emptyHint}
+        emptyButton={emptyButton}
+        colSpan={columns.length}
+      />
+    );
   };
 
   if (serversideProps) {
@@ -133,30 +185,36 @@ export function Table<T>({
         data={state.data}
         renderHeaders={renderHeaders}
         renderBody={renderBody}
-        nextPage={fetching.onFetchNext}
-        prevPage={fetching.onFetchPrev}
+        nextPage={fetching?.onFetchNext}
+        prevPage={fetching?.onFetchPrev}
         pagination={state.pagination}
         serversideProps={serversideProps}
+        fetchStatus={fetching?.fetchStatus}
       />
     );
   }
 
   if (state.pagination) {
-    return (
-      <PagedTable
-        style={style}
-        className={className}
-        data={state.data}
-        renderHeaders={renderHeaders}
-        renderBody={renderBody}
-        nextPage={nextPage}
-        prevPage={prevPage}
-        pagination={state.pagination}
-        searchValue={state.searchValue}
-        setSearchValue={setSearchValue}
-        fetching={fetching}
-      />
-    );
+    const paginationProps: PagedTableProps<T> = {
+      style,
+      className,
+      data: state.data,
+      renderHeaders,
+      renderBody,
+      nextPage,
+      prevPage,
+      pagination: state.pagination,
+      searchValue: state.searchValue,
+      setSearchValue,
+      fetching,
+      isSearchable,
+    };
+
+    if (state.pagination.CustomTable) {
+      return <state.pagination.CustomTable {...paginationProps} />;
+    }
+
+    return <PagedTable {...paginationProps} />;
   }
 
   if (isSearchable) {
@@ -210,12 +268,12 @@ function SearchableBasicTable<T>({
 }: SearchableBasicTableProps<T>) {
   return (
     <>
-      <StyledPanel borderTopLeftRadius={3} borderTopRightRadius={3}>
+      <Box mb={3}>
         <InputSearch
           searchValue={searchValue}
           setSearchValue={setSearchValue}
         />
-      </StyledPanel>
+      </Box>
       <StyledTable
         className={className}
         borderTopLeftRadius={0}
@@ -241,47 +299,41 @@ function PagedTable<T>({
   fetching,
   className,
   style,
+  isSearchable,
 }: PagedTableProps<T>) {
   const { pagerPosition, paginatedData, currentPage } = pagination;
-  const isTopPager = pagerPosition === 'top';
+  const { showBothPager, showBottomPager, showTopPager } = getPagerPosition(
+    pagerPosition,
+    paginatedData[currentPage].length
+  );
 
-  const radiusProps = {
-    borderTopLeftRadius: 3,
-    borderTopRightRadius: 3,
-    borderBottomLeftRadius: 3,
-    borderBottomRightRadius: 3,
-  };
-
-  if (isTopPager) {
-    radiusProps.borderTopLeftRadius = 0;
-    radiusProps.borderTopRightRadius = 0;
-  } else {
-    radiusProps.borderBottomLeftRadius = 0;
-    radiusProps.borderBottomRightRadius = 0;
-  }
   return (
     <>
-      {isTopPager && (
-        <StyledPanel borderTopLeftRadius={3} borderTopRightRadius={3}>
-          <InputSearch
-            searchValue={searchValue}
-            setSearchValue={setSearchValue}
-          />
-          <ClientSidePager
-            nextPage={nextPage}
-            prevPage={prevPage}
-            data={data}
-            {...fetching}
-            {...pagination}
-          />
+      {(isSearchable || showTopPager || showBothPager) && (
+        <StyledPanel>
+          {isSearchable && (
+            <InputSearch
+              searchValue={searchValue}
+              setSearchValue={setSearchValue}
+            />
+          )}
+          {(showTopPager || showBothPager) && (
+            <ClientSidePager
+              nextPage={nextPage}
+              prevPage={prevPage}
+              data={data}
+              {...fetching}
+              {...pagination}
+            />
+          )}
         </StyledPanel>
       )}
-      <StyledTable {...radiusProps} className={className} style={style}>
+      <StyledTable className={className} style={style}>
         {renderHeaders()}
         {renderBody(paginatedData[currentPage])}
       </StyledTable>
-      {!isTopPager && (
-        <StyledPanel borderBottomLeftRadius={3} borderBottomRightRadius={3}>
+      {(showBottomPager || showBothPager) && (
+        <StyledPanel>
           <ClientSidePager
             nextPage={nextPage}
             prevPage={prevPage}
@@ -303,44 +355,92 @@ function ServersideTable<T>({
   className,
   style,
   serversideProps,
+  fetchStatus,
+  pagination,
 }: ServersideTableProps<T>) {
+  const { showTopPager, showBothPager, showBottomPager } = getPagerPosition(
+    pagination?.pagerPosition,
+    data.length
+  );
   return (
     <>
-      {serversideProps.serversideSearchPanel}
+      <StyledPanel>
+        <Box width="100%">{serversideProps?.serversideSearchPanel}</Box>
+        {(showTopPager || showBothPager) && (
+          <ServerSidePager
+            nextPage={nextPage}
+            prevPage={prevPage}
+            isLoading={fetchStatus === 'loading'}
+          />
+        )}
+      </StyledPanel>
       <StyledTable className={className} style={style}>
         {renderHeaders()}
         {renderBody(data)}
       </StyledTable>
-      <StyledPanel borderBottomLeftRadius={3} borderBottomRightRadius={3}>
-        <ServerSidePager nextPage={nextPage} prevPage={prevPage} />
-      </StyledPanel>
+      {(showBottomPager || showBothPager) && (
+        <Box mt={2}>
+          <ServerSidePager
+            nextPage={nextPage}
+            prevPage={prevPage}
+            isLoading={fetchStatus === 'loading'}
+          />
+        </Box>
+      )}
     </>
   );
 }
 
 const EmptyIndicator = ({
   emptyText,
+  emptyHint,
+  emptyButton,
   colSpan,
+  hideIcon = false,
 }: {
+  hideIcon?: boolean;
   emptyText: string;
+  emptyHint: string | undefined;
+  emptyButton: JSX.Element | undefined;
   colSpan: number;
 }) => (
   <tfoot>
     <tr>
       <td colSpan={colSpan}>
-        <Text
-          typography="paragraph"
+        <Flex
           m="4"
-          color="text.primary"
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-          }}
+          gap={2}
+          flexDirection="column"
+          alignItems="center"
+          justifyContent="center"
         >
-          <Icons.Database mr="2" />
-          {emptyText}
-        </Text>
+          <Flex
+            gap={3}
+            flexWrap="nowrap"
+            alignItems="flex-start"
+            justifyContent="center"
+          >
+            {/* TODO (avatus) allow overriding this icon */}
+            {!hideIcon && (
+              <Icons.Database
+                color="text.main"
+                // line-height and height must match line-height of Text below for the icon to be
+                // aligned to the first line of Text if Text spans multiple lines.
+                css={`
+                  line-height: 32px;
+                  height: 32px;
+                `}
+              />
+            )}
+            <Text textAlign="center" typography="h1" m="0" color="text.main">
+              {emptyText}
+            </Text>
+          </Flex>
+
+          {emptyHint && <P1 textAlign="center">{emptyHint}</P1>}
+
+          {emptyButton}
+        </Flex>
       </td>
     </tr>
   </tfoot>
@@ -358,29 +458,24 @@ const LoadingIndicator = ({ colSpan }: { colSpan: number }) => (
   </tfoot>
 );
 
-type BasicTableProps<T> = {
-  data: T[];
-  renderHeaders: () => JSX.Element;
-  renderBody: (data: T[]) => JSX.Element;
-  className?: string;
-  style?: React.CSSProperties;
-};
+/**
+ * Returns pager position flags.
+ *
+ * If pagerPosition is not defined, it defaults to:
+ *   - top pager only: if current dataLen < 5
+ *   - both top and bottom pager if dataLen > 5
+ */
+export function getPagerPosition(
+  pagerPosition: PagerPosition | undefined,
+  dataLen: number
+) {
+  const hasSufficientData = dataLen > 5;
 
-type SearchableBasicTableProps<T> = BasicTableProps<T> & {
-  searchValue: string;
-  setSearchValue: (searchValue: string) => void;
-};
+  const showBottomPager = pagerPosition === 'bottom';
+  const showTopPager =
+    pagerPosition === 'top' || (!pagerPosition && !hasSufficientData);
+  const showBothPager =
+    pagerPosition === 'both' || (!pagerPosition && hasSufficientData);
 
-type PagedTableProps<T> = SearchableBasicTableProps<T> & {
-  nextPage: () => void;
-  prevPage: () => void;
-  pagination: State<T>['state']['pagination'];
-  fetching?: State<T>['fetching'];
-};
-
-type ServersideTableProps<T> = BasicTableProps<T> & {
-  nextPage: () => void;
-  prevPage: () => void;
-  pagination: State<T>['state']['pagination'];
-  serversideProps: State<T>['serversideProps'];
-};
+  return { showBothPager, showBottomPager, showTopPager };
+}

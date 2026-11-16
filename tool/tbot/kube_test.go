@@ -1,24 +1,24 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package main
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/x509/pkix"
 	"encoding/json"
 	"testing"
@@ -28,8 +28,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/identityfile"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/fixtures"
 	"github.com/gravitational/teleport/lib/tlsca"
 )
@@ -39,7 +40,7 @@ func TestGetKubeCredentialData(t *testing.T) {
 	ca, err := tlsca.FromKeys([]byte(fixtures.TLSCACertPEM), []byte(fixtures.TLSCAKeyPEM))
 	require.NoError(t, err)
 
-	privateKey, err := rsa.GenerateKey(rand.Reader, constants.RSAKeySize)
+	privateKey, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
 	require.NoError(t, err)
 
 	clock := clockwork.NewFakeClock()
@@ -52,7 +53,8 @@ func TestGetKubeCredentialData(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	privateKeyBytes := tlsca.MarshalPrivateKeyPEM(privateKey)
+	privateKeyBytes, err := keys.MarshalPrivateKey(privateKey)
+	require.NoError(t, err)
 	idFile := &identityfile.IdentityFile{
 		PrivateKey: privateKeyBytes,
 		Certs: identityfile.Certs{
@@ -65,21 +67,20 @@ func TestGetKubeCredentialData(t *testing.T) {
 		},
 	}
 
-	data, err := getCredentialData(idFile)
+	data, err := getCredentialData(idFile, clock.Now())
 	require.NoError(t, err)
 
-	var parsed map[string]interface{}
+	var parsed map[string]any
 	require.NoError(t, json.Unmarshal(data, &parsed))
-	status := parsed["status"].(map[string]interface{})
+	status := parsed["status"].(map[string]any)
 	require.NotNil(t, status)
 
 	require.Equal(t, string(certBytes), status["clientCertificateData"])
 	require.Equal(t, string(privateKeyBytes), status["clientKeyData"])
 
-	// Note: We'll usually subtract a minute from the expiration time, but
-	// since clockwerk's testing clock is set to 1984 we don't take that
-	// conditional.
+	// Note: We usually subtract a minute from the expiration time in
+	// getCredentialData to avoid the cert expiring mid-request.
 	ts, err := time.Parse(time.RFC3339, status["expirationTimestamp"].(string))
 	require.NoError(t, err)
-	require.Equal(t, notAfter, ts)
+	require.WithinDuration(t, notAfter.Add(-1*time.Minute), ts, time.Second)
 }

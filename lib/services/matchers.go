@@ -1,156 +1,147 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
-	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
+	"context"
+	"log/slog"
+	"slices"
+	"strings"
 
+	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
 	apiutils "github.com/gravitational/teleport/api/utils"
 	azureutils "github.com/gravitational/teleport/api/utils/azure"
+	"github.com/gravitational/teleport/lib/scopes"
+	"github.com/gravitational/teleport/lib/utils"
+	libslices "github.com/gravitational/teleport/lib/utils/slices"
+	"github.com/gravitational/teleport/lib/utils/typical"
 )
 
 // ResourceMatcher matches cluster resources.
 type ResourceMatcher struct {
 	// Labels match resource labels.
 	Labels types.Labels
+	// AWS contains AWS specific settings.
+	AWS ResourceMatcherAWS
+}
+
+// ResourceMatcherAWS contains AWS specific settings.
+type ResourceMatcherAWS struct {
+	// AssumeRoleARN is the AWS role to assume for accessing the resource.
+	AssumeRoleARN string
+	// ExternalID is an optional AWS external ID used to enable assuming an AWS
+	// role across accounts.
+	ExternalID string
 }
 
 // ResourceMatchersToTypes converts []]services.ResourceMatchers into []*types.ResourceMatcher
 func ResourceMatchersToTypes(in []ResourceMatcher) []*types.DatabaseResourceMatcher {
 	out := make([]*types.DatabaseResourceMatcher, len(in))
 	for i, resMatcher := range in {
-		resMatcher := resMatcher
 		out[i] = &types.DatabaseResourceMatcher{
 			Labels: &resMatcher.Labels,
+			AWS: types.ResourceMatcherAWS{
+				AssumeRoleARN: resMatcher.AWS.AssumeRoleARN,
+				ExternalID:    resMatcher.AWS.ExternalID,
+			},
 		}
 	}
 	return out
 }
 
-// AWSSSM provides options to use when executing SSM documents
-type AWSSSM struct {
-	// DocumentName is the name of the document to use when executing an
-	// SSM command
-	DocumentName string
-}
-
-// InstallerParams are passed to the AWS SSM document
-type InstallerParams struct {
-	// JoinMethod is the method to use when joining the cluster
-	JoinMethod types.JoinMethod
-	// JoinToken is the token to use when joining the cluster
-	JoinToken string
-	// ScriptName is the name of the teleport script for the EC2
-	// instance to execute
-	ScriptName string
-	// InstallTeleport disables agentless discovery
-	InstallTeleport bool
-	// SSHDConfig provides the path to write sshd configuration changes
-	SSHDConfig string
-}
-
-// AWSMatcher matches AWS databases.
-type AWSMatcher struct {
-	// Types are AWS database types to match, "rds" or "redshift".
-	Types []string
-	// Regions are AWS regions to query for databases.
-	Regions []string
-	// Tags are AWS tags to match.
-	Tags types.Labels
-	// Params are passed to AWS when executing the SSM document
-	Params InstallerParams
-	// SSM provides options to use when sending a document command to
-	// an EC2 node
-	SSM *AWSSSM
-}
-
-// AzureMatcher matches Azure databases.
-type AzureMatcher struct {
-	// Subscriptions are Azure subscriptions to query for resources.
-	Subscriptions []string
-	// ResourceGroups are Azure resource groups to query for resources.
-	ResourceGroups []string
-	// Types are Azure resource types to match, for example "mysql" or "postgres".
-	Types []string
-	// Regions are Azure regions to query for resources.
-	Regions []string
-	// ResourceTags are Azure tags to match.
-	ResourceTags types.Labels
-}
-
-// GCPMatcher matches GCP resources.
-type GCPMatcher struct {
-	// Types are GKE resource types to match: "gke".
-	Types []string `yaml:"types,omitempty"`
-	// Locations are GCP locations to search resources for.
-	Locations []string `yaml:"locations,omitempty"`
-	// Tags are GCP labels to match.
-	Tags types.Labels `yaml:"tags,omitempty"`
-	// ProjectIDs are the GCP project IDs where the resources are deployed.
-	ProjectIDs []string `yaml:"project_ids,omitempty"`
-}
-
-// SimplifyAzureMatchers returns simplified Azure Matchers.
-// Selectors are deduplicated, wildcard in a selector reduces the selector
-// to just the wildcard, and defaults are applied.
-func SimplifyAzureMatchers(matchers []AzureMatcher) []AzureMatcher {
-	result := make([]AzureMatcher, 0, len(matchers))
+// SimplifyAzureMatchers returns simplified Azure matchers. Each selector list
+// is trimmed, deduplicated, and collapsed to the wildcard if any entry is the
+// wildcard or the list is empty. Lists where every entry is whitespace-only are
+// preserved verbatim rather than widened to wildcard, so invalid hand-edited
+// scopes fail closed downstream instead of matching all.
+func SimplifyAzureMatchers(matchers []types.AzureMatcher) []types.AzureMatcher {
+	result := make([]types.AzureMatcher, 0, len(matchers))
 	for _, m := range matchers {
-		subs := apiutils.Deduplicate(m.Subscriptions)
-		groups := apiutils.Deduplicate(m.ResourceGroups)
-		regions := apiutils.Deduplicate(m.Regions)
+		subs := simplifySelector(m.Subscriptions)
+		groups := simplifySelector(m.ResourceGroups)
 		ts := apiutils.Deduplicate(m.Types)
-		if len(subs) == 0 || slices.Contains(subs, types.Wildcard) {
-			subs = []string{types.Wildcard}
-		}
-		if len(groups) == 0 || slices.Contains(groups, types.Wildcard) {
-			groups = []string{types.Wildcard}
-		}
-		if len(regions) == 0 || slices.Contains(regions, types.Wildcard) {
+		var regions []string
+		if len(m.Regions) == 0 || slices.Contains(m.Regions, types.Wildcard) {
 			regions = []string{types.Wildcard}
 		} else {
-			for i, region := range regions {
-				regions[i] = azureutils.NormalizeLocation(region)
-			}
+			// Normalize before dedup so case-variant inputs ("East US", "eastus") collapse.
+			// The fresh slice also keeps m.Regions safe from the watcher's concurrent IsEqual reads.
+			regions = apiutils.Deduplicate(libslices.Map(m.Regions, azureutils.NormalizeLocation))
 		}
-		result = append(result, AzureMatcher{
-			Subscriptions:  subs,
-			ResourceGroups: groups,
-			Regions:        regions,
-			Types:          ts,
-			ResourceTags:   m.ResourceTags,
-		})
+		elem := m
+		elem.Subscriptions = subs
+		elem.ResourceGroups = groups
+		elem.Regions = regions
+		elem.Types = ts
+
+		result = append(result, elem)
 	}
 	return result
 }
 
+// simplifySelector applies the SimplifyAzureMatchers normalization rules to a
+// single selector list (Subscriptions or ResourceGroups). The four input
+// shapes are handled distinctly to avoid silently widening malformed config
+// to the wildcard:
+//
+//   - empty input (len == 0)                -> wildcard (existing convention)
+//   - any wildcard among trimmed entries    -> wildcard (existing convention)
+//   - non-empty input with at least one
+//     non-empty trimmed entry               -> trimmed, deduped entries
+//   - non-empty input that ALL trim to empty
+//     (e.g. [" "], ["", "  "])              -> original input preserved verbatim
+//     (do NOT widen to wildcard; the Azure
+//     SDK call surfaces the typo)
+func simplifySelector(input []string) []string {
+	if len(input) == 0 {
+		return []string{types.Wildcard}
+	}
+	trimmed := libslices.FilterMapUnique(input, utils.TrimNonEmpty)
+	if slices.Contains(trimmed, types.Wildcard) {
+		return []string{types.Wildcard}
+	}
+	if len(trimmed) == 0 {
+		// User supplied selectors but every entry was whitespace-only.
+		// This is a config typo, not a "match everything" signal.
+		// Preserve the original input so the Azure SDK rejects it as an
+		// invalid scope rather than silently broadening discovery.
+		return input
+	}
+	return trimmed
+}
+
 // MatchResourceLabels returns true if any of the provided selectors matches the provided database.
-func MatchResourceLabels(matchers []ResourceMatcher, resource types.ResourceWithLabels) bool {
+func MatchResourceLabels(matchers []ResourceMatcher, labels map[string]string) bool {
 	for _, matcher := range matchers {
 		if len(matcher.Labels) == 0 {
 			return false
 		}
-		match, _, err := MatchLabels(matcher.Labels, resource.GetAllLabels())
+		match, _, err := MatchLabels(matcher.Labels, labels)
 		if err != nil {
-			logrus.WithError(err).Errorf("Failed to match labels %v: %v.",
-				matcher.Labels, resource)
+			slog.ErrorContext(context.Background(), "Failed to match labels",
+				"error", err,
+				"matcher_labels", matcher.Labels,
+				"resource_labels", labels,
+			)
 			return false
 		}
 		if match {
@@ -160,10 +151,34 @@ func MatchResourceLabels(matchers []ResourceMatcher, resource types.ResourceWith
 	return false
 }
 
+// resourceWithTargetHealth wraps a resource to provide target health info.
+type resourceWithTargetHealth struct {
+	types.ResourceWithLabels
+	health types.TargetHealthStatus
+}
+
+func (r *resourceWithTargetHealth) GetTargetHealthStatus() types.TargetHealthStatus {
+	return r.health
+}
+
 // ResourceSeenKey is used as a key for a map that keeps track
 // of unique resource names and address. Currently "addr"
 // only applies to resource Application.
-type ResourceSeenKey struct{ name, addr string }
+type ResourceSeenKey struct{ name, kind, addr, scope string }
+
+// MatchResourcesByFilters filters provided resources with profiled filter.
+func MatchResourcesByFilters[E types.ResourceWithLabels, S ~[]E](all S, filter MatchResourceFilter) (S, error) {
+	var filtered S
+	for _, r := range all {
+		match, err := MatchResourceByFilters(r, filter, nil)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		} else if match {
+			filtered = append(filtered, r)
+		}
+	}
+	return filtered, nil
+}
 
 // MatchResourceByFilters returns true if all filter values given matched against the resource.
 //
@@ -178,49 +193,79 @@ type ResourceSeenKey struct{ name, addr string }
 // is not provided but is provided for kind `KubernetesCluster`.
 func MatchResourceByFilters(resource types.ResourceWithLabels, filter MatchResourceFilter, seenMap map[ResourceSeenKey]struct{}) (bool, error) {
 	var specResource types.ResourceWithLabels
+	kind := resource.GetKind()
 
+	scope := ""
+	switch res := resource.(type) {
+	case *types.KubernetesClusterV3:
+		scope = res.GetScope()
+	case types.KubeServer:
+		scope = res.GetScope()
+	case types.AppServer:
+		scope = res.GetScope()
+	case types.Server:
+		scope = res.GetScope()
+	}
 	// We assume when filtering for services like KubeService, AppServer, and DatabaseServer
 	// the user is wanting to filter the contained resource ie. KubeClusters, Application, and Database.
-	resourceKey := ResourceSeenKey{}
-	switch filter.ResourceKind {
+	key := ResourceSeenKey{
+		kind:  kind,
+		name:  resource.GetName(),
+		scope: scopes.NormalizeForEquality(scope),
+	}
+	switch kind {
 	case types.KindNode,
 		types.KindDatabaseService,
-		types.KindKubernetesCluster, types.KindKubePod,
-		types.KindWindowsDesktop, types.KindWindowsDesktopService:
+		types.KindKubernetesCluster,
+		types.KindWindowsDesktop, types.KindWindowsDesktopService,
+		types.KindLinuxDesktop,
+		types.KindUserGroup,
+		types.KindIdentityCenterAccount,
+		types.KindIdentityCenterAccountAssignment,
+		types.KindGitServer:
 		specResource = resource
-		resourceKey.name = specResource.GetName()
-
-	case types.KindKubeService, types.KindKubeServer:
+	case types.KindKubeServer:
 		if seenMap != nil {
 			return false, trace.BadParameter("checking for duplicate matches for resource kind %q is not supported", filter.ResourceKind)
 		}
 		return matchAndFilterKubeClusters(resource, filter)
-
-	case types.KindAppServer:
-		server, ok := resource.(types.AppServer)
-		if !ok {
-			return false, trace.BadParameter("expected types.AppServer, got %T", resource)
-		}
-		specResource = server.GetApp()
-		app := server.GetApp()
-		resourceKey.name = app.GetName()
-		resourceKey.addr = app.GetPublicAddr()
 
 	case types.KindDatabaseServer:
 		server, ok := resource.(types.DatabaseServer)
 		if !ok {
 			return false, trace.BadParameter("expected types.DatabaseServer, got %T", resource)
 		}
-		specResource = server.GetDatabase()
-		resourceKey.name = specResource.GetName()
-
+		specResource = &resourceWithTargetHealth{
+			ResourceWithLabels: server.GetDatabase(),
+			health:             server.GetTargetHealthStatus(),
+		}
+		key.name = specResource.GetName()
+	case types.KindAppServer, types.KindSAMLIdPServiceProvider:
+		switch appOrSP := resource.(type) {
+		case types.AppServer:
+			app := appOrSP.GetApp()
+			specResource = app
+			key.addr = app.GetPublicAddr()
+			key.name = app.GetName()
+		case types.SAMLIdPServiceProvider:
+			specResource = appOrSP
+			key.name = specResource.GetName()
+		default:
+			return false, trace.BadParameter("expected types.SAMLIdPServiceProvider or types.AppServer, got %T", resource)
+		}
 	default:
-		return false, trace.NotImplemented("filtering for resource kind %q not supported", filter.ResourceKind)
+		// We check if the resource kind is a Kubernetes resource kind to reduce the amount of
+		// of cases we need to handle. If the resource type didn't match any arm before
+		// and it is not a Kubernetes resource kind, we return an error.
+		if !slices.Contains(types.KubernetesResourcesKinds, filter.ResourceKind) && !strings.HasPrefix(filter.ResourceKind, types.AccessRequestPrefixKindKube) {
+			return false, trace.NotImplemented("filtering for resource kind %q not supported", kind)
+		}
+		specResource = resource
 	}
 
 	var match bool
 
-	if len(filter.Labels) == 0 && len(filter.SearchKeywords) == 0 && filter.PredicateExpression == "" {
+	if filter.IsSimple() {
 		match = true
 	}
 
@@ -234,36 +279,37 @@ func MatchResourceByFilters(resource types.ResourceWithLabels, filter MatchResou
 
 	// Deduplicate matches.
 	if match && seenMap != nil {
-		if _, exists := seenMap[resourceKey]; exists {
+		if _, exists := seenMap[key]; exists {
 			return false, nil
 		}
-		seenMap[resourceKey] = struct{}{}
+		seenMap[key] = struct{}{}
 	}
 
 	return match, nil
 }
 
 func matchResourceByFilters(resource types.ResourceWithLabels, filter MatchResourceFilter) (bool, error) {
-	if filter.PredicateExpression != "" {
-		parser, err := NewResourceParser(resource)
-		if err != nil {
-			return false, trace.Wrap(err)
-		}
-
-		switch match, err := parser.EvalBoolPredicate(filter.PredicateExpression); {
-		case err != nil:
-			return false, trace.BadParameter("failed to parse predicate expression: %s", err.Error())
-		case !match:
-			return false, nil
-		}
+	if !types.MatchKinds(resource, filter.Kinds) {
+		return false, nil
 	}
 
 	if !types.MatchLabels(resource, filter.Labels) {
 		return false, nil
 	}
 
-	if !resource.MatchSearch(filter.SearchKeywords) {
+	if len(filter.SearchKeywords) > 0 && !resource.MatchSearch(filter.SearchKeywords) {
 		return false, nil
+	}
+
+	if filter.PredicateExpression != nil {
+		match, err := filter.PredicateExpression.Evaluate(resource)
+		if err != nil {
+			return false, trace.Wrap(err)
+		}
+
+		if !match {
+			return false, nil
+		}
 	}
 
 	return true, nil
@@ -276,52 +322,24 @@ func matchResourceByFilters(resource types.ResourceWithLabels, filter MatchResou
 //     modified in place with only the matched clusters
 //  3. only returns true if the service contained any matched cluster
 func matchAndFilterKubeClusters(resource types.ResourceWithLabels, filter MatchResourceFilter) (bool, error) {
-	if len(filter.Labels) == 0 && len(filter.SearchKeywords) == 0 && filter.PredicateExpression == "" {
+	if filter.IsSimple() {
 		return true, nil
 	}
 
 	switch server := resource.(type) {
-	case types.Server:
-		return matchAndFilterKubeClustersLegacy(server, filter)
 	case types.KubeServer:
 		kubeCluster := server.GetCluster()
 		if kubeCluster == nil {
 			return false, nil
 		}
-		match, err := matchResourceByFilters(kubeCluster, filter)
+		match, err := matchResourceByFilters(&resourceWithTargetHealth{
+			ResourceWithLabels: kubeCluster,
+			health:             server.GetTargetHealthStatus(),
+		}, filter)
 		return match, trace.Wrap(err)
 	default:
 		return false, trace.BadParameter("unexpected kube server of type %T", resource)
 	}
-}
-
-// matchAndFilterKubeClustersLegacy is used by matchAndFilterKubeClusters to filter kube clusters that are stil living in old kube services
-// REMOVE in 13.0
-func matchAndFilterKubeClustersLegacy(server types.Server, filter MatchResourceFilter) (bool, error) {
-	kubeClusters := server.GetKubernetesClusters()
-
-	// Apply filter to each kube cluster.
-	filtered := make([]*types.KubernetesCluster, 0, len(kubeClusters))
-	for _, kube := range kubeClusters {
-		kubeResource, err := types.NewKubernetesClusterV3FromLegacyCluster(server.GetNamespace(), kube)
-		if err != nil {
-			return false, trace.Wrap(err)
-		}
-
-		match, err := matchResourceByFilters(kubeResource, filter)
-		if err != nil {
-			return false, trace.Wrap(err)
-		}
-		if match {
-			filtered = append(filtered, kube)
-		}
-	}
-
-	// Update in place with the filtered clusters.
-	server.SetKubernetesClusters(filtered)
-
-	// Length of 0 means this service does not contain any matches.
-	return len(filtered) > 0, nil
 }
 
 // MatchResourceFilter holds the filter values to match against a resource.
@@ -333,74 +351,36 @@ type MatchResourceFilter struct {
 	// SearchKeywords is a list of search keywords to match.
 	SearchKeywords []string
 	// PredicateExpression holds boolean conditions that must be matched.
-	PredicateExpression string
+	PredicateExpression typical.Expression[types.ResourceWithLabels, bool]
+	// Kinds is a list of resourceKinds to be used when doing a unified resource query.
+	// It will filter out any kind not present in the list. If the list is not present or empty
+	// then all kinds are valid and will be returned (still subject to other included filters)
+	Kinds []string
 }
 
-const (
-	// AWSMatcherEC2 is the AWS matcher type for EC2 instances.
-	AWSMatcherEC2 = "ec2"
-	// AWSMatcherEKS is the AWS matcher type for AWS Kubernetes.
-	AWSMatcherEKS = "eks"
-	// AWSMatcherRDS is the AWS matcher type for RDS databases.
-	AWSMatcherRDS = "rds"
-	// AWSMatcherRDSProxy is the AWS matcher type for RDS Proxy databases.
-	AWSMatcherRDSProxy = "rdsproxy"
-	// AWSMatcherRedshift is the AWS matcher type for Redshift databases.
-	AWSMatcherRedshift = "redshift"
-	// AWSMatcherRedshiftServerless is the AWS matcher type for Redshift Serverless databases.
-	AWSMatcherRedshiftServerless = "redshift-serverless"
-	// AWSMatcherElastiCache is the AWS matcher type for ElastiCache databases.
-	AWSMatcherElastiCache = "elasticache"
-	// AWSMatcherMemoryDB is the AWS matcher type for MemoryDB databases.
-	AWSMatcherMemoryDB = "memorydb"
-)
-
-// SupportedAWSMatchers is list of AWS services currently supported by the
-// Teleport discovery service.
-var SupportedAWSMatchers = []string{
-	AWSMatcherEC2,
-	AWSMatcherEKS,
-	AWSMatcherRDS,
-	AWSMatcherRDSProxy,
-	AWSMatcherRedshift,
-	AWSMatcherRedshiftServerless,
-	AWSMatcherElastiCache,
-	AWSMatcherMemoryDB,
+// IsSimple is used to short-circuit matching when a filter doesn't specify anything more
+// specific than resource kind.
+func (m *MatchResourceFilter) IsSimple() bool {
+	return len(m.Labels) == 0 &&
+		len(m.SearchKeywords) == 0 &&
+		m.PredicateExpression == nil &&
+		len(m.Kinds) == 0
 }
 
-const (
-	// AzureMatcherVM is the Azure matcher type for Azure VMs.
-	AzureMatcherVM = "vm"
-	// AzureMatcherKubernetes is the Azure matcher type for Azure Kubernetes.
-	AzureMatcherKubernetes = "aks"
-	// AzureMatcherMySQL is the Azure matcher type for Azure MySQL databases.
-	AzureMatcherMySQL = "mysql"
-	// AzureMatcherPostgres is the Azure matcher type for Azure Postgres databases.
-	AzureMatcherPostgres = "postgres"
-	// AzureMatcherRedis is the Azure matcher type for Azure Cache for Redis databases.
-	AzureMatcherRedis = "redis"
-	// AzureMatcherSQLServer is the Azure matcher type for SQL Server databases.
-	AzureMatcherSQLServer = "sqlserver"
-)
-
-// SupportedAzureMatchers is list of Azure services currently supported by the
-// Teleport discovery service.
-var SupportedAzureMatchers = []string{
-	AzureMatcherVM,
-	AzureMatcherKubernetes,
-	AzureMatcherMySQL,
-	AzureMatcherPostgres,
-	AzureMatcherRedis,
-	AzureMatcherSQLServer,
-}
-
-const (
-	// GCPMatcherKubernetes is the GCP matcher type for GCP kubernetes.
-	GCPMatcherKubernetes = "gke"
-)
-
-// SupportedGCPMatchers is list of GCP services currently supported by the
-// Teleport discovery service.
-var SupportedGCPMatchers = []string{
-	GCPMatcherKubernetes,
+// MatchResourceFilterFromListResourceRequest converts a
+// proto.ListResourcesRequest to MatchResourceFilter.
+func MatchResourceFilterFromListResourceRequest(req *proto.ListResourcesRequest) (MatchResourceFilter, error) {
+	filter := MatchResourceFilter{
+		ResourceKind:   req.ResourceType,
+		Labels:         req.Labels,
+		SearchKeywords: req.SearchKeywords,
+	}
+	if req.PredicateExpression != "" {
+		expression, err := NewResourceExpression(req.PredicateExpression)
+		if err != nil {
+			return MatchResourceFilter{}, trace.Wrap(err)
+		}
+		filter.PredicateExpression = expression
+	}
+	return filter, nil
 }

@@ -1,26 +1,28 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package metrics
 
 import (
+	"errors"
 	"runtime"
 
 	"github.com/gravitational/trace"
-	om "github.com/grpc-ecosystem/go-grpc-middleware/providers/openmetrics/v2"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/gravitational/teleport"
@@ -31,10 +33,18 @@ import (
 //   - returns an error if a collector does not fulfill the consistency and
 //     uniqueness criteria
 func RegisterPrometheusCollectors(collectors ...prometheus.Collector) error {
+	return RegisterCollectors(prometheus.DefaultRegisterer, collectors...)
+}
+
+// RegisterCollectors registers the collectors in the registry. Any errors
+// for already registered collectors are ignored. Errors are only returned
+// if a collector does not fulfill the consistency and uniqueness criteria.
+func RegisterCollectors(registry prometheus.Registerer, collectors ...prometheus.Collector) error {
 	var errs []error
 	for _, c := range collectors {
-		if err := prometheus.Register(c); err != nil {
-			if _, ok := err.(prometheus.AlreadyRegisteredError); ok {
+		if err := registry.Register(c); err != nil {
+			var alreadyRegisteredError prometheus.AlreadyRegisteredError
+			if errors.As(err, &alreadyRegisteredError) {
 				continue
 			}
 			errs = append(errs, err)
@@ -58,33 +68,4 @@ func BuildCollector() prometheus.Collector {
 		},
 		func() float64 { return 1 },
 	)
-}
-
-// CreateGRPCServerMetrics creates server grpc metrics configuration that is to be registered and used by the caller
-// in an openmetrics unary and/or stream interceptor
-func CreateGRPCServerMetrics(latencyEnabled bool, labels prometheus.Labels) *om.ServerMetrics {
-	serverOpts := []om.ServerMetricsOption{om.WithServerCounterOptions(om.WithConstLabels(labels))}
-	if latencyEnabled {
-		histOpts := grpcHistogramOpts(labels)
-		serverOpts = append(serverOpts, om.WithServerHandlingTimeHistogram(histOpts...))
-	}
-	return om.NewServerMetrics(serverOpts...)
-}
-
-// CreateGRPCClientMetrics creates client grpc metrics configuration that is to be registered and used by the caller
-// in an openmetrics unary and/or stream interceptor
-func CreateGRPCClientMetrics(latencyEnabled bool, labels prometheus.Labels) *om.ClientMetrics {
-	clientOpts := []om.ClientMetricsOption{om.WithClientCounterOptions(om.WithConstLabels(labels))}
-	if latencyEnabled {
-		histOpts := grpcHistogramOpts(labels)
-		clientOpts = append(clientOpts, om.WithClientHandlingTimeHistogram(histOpts...))
-	}
-	return om.NewClientMetrics(clientOpts...)
-}
-
-func grpcHistogramOpts(labels prometheus.Labels) []om.HistogramOption {
-	return []om.HistogramOption{
-		om.WithHistogramBuckets(prometheus.ExponentialBuckets(0.001, 2, 16)),
-		om.WithHistogramConstLabels(labels),
-	}
 }

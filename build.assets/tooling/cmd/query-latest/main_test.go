@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package main
 
@@ -28,17 +30,16 @@ func TestGetLatest(t *testing.T) {
 	tests := []struct {
 		desc     string
 		spec     string
-		releases []string
+		releases map[string][]string
 		wantErr  require.ErrorAssertionFunc
 		latest   string
 	}{
 		{
 			desc: "pass",
 			spec: "v8",
-			releases: []string{
-				"v8.1.9",
-				"v8.1.10",
-				"v8.0.11",
+			releases: map[string][]string{
+				"teleport":         {"v8.1.9", "v8.1.10", "v8.0.11"},
+				"teleport-private": {"v1.0.1"},
 			},
 			wantErr: require.NoError,
 			latest:  "v8.1.10",
@@ -46,10 +47,9 @@ func TestGetLatest(t *testing.T) {
 		{
 			desc: "fail-bad-spec",
 			spec: "v9",
-			releases: []string{
-				"v8.1.9",
-				"v8.1.10",
-				"v8.0.11",
+			releases: map[string][]string{
+				"teleport":         {"v8.1.9", "v8.1.10", "v8.0.11"},
+				"teleport-private": {"v1.0.1"},
 			},
 			wantErr: require.Error,
 			latest:  "",
@@ -57,10 +57,9 @@ func TestGetLatest(t *testing.T) {
 		{
 			desc: "pass-prerelease",
 			spec: "v8",
-			releases: []string{
-				"v8.1.10-rc.1",
-				"v8.1.10",
-				"v8.1.10-alpha.1",
+			releases: map[string][]string{
+				"teleport":         {"v8.1.10-rc.1", "v8.1.10", "v8.1.10-alpha.1"},
+				"teleport-private": {"v1.0.1"},
 			},
 			wantErr: require.NoError,
 			latest:  "v8.1.10",
@@ -68,14 +67,52 @@ func TestGetLatest(t *testing.T) {
 		{
 			desc: "pass-major-minor",
 			spec: "v8.1",
-			releases: []string{
-				"v8.1.9",
-				"v8.2.1",
-				"v8.1.10",
-				"v8.0.11",
+			releases: map[string][]string{
+				"teleport":         {"v8.1.9", "v8.2.1", "v8.1.10", "v8.0.11"},
+				"teleport-private": {"v1.0.1"},
 			},
 			wantErr: require.NoError,
 			latest:  "v8.1.10",
+		},
+		{
+			desc: "latest-private",
+			spec: "v8",
+			releases: map[string][]string{
+				"teleport":         {"v8.1.9", "v8.2.1", "v8.1.10", "v8.0.11"},
+				"teleport-private": {"v8.2.2"},
+			},
+			wantErr: require.NoError,
+			latest:  "private-v8.2.2",
+		},
+		{
+			desc: "latest-not-private",
+			spec: "v8",
+			releases: map[string][]string{
+				"teleport":         {"v8.1.9", "v8.2.3", "v8.1.10", "v8.0.11"},
+				"teleport-private": {"v8.2.2"},
+			},
+			wantErr: require.NoError,
+			latest:  "v8.2.3",
+		},
+		{
+			desc: "no-private-releases",
+			spec: "v8",
+			releases: map[string][]string{
+				"teleport":         {"v8.1.9", "v8.2.3", "v8.1.10", "v8.0.11"},
+				"teleport-private": {},
+			},
+			wantErr: require.Error,
+			latest:  "",
+		},
+		{
+			desc: "no-matching-private",
+			spec: "v8",
+			releases: map[string][]string{
+				"teleport":         {"v8.1.9", "v8.2.3", "v8.1.10", "v8.0.11"},
+				"teleport-private": {"v7.5.2"},
+			},
+			wantErr: require.NoError,
+			latest:  "v8.2.3",
 		},
 	}
 	for _, test := range tests {
@@ -92,12 +129,12 @@ func TestGetLatest(t *testing.T) {
 }
 
 type fakeGitHub struct {
-	releases []string
+	releases map[string][]string
 }
 
 func (f *fakeGitHub) ListReleases(ctx context.Context, organization, repository string) ([]github.RepositoryRelease, error) {
 	ghReleases := make([]github.RepositoryRelease, 0)
-	for _, r := range f.releases {
+	for _, r := range f.releases[repository] {
 		tag := r
 		ghReleases = append(ghReleases, github.RepositoryRelease{TagName: &tag})
 	}

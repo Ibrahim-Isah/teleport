@@ -1,18 +1,20 @@
 /*
-Copyright 2015-2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package etcdbk
 
@@ -20,17 +22,19 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"maps"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/test"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/clocki"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
 
 const (
@@ -39,7 +43,7 @@ const (
 )
 
 func TestMain(m *testing.M) {
-	utils.InitLoggerForTests()
+	logtest.InitLogger(testing.Verbose)
 	os.Exit(m.Run())
 }
 
@@ -47,9 +51,9 @@ func TestMain(m *testing.M) {
 var commonEtcdParams = backend.Params{
 	"peers":         []string{etcdTestEndpoint()},
 	"prefix":        examplePrefix,
-	"tls_key_file":  "../../../examples/etcd/certs/client-key.pem",
-	"tls_cert_file": "../../../examples/etcd/certs/client-cert.pem",
-	"tls_ca_file":   "../../../examples/etcd/certs/ca-cert.pem",
+	"tls_key_file":  "../../../fixtures/etcdcerts/client-key.pem",
+	"tls_cert_file": "../../../fixtures/etcdcerts/client-cert.pem",
+	"tls_ca_file":   "../../../fixtures/etcdcerts/ca-cert.pem",
 }
 
 var commonEtcdOptions = []Option{
@@ -58,10 +62,10 @@ var commonEtcdOptions = []Option{
 
 func TestEtcd(t *testing.T) {
 	if !etcdTestEnabled() {
-		t.Skip("This test requires etcd, start it with examples/etcd/start-etcd.sh and set TELEPORT_ETCD_TEST=yes")
+		t.Skip("This test requires etcd, run `make run-etcd` and set TELEPORT_ETCD_TEST=yes in your environment")
 	}
 
-	newBackend := func(options ...test.ConstructionOption) (backend.Backend, clockwork.FakeClock, error) {
+	newBackend := func(options ...test.ConstructionOption) (backend.Backend, clocki.FakeClock, error) {
 		opts, err := test.ApplyOptions(options)
 		if err != nil {
 			return nil, nil, trace.Wrap(err)
@@ -82,7 +86,7 @@ func TestEtcd(t *testing.T) {
 		// we can't fiddle with clocks inside the etcd client, so instead of creating
 		// and returning a fake clock, we wrap the real clock used by the etcd client
 		// in a FakeClock interface that sleeps instead of instantly advancing.
-		sleepingClock := blockingFakeClock{bk.clock}
+		sleepingClock := test.BlockingFakeClock{Clock: bk.clock}
 
 		return bk, sleepingClock, nil
 	}
@@ -92,7 +96,7 @@ func TestEtcd(t *testing.T) {
 
 func TestPrefix(t *testing.T) {
 	if !etcdTestEnabled() {
-		t.Skip("This test requires etcd, start it with examples/etcd/start-etcd.sh and set TELEPORT_ETCD_TEST=yes")
+		t.Skip("This test requires etcd, run `make run-etcd` and set TELEPORT_ETCD_TEST=yes in your environment")
 	}
 
 	ctx := context.Background()
@@ -104,9 +108,7 @@ func TestPrefix(t *testing.T) {
 
 	// ...and an etcd backend configured to use a custom prefix
 	cfg := make(backend.Params)
-	for k, v := range commonEtcdParams {
-		cfg[k] = v
-	}
+	maps.Copy(cfg, commonEtcdParams)
 	cfg["prefix"] = customPrefix
 
 	prefixedUut, err := New(context.Background(), cfg, commonEtcdOptions...)
@@ -116,7 +118,7 @@ func TestPrefix(t *testing.T) {
 	// When I push an item with a key starting with "/" into etcd via the
 	// _prefixed_ client...
 	item := backend.Item{
-		Key:   []byte("/foo"),
+		Key:   backend.NewKey("foo"),
 		Value: []byte("bar"),
 	}
 	_, err = prefixedUut.Put(ctx, item)
@@ -124,7 +126,7 @@ func TestPrefix(t *testing.T) {
 
 	// Expect that I can retrieve it from the _un_prefixed client by
 	// manually prepending a prefix to the key and asking for it.
-	wantKey := prefixedUut.cfg.Key + string(item.Key)
+	wantKey := prefixedUut.cfg.Key + item.Key.String()
 	requireKV(ctx, t, unprefixedUut, wantKey, string(item.Value))
 	got, err := prefixedUut.Get(ctx, item.Key)
 	require.NoError(t, err)
@@ -134,7 +136,7 @@ func TestPrefix(t *testing.T) {
 	// When I push an item with a key that does _not_ start with a separator
 	// char (i.e. "/") into etcd via the _prefixed_ client...
 	item = backend.Item{
-		Key:   []byte("foo"),
+		Key:   backend.NewKey("foo"),
 		Value: []byte("bar"),
 	}
 	_, err = prefixedUut.Put(ctx, item)
@@ -142,7 +144,7 @@ func TestPrefix(t *testing.T) {
 
 	// Expect, again, that I can retrieve it from the _un_prefixed client
 	// by manually prepending a prefix to the key and asking for it.
-	wantKey = prefixedUut.cfg.Key + string(item.Key)
+	wantKey = prefixedUut.cfg.Key + item.Key.String()
 	requireKV(ctx, t, unprefixedUut, wantKey, string(item.Value))
 	got, err = prefixedUut.Get(ctx, item.Key)
 	require.NoError(t, err)
@@ -153,7 +155,7 @@ func TestPrefix(t *testing.T) {
 func requireKV(ctx context.Context, t *testing.T, bk *EtcdBackend, key, val string) {
 	t.Logf("assert that key %q contains value %q", key, val)
 
-	resp, err := bk.client.Get(ctx, key)
+	resp, err := bk.clients.Next().Get(ctx, key)
 	require.NoError(t, err)
 	require.Len(t, resp.Kvs, 1)
 	require.Equal(t, key, string(resp.Kvs[0].Key))
@@ -169,16 +171,16 @@ func requireKV(ctx context.Context, t *testing.T, bk *EtcdBackend, key, val stri
 // See https://github.com/gravitational/teleport/issues/4786
 func TestCompareAndSwapOversizedValue(t *testing.T) {
 	if !etcdTestEnabled() {
-		t.Skip("This test requires etcd, start it with examples/etcd/start-etcd.sh and set TELEPORT_ETCD_TEST=yes")
+		t.Skip("This test requires etcd, run `make run-etcd` and set TELEPORT_ETCD_TEST=yes in your environment")
 	}
 	// setup
 	const maxClientMsgSize = 128
 	bk, err := New(context.Background(), backend.Params{
 		"peers":                          []string{etcdTestEndpoint()},
 		"prefix":                         "/teleport",
-		"tls_key_file":                   "../../../examples/etcd/certs/client-key.pem",
-		"tls_cert_file":                  "../../../examples/etcd/certs/client-cert.pem",
-		"tls_ca_file":                    "../../../examples/etcd/certs/ca-cert.pem",
+		"tls_key_file":                   "../../../fixtures/etcdcerts/client-key.pem",
+		"tls_cert_file":                  "../../../fixtures/etcdcerts/client-cert.pem",
+		"tls_ca_file":                    "../../../fixtures/etcdcerts/ca-cert.pem",
 		"dial_timeout":                   500 * time.Millisecond,
 		"etcd_max_client_msg_size_bytes": maxClientMsgSize,
 	}, commonEtcdOptions...)
@@ -202,11 +204,10 @@ func TestLeaseBucketing(t *testing.T) {
 	const count = 40
 
 	if !etcdTestEnabled() {
-		t.Skip("This test requires etcd, start it with examples/etcd/start-etcd.sh and set TELEPORT_ETCD_TEST=yes")
+		t.Skip("This test requires etcd, run `make run-etcd` and set TELEPORT_ETCD_TEST=yes in your environment")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	var opts []Option
 	opts = append(opts, commonEtcdOptions...)
@@ -216,31 +217,35 @@ func TestLeaseBucketing(t *testing.T) {
 	require.NoError(t, err)
 	defer bk.Close()
 
-	for i := 0; i < count; i++ {
+	// Stagger expiry times so items land in different lease buckets.
+	baseExpiry := time.Now().Add(time.Minute)
+
+	buckets := make(map[int64]struct{})
+	for i := range count {
+		key := backend.NewKey(pfx, fmt.Sprintf("%d", i))
 		_, err := bk.Put(ctx, backend.Item{
-			Key:     backend.Key(pfx, fmt.Sprintf("%d", i)),
-			Value:   []byte(fmt.Sprintf("val-%d", i)),
-			Expires: time.Now().Add(time.Minute),
+			Key:     key,
+			Value:   fmt.Appendf(nil, "val-%d", i),
+			Expires: baseExpiry.Add(time.Duration(i) * 200 * time.Millisecond),
 		})
 		require.NoError(t, err)
-		time.Sleep(time.Millisecond * 200)
+
+		item, err := bk.Get(ctx, key)
+		require.NoError(t, err)
+
+		buckets[item.Expires.Unix()] = struct{}{}
 	}
 
-	start := backend.Key(pfx, "")
+	start := backend.NewKey(pfx, "")
 
 	rslt, err := bk.GetRange(ctx, start, backend.RangeEnd(start), backend.NoLimit)
 	require.NoError(t, err)
 	require.Len(t, rslt.Items, count)
 
-	leases := make(map[int64]struct{})
-	for _, item := range rslt.Items {
-		leases[item.LeaseID] = struct{}{}
-	}
-
 	// ensure that we averaged more than 1 item per lease, but
 	// also spanned more than one bucket.
-	require.Greater(t, len(leases), 1)
-	require.Less(t, len(leases), count/2)
+	require.NotEmpty(t, buckets)
+	require.Less(t, len(buckets), count/2)
 }
 
 func etcdTestEnabled() bool {
@@ -256,20 +261,28 @@ func etcdTestEndpoint() string {
 	return "https://127.0.0.1:2379"
 }
 
-func (r blockingFakeClock) Advance(d time.Duration) {
-	if d < 0 {
-		panic("Invalid argument, negative duration")
+func TestKeyPrefix(t *testing.T) {
+	prefixes := []string{"teleport", "/teleport", "/teleport/"}
+
+	for _, prefix := range prefixes {
+		t.Run("prefix="+prefix, func(t *testing.T) {
+			bk := EtcdBackend{cfg: &Config{Key: prefix}}
+
+			t.Run("leading separator in key", func(t *testing.T) {
+				prefixed := bk.prependPrefix(backend.NewKey("test", "llama"))
+				assert.Equal(t, prefix+"/test/llama", prefixed)
+
+				key := bk.trimPrefix([]byte(prefixed))
+				assert.Equal(t, "/test/llama", key.String())
+			})
+
+			t.Run("no leading separator in key", func(t *testing.T) {
+				prefixed := bk.prependPrefix(backend.KeyFromString(".locks/test/llama"))
+				assert.Equal(t, prefix+".locks/test/llama", prefixed)
+
+				key := bk.trimPrefix([]byte(prefixed))
+				assert.Equal(t, ".locks/test/llama", key.String())
+			})
+		})
 	}
-
-	// We cannot rewind time for etcd since it will not have any effect on the server
-	// so we actually sleep in this case
-	time.Sleep(d)
-}
-
-func (r blockingFakeClock) BlockUntil(int) {
-	panic("Not implemented")
-}
-
-type blockingFakeClock struct {
-	clockwork.Clock
 }

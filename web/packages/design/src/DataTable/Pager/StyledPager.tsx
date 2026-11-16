@@ -1,51 +1,37 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import styled from 'styled-components';
 
-import Icon from 'design/Icon';
+import { ButtonIcon } from 'design';
 
-export const StyledArrowBtn = styled.button`
-  background: none;
-  border: none;
-  cursor: pointer;
-
-  ${Icon} {
-    font-size: 20px;
-    transition: all 0.3s;
-    opacity: 0.5;
+export const StyledArrowBtn = styled(ButtonIcon)`
+  svg {
+    font-size: ${props => props.theme.fontSizes[5]}px;
   }
-
-  &:hover,
-  &:focus {
-    ${Icon} {
-      opacity: 1;
-    }
-  }
-
-  &:disabled {
-    cursor: default;
-    ${Icon} {
-      opacity: 0.1;
-    }
+  svg:before {
+    // arrow icons have some padding that makes them look slightly off-center, padding compensates it
+    padding-left: 1px;
   }
 `;
 
 export const StyledFetchMoreBtn = styled.button`
-  color: ${props => props.theme.colors.link};
+  color: ${props => props.theme.colors.buttons.link.default};
   background: none;
   text-decoration: underline;
   text-transform: none;
@@ -53,7 +39,7 @@ export const StyledFetchMoreBtn = styled.button`
   border: none;
   font-weight: bold;
   line-height: 0;
-  font-size: 12px;
+  font-size: ${props => props.theme.fontSizes[1]}px;
 
   &:hover,
   &:focus {
@@ -61,7 +47,7 @@ export const StyledFetchMoreBtn = styled.button`
   }
 
   &:disabled {
-    color: ${props => props.theme.colors.action.disabled};
+    color: ${props => props.theme.colors.text.disabled};
     cursor: wait;
   }
 `;

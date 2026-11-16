@@ -1,65 +1,82 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package service
 
 import (
+	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
+	apissh "github.com/gravitational/teleport/api/ssh"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/entitlements"
+	"github.com/gravitational/teleport/lib/authz"
+	"github.com/gravitational/teleport/lib/healthcheck"
 	kubeproxy "github.com/gravitational/teleport/lib/kube/proxy"
 	"github.com/gravitational/teleport/lib/labels"
+	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/multiplexer"
+	"github.com/gravitational/teleport/lib/relaytunnel"
 	"github.com/gravitational/teleport/lib/reversetunnel"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/utils"
 )
 
 func (process *TeleportProcess) initKubernetes() {
-	log := process.log.WithFields(logrus.Fields{
-		trace.Component: teleport.Component(teleport.ComponentKube, process.id),
-	})
+	logger := process.logger.With(teleport.ComponentKey, teleport.Component(teleport.ComponentKube, process.id))
 
 	process.RegisterWithAuthServer(types.RoleKube, KubeIdentityEvent)
+	process.ExpectService(teleport.ComponentKube)
 	process.RegisterCriticalFunc("kube.init", func() error {
-		conn, err := process.WaitForConnector(KubeIdentityEvent, log)
+		conn, err := process.WaitForConnector(KubeIdentityEvent, logger)
 		if conn == nil {
 			return trace.Wrap(err)
 		}
-
-		if err := process.initKubernetesService(log, conn); err != nil {
-			warnOnErr(conn.Close(), log)
+		features := process.GetClusterFeatures()
+		k8s := modules.GetProtoEntitlement(&features, entitlements.K8s)
+		if !k8s.Enabled {
+			logger.WarnContext(process.ExitContext(), "Warning: Kubernetes service not initialized because Teleport Auth Server is not licensed for Kubernetes Access. Please contact the cluster administrator to enable it.")
+			// Do not close conn: it is stored in process.connectors
+			// by RegisterWithAuthServer and rotation code reads it.
+			process.BroadcastEvent(Event{Name: KubernetesReady, Payload: nil})
+			process.OnHeartbeat(teleport.ComponentKube)(nil)
+			return nil
+		}
+		if err := process.initKubernetesService(logger, conn); err != nil {
+			warnOnErr(process.ExitContext(), conn.Close(), logger)
 			return trace.Wrap(err)
 		}
 		return nil
 	})
 }
 
-func (process *TeleportProcess) initKubernetesService(log *logrus.Entry, conn *Connector) (retErr error) {
+func (process *TeleportProcess) initKubernetesService(logger *slog.Logger, conn *Connector) (retErr error) {
 	// clean up unused descriptors passed for proxy, but not used by it
 	defer func() {
 		if err := process.closeImportedDescriptors(teleport.ComponentKube); err != nil {
-			log.WithError(err).Warn("Failed closing imported file descriptors.")
+			logger.WarnContext(process.ExitContext(), "Failed closing imported file descriptors.", "error", err)
 		}
 	}()
 	cfg := process.Config
@@ -70,8 +87,9 @@ func (process *TeleportProcess) initKubernetesService(log *logrus.Entry, conn *C
 		return trace.Wrap(err)
 	}
 
-	teleportClusterName := conn.ServerIdentity.ClusterName
+	teleportClusterName := conn.ClusterName()
 	proxyGetter := reversetunnel.NewConnectedProxyGetter()
+	relayInfoHolder := new(relaytunnel.InfoHolder)
 
 	// This service can run in 2 modes:
 	// 1. Reachable (by the proxy) - registers with auth server directly and
@@ -82,6 +100,7 @@ func (process *TeleportProcess) initKubernetesService(log *logrus.Entry, conn *C
 	// The listener exposes incoming connections over either mode.
 	var listener net.Listener
 	var agentPool *reversetunnel.AgentPool
+	var relayTunnelClient *relaytunnel.Client
 	switch {
 	// Filter out cases where both listen_addr and tunnel are set or both are
 	// not set.
@@ -100,35 +119,41 @@ func (process *TeleportProcess) initKubernetesService(log *logrus.Entry, conn *C
 
 	// Start a local listener and let proxies dial in.
 	case !conn.UseTunnel() && !cfg.Kube.ListenAddr.IsEmpty():
-		log.Debug("Turning on Kubernetes service listening address.")
+		logger.DebugContext(process.ExitContext(), "Turning on Kubernetes service listening address.")
 		listener, err = process.importOrCreateListener(ListenerKube, cfg.Kube.ListenAddr.Addr)
 		if err != nil {
 			return trace.Wrap(err)
 		}
 		defer func() {
 			if retErr != nil {
-				warnOnErr(listener.Close(), log)
+				warnOnErr(process.ExitContext(), listener.Close(), logger)
 			}
 		}()
 
 	// Dialed out to a proxy, start servicing the reverse tunnel as a listener.
 	case conn.UseTunnel() && cfg.Kube.ListenAddr.IsEmpty():
 		// create an adapter, from reversetunnel.ServerHandler to net.Listener.
-		shtl := reversetunnel.NewServerHandlerToListener(reversetunnel.LocalKubernetes)
+		shtl := reversetunnel.NewServerHandlerToListener(reversetunnelclient.LocalKubernetes)
 		listener = shtl
 		agentPool, err = reversetunnel.NewAgentPool(
 			process.ExitContext(),
 			reversetunnel.AgentPoolConfig{
-				Component:            teleport.ComponentKube,
-				HostUUID:             conn.ServerIdentity.ID.HostUUID,
-				Resolver:             conn.TunnelProxyResolver(),
-				Client:               conn.Client,
-				AccessPoint:          accessPoint,
-				HostSigner:           conn.ServerIdentity.KeySigner,
-				Cluster:              teleportClusterName,
-				Server:               shtl,
-				FIPS:                 process.Config.FIPS,
-				ConnectedProxyGetter: proxyGetter,
+				InsecureMode: process.Config.InsecureMode,
+				Component:    teleport.ComponentKube,
+				HostUUID:     conn.HostID(),
+				Resolver:     conn.TunnelProxyResolver(),
+				Client:       conn.Client,
+				AccessPoint:  accessPoint,
+				PublicKeyAuth: apissh.PublicKeyAuthConfig{
+					Signers: func() ([]ssh.Signer, error) {
+						return conn.ClientSigners(), nil
+					},
+				},
+				Cluster:                  teleportClusterName,
+				Server:                   shtl,
+				FIPS:                     process.Config.FIPS,
+				ConnectedProxyGetter:     proxyGetter,
+				StaleConnTimeoutDisabled: reversetunnel.IsAgentStaleConnTimeoutDisabledByEnv(),
 			})
 		if err != nil {
 			return trace.Wrap(err)
@@ -141,14 +166,42 @@ func (process *TeleportProcess) initKubernetesService(log *logrus.Entry, conn *C
 				agentPool.Stop()
 			}
 		}()
-		log.Info("Started reverse tunnel client.")
+		logger.InfoContext(process.ExitContext(), "Started reverse tunnel client.")
+
+		if cfg.RelayServer != "" {
+			relayTunnelClient, err = relaytunnel.NewClient(relaytunnel.ClientConfig{
+				Log: logger,
+
+				GetCertificate: conn.ClientGetCertificate,
+				GetPool:        conn.ClientGetPool,
+				Ciphersuites:   cfg.CipherSuites,
+
+				TunnelType: types.KubeTunnel,
+				RelayAddr:  cfg.RelayServer,
+
+				HandleConnection: shtl.HandleConnection,
+				RelayInfoSetter:  relayInfoHolder.SetRelayInfo,
+			})
+			if err != nil {
+				return trace.Wrap(err)
+			}
+			if err := relayTunnelClient.Start(); err != nil {
+				return trace.Wrap(err)
+			}
+			defer func() {
+				if retErr != nil {
+					relayTunnelClient.Close()
+				}
+			}()
+			logger.InfoContext(process.ExitContext(), "Started relay tunnel client.")
+		}
 	}
 
 	var dynLabels *labels.Dynamic
 	if len(cfg.Kube.DynamicLabels) != 0 {
 		dynLabels, err = labels.NewDynamic(process.ExitContext(), &labels.DynamicConfig{
 			Labels: cfg.Kube.DynamicLabels,
-			Log:    log,
+			Log:    process.logger.With(teleport.ComponentKey, teleport.Component(teleport.ComponentKube, process.id)),
 		})
 		if err != nil {
 			return trace.Wrap(err)
@@ -165,7 +218,7 @@ func (process *TeleportProcess) initKubernetesService(log *logrus.Entry, conn *C
 	lockWatcher, err := services.NewLockWatcher(process.ExitContext(), services.LockWatcherConfig{
 		ResourceWatcherConfig: services.ResourceWatcherConfig{
 			Component: teleport.ComponentKube,
-			Log:       log,
+			Logger:    process.logger.With(teleport.ComponentKey, teleport.Component(teleport.ComponentKube, process.id)),
 			Client:    conn.Client,
 		},
 	})
@@ -174,36 +227,48 @@ func (process *TeleportProcess) initKubernetesService(log *logrus.Entry, conn *C
 	}
 
 	// Create the kube server to service listener.
-	authorizer, err := auth.NewAuthorizer(auth.AuthorizerOpts{
-		ClusterName: teleportClusterName,
-		AccessPoint: accessPoint,
-		LockWatcher: lockWatcher,
+	scopedAuthorizer, err := authz.NewScopedAuthorizer(authz.AuthorizerOpts{
+		ClusterName:      teleportClusterName,
+		AccessPoint:      accessPoint,
+		ScopedRoleReader: accessPoint.ScopedRoleReader(),
+		LockWatcher:      lockWatcher,
+		Logger:           process.logger.With(teleport.ComponentKey, teleport.Component(teleport.ComponentKube, process.id)),
+		ScopesFeatures:   process.scopesFeatures,
 	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	tlsConfig, err := conn.ServerIdentity.TLSConfig(cfg.CipherSuites)
+	tlsConfig, err := process.ServerTLSConfig(conn)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	// asyncEmitter makes sure that sessions do not block
 	// in case if connections are slow
-	asyncEmitter, err := process.newAsyncEmitter(conn.Client)
+	asyncEmitter, err := process.NewAsyncEmitter(conn.Client)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	streamer, err := events.NewCheckingStreamer(events.CheckingStreamerConfig{
-		Inner:       conn.Client,
-		Clock:       process.Clock,
-		ClusterName: teleportClusterName,
-	})
+
+	// Create a health check manager.
+	healthCheckManager, err := healthcheck.NewManager(
+		process.ExitContext(),
+		healthcheck.ManagerConfig{
+			Component:               teleport.ComponentKube,
+			Events:                  accessPoint,
+			HealthCheckConfigReader: accessPoint,
+		},
+	)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	streamEmitter := &events.StreamerAndEmitter{
-		Emitter:  asyncEmitter,
-		Streamer: streamer,
+
+	// TODO (eriktate): because HealthCheckConfigs do not yet support scopes, the service will never report
+	// healthy when scope pinned. We need to remove this opt-out behavior once HealthCheckConfigs support scopes
+	if conn.Scope() == "" {
+		if err := healthCheckManager.Start(process.ExitContext()); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 
 	var publicAddr string
@@ -211,63 +276,69 @@ func (process *TeleportProcess) initKubernetesService(log *logrus.Entry, conn *C
 		publicAddr = cfg.Kube.PublicAddrs[0].String()
 	}
 
+	// if scope pin is set, we should not pass the bare agent scope along to the kube forwarder
+	agentScope := conn.Scope()
+	scopePin := conn.ScopePin()
+	if scopePin != nil {
+		agentScope = ""
+	}
 	kubeServer, err := kubeproxy.NewTLSServer(kubeproxy.TLSServerConfig{
 		ForwarderConfig: kubeproxy.ForwarderConfig{
-			Namespace:         apidefaults.Namespace,
-			Keygen:            cfg.Keygen,
-			ClusterName:       teleportClusterName,
-			Authz:             authorizer,
-			AuthClient:        conn.Client,
-			StreamEmitter:     streamEmitter,
-			DataDir:           cfg.DataDir,
-			CachingAuthClient: accessPoint,
-			HostID:            cfg.HostUUID,
-			Context:           process.ExitContext(),
-			KubeconfigPath:    cfg.Kube.KubeconfigPath,
-			KubeClusterName:   cfg.Kube.KubeClusterName,
-			KubeServiceType:   kubeproxy.KubeService,
-			Component:         teleport.ComponentKube,
-
+			Namespace:                     apidefaults.Namespace,
+			Keygen:                        cfg.Keygen,
+			ClusterName:                   teleportClusterName,
+			ScopedAuthz:                   scopedAuthorizer,
+			AuthClient:                    conn.Client,
+			Emitter:                       asyncEmitter,
+			DataDir:                       cfg.DataDir,
+			CachingAuthClient:             accessPoint,
+			HostID:                        conn.HostUUID(),
+			Context:                       process.ExitContext(),
+			KubeconfigPath:                cfg.Kube.KubeconfigPath,
+			KubeClusterName:               cfg.Kube.KubeClusterName,
+			KubeServiceType:               kubeproxy.KubeService,
+			Component:                     teleport.ComponentKube,
 			LockWatcher:                   lockWatcher,
 			CheckImpersonationPermissions: cfg.Kube.CheckImpersonationPermissions,
 			PublicAddr:                    publicAddr,
+			ClusterFeatures:               process.GetClusterFeatures,
+			ScopePin:                      scopePin,
+			Scope:                         agentScope,
 		},
 		TLS:                  tlsConfig,
 		AccessPoint:          accessPoint,
 		LimiterConfig:        cfg.Kube.Limiter,
-		OnHeartbeat:          process.onHeartbeat(teleport.ComponentKube),
-		GetRotation:          process.getRotation,
+		OnHeartbeat:          process.OnHeartbeat(teleport.ComponentKube),
+		GetRotation:          process.GetRotation,
 		ConnectedProxyGetter: proxyGetter,
+		RelayInfoGetter:      relayInfoHolder.GetRelayInfo,
 		ResourceMatchers:     cfg.Kube.ResourceMatchers,
 		StaticLabels:         cfg.Kube.StaticLabels,
 		DynamicLabels:        dynLabels,
 		CloudLabels:          process.cloudLabels,
-		Log:                  log,
+		Log:                  process.logger.With(teleport.ComponentKey, teleport.Component(teleport.ComponentKube, process.id)),
+		PROXYProtocolMode:    multiplexer.PROXYProtocolOff, // Kube service doesn't need to process unsigned PROXY headers.
+		InventoryHandle:      process.inventoryHandle,
+		HealthCheckManager:   healthCheckManager,
 	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	defer func() {
 		if retErr != nil {
-			warnOnErr(kubeServer.Close(), log)
+			warnOnErr(process.ExitContext(), kubeServer.Close(), logger)
 		}
 	}()
 	process.RegisterCriticalFunc("kube.serve", func() error {
 		if conn.UseTunnel() {
-			log.Info("Starting Kube service via proxy reverse tunnel.")
-			utils.Consolef(cfg.Console, log, teleport.ComponentKube,
-				"Kubernetes service %s:%s is starting via proxy reverse tunnel.",
-				teleport.Version, teleport.Gitref)
+			logger.InfoContext(process.ExitContext(), "Starting Kube service via proxy reverse tunnel.")
 		} else {
-			log.Infof("Starting Kube service on %v.", listener.Addr())
-			utils.Consolef(cfg.Console, log, teleport.ComponentKube,
-				"Kubernetes service %s:%s is starting on %v.",
-				teleport.Version, teleport.Gitref, listener.Addr())
+			logger.InfoContext(process.ExitContext(), "Starting Kube service.", "listen_address", listener.Addr())
 		}
 		process.BroadcastEvent(Event{Name: KubernetesReady, Payload: nil})
 		err := kubeServer.Serve(listener)
 		if err != nil {
-			if err == http.ErrServerClosed {
+			if errors.Is(err, http.ErrServerClosed) {
 				return nil
 			}
 			return trace.Wrap(err)
@@ -276,29 +347,33 @@ func (process *TeleportProcess) initKubernetesService(log *logrus.Entry, conn *C
 	})
 
 	// Cleanup, when process is exiting.
-	process.OnExit("kube.shutdown", func(payload interface{}) {
+	process.OnExit("kube.shutdown", func(payload any) {
 		// Clean up items in reverse order from their initialization.
 		if payload != nil {
 			// Graceful shutdown.
-			warnOnErr(kubeServer.Shutdown(payloadContext(payload, log)), log)
+			warnOnErr(process.ExitContext(), kubeServer.Shutdown(payloadContext(payload)), logger)
 			agentPool.Stop()
 			agentPool.Wait()
 		} else {
 			// Fast shutdown.
-			warnOnErr(kubeServer.Close(), log)
+			warnOnErr(process.ExitContext(), kubeServer.Close(), logger)
 			agentPool.Stop()
 		}
-		if asyncEmitter != nil {
-			warnOnErr(asyncEmitter.Close(), log)
+		if relayTunnelClient != nil {
+			relayTunnelClient.Close()
 		}
-		warnOnErr(listener.Close(), log)
-		warnOnErr(conn.Close(), log)
+		shutdownEmitter(process, asyncEmitter, payload, logger)
+		if healthCheckManager != nil {
+			warnOnErr(process.ExitContext(), healthCheckManager.Close(), logger)
+		}
+		warnOnErr(process.ExitContext(), listener.Close(), logger)
+		warnOnErr(process.ExitContext(), conn.Close(), logger)
 
 		if dynLabels != nil {
 			dynLabels.Close()
 		}
 
-		log.Info("Exited.")
+		logger.InfoContext(process.ExitContext(), "Exited.")
 	})
 	return nil
 }

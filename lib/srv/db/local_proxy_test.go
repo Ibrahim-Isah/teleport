@@ -1,26 +1,30 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
 	"context"
 	"testing"
+	"time"
 
-	"github.com/jackc/pgconn"
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
 
@@ -31,27 +35,70 @@ import (
 // TestLocalProxyPostgres verifies connecting to a Postgres database
 // through the local authenticated ALPN proxy.
 func TestLocalProxyPostgres(t *testing.T) {
-	ctx := context.Background()
-	testCtx := setupTestContext(ctx, t, withSelfHostedPostgres("postgres"))
-	go testCtx.startHandlingConnections()
+	tests := []struct {
+		name        string
+		noCancelKey bool
+	}{
+		{
+			name: "with query cancellation",
+		},
+		{
+			name:        "without query cancellation",
+			noCancelKey: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			var opts []testPostgresOption
+			if tt.noCancelKey {
+				opts = append(opts, withPostgresNoCancelKey())
+			}
+			testCtx := setupTestContext(ctx, t, withSelfHostedPostgres("postgres", opts...))
+			go testCtx.startHandlingConnections()
 
-	// Create test user/role.
-	testCtx.createUserAndRole(ctx, t, "alice", "admin", []string{types.Wildcard}, []string{types.Wildcard})
+			// Create test user/role.
+			testCtx.createUserAndRole(ctx, t, "alice", "admin", []string{types.Wildcard}, []string{types.Wildcard})
 
-	// Try to connect to the database as this user.
-	conn, proxy, err := testCtx.postgresClientLocalProxy(ctx, "alice", "postgres", "postgres", "postgres")
-	require.NoError(t, err)
+			// Try to connect to the database as this user.
+			conn, proxy, err := testCtx.postgresClientLocalProxy(ctx, "alice", "postgres", "postgres", "postgres")
+			require.NoError(t, err)
 
-	// Close connection and local proxy after the test.
-	t.Cleanup(func() {
-		require.NoError(t, conn.Close(ctx))
-		require.NoError(t, proxy.Close())
-	})
+			// Close connection and local proxy after the test.
+			t.Cleanup(func() {
+				require.NoError(t, conn.Close(ctx))
+				require.NoError(t, proxy.Close())
+			})
 
-	// Execute a query.
-	result, err := conn.Exec(ctx, "select 1").ReadAll()
-	require.NoError(t, err)
-	require.Equal(t, []*pgconn.Result{postgres.TestQueryResponse}, result)
+			// Execute a query.
+			results, err := conn.Exec(ctx, "select 1").ReadAll()
+			require.NoError(t, err)
+			require.Equal(t, []*pgconn.Result{postgres.TestQueryResponse}, results)
+
+			if tt.noCancelKey {
+				// No BackendKeyData should reach the client; nothing to cancel.
+				require.Zero(t, conn.PID())
+				require.Empty(t, conn.SecretKey())
+				return
+			}
+
+			// The backend's cancel key must reach the client.
+			require.NotZero(t, conn.PID())
+			require.NotEmpty(t, conn.SecretKey())
+
+			// Execute a "long running" query and cancel it.
+			resultReader := conn.Exec(ctx, postgres.TestLongRunningQuery)
+			require.NoError(t, conn.CancelRequest(ctx))
+			// timeout this test quickly if the cancel request fails to propagate.
+			conn.Conn().SetDeadline(time.Now().Add(time.Second * 10))
+			results, err = resultReader.ReadAll()
+			require.Error(t, err)
+			var pgErr *pgconn.PgError
+			require.ErrorAs(t, err, &pgErr)
+			require.Equal(t, pgerrcode.QueryCanceled, pgErr.Code)
+			require.Empty(t, results)
+		})
+	}
 }
 
 // TestLocalProxyMySQL verifies connecting to a MySQL database

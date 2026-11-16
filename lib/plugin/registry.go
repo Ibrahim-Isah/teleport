@@ -1,45 +1,66 @@
 /*
-Copyright 2015-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package plugin
 
-import "github.com/gravitational/trace"
+import (
+	"context"
+	"crypto/tls"
+
+	"github.com/gravitational/trace"
+)
+
+type getCertFunc = func() (*tls.Certificate, error)
 
 // Plugin describes interfaces of the teleport core plugin
 type Plugin interface {
 	// GetName returns plugin name
 	GetName() string
 	// RegisterProxyWebHandlers registers new methods with the ProxyWebHandler
-	RegisterProxyWebHandlers(handler interface{}) error
+	RegisterProxyWebHandlers(handler any) error
 	// RegisterAuthWebHandlers registers new methods with the Auth Web Handler
-	RegisterAuthWebHandlers(service interface{}) error
+	RegisterAuthWebHandlers(service any) error
 	// RegisterAuthServices registers new services on the AuthServer
-	RegisterAuthServices(server interface{}) error
+	RegisterAuthServices(ctx context.Context, server any, getClientCert getCertFunc) error
 }
 
 // Registry is the plugin registry
 type Registry interface {
+	// IsRegistered returns whether a plugin with the give name exists.
+	IsRegistered(name string) bool
 	// Add adds plugin to the registry
 	Add(plugin Plugin) error
 	// RegisterProxyWebHandlers registers Teleport Proxy web handlers
-	RegisterProxyWebHandlers(hander interface{}) error
+	RegisterProxyWebHandlers(handler any) error
 	// RegisterAuthWebHandlers registers Teleport Auth web handlers
-	RegisterAuthWebHandlers(handler interface{}) error
-	// RegisterAuthServices registerse Teleport AuthServer services
-	RegisterAuthServices(server interface{}) error
+	RegisterAuthWebHandlers(handler any) error
+	// RegisterAuthServices registers Teleport AuthServer services
+	RegisterAuthServices(ctx context.Context, server any, getClientCert getCertFunc) error
+	// SetUsageReportingInitFunc stores a callback that will be called once the OSS auth server is
+	// fully initialized. The callback receives a *service.TeleportProcess and is responsible for
+	// starting all usage-reporting pipelines. It must be set before service.NewTeleport is called.
+	SetUsageReportingInitFunc(func(process any) error)
+	// InitUsageReporting invokes the callback registered with SetUsageReportingInitFunc. It is
+	// called by initAuthService after setLocalAuth, ensuring the UsageReporter is available to
+	// auth-server enterprise extensions. The function process parameter is a *service.TeleportProcess
+	// instance.
+	// A no-op if no callback was registered.
+	InitUsageReporting(process any) error
 }
 
 // NewRegistry creates an instance of the Registry
@@ -50,7 +71,25 @@ func NewRegistry() Registry {
 }
 
 type registry struct {
-	plugins map[string]Plugin
+	plugins              map[string]Plugin
+	usageReportingInitFn func(process any) error
+}
+
+func (r *registry) SetUsageReportingInitFunc(f func(process any) error) {
+	r.usageReportingInitFn = f
+}
+
+func (r *registry) InitUsageReporting(process any) error {
+	if r.usageReportingInitFn != nil {
+		return r.usageReportingInitFn(process)
+	}
+	return nil
+}
+
+// IsRegistered returns whether a plugin with the give name exists.
+func (r *registry) IsRegistered(name string) bool {
+	_, ok := r.plugins[name]
+	return ok
 }
 
 // Add adds plugin to the plugin registry
@@ -64,8 +103,7 @@ func (r *registry) Add(p Plugin) error {
 		return trace.BadParameter("missing plugin name")
 	}
 
-	_, exists := r.plugins[name]
-	if exists {
+	if r.IsRegistered(name) {
 		return trace.AlreadyExists("plugin %v already exists", name)
 	}
 
@@ -75,7 +113,7 @@ func (r *registry) Add(p Plugin) error {
 }
 
 // RegisterProxyWebHandlers registers Teleport Proxy web handlers
-func (r *registry) RegisterProxyWebHandlers(handler interface{}) error {
+func (r *registry) RegisterProxyWebHandlers(handler any) error {
 	for _, p := range r.plugins {
 		if err := p.RegisterProxyWebHandlers(handler); err != nil {
 			return trace.Wrap(err, "plugin %v failed to register", p.GetName())
@@ -86,7 +124,7 @@ func (r *registry) RegisterProxyWebHandlers(handler interface{}) error {
 }
 
 // RegisterAuthWebHandlers registers Teleport Auth web handlers
-func (r *registry) RegisterAuthWebHandlers(handler interface{}) error {
+func (r *registry) RegisterAuthWebHandlers(handler any) error {
 	for _, p := range r.plugins {
 		if err := p.RegisterAuthWebHandlers(handler); err != nil {
 			return trace.Wrap(err, "plugin %v failed to register", p.GetName())
@@ -96,10 +134,9 @@ func (r *registry) RegisterAuthWebHandlers(handler interface{}) error {
 	return nil
 }
 
-// RegisterAuthServices registerse Teleport AuthServer services
-func (r *registry) RegisterAuthServices(server interface{}) error {
+func (r *registry) RegisterAuthServices(ctx context.Context, server any, getClientCert getCertFunc) error {
 	for _, p := range r.plugins {
-		if err := p.RegisterAuthServices(server); err != nil {
+		if err := p.RegisterAuthServices(ctx, server, getClientCert); err != nil {
 			return trace.Wrap(err, "plugin %v failed to register", p.GetName())
 		}
 	}

@@ -1,30 +1,33 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package main
 
 import (
 	"fmt"
+	"log"
 	"os"
-	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/gravitational/kingpin"
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/gravitational/trace"
 )
 
@@ -34,6 +37,7 @@ var (
 	exclude  = kingpin.Flag("exclude", "Comma-separated list of exclude paths").Short('e').Strings()
 	include  = kingpin.Flag("include", "Comma-separated list of include paths").Short('i').Strings()
 	relative = kingpin.Flag("relative", "Returns paths relative to specified folder").String()
+	skip     = kingpin.Flag("skip", "A space-delimited list of test names to skip").String()
 
 	_ = kingpin.Command("diff", "Print diff in human-readable format")
 
@@ -45,6 +49,8 @@ var (
 
 func main() {
 	command := kingpin.Parse()
+
+	testsToSkip := strings.Fields(*skip)
 
 	// Set default git directory to cwd
 	if repoPath == nil {
@@ -86,7 +92,7 @@ func main() {
 	case "diff":
 		diff(*repoPath, ref, changedFiles, time.Since(start))
 	case "test":
-		test(*repoPath, ref, changedFiles)
+		test(*repoPath, ref, changedFiles, testsToSkip)
 	}
 }
 
@@ -124,8 +130,8 @@ func diff(repoPath string, ref string, changedFiles []string, elapsed time.Durat
 }
 
 // test builds and prints go test flags
-func test(repoPath string, ref string, changedFiles []string) {
-	var dirs = make(StringSet)
+func test(repoPath string, ref string, changedFiles []string, testsToSkip []string) {
+	dirs := make(StringSet)
 	methods := make([]string, 0)
 
 	dollarSign := "$"
@@ -143,7 +149,13 @@ func test(repoPath string, ref string, changedFiles []string) {
 			bail(err)
 		}
 
+		skipAll := slices.Contains(testsToSkip, "*")
+
 		for _, n := range r.New {
+			if (skipAll || slices.Contains(testsToSkip, n.RefName)) && !slices.Contains(testsToSkip, "!"+n.RefName) {
+				log.Printf("-skipping %q (%s)\n", n.RefName, dir)
+				continue
+			}
 			methods = append(methods, "^"+n.RefName+dollarSign)
 			dirs[dir] = struct{}{}
 		}
@@ -153,6 +165,10 @@ func test(repoPath string, ref string, changedFiles []string) {
 		}
 
 		for _, n := range r.Changed {
+			if (skipAll || slices.Contains(testsToSkip, n.RefName)) && !slices.Contains(testsToSkip, "!"+n.RefName) {
+				log.Printf("-skipping %q (%s)\n", n.RefName, dir)
+				continue
+			}
 			methods = append(methods, "^"+n.RefName+dollarSign)
 			dirs[dir] = struct{}{}
 		}
@@ -193,7 +209,7 @@ func inspect(repoPath string, ref string, changedFiles []string, fn func(string,
 			}
 		}
 
-		head, err := parseMethodMap(path.Join(repoPath, filename), nil, runners)
+		head, err := parseMethodMap(filepath.Join(repoPath, filename), nil, runners)
 		if err != nil {
 			return trace.Wrap(err)
 		}

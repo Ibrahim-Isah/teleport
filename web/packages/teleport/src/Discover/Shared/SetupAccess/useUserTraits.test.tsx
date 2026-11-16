@@ -1,93 +1,86 @@
-/*
-Copyright 2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { act, renderHook, waitFor } from '@testing-library/react';
 
-    http://www.apache.org/licenses/LICENSE-2.0
+import { AwsRole } from 'shared/services/apps';
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-import { MemoryRouter } from 'react-router';
-import { renderHook, act } from '@testing-library/react-hooks';
-
-import { baseContext } from 'teleport/mocks/contexts';
-import makeUserContext from 'teleport/services/user/makeUserContext';
-import { ContextProvider, Context as TeleportContext } from 'teleport';
-import { FeaturesContextProvider } from 'teleport/FeaturesContext';
-import { DiscoverProvider } from 'teleport/Discover/useDiscover';
-import cfg from 'teleport/config';
+import { app } from 'teleport/Discover/AwsMangementConsole/fixtures';
+import {
+  resourceSpecAwsRdsPostgres,
+  resourceSpecSelfHostedPostgres,
+} from 'teleport/Discover/Fixtures/databases';
+import {
+  emptyDiscoverContext,
+  RequiredDiscoverProviders,
+  resourceSpecAppAwsCliConsole,
+  resourceSpecAwsEc2Ssm,
+  resourceSpecSelfHostedKube,
+  resourceSpecServerLinuxUbuntu,
+} from 'teleport/Discover/Fixtures/fixtures';
+import {
+  type AppMeta,
+  type DbMeta,
+  type DiscoverContextState,
+  type KubeMeta,
+  type NodeMeta,
+} from 'teleport/Discover/useDiscover';
+import { createTeleportContext } from 'teleport/mocks/contexts';
+import { ExcludeUserField } from 'teleport/services/user';
 import { userEventService } from 'teleport/services/userEvent';
+import TeleportContext from 'teleport/teleportContext';
 
 import { ResourceKind } from '../ResourceKind';
-
 import { useUserTraits } from './useUserTraits';
 
-import type {
-  AgentMeta,
-  DbMeta,
-  KubeMeta,
-  NodeMeta,
-} from 'teleport/Discover/useDiscover';
-
-const crypto = require('crypto');
-
-// eslint-disable-next-line jest/require-hook
-Object.defineProperty(globalThis, 'crypto', {
-  value: {
-    randomUUID: () => crypto.randomUUID(),
-  },
-});
-
 describe('onProceed correctly deduplicates, removes static traits, updates meta, and calls updateUser', () => {
-  const ctx = createTeleportContext();
-  jest.spyOn(ctx.userService, 'fetchUser').mockResolvedValue(getMockUser());
-  jest.spyOn(ctx.userService, 'updateUser').mockResolvedValue(null);
-  jest.spyOn(ctx.userService, 'applyUserTraits').mockResolvedValue(null);
+  const teleCtx = createTeleportContext();
+  jest.spyOn(teleCtx.userService, 'fetchUser').mockResolvedValue(getMockUser());
+  jest.spyOn(teleCtx.userService, 'updateUser').mockResolvedValue(null);
+  jest.spyOn(teleCtx.userService, 'reloadUser').mockResolvedValue(null);
   jest
     .spyOn(userEventService, 'captureDiscoverEvent')
     .mockResolvedValue(null as never); // return value does not matter but required by ts
-
-  let wrapper;
-
-  beforeEach(() => {
-    wrapper = ({ children }) => (
-      <MemoryRouter initialEntries={[{ pathname: cfg.routes.discover }]}>
-        <ContextProvider ctx={ctx}>
-          <FeaturesContextProvider value={[]}>
-            <DiscoverProvider>{children}</DiscoverProvider>
-          </FeaturesContextProvider>
-        </ContextProvider>
-      </MemoryRouter>
-    );
-  });
 
   afterEach(() => {
     jest.clearAllMocks();
   });
 
   test('kubernetes', async () => {
-    const props = {
-      agentMeta: getMeta(ResourceKind.Kubernetes) as AgentMeta,
-      updateAgentMeta: jest.fn(x => x),
-      nextStep: () => null,
-      selectedResourceKind: ResourceKind.Kubernetes,
+    const discoverCtx = emptyDiscoverContext({
+      resourceSpec: resourceSpecSelfHostedKube,
+    });
+    discoverCtx.nextStep = jest.fn();
+    discoverCtx.agentMeta = {
+      ...discoverCtx.agentMeta,
+      ...getMeta(ResourceKind.Kubernetes),
     };
+    const spyUpdateAgentMeta = jest
+      .spyOn(discoverCtx, 'updateAgentMeta')
+      .mockImplementation(x => x);
 
-    const { result, waitForNextUpdate, waitFor } = renderHook(
-      () => useUserTraits(props),
-      {
-        wrapper,
-      }
+    const { result } = renderHook(() => useUserTraits(), {
+      wrapper: wrapperFn(discoverCtx, teleCtx),
+    });
+
+    await waitFor(() =>
+      expect(result.current.staticTraits.kubeUsers).toHaveLength(2)
     );
-    await waitForNextUpdate();
 
     const staticTraits = result.current.staticTraits;
     const dynamicTraits = result.current.dynamicTraits;
@@ -125,23 +118,30 @@ describe('onProceed correctly deduplicates, removes static traits, updates meta,
       kubeGroups: [dynamicTraits.kubeGroups[0]],
     };
 
+    await waitFor(() => {
+      expect(teleCtx.userService.fetchUser).toHaveBeenCalledTimes(1);
+    });
+
     act(() => {
       result.current.onProceed(mockedSelectedOptions);
     });
 
     await waitFor(() => {
-      expect(ctx.userService.applyUserTraits).toHaveBeenCalledTimes(1);
+      expect(teleCtx.userService.reloadUser).toHaveBeenCalledTimes(1);
     });
 
     // Test that we are updating the user with the correct traits.
     const mockUser = getMockUser();
-    expect(ctx.userService.updateUser).toHaveBeenCalledWith({
-      ...mockUser,
-      traits: { ...mockUser.traits, ...expected },
+    expect(teleCtx.userService.updateUser).toHaveBeenCalledWith({
+      user: {
+        ...mockUser,
+        traits: { ...mockUser.traits, ...expected },
+      },
+      excludeUserField: ExcludeUserField.AllTraits,
     });
 
     // Test that updating meta correctly updated the dynamic traits.
-    const updatedMeta = props.updateAgentMeta.mock.results[0].value as KubeMeta;
+    const updatedMeta = spyUpdateAgentMeta.mock.results[0].value as KubeMeta;
     expect(updatedMeta.kube.users).toStrictEqual([
       ...staticTraits.kubeUsers,
       ...expected.kubeUsers,
@@ -152,21 +152,110 @@ describe('onProceed correctly deduplicates, removes static traits, updates meta,
     ]);
   });
 
-  test('database', async () => {
-    const props = {
-      agentMeta: getMeta(ResourceKind.Database) as AgentMeta,
-      updateAgentMeta: jest.fn(x => x),
-      nextStep: () => null,
-      selectedResourceKind: ResourceKind.Database,
+  test('kubernetes with auto discover preserves existing + new dynamic traits', async () => {
+    const discoverCtx = emptyDiscoverContext({
+      resourceSpec: resourceSpecSelfHostedKube,
+    });
+    discoverCtx.nextStep = jest.fn();
+    discoverCtx.agentMeta = {
+      ...discoverCtx.agentMeta,
+      ...getMeta(ResourceKind.Kubernetes),
+      autoDiscovery: {
+        config: { name: '', discoveryGroup: '', aws: [] },
+        requiredVpcsAndSubnets: {},
+      },
     };
 
-    const { result, waitForNextUpdate, waitFor } = renderHook(
-      () => useUserTraits(props),
-      {
-        wrapper,
-      }
+    const { result } = renderHook(() => useUserTraits(), {
+      wrapper: wrapperFn(discoverCtx, teleCtx),
+    });
+
+    await waitFor(() =>
+      expect(result.current.dynamicTraits.kubeUsers).toHaveLength(2)
     );
-    await waitForNextUpdate();
+
+    expect(result.current.dynamicTraits.kubeGroups).toHaveLength(2);
+
+    // Should not be setting statics.
+    expect(result.current.staticTraits.kubeUsers).toHaveLength(0);
+    expect(result.current.staticTraits.kubeGroups).toHaveLength(0);
+
+    const addedTraitsOpts = {
+      kubeUsers: [
+        {
+          isFixed: false,
+          label: 'dynamicKbUser3',
+          value: 'dynamicKbUser3',
+        },
+        {
+          isFixed: false,
+          label: 'dynamicKbUser4',
+          value: 'dynamicKbUser4',
+        },
+        // duplicate
+        {
+          isFixed: false,
+          label: 'dynamicKbUser4',
+          value: 'dynamicKbUser4',
+        },
+      ],
+      kubeGroups: [
+        {
+          isFixed: false,
+          label: 'dynamicKbGroup3',
+          value: 'dynamicKbGroup3',
+        },
+        {
+          isFixed: false,
+          label: 'dynamicKbGroup4',
+          value: 'dynamicKbGroup4',
+        },
+      ],
+    };
+
+    act(() => {
+      result.current.onProceed(addedTraitsOpts);
+    });
+
+    await waitFor(() => {
+      expect(teleCtx.userService.reloadUser).toHaveBeenCalledTimes(1);
+    });
+
+    // Test that we are updating the user with the correct traits.
+    const mockUser = getMockUser();
+    expect(teleCtx.userService.updateUser).toHaveBeenCalledWith({
+      user: {
+        ...mockUser,
+        traits: {
+          ...result.current.dynamicTraits,
+          kubeGroups: ['dynamicKbGroup3', 'dynamicKbGroup4'],
+          kubeUsers: ['dynamicKbUser3', 'dynamicKbUser4'],
+        },
+      },
+      excludeUserField: ExcludeUserField.AllTraits,
+    });
+  });
+
+  test('database', async () => {
+    const discoverCtx = emptyDiscoverContext({
+      resourceSpec: resourceSpecSelfHostedPostgres,
+    });
+    discoverCtx.nextStep = jest.fn();
+    discoverCtx.agentMeta = {
+      ...discoverCtx.agentMeta,
+      ...getMeta(ResourceKind.Database),
+    };
+    const spyUpdateAgentMeta = jest
+      .spyOn(discoverCtx, 'updateAgentMeta')
+      .mockImplementation(x => x);
+
+    const { result } = renderHook(() => useUserTraits(), {
+      wrapper: wrapperFn(discoverCtx, teleCtx),
+    });
+
+    await waitFor(() =>
+      expect(result.current.staticTraits.databaseNames).toHaveLength(2)
+    );
 
     const staticTraits = result.current.staticTraits;
     const dynamicTraits = result.current.dynamicTraits;
@@ -209,18 +298,21 @@ describe('onProceed correctly deduplicates, removes static traits, updates meta,
     });
 
     await waitFor(() => {
-      expect(ctx.userService.applyUserTraits).toHaveBeenCalledTimes(1);
+      expect(teleCtx.userService.reloadUser).toHaveBeenCalledTimes(1);
     });
 
     // Test that we are updating the user with the correct traits.
     const mockUser = getMockUser();
-    expect(ctx.userService.updateUser).toHaveBeenCalledWith({
-      ...mockUser,
-      traits: { ...mockUser.traits, ...expected },
+    expect(teleCtx.userService.updateUser).toHaveBeenCalledWith({
+      user: {
+        ...mockUser,
+        traits: { ...mockUser.traits, ...expected },
+      },
+      excludeUserField: ExcludeUserField.AllTraits,
     });
 
     // Test that updating meta correctly updated the dynamic traits.
-    const updatedMeta = props.updateAgentMeta.mock.results[0].value as DbMeta;
+    const updatedMeta = spyUpdateAgentMeta.mock.results[0].value as DbMeta;
     expect(updatedMeta.db.users).toStrictEqual([
       ...staticTraits.databaseUsers,
       ...expected.databaseUsers,
@@ -231,21 +323,99 @@ describe('onProceed correctly deduplicates, removes static traits, updates meta,
     ]);
   });
 
-  test('node', async () => {
-    const props = {
-      agentMeta: getMeta(ResourceKind.Server) as AgentMeta,
-      updateAgentMeta: jest.fn(x => x),
-      nextStep: () => null,
-      selectedResourceKind: ResourceKind.Server,
+  test('database with auto discover preserves existing + new dynamic traits', async () => {
+    const discoverCtx = emptyDiscoverContext({
+      resourceSpec: resourceSpecSelfHostedPostgres,
+    });
+    discoverCtx.nextStep = jest.fn();
+    discoverCtx.agentMeta = {
+      ...discoverCtx.agentMeta,
+      ...getMeta(ResourceKind.Database),
+      autoDiscovery: {
+        config: { name: '', discoveryGroup: '', aws: [] },
+        requiredVpcsAndSubnets: {},
+      },
     };
 
-    const { result, waitForNextUpdate, waitFor } = renderHook(
-      () => useUserTraits(props),
-      {
-        wrapper,
-      }
+    const { result } = renderHook(() => useUserTraits(), {
+      wrapper: wrapperFn(discoverCtx, teleCtx),
+    });
+
+    await waitFor(() =>
+      expect(result.current.dynamicTraits.databaseNames).toHaveLength(2)
     );
-    await waitForNextUpdate();
+
+    expect(result.current.dynamicTraits.databaseUsers).toHaveLength(2);
+
+    // Should not be setting statics.
+    expect(result.current.staticTraits.databaseNames).toHaveLength(0);
+    expect(result.current.staticTraits.databaseUsers).toHaveLength(0);
+
+    const addedTraitsOpts = {
+      databaseNames: [
+        {
+          isFixed: true,
+          label: 'banana',
+          value: 'banana',
+        },
+        {
+          isFixed: true,
+          label: 'carrot',
+          value: 'carrot',
+        },
+      ],
+      databaseUsers: [
+        {
+          isFixed: false,
+          label: 'apple',
+          value: 'apple',
+        },
+      ],
+    };
+
+    act(() => {
+      result.current.onProceed(addedTraitsOpts);
+    });
+
+    await waitFor(() => {
+      expect(teleCtx.userService.reloadUser).toHaveBeenCalledTimes(1);
+    });
+
+    // Test that we are updating the user with the correct traits.
+    const mockUser = getMockUser();
+    expect(teleCtx.userService.updateUser).toHaveBeenCalledWith({
+      user: {
+        ...mockUser,
+        traits: {
+          ...result.current.dynamicTraits,
+          databaseNames: ['banana', 'carrot'],
+          databaseUsers: ['apple'],
+        },
+      },
+      excludeUserField: ExcludeUserField.AllTraits,
+    });
+  });
+
+  test('node', async () => {
+    const discoverCtx = emptyDiscoverContext({
+      resourceSpec: resourceSpecServerLinuxUbuntu,
+    });
+    discoverCtx.nextStep = jest.fn();
+    discoverCtx.agentMeta = {
+      ...discoverCtx.agentMeta,
+      ...getMeta(ResourceKind.Server),
+    };
+    const spyUpdateAgentMeta = jest
+      .spyOn(discoverCtx, 'updateAgentMeta')
+      .mockImplementation(x => x);
+
+    const { result } = renderHook(() => useUserTraits(), {
+      wrapper: wrapperFn(discoverCtx, teleCtx),
+    });
+
+    await waitFor(() =>
+      expect(result.current.staticTraits.logins).toHaveLength(2)
+    );
 
     const staticTraits = result.current.staticTraits;
     const dynamicTraits = result.current.dynamicTraits;
@@ -280,63 +450,226 @@ describe('onProceed correctly deduplicates, removes static traits, updates meta,
     });
 
     await waitFor(() => {
-      expect(ctx.userService.applyUserTraits).toHaveBeenCalledTimes(1);
+      expect(teleCtx.userService.reloadUser).toHaveBeenCalledTimes(1);
     });
 
     // Test that we are updating the user with the correct traits.
     const mockUser = getMockUser();
-    expect(ctx.userService.updateUser).toHaveBeenCalledWith({
-      ...mockUser,
-      traits: { ...mockUser.traits, ...expected },
+    expect(teleCtx.userService.updateUser).toHaveBeenCalledWith({
+      user: {
+        ...mockUser,
+        traits: { ...mockUser.traits, ...expected },
+      },
+      excludeUserField: ExcludeUserField.AllTraits,
     });
 
     // Test that updating meta correctly updated the dynamic traits.
-    const updatedMeta = props.updateAgentMeta.mock.results[0].value as NodeMeta;
+    const updatedMeta = spyUpdateAgentMeta.mock.results[0].value as NodeMeta;
     expect(updatedMeta.node.sshLogins).toStrictEqual([
       ...staticTraits.logins,
       ...expected.logins,
     ]);
   });
+
+  test('only update user traits with dynamic awsRoleArns', async () => {
+    const staticAwsRoles: AwsRole[] = [
+      {
+        name: 'static-arn1',
+        arn: 'arn:aws:iam::123456789012:role/static-arn1',
+        display: 'static-arn1',
+        accountId: '123456789012',
+      },
+      {
+        name: 'static-arn2',
+        arn: 'arn:aws:iam::123456789012:role/static-arn2',
+        display: 'static-arn2',
+        accountId: '123456789012',
+      },
+    ];
+    const discoverCtx = emptyDiscoverContext({
+      resourceSpec: resourceSpecAppAwsCliConsole,
+      agentMeta: {
+        app: {
+          ...app,
+          awsRoles: staticAwsRoles,
+        },
+      },
+    });
+    discoverCtx.nextStep = jest.fn();
+    const spyUpdateAgentMeta = jest
+      .spyOn(discoverCtx, 'updateAgentMeta')
+      .mockImplementation(x => x);
+
+    const { result } = renderHook(() => useUserTraits(), {
+      wrapper: wrapperFn(discoverCtx, teleCtx),
+    });
+
+    await waitFor(() =>
+      expect(teleCtx.userService.fetchUser).toHaveBeenCalledTimes(1)
+    );
+
+    await waitFor(() =>
+      expect(result.current.staticTraits.awsRoleArns.length).toBeGreaterThan(0)
+    );
+
+    const dynamicTraits = result.current.dynamicTraits;
+    const staticTraits = result.current.staticTraits;
+    const mockedSelectedOptions = {
+      awsRoleArns: [
+        {
+          isFixed: false,
+          label: staticTraits.awsRoleArns[0],
+          value: staticTraits.awsRoleArns[0],
+        },
+        {
+          isFixed: false,
+          label: dynamicTraits.awsRoleArns[0],
+          value: dynamicTraits.awsRoleArns[0],
+        },
+        // duplicate
+        {
+          isFixed: false,
+          label: dynamicTraits.awsRoleArns[0],
+          value: dynamicTraits.awsRoleArns[0],
+        },
+      ],
+    };
+
+    act(() => {
+      result.current.onProceed(mockedSelectedOptions);
+    });
+
+    await waitFor(() => {
+      expect(teleCtx.userService.reloadUser).toHaveBeenCalledTimes(1);
+    });
+
+    // Test that we are updating the user with the correct traits.
+    const mockUser = getMockUser();
+    expect(teleCtx.userService.updateUser).toHaveBeenCalledWith({
+      user: {
+        ...mockUser,
+        traits: {
+          ...mockUser.traits,
+          awsRoleArns: [dynamicTraits.awsRoleArns[0]],
+        },
+      },
+      excludeUserField: ExcludeUserField.AllTraits,
+    });
+
+    // Test that app's awsRoles field got updated with the dynamic trait.
+    const updatedMeta = spyUpdateAgentMeta.mock.results[0].value as AppMeta;
+    expect(updatedMeta.app.awsRoles).toStrictEqual([
+      ...staticAwsRoles,
+      {
+        name: 'dynamicArn1',
+        display: 'dynamicArn1',
+        arn: 'arn:aws:iam::123456789012:role/dynamicArn1',
+        accountId: '123456789012',
+      },
+    ]);
+  });
+
+  test('node with auto discover preserves existing + new dynamic traits', async () => {
+    const discoverCtx = emptyDiscoverContext({
+      resourceSpec: resourceSpecAwsEc2Ssm,
+    });
+    discoverCtx.nextStep = jest.fn();
+    discoverCtx.agentMeta = {
+      ...discoverCtx.agentMeta,
+      ...getMeta(ResourceKind.Server),
+      autoDiscovery: {
+        config: { name: '', discoveryGroup: '', aws: [] },
+        requiredVpcsAndSubnets: {},
+      },
+    };
+
+    const { result } = renderHook(() => useUserTraits(), {
+      wrapper: wrapperFn(discoverCtx, teleCtx),
+    });
+
+    await waitFor(() =>
+      expect(result.current.dynamicTraits.logins).toHaveLength(2)
+    );
+
+    // Should not be setting statics.
+    expect(result.current.staticTraits.logins).toHaveLength(0);
+
+    const addedTraitsOpts = {
+      logins: [
+        {
+          isFixed: true,
+          label: 'banana',
+          value: 'banana',
+        },
+        {
+          isFixed: false,
+          label: 'carrot',
+          value: 'carrot',
+        },
+      ],
+    };
+
+    act(() => {
+      result.current.onProceed(addedTraitsOpts);
+    });
+
+    await waitFor(() => {
+      expect(teleCtx.userService.reloadUser).toHaveBeenCalledTimes(1);
+    });
+    // Test that we are updating the user with the correct traits.
+    const mockUser = getMockUser();
+    expect(teleCtx.userService.updateUser).toHaveBeenCalledWith({
+      user: {
+        ...mockUser,
+        traits: {
+          ...result.current.dynamicTraits,
+          logins: ['banana', 'carrot'],
+        },
+      },
+      excludeUserField: ExcludeUserField.AllTraits,
+    });
+  });
 });
 
 describe('static and dynamic traits are correctly separated and correctly creates Option objects', () => {
   test.each`
-    resourceKind               | traitName
-    ${ResourceKind.Kubernetes} | ${'kubeUsers'}
-    ${ResourceKind.Kubernetes} | ${'kubeGroups'}
-    ${ResourceKind.Server}     | ${'logins'}
-    ${ResourceKind.Database}   | ${'databaseNames'}
-    ${ResourceKind.Database}   | ${'databaseUsers'}
-  `('$traitName', async ({ resourceKind, traitName }) => {
-    const ctx = createTeleportContext();
-    jest.spyOn(ctx.userService, 'fetchUser').mockResolvedValue(getMockUser());
+    resourceKind               | resourceSpec                      | traitName
+    ${ResourceKind.Kubernetes} | ${resourceSpecSelfHostedKube}     | ${'kubeUsers'}
+    ${ResourceKind.Kubernetes} | ${resourceSpecSelfHostedKube}     | ${'kubeGroups'}
+    ${ResourceKind.Server}     | ${resourceSpecServerLinuxUbuntu}  | ${'logins'}
+    ${ResourceKind.Database}   | ${resourceSpecSelfHostedPostgres} | ${'databaseNames'}
+    ${ResourceKind.Database}   | ${resourceSpecSelfHostedPostgres} | ${'databaseUsers'}
+  `('$traitName', async ({ resourceKind, resourceSpec, traitName }) => {
+    const teleCtx = createTeleportContext();
+    jest
+      .spyOn(teleCtx.userService, 'fetchUser')
+      .mockResolvedValue(getMockUser());
 
-    const props = {
-      agentMeta: getMeta(resourceKind) as AgentMeta,
-      updateAgentMeta: () => null,
-      nextStep: () => null,
-      selectedResourceKind: resourceKind,
+    const discoverCtx = emptyDiscoverContext({
+      resourceSpec,
+    });
+    discoverCtx.nextStep = jest.fn();
+    discoverCtx.agentMeta = {
+      ...discoverCtx.agentMeta,
+      ...getMeta(resourceKind),
     };
 
-    const wrapper = ({ children }) => (
-      <MemoryRouter initialEntries={[{ pathname: cfg.routes.discover }]}>
-        <ContextProvider ctx={ctx}>
-          <FeaturesContextProvider value={[]}>
-            <DiscoverProvider>{children}</DiscoverProvider>
-          </FeaturesContextProvider>
-        </ContextProvider>
-      </MemoryRouter>
-    );
+    const { result } = renderHook(() => useUserTraits(), {
+      wrapper: wrapperFn(discoverCtx, teleCtx),
+    });
 
-    const { result, waitForNextUpdate } = renderHook(
-      () => useUserTraits(props),
-      {
-        wrapper,
-      }
+    await waitFor(() =>
+      expect(result.current.dynamicTraits.logins.length).toBeGreaterThan(0)
     );
-
-    await waitForNextUpdate();
-    expect(ctx.userService.fetchUser).toHaveBeenCalled();
+    expect(teleCtx.userService.fetchUser).toHaveBeenCalled();
+    expect(result.current.dynamicTraits.kubeGroups.length).toBeGreaterThan(0);
+    expect(result.current.dynamicTraits.kubeUsers.length).toBeGreaterThan(0);
+    expect(result.current.dynamicTraits.databaseNames.length).toBeGreaterThan(
+      0
+    );
+    expect(result.current.dynamicTraits.databaseUsers.length).toBeGreaterThan(
+      0
+    );
 
     // Test correct making of dynamic traits.
     const dynamicTraits = result.current.dynamicTraits;
@@ -382,14 +715,45 @@ describe('static and dynamic traits are correctly separated and correctly create
   });
 });
 
-function createTeleportContext() {
-  const ctx = new TeleportContext();
-  const userCtx = makeUserContext(baseContext);
+describe('calls to nextStep respects number of steps to skip', () => {
+  test('with auto discover, as a sso user with no traits', async () => {
+    const teleCtx = createTeleportContext();
+    teleCtx.storeUser.state.authType = 'sso';
+    const user = getMockUser();
+    user.traits = {
+      logins: ['login'],
+      databaseUsers: [],
+      databaseNames: [],
+      kubeUsers: [],
+      kubeGroups: [],
+      windowsLogins: [],
+      awsRoleArns: [],
+    };
 
-  ctx.storeUser.setState(userCtx);
+    jest.spyOn(teleCtx.userService, 'fetchUser').mockResolvedValue(user);
 
-  return ctx;
-}
+    const discoverCtx = emptyDiscoverContext({
+      resourceSpec: resourceSpecAwsRdsPostgres,
+    });
+    discoverCtx.nextStep = jest.fn();
+    discoverCtx.agentMeta.autoDiscovery = {
+      config: { name: '', discoveryGroup: '', aws: [] },
+    };
+
+    const { result } = renderHook(() => useUserTraits(), {
+      wrapper: wrapperFn(discoverCtx, teleCtx),
+    });
+    await waitFor(() =>
+      expect(result.current.dynamicTraits.logins.length).toBeGreaterThan(0)
+    );
+
+    act(() => {
+      result.current.onProceed({ databaseNames: [], databaseUsers: [] }, 7);
+    });
+
+    expect(discoverCtx.nextStep).toHaveBeenCalledWith(7);
+  });
+});
 
 function getMockUser() {
   return {
@@ -402,9 +766,12 @@ function getMockUser() {
       databaseUsers: ['dynamicDbUser1', 'dynamicDbUser2'],
       databaseNames: ['dynamicDbName1', 'dynamicDbName2'],
       kubeUsers: ['dynamicKbUser1', 'dynamicKbUser2'],
-      kubeGroups: ['dynamicKbGroup1', 'dynamicKbGroup1'],
+      kubeGroups: ['dynamicKbGroup1', 'dynamicKbGroup2'],
       windowsLogins: [],
-      awsRoleArns: [],
+      awsRoleArns: [
+        'arn:aws:iam::123456789012:role/dynamicArn1',
+        'arn:aws:iam::123456789012:role/dynamicArn2',
+      ],
     },
   };
 }
@@ -469,4 +836,20 @@ function getMeta(resource: ResourceKind) {
         },
       } as DbMeta;
   }
+}
+
+function wrapperFn(
+  discoverCtx: DiscoverContextState,
+  teleportCtx: TeleportContext
+) {
+  return ({ children }) => (
+    <RequiredDiscoverProviders
+      agentMeta={discoverCtx.agentMeta}
+      resourceSpec={discoverCtx.resourceSpec}
+      discoverCtx={discoverCtx}
+      teleportCtx={teleportCtx}
+    >
+      {children}
+    </RequiredDiscoverProviders>
+  );
 }

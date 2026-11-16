@@ -1,44 +1,83 @@
 /**
- * Copyright 2020 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
 import {
-  render as testingRender,
+  createThemeSystem,
+  TELEPORT_THEME,
+  ThemeProvider as NewThemeProvider,
+} from '@gravitational/design-system';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import {
   act,
   fireEvent,
-  waitFor,
-  screen,
   prettyDOM,
-  getByTestId,
+  screen,
+  render as testingRender,
+  waitFor,
   waitForElementToBeRemoved,
+  within,
 } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter as Router } from 'react-router-dom';
+import { HttpResponse, JsonBodyType } from 'msw';
+import { setupServer } from 'msw/node';
+import { PropsWithChildren, ReactNode } from 'react';
+import { MemoryRouter, useLocation } from 'react-router';
 
-import ThemeProvider from 'design/ThemeProvider';
-import theme from 'design/theme';
-import '@testing-library/jest-dom';
-import 'jest-styled-components';
+import { darkTheme, resolveTheme } from 'design/theme';
+import { ConfiguredThemeProvider } from 'design/ThemeProvider';
 
-function Providers({ children }: { children: React.ReactElement }) {
-  return <ThemeProvider theme={theme}>{children}</ThemeProvider>;
+const testThemeSystem = createThemeSystem(TELEPORT_THEME.config);
+
+export const testQueryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: false,
+    },
+  },
+});
+
+const legacyTheme = resolveTheme(darkTheme);
+
+export function Providers({ children }: { children: ReactNode }) {
+  return (
+    <QueryClientProvider client={testQueryClient}>
+      <NewThemeProvider system={testThemeSystem} forcedTheme="dark">
+        <ConfiguredThemeProvider theme={legacyTheme}>
+          {children}
+        </ConfiguredThemeProvider>
+      </NewThemeProvider>
+    </QueryClientProvider>
+  );
 }
 
-function render(ui: React.ReactElement<any>, options?: RenderOptions) {
+function render(
+  ui: ReactNode,
+  options?: RenderOptions
+): ReturnType<typeof testingRender> {
   return testingRender(ui, { wrapper: Providers, ...options });
+}
+
+/*
+ Returns a Promise resolving on the next macrotask, allowing any pending state
+ updates / timeouts to finish.
+ */
+function tick() {
+  return new Promise<void>(res => setTimeout(res, 0));
 }
 
 screen.debug = () => {
@@ -46,20 +85,153 @@ screen.debug = () => {
 };
 
 type RenderOptions = {
-  wrapper: React.FC;
-  container: HTMLElement;
+  wrapper?: React.FC<PropsWithChildren>;
+  container?: HTMLElement;
 };
+
+type CurrentPathProps = {
+  testId?: string;
+};
+
+export function CurrentPath({ testId = 'current-path' }: CurrentPathProps) {
+  const location = useLocation();
+  return <span data-testid={testId}>{location.pathname}</span>;
+}
+
+type CurrentLocationProps = {
+  testId?: string;
+};
+
+export function CurrentLocation({
+  testId = 'location-display',
+}: CurrentLocationProps) {
+  const location = useLocation();
+  return (
+    <span data-testid={testId}>
+      {location.pathname}
+      {location.search}
+      {location.hash}
+    </span>
+  );
+}
+
+/**
+ * createDeferredResponse is a utility function to create a deferred response
+ * handler for testing purposes.
+ *
+ * This is useful when you want to assert that a loading state is shown,
+ * and then the loaded data is displayed after resolving the promise,
+ * instead of using a timeout or a fixed delay in the response handler.
+ *
+ * Example usage:
+ *
+ * ```ts
+ * const deferred = createDeferredResponse({
+ *   events: MOCK_EVENTS,
+ *   startKey: '',
+ * });
+ *
+ * server.use(http.get(listRecordingsUrl, deferred.handler));
+ *
+ * setupTest();
+ *
+ * await waitFor(() => {
+ *   expect(screen.getByTestId('indicator')).toBeInTheDocument();
+ * });
+ *
+ * deferred.resolve();
+ *
+ * await waitFor(() => {
+ *   expect(screen.queryByTestId('indicator')).not.toBeInTheDocument();
+ * });
+ * ```
+ */
+export function createDeferredResponse<T extends JsonBodyType>(data: T) {
+  let resolve: () => void;
+
+  const promise = new Promise<void>(r => {
+    resolve = r;
+  });
+
+  return {
+    handler: async () => {
+      await promise;
+
+      return HttpResponse.json(data);
+    },
+    resolve: () => resolve(),
+  };
+}
+
+export const server = setupServer();
+
+/**
+ * Registers MSW lifecycle hooks for the current test suite. Call this at the
+ * top level of every test file that uses `server.use()`.
+ *
+ * This is intentionally opt-in rather than global (via setupTests.ts) to
+ * avoid the overhead of patching fetch/XHR in the hundreds of test suites
+ * that don't use MSW.
+ */
+export function enableMswServer() {
+  beforeAll(() => server.listen());
+  afterEach(() => server.resetHandlers());
+  afterAll(() => server.close());
+}
+
+/**
+ * Mocks HTMLElement.prototype.offsetParent for the current test suite. Call
+ * this at the top level of a test file (or inside a describe block) that
+ * exercises code filtering out hidden elements by offsetParent, e.g. the focus
+ * trap in Modal.
+ */
+export function mockOffsetParent() {
+  let originalOffsetParent: PropertyDescriptor | undefined;
+
+  beforeAll(() => {
+    originalOffsetParent = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      'offsetParent'
+    );
+    Object.defineProperty(HTMLElement.prototype, 'offsetParent', {
+      get(this: HTMLElement) {
+        // Walk up the ancestor chain — in real browsers, offsetParent is null when any
+        // ancestor has display: none.
+        let el: HTMLElement | null = this;
+        while (el) {
+          if (el.style.display === 'none') {
+            return null;
+          }
+          el = el.parentElement;
+        }
+        return this.parentElement;
+      },
+      configurable: true,
+    });
+  });
+
+  afterAll(() => {
+    if (originalOffsetParent) {
+      Object.defineProperty(
+        HTMLElement.prototype,
+        'offsetParent',
+        originalOffsetParent
+      );
+    }
+  });
+}
 
 export {
   act,
   screen,
   fireEvent,
-  theme,
+  legacyTheme as theme,
+  testThemeSystem,
+  tick,
   render,
-  prettyDOM,
   waitFor,
-  getByTestId,
-  Router,
+  MemoryRouter as Router,
   userEvent,
   waitForElementToBeRemoved,
+  within,
 };

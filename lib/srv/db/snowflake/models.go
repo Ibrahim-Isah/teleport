@@ -1,20 +1,20 @@
 /*
-
- Copyright 2022 Gravitational, Inc.
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package snowflake
 
@@ -56,13 +56,13 @@ type loginResponseData struct {
 
 	// allFields contains all fields from the JSON. Those fields will
 	// be added when marshaling JSON.
-	allFields map[string]interface{}
+	allFields map[string]any
 }
 
 func (l *loginResponseData) MarshalJSON() ([]byte, error) {
 	elems := reflect.TypeOf(l).Elem()
 
-	for i := 0; i < elems.NumField(); i++ {
+	for i := range elems.NumField() {
 		jsonTag, ok := elems.Field(i).Tag.Lookup("json")
 		if !ok {
 			continue
@@ -93,8 +93,8 @@ func (l *loginResponseData) UnmarshalJSON(data []byte) error {
 // loginResponse is the payload returned by the /queries/v1/query-request endpoint.
 type loginResponse struct {
 	Data    loginResponseData `json:"data"`
-	Code    interface{}       `json:"code"`
-	Message interface{}       `json:"message"`
+	Code    any               `json:"code"`
+	Message any               `json:"message"`
 	Success bool              `json:"success"`
 }
 
@@ -151,14 +151,14 @@ type renewSessionResponse struct {
 // SQL query that we need to log.
 type queryRequest struct {
 	SQLText    string                       `json:"sqlText"`
-	Parameters map[string]interface{}       `json:"parameters,omitempty"`
+	Parameters map[string]any               `json:"parameters,omitempty"`
 	Bindings   map[string]execBindParameter `json:"bindings,omitempty"`
 	BindStage  string                       `json:"bindStage,omitempty"`
 }
 
 type execBindParameter struct {
-	Type  string      `json:"type"`
-	Value interface{} `json:"value"`
+	Type  string `json:"type"`
+	Value any    `json:"value"`
 }
 
 func (q *queryRequest) paramsToSlice() []string {
@@ -174,7 +174,7 @@ func (q *queryRequest) paramsToSlice() []string {
 	return args
 }
 
-func queryParametersToSlice(parameters map[string]interface{}) []string {
+func queryParametersToSlice(parameters map[string]any) []string {
 	params := make([]string, 0)
 
 	for k, v := range parameters {

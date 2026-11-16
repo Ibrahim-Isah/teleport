@@ -1,18 +1,20 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
@@ -22,81 +24,143 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/gravitational/teleport/api/constants"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/auth/authcatest"
 	"github.com/gravitational/teleport/lib/backend"
+	"github.com/gravitational/teleport/lib/fixtures"
+	"github.com/gravitational/teleport/lib/itertools/stream"
 	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/services/suite"
+	"github.com/gravitational/teleport/lib/utils"
 )
+
+func TestCreateResourcesProvisionToken(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tt := setupServicesContext(ctx, t)
+
+	token, err := types.NewProvisionToken(
+		"foo",
+		types.SystemRoles{types.RoleNode},
+		time.Time{},
+	)
+	require.NoError(t, err)
+	require.NoError(t, CreateResources(ctx, tt.bk, token))
+
+	s := NewProvisioningService(tt.bk)
+	fetchedToken, err := s.GetToken(ctx, "foo")
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(token, fetchedToken, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+}
+
+func TestCreateResource(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tt := setupServicesContext(ctx, t)
+	cap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type: constants.Local,
+	})
+	require.NoError(t, err)
+
+	// Check that the initial call to CreateResources creates the given resources.
+	s, err := NewClusterConfigurationService(tt.bk)
+	require.NoError(t, err)
+	err = CreateResources(ctx, tt.bk, cap)
+	require.NoError(t, err)
+	got, err := s.GetAuthPreference(ctx)
+	require.NoError(t, err)
+	require.Equal(t, cap.GetType(), got.GetType())
+
+	// Check that already exists errors are ignored and the resource is not
+	// updated.
+	cap.SetType(constants.SAML)
+	err = CreateResources(ctx, tt.bk, cap)
+	require.NoError(t, err)
+	got, err = s.GetAuthPreference(ctx)
+	require.NoError(t, err)
+	require.NotEqual(t, cap.GetType(), got.GetType())
+}
 
 func TestUserResource(t *testing.T) {
 	t.Parallel()
-
-	tt := setupServicesContext(context.Background(), t)
-	runUserResourceTest(t, tt, false)
+	ctx := context.Background()
+	tt := setupServicesContext(ctx, t)
+	runUserResourceTest(ctx, t, tt, false)
 }
 
 func TestUserResourceWithSecrets(t *testing.T) {
 	t.Parallel()
-
-	tt := setupServicesContext(context.Background(), t)
-	runUserResourceTest(t, tt, true)
+	ctx := context.Background()
+	tt := setupServicesContext(ctx, t)
+	runUserResourceTest(ctx, t, tt, true)
 }
 
-func runUserResourceTest(t *testing.T, tt *servicesContext, withSecrets bool) {
+func runUserResourceTest(
+	ctx context.Context,
+	t *testing.T,
+	tt *servicesContext,
+	withSecrets bool,
+) {
 	expiry := tt.bk.Clock().Now().Add(time.Minute)
 
 	alice := newUserTestCase(t, "alice", nil, withSecrets, expiry)
 	bob := newUserTestCase(t, "bob", nil, withSecrets, expiry)
 
 	// Check basic dynamic item creation
-	runCreationChecks(t, tt, alice, bob)
+	err := CreateResources(ctx, tt.bk, alice, bob)
+	require.NoError(t, err)
 
 	// Check that dynamically created item is compatible with service
-	s := NewIdentityService(tt.bk)
-	b, err := s.GetUser("bob", withSecrets)
+	s, err := NewTestIdentityService(tt.bk)
 	require.NoError(t, err)
-	require.Equal(t, services.UsersEquals(bob, b), true, "dynamically inserted user does not match")
-	allUsers, err := s.GetUsers(withSecrets)
+	b, err := s.GetUser(ctx, "bob", withSecrets)
 	require.NoError(t, err)
-	require.Equal(t, len(allUsers), 2, "expected exactly two users")
+	require.True(t, bob.IsEqual(b), "dynamically inserted user does not match")
+	allUsers, err := s.GetUsers(ctx, withSecrets)
+	require.NoError(t, err)
+	require.Len(t, allUsers, 2, "expected exactly two users")
 	for _, user := range allUsers {
 		switch user.GetName() {
 		case "alice":
-			require.Equal(t, services.UsersEquals(alice, user), true, "alice does not match")
+			require.True(t, alice.IsEqual(user), "alice does not match")
 		case "bob":
-			require.Equal(t, services.UsersEquals(bob, user), true, "bob does not match")
+			require.True(t, bob.IsEqual(user), "bob does not match")
 		default:
 			t.Errorf("Unexpected user %q", user.GetName())
 		}
 	}
 
 	// Advance the clock to let the users to expire.
-	tt.bk.Clock().(clockwork.FakeClock).Advance(2 * time.Minute)
-	allUsers, err = s.GetUsers(withSecrets)
+	tt.bk.Clock().(*clockwork.FakeClock).Advance(2 * time.Minute)
+	allUsers, err = s.GetUsers(ctx, withSecrets)
 	require.NoError(t, err)
-	require.Equal(t, len(allUsers), 0, "expected all users to expire")
+	require.Empty(t, allUsers, "expected all users to expire")
 }
 
 func TestCertAuthorityResource(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
+	tt := setupServicesContext(ctx, t)
 
-	tt := setupServicesContext(context.Background(), t)
-
-	userCA := suite.NewTestCA(types.UserCA, "example.com")
-	hostCA := suite.NewTestCA(types.HostCA, "example.com")
+	userCA, err := authcatest.NewCA(types.UserCA, "example.com")
+	require.NoError(t, err)
+	hostCA, err := authcatest.NewCA(types.HostCA, "example.com")
+	require.NoError(t, err)
 
 	// Check basic dynamic item creation
-	runCreationChecks(t, tt, userCA, hostCA)
+	require.NoError(t, CreateResources(ctx, tt.bk, userCA, hostCA))
 
 	// Check that dynamically created item is compatible with service
 	s := NewCAService(tt.bk)
-	err := s.CompareAndSwapCertAuthority(userCA, userCA)
-	require.NoError(t, err)
+	require.NoError(t, s.CompareAndSwapCertAuthority(userCA, userCA))
 }
 
 func TestTrustedClusterResource(t *testing.T) {
@@ -124,9 +188,10 @@ func TestTrustedClusterResource(t *testing.T) {
 	require.NoError(t, err)
 
 	// Check basic dynamic item creation
-	runCreationChecks(t, tt, foo, bar)
+	err = CreateResources(ctx, tt.bk, foo, bar)
+	require.NoError(t, err)
 
-	s := NewPresenceService(tt.bk)
+	s := NewCAService(tt.bk)
 	_, err = s.GetTrustedCluster(ctx, "foo")
 	require.NoError(t, err)
 	_, err = s.GetTrustedCluster(ctx, "bar")
@@ -150,7 +215,7 @@ func TestGithubConnectorResource(t *testing.T) {
 			ClientID:     "aaa",
 			ClientSecret: "bbb",
 			RedirectURL:  "https://localhost:3080/v1/webapi/github/callback",
-			Display:      "Github",
+			Display:      "GitHub",
 			TeamsToLogins: []types.TeamMapping{
 				{
 					Organization: "gravitational",
@@ -163,11 +228,195 @@ func TestGithubConnectorResource(t *testing.T) {
 	}
 
 	// Check basic dynamic item creation
-	runCreationChecks(t, tt, connector)
-
-	s := NewIdentityService(tt.bk)
-	_, err := s.GetGithubConnector(ctx, "github", true)
+	err := CreateResources(ctx, tt.bk, connector)
 	require.NoError(t, err)
+
+	s, err := NewTestIdentityService(tt.bk)
+	require.NoError(t, err)
+	_, err = s.GetGithubConnector(ctx, "github", true)
+	require.NoError(t, err)
+}
+
+func TestOIDCConnectorWithoutClaimsToRoles(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	tt := setupServicesContext(ctx, t)
+
+	identity, err := NewTestIdentityService(tt.bk)
+	require.NoError(t, err)
+
+	newOIDCConnector := func(name string) types.OIDCConnector {
+		connector, err := types.NewOIDCConnector(name, types.OIDCConnectorSpecV3{
+			ClientID:     "client-id",
+			ClientSecret: "client-secret",
+			RedirectURLs: []string{"https://localhost:3080/v1/webapi/oidc/callback"},
+		})
+		require.NoError(t, err)
+		return connector
+	}
+
+	connector := newOIDCConnector("oidc-connector")
+	value, err := services.MarshalOIDCConnector(connector)
+	require.NoError(t, err)
+	_, err = tt.bk.Put(ctx, backend.Item{
+		Key:   backend.NewKey(webPrefix, connectorsPrefix, oidcPrefix, connectorsPrefix, connector.GetName()),
+		Value: value,
+	})
+	require.NoError(t, err)
+
+	t.Run("reads succeed", func(t *testing.T) {
+		const withSecrets = true
+
+		single, err := identity.GetOIDCConnector(ctx, connector.GetName(), withSecrets)
+		require.NoError(t, err)
+		require.Empty(t, cmp.Diff(connector, single, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+
+		multiple, err := identity.GetOIDCConnectors(ctx, withSecrets)
+		require.NoError(t, err)
+		require.Len(t, multiple, 1)
+
+		list, _, err := identity.ListOIDCConnectors(ctx, 10, "", withSecrets)
+		require.NoError(t, err)
+		require.Len(t, list, 1)
+
+		ranged, err := stream.Collect(identity.RangeOIDCConnectors(ctx, "", "", withSecrets))
+		require.NoError(t, err)
+		require.Len(t, ranged, 1)
+	})
+
+	t.Run("writes fail", func(t *testing.T) {
+		_, err := identity.CreateOIDCConnector(ctx, connector)
+		require.ErrorAs(t, err, new(*trace.BadParameterError))
+
+		_, err = identity.UpdateOIDCConnector(ctx, connector)
+		require.ErrorAs(t, err, new(*trace.BadParameterError))
+
+		_, err = identity.UpsertOIDCConnector(ctx, connector)
+		require.ErrorAs(t, err, new(*trace.BadParameterError))
+	})
+}
+
+func TestGithubConnectorWithoutTeamsToRoles(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	tt := setupServicesContext(ctx, t)
+
+	identity, err := NewTestIdentityService(tt.bk)
+	require.NoError(t, err)
+
+	newGithubConnector := func(name string) types.GithubConnector {
+		connector, err := types.NewGithubConnector(name, types.GithubConnectorSpecV3{
+			ClientID:     "client-id",
+			ClientSecret: "client-secret",
+			RedirectURL:  "https://localhost:3080/v1/webapi/oidc/callback",
+		})
+		require.NoError(t, err)
+		return connector
+	}
+
+	connector := newGithubConnector("github-connector")
+	value, err := services.MarshalGithubConnector(connector)
+	require.NoError(t, err)
+	_, err = tt.bk.Put(ctx, backend.Item{
+		Key:   backend.NewKey(webPrefix, connectorsPrefix, githubPrefix, connectorsPrefix, connector.GetName()),
+		Value: value,
+	})
+	require.NoError(t, err)
+
+	t.Run("reads succeed", func(t *testing.T) {
+		const withSecrets = true
+
+		single, err := identity.GetGithubConnector(ctx, connector.GetName(), withSecrets)
+		require.NoError(t, err)
+		require.Empty(t, cmp.Diff(connector, single, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+
+		multiple, err := identity.GetGithubConnectors(ctx, withSecrets)
+		require.NoError(t, err)
+		require.Len(t, multiple, 1)
+
+		list, _, err := identity.ListGithubConnectors(ctx, 10, "", withSecrets)
+		require.NoError(t, err)
+		require.Len(t, list, 1)
+
+		ranged, err := stream.Collect(identity.RangeGithubConnectors(ctx, "", "", withSecrets))
+		require.NoError(t, err)
+		require.Len(t, ranged, 1)
+	})
+
+	t.Run("writes fail", func(t *testing.T) {
+		_, err := identity.CreateGithubConnector(ctx, connector)
+		require.ErrorAs(t, err, new(*trace.BadParameterError))
+
+		_, err = identity.UpdateGithubConnector(ctx, connector)
+		require.ErrorAs(t, err, new(*trace.BadParameterError))
+
+		_, err = identity.UpsertGithubConnector(ctx, connector)
+		require.ErrorAs(t, err, new(*trace.BadParameterError))
+	})
+}
+
+func TestSAMLConnectorWithoutAttributesToRoles(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	tt := setupServicesContext(ctx, t)
+
+	identity, err := NewTestIdentityService(tt.bk)
+	require.NoError(t, err)
+
+	newSAMLConnector := func(name string) types.SAMLConnector {
+		connector, err := types.NewSAMLConnector(name, types.SAMLConnectorSpecV2{
+			AssertionConsumerService: "http://localhost:65535/acs",
+			Issuer:                   "test",
+			SSO:                      "https://localhost:65535/sso",
+			Cert:                     fixtures.TLSCACertPEM,
+			SigningKeyPair: &types.AsymmetricKeyPair{
+				PrivateKey: fixtures.TLSCAKeyPEM,
+				Cert:       fixtures.TLSCACertPEM,
+			},
+		})
+		require.NoError(t, err)
+		return connector
+	}
+
+	connector := newSAMLConnector("saml-connector")
+	value, err := utils.FastMarshal(connector)
+	require.NoError(t, err)
+	_, err = tt.bk.Put(ctx, backend.Item{
+		Key:   backend.NewKey(webPrefix, connectorsPrefix, samlPrefix, connectorsPrefix, connector.GetName()),
+		Value: value,
+	})
+	require.NoError(t, err)
+
+	t.Run("reads succeed", func(t *testing.T) {
+		const withSecrets = true
+
+		single, err := identity.GetSAMLConnector(ctx, connector.GetName(), withSecrets)
+		require.NoError(t, err)
+		require.Empty(t, cmp.Diff(connector, single, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+
+		multiple, err := identity.GetSAMLConnectors(ctx, withSecrets)
+		require.NoError(t, err)
+		require.Len(t, multiple, 1)
+
+		list, _, err := identity.ListSAMLConnectorsWithOptions(ctx, 10, "", withSecrets)
+		require.NoError(t, err)
+		require.Len(t, list, 1)
+
+		ranged, err := stream.Collect(identity.RangeSAMLConnectorsWithOptions(ctx, "", "", withSecrets))
+		require.NoError(t, err)
+		require.Len(t, ranged, 1)
+	})
+
+	t.Run("writes fail", func(t *testing.T) {
+		_, err := identity.CreateSAMLConnector(ctx, connector)
+		require.ErrorAs(t, err, new(*trace.BadParameterError))
+
+		_, err = identity.UpdateSAMLConnector(ctx, connector)
+		require.ErrorAs(t, err, new(*trace.BadParameterError))
+
+		_, err = identity.UpsertSAMLConnector(ctx, connector)
+		require.ErrorAs(t, err, new(*trace.BadParameterError))
+	})
 }
 
 func localAuthSecretsTestCase(t *testing.T) types.LocalAuthSecrets {
@@ -199,38 +448,26 @@ func newUserTestCase(t *testing.T, name string, roles []string, withSecrets bool
 	if withSecrets {
 		auth := localAuthSecretsTestCase(t)
 		user.SetLocalAuth(&auth)
+		user.SetWeakestDevice(types.MFADeviceKind_MFA_DEVICE_KIND_TOTP)
 	}
 	return &user
 }
 
-func dumpResources(t *testing.T, tt *servicesContext) []types.Resource {
-	startKey := []byte("/")
-	endKey := backend.RangeEnd(startKey)
-	result, err := tt.bk.GetRange(context.TODO(), startKey, endKey, 0)
-	require.NoError(t, err)
-	resources, err := ItemsToResources(result.Items...)
-	require.NoError(t, err)
-	return resources
-}
+func TestBootstrapLock(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tt := setupServicesContext(ctx, t)
 
-func runCreationChecks(t *testing.T, tt *servicesContext, resources ...types.Resource) {
-	for _, rsc := range resources {
-		switch r := rsc.(type) {
-		case types.User:
-			t.Logf("Creating User: %+v", r)
-		default:
-		}
-	}
-	err := CreateResources(context.TODO(), tt.bk, resources...)
+	nl, err := types.NewLock("test", types.LockSpecV2{
+		Target: types.LockTarget{
+			User: "user",
+		},
+		Message: "lock test",
+	})
 	require.NoError(t, err)
-	dump := dumpResources(t, tt)
-Outer:
-	for _, exp := range resources {
-		for _, got := range dump {
-			if got.GetKind() == exp.GetKind() && got.GetName() == exp.GetName() && got.Expiry() == exp.Expiry() {
-				continue Outer
-			}
-		}
-		t.Errorf("Missing expected resource kind=%s,name=%s,expiry=%v", exp.GetKind(), exp.GetName(), exp.Expiry().String())
-	}
+	require.NoError(t, CreateResources(ctx, tt.bk, nl))
+
+	l, err := tt.suite.Access.GetLock(ctx, "test")
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(nl, l, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 }

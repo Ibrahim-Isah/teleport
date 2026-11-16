@@ -1,23 +1,31 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gcp
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 
+	"cloud.google.com/go/compute/metadata"
 	"github.com/gravitational/trace"
+	"golang.org/x/oauth2/google"
 )
 
 // SortedGCPServiceAccounts sorts service accounts by project and service account name.
@@ -52,7 +60,7 @@ func (s SortedGCPServiceAccounts) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
-const expectedParentDomain = "iam.gserviceaccount.com"
+const serviceAccountParentDomain = "iam.gserviceaccount.com"
 
 func ProjectIDFromServiceAccountName(serviceAccount string) (string, error) {
 	if serviceAccount == "" {
@@ -76,8 +84,8 @@ func ProjectIDFromServiceAccountName(serviceAccount string) (string, error) {
 		return "", trace.BadParameter("invalid service account format: missing project ID")
 	}
 
-	if iamDomain != expectedParentDomain {
-		return "", trace.BadParameter("invalid service account format: expected suffix %q, got %q", expectedParentDomain, iamDomain)
+	if iamDomain != serviceAccountParentDomain {
+		return "", trace.BadParameter("invalid service account format: expected suffix %q, got %q", serviceAccountParentDomain, iamDomain)
 	}
 
 	return projectID, nil
@@ -86,4 +94,63 @@ func ProjectIDFromServiceAccountName(serviceAccount string) (string, error) {
 func ValidateGCPServiceAccountName(serviceAccount string) error {
 	_, err := ProjectIDFromServiceAccountName(serviceAccount)
 	return err
+}
+
+// GetServiceAccountFromCredentials attempts to retrieve service account email
+// from provided credentials.
+func GetServiceAccountFromCredentials(credentials *google.Credentials) (string, error) {
+	// When credentials JSON file is provided through either
+	// GOOGLE_APPLICATION_CREDENTIALS env var or a well known file.
+	if len(credentials.JSON) > 0 {
+		sa, err := GetServiceAccountFromCredentialsJSON(credentials.JSON)
+		return sa, trace.Wrap(err)
+	}
+
+	// No credentials from JSON files but using metadata endpoints when on
+	// Google Compute Engine.
+	if metadata.OnGCE() {
+		email, err := metadata.EmailWithContext(context.Background(), "")
+		return email, trace.Wrap(err)
+	}
+
+	return "", trace.NotImplemented("unknown environment for getting service account")
+}
+
+// GetServiceAccountFromCredentialsJSON attempts to retrieve service account
+// email from provided credentials JSON.
+func GetServiceAccountFromCredentialsJSON(credentialsJSON []byte) (string, error) {
+	content := struct {
+		// ClientEmail defines the service account email for service_account
+		// credentials.
+		//
+		// Reference: https://google.aip.dev/auth/4112
+		ClientEmail string `json:"client_email"`
+
+		// ServiceAccountImpersonationURL is used for external
+		// account_credentials (e.g. Workload Identity Federation) when using
+		// service account personation.
+		//
+		// Reference: https://google.aip.dev/auth/4117
+		ServiceAccountImpersonationURL string `json:"service_account_impersonation_url"`
+	}{}
+
+	if err := json.Unmarshal(credentialsJSON, &content); err != nil {
+		return "", trace.Wrap(err)
+	}
+
+	if content.ClientEmail != "" {
+		return content.ClientEmail, nil
+	}
+
+	// Format:
+	// https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$EMAIL:generateAccessToken
+	if _, after, ok := strings.Cut(content.ServiceAccountImpersonationURL, "/serviceAccounts/"); ok {
+		index := strings.LastIndex(after, serviceAccountParentDomain)
+		if index < 0 {
+			return "", trace.BadParameter("invalid service_account_impersonation_url %q", content.ServiceAccountImpersonationURL)
+		}
+		return after[:index+len(serviceAccountParentDomain)], nil
+	}
+
+	return "", trace.NotImplemented("unknown environment for getting service account")
 }

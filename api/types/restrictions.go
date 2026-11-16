@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/api/utils"
 )
 
 // NetworkRestrictions defines network restrictions applied to SSH session.
@@ -33,6 +35,8 @@ type NetworkRestrictions interface {
 	GetDeny() []AddressCondition
 	// SetDeny sets a list of denied network addresses (overrides Allow list)
 	SetDeny(deny []AddressCondition)
+	// Clone returns a copy of the network restrictions.
+	Clone() NetworkRestrictions
 }
 
 // NewNetworkRestrictions creates a new NetworkRestrictions with the given name.
@@ -46,20 +50,32 @@ func NewNetworkRestrictions() NetworkRestrictions {
 	}
 }
 
+// Clone returns a copy of the network restrictions.
+func (r *NetworkRestrictionsV4) Clone() NetworkRestrictions {
+	return utils.CloneProtoMsg(r)
+}
+
+func (r *NetworkRestrictionsV4) setStaticFields() {
+	if r.Version == "" {
+		r.Version = V4
+	}
+	if r.Kind == "" {
+		r.Kind = KindNetworkRestrictions
+	}
+	if r.Metadata.Name == "" {
+		r.Metadata.Name = MetaNameNetworkRestrictions
+	}
+}
+
 // CheckAndSetDefaults validates NetworkRestrictions fields and populates empty fields
 // with default values.
 func (r *NetworkRestrictionsV4) CheckAndSetDefaults() error {
-	r.Metadata.Name = MetaNameNetworkRestrictions
+	r.setStaticFields()
 
 	if err := r.Metadata.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}
-	if r.Kind == "" {
-		return trace.BadParameter("NetworkRestrictions missing Kind field")
-	}
-	if r.Version == "" {
-		r.Version = V1
-	}
+
 	return nil
 }
 
@@ -91,12 +107,14 @@ func (r *NetworkRestrictionsV4) SetName(n string) {
 	r.Metadata.SetName(n)
 }
 
-func (r *NetworkRestrictionsV4) GetResourceID() int64 {
-	return r.Metadata.ID
+// GetRevision returns the revision
+func (r *NetworkRestrictionsV4) GetRevision() string {
+	return r.Metadata.GetRevision()
 }
 
-func (r *NetworkRestrictionsV4) SetResourceID(id int64) {
-	r.Metadata.SetID(id)
+// SetRevision sets the revision
+func (r *NetworkRestrictionsV4) SetRevision(rev string) {
+	r.Metadata.SetRevision(rev)
 }
 
 func (r *NetworkRestrictionsV4) Expiry() time.Time {

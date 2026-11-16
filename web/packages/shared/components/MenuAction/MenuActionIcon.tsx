@@ -1,27 +1,37 @@
-/*
-Copyright 2019-2020 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import React, { PropsWithChildren } from 'react';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-import Menu from 'design/Menu';
 import { ButtonIcon } from 'design';
-import { Ellipsis } from 'design/Icon';
+import { MoreHoriz } from 'design/Icon';
+import { IconProps } from 'design/Icon/Icon';
+import Menu from 'design/Menu';
+import { HoverTooltip } from 'design/Tooltip';
 
-import { MenuProps, AnchorProps } from './types';
+import { AnchorProps, MenuProps } from './types';
 
-export default class MenuActionIcon extends React.Component<Props> {
+export default class MenuActionIcon extends React.Component<
+  PropsWithChildren<Props>
+> {
+  static defaultProps = {
+    Icon: MoreHoriz,
+  };
   anchorEl = null;
 
   state = {
@@ -44,24 +54,31 @@ export default class MenuActionIcon extends React.Component<Props> {
 
   render() {
     const { open } = this.state;
-    const { children, buttonIconProps, menuProps } = this.props;
+    const { children, buttonIconProps, menuProps, Icon } = this.props;
     return (
       <>
-        <ButtonIcon
-          {...buttonIconProps}
-          setRef={e => (this.anchorEl = e)}
-          onClick={this.onOpen}
-          data-testid="button"
-        >
-          <Ellipsis />
-        </ButtonIcon>
+        <HoverTooltip tipContent={this.props.tooltip} position="bottom">
+          <ButtonIcon
+            {...buttonIconProps}
+            ref={e => {
+              this.anchorEl = e;
+            }}
+            onClick={this.onOpen}
+            data-testid="button"
+          >
+            <Icon size="medium" />
+          </ButtonIcon>
+        </HoverTooltip>
         <Menu
+          getContentAnchorEl={null}
           menuListCss={menuListCss}
           anchorEl={this.anchorEl}
           open={open}
           onClose={this.onClose}
+          autoFocus
+          trapFocus
           anchorOrigin={{
-            vertical: 'center',
+            vertical: 'bottom',
             horizontal: 'center',
           }}
           transformOrigin={{
@@ -77,7 +94,9 @@ export default class MenuActionIcon extends React.Component<Props> {
   }
 
   renderItems(children: React.ReactNode) {
-    const filtered = React.Children.toArray(children) as React.ReactElement[];
+    const filtered = React.Children.toArray(
+      children
+    ) as React.ReactElement<any>[];
     const cloned = filtered.map(child => {
       return React.cloneElement(child, {
         onClick: this.makeOnClick(child.props.onClick),
@@ -104,4 +123,6 @@ type Props = MenuProps & {
   defaultOpen?: boolean;
   buttonIconProps?: AnchorProps;
   menuProps?: MenuProps;
+  Icon?: React.ComponentType<IconProps>;
+  tooltip?: React.ReactNode;
 };

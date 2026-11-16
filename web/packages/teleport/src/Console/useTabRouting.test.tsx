@@ -1,26 +1,27 @@
 /**
- * Copyright 2020 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
-import { createMemoryHistory } from 'history';
-import { Router } from 'react-router';
+import { MemoryRouter, Route, Routes } from 'react-router';
+
 import renderHook from 'design/utils/renderHook';
 
-import useTabRouting from './useTabRouting';
 import ConsoleContext from './consoleContext';
+import useTabRouting from './useTabRouting';
 
 test('handling of index route', async () => {
   const ctx = new ConsoleContext();
@@ -63,6 +64,30 @@ test('handling of join ssh session route', async () => {
   expect(docs).toHaveLength(2);
 });
 
+test('handling of init kubeExec session route', async () => {
+  const ctx = new ConsoleContext();
+  const wrapper = makeWrapper(
+    '/web/cluster/localhost/console/kube/exec/kubeCluster/'
+  );
+  const { current } = renderHook(() => useTabRouting(ctx), { wrapper });
+  const docs = ctx.getDocuments();
+  expect(docs[1].kind).toBe('kubeExec');
+  expect(docs[1].id).toBe(current.activeDocId);
+  expect(docs).toHaveLength(2);
+});
+
+test('handling of init kubeExec session route with container', async () => {
+  const ctx = new ConsoleContext();
+  const wrapper = makeWrapper(
+    '/web/cluster/localhost/console/kube/exec/kubeCluster/'
+  );
+  const { current } = renderHook(() => useTabRouting(ctx), { wrapper });
+  const docs = ctx.getDocuments();
+  expect(docs[1].kind).toBe('kubeExec');
+  expect(docs[1].id).toBe(current.activeDocId);
+  expect(docs).toHaveLength(2);
+});
+
 test('active document id', async () => {
   const ctx = new ConsoleContext();
   const doc = ctx.addSshDocument({
@@ -72,7 +97,22 @@ test('active document id', async () => {
   });
 
   const countBefore = ctx.getDocuments();
-  const wrapper = makeWrapper('/web/cluster/two/console/node/server-123/root');
+  const wrapper = makeWrapper(doc.url);
+  const { current } = renderHook(() => useTabRouting(ctx), { wrapper });
+  const countAfter = ctx.getDocuments();
+  expect(doc.id).toBe(current.activeDocId);
+  expect(countAfter).toBe(countBefore);
+});
+
+test('active document id, document url with query parameters', async () => {
+  const ctx = new ConsoleContext();
+  const doc = ctx.addKubeExecDocument({
+    clusterId: 'cluster1',
+    kubeId: 'kube1',
+  });
+
+  const countBefore = ctx.getDocuments();
+  const wrapper = makeWrapper(doc.url);
   const { current } = renderHook(() => useTabRouting(ctx), { wrapper });
   const countAfter = ctx.getDocuments();
   expect(doc.id).toBe(current.activeDocId);
@@ -81,10 +121,15 @@ test('active document id', async () => {
 
 function makeWrapper(route: string) {
   return function MockedContextProviders(props: any) {
-    const history = createMemoryHistory({
-      initialEntries: [route],
-    });
-
-    return <Router history={history} {...props} />;
+    return (
+      <MemoryRouter initialEntries={[route]}>
+        <Routes>
+          <Route
+            path="/web/cluster/:clusterId/console/*"
+            element={props.children}
+          />
+        </Routes>
+      </MemoryRouter>
+    );
   };
 }

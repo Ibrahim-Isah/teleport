@@ -1,32 +1,39 @@
-/*
-Copyright 2021-2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { act } from '@testing-library/react';
+import { userEvent, UserEvent } from '@testing-library/user-event';
+import { createMemoryRouter, RouterProvider } from 'react-router';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-import { MemoryRouter, Route, Router } from 'react-router';
-import { createMemoryHistory } from 'history';
 import { fireEvent, render, screen, waitFor } from 'design/utils/testing';
 import { Logger } from 'shared/libs/logger';
 
+import { Route, Switch } from 'teleport/components/Router';
 import cfg from 'teleport/config';
-import history from 'teleport/services/history';
 import auth from 'teleport/services/auth';
-
+import history from 'teleport/services/history';
 import { userEventService } from 'teleport/services/userEvent';
+import { NewCredentials } from 'teleport/Welcome/NewCredentials';
 
-import Welcome from './Welcome';
+import { Welcome } from './Welcome';
+
+jest.mock('design/assets/images/beams-light.svg', () => 'beams-light-stub');
+jest.mock('design/assets/images/beams-dark.svg', () => 'beams-dark-stub');
 
 const invitePath = '/web/invite/5182';
 const inviteContinuePath = '/web/invite/5182/continue';
@@ -34,7 +41,11 @@ const resetPath = '/web/reset/5182';
 const resetContinuePath = '/web/reset/5182/continue';
 
 describe('teleport/components/Welcome', () => {
+  let user: UserEvent;
+
   beforeEach(() => {
+    user = userEvent.setup();
+    jest.spyOn(cfg, 'getBeamsUi').mockReturnValue(false);
     jest.spyOn(Logger.prototype, 'log').mockImplementation();
     jest.spyOn(auth, 'fetchPasswordToken').mockImplementation(async () => ({
       user: 'sam',
@@ -53,18 +64,21 @@ describe('teleport/components/Welcome', () => {
   it('should have correct welcome prompt flow for invite', async () => {
     jest.spyOn(history, 'push').mockImplementation();
 
-    const mockHistory = createMemoryHistory({
-      initialEntries: [invitePath],
-    });
-
-    render(
-      <Router history={mockHistory}>
-        <Route path={cfg.routes.userInvite}>
-          <Welcome />
-        </Route>
-      </Router>
+    const router = createMemoryRouter(
+      [
+        {
+          path: '*',
+          element: renderWelcomeRoutes(),
+        },
+      ],
+      {
+        initialEntries: [invitePath],
+      }
     );
 
+    render(<RouterProvider router={router} />);
+
+    expect(screen.getByText('Welcome to Teleport')).toBeInTheDocument();
     expect(
       screen.getByText(/Please click the button below to create an account/i)
     ).toBeInTheDocument();
@@ -72,30 +86,60 @@ describe('teleport/components/Welcome', () => {
     expect(auth.fetchPasswordToken).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByText(/get started/i));
-    mockHistory.push(inviteContinuePath);
-
     expect(history.push).toHaveBeenCalledWith(inviteContinuePath);
+
+    // Navigate the router to the continue path (since history.push is mocked)
+    await act(async () => {
+      router.navigate(inviteContinuePath);
+    });
+
     await waitFor(() => {
       expect(auth.fetchPasswordToken).toHaveBeenCalled();
     });
 
-    expect(screen.getByText(/confirm password/i)).toBeInTheDocument();
+    expect(await screen.findByText(/confirm password/i)).toBeInTheDocument();
+  });
+
+  it('shows Beams branding on invite when beamsUi is enabled', async () => {
+    jest.spyOn(cfg, 'getBeamsUi').mockReturnValue(true);
+    jest.spyOn(history, 'push').mockImplementation();
+    const router = createMemoryRouter(
+      [
+        {
+          path: '*',
+          element: renderWelcomeRoutes(),
+        },
+      ],
+      {
+        initialEntries: [invitePath],
+      }
+    );
+    render(<RouterProvider router={router} />);
+
+    expect(screen.getByText('Welcome to Beams')).toBeInTheDocument();
+    expect(screen.queryByText('Welcome to Teleport')).not.toBeInTheDocument();
+    expect(screen.getByRole('img')).toHaveAttribute(
+      'src',
+      expect.stringMatching(/^beams-(light|dark)-stub$/)
+    );
   });
 
   it('should have correct welcome prompt flow for reset', async () => {
     jest.spyOn(history, 'push').mockImplementation();
 
-    const mockHistory = createMemoryHistory({
-      initialEntries: [resetPath],
-    });
-
-    render(
-      <Router history={mockHistory}>
-        <Route path={cfg.routes.userReset}>
-          <Welcome />
-        </Route>
-      </Router>
+    const router = createMemoryRouter(
+      [
+        {
+          path: '*',
+          element: renderWelcomeRoutes(),
+        },
+      ],
+      {
+        initialEntries: [resetPath],
+      }
     );
+
+    render(<RouterProvider router={router} />);
 
     expect(
       screen.getByText(
@@ -106,14 +150,18 @@ describe('teleport/components/Welcome', () => {
     expect(auth.fetchPasswordToken).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByText(/Continue/i));
-    mockHistory.push(resetContinuePath);
+    expect(history.push).toHaveBeenCalledWith(resetContinuePath);
+
+    // Navigate the router to the continue path (since history.push is mocked)
+    await act(async () => {
+      router.navigate(resetContinuePath);
+    });
 
     await waitFor(() => {
-      expect(history.push).toHaveBeenCalledWith(resetContinuePath);
+      expect(auth.fetchPasswordToken).toHaveBeenCalled();
     });
-    expect(auth.fetchPasswordToken).toHaveBeenCalled();
 
-    expect(screen.getByText(/submit/i)).toBeInTheDocument();
+    expect(await screen.findByText(/submit/i)).toBeInTheDocument();
   });
 
   it('reset password', async () => {
@@ -128,16 +176,20 @@ describe('teleport/components/Welcome', () => {
     const pwdConfirmField = screen.getByPlaceholderText('Confirm Password');
 
     // fill out input boxes and trigger submit
-    fireEvent.change(pwdField, { target: { value: 'pwd_value' } });
-    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value' } });
+    fireEvent.change(pwdField, { target: { value: 'pwd_value_123' } });
+    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value_123' } });
     fireEvent.click(screen.getByRole('button'));
 
-    expect(auth.resetPassword).toHaveBeenCalledWith({
-      tokenId: '5182',
-      password: 'pwd_value',
-      otpCode: '',
-      deviceName: '',
-    });
+    expect(auth.resetPassword).toHaveBeenCalledWith(
+      expect.objectContaining({
+        req: {
+          tokenId: '5182',
+          password: 'pwd_value_123',
+          otpCode: '',
+          deviceName: '',
+        },
+      })
+    );
   });
 
   it('reset password with otp', async () => {
@@ -151,8 +203,8 @@ describe('teleport/components/Welcome', () => {
     // Fill out password.
     const pwdField = await screen.findByPlaceholderText('Password');
     const pwdConfirmField = screen.getByPlaceholderText('Confirm Password');
-    fireEvent.change(pwdField, { target: { value: 'pwd_value' } });
-    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value' } });
+    fireEvent.change(pwdField, { target: { value: 'pwd_value_123' } });
+    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value_123' } });
 
     // Go to the next view.
     fireEvent.click(screen.getByText(/next/i));
@@ -162,16 +214,23 @@ describe('teleport/components/Welcome', () => {
     fireEvent.change(otpField, { target: { value: '2222' } });
     fireEvent.click(screen.getByText(/submit/i));
 
-    expect(auth.resetPassword).toHaveBeenCalledWith({
-      tokenId: '5182',
-      password: 'pwd_value',
-      otpCode: '2222',
-      deviceName: 'otp-device',
-    });
+    expect(auth.resetPassword).toHaveBeenCalledWith(
+      expect.objectContaining({
+        req: {
+          tokenId: '5182',
+          password: 'pwd_value_123',
+          otpCode: '2222',
+          deviceName: 'otp-device',
+        },
+      })
+    );
   });
 
   it('reset password with webauthn', async () => {
     jest.spyOn(cfg, 'getAuth2faType').mockImplementation(() => 'webauthn');
+    jest
+      .spyOn(auth, 'createNewWebAuthnDevice')
+      .mockResolvedValueOnce({ id: 'dummy', type: 'public-key' });
     jest
       .spyOn(auth, 'resetPasswordWithWebauthn')
       .mockImplementation(() => new Promise(() => null));
@@ -181,20 +240,32 @@ describe('teleport/components/Welcome', () => {
     // Fill out password.
     const pwdField = await screen.findByPlaceholderText('Password');
     const pwdConfirmField = screen.getByPlaceholderText('Confirm Password');
-    fireEvent.change(pwdField, { target: { value: 'pwd_value' } });
-    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value' } });
+    await user.type(pwdField, 'pwd_value_123');
+    await user.type(pwdConfirmField, 'pwd_value_123');
 
     // Go to the next view.
-    fireEvent.click(screen.getByText(/next/i));
+    await user.click(screen.getByText(/next/i));
+
+    // Create a WebAuthn credential.
+    await user.click(screen.getByText(/create an MFA method/i));
+
+    expect(auth.createNewWebAuthnDevice).toHaveBeenCalledWith({
+      tokenId: '5182',
+      deviceUsage: 'mfa',
+    });
 
     // Trigger submit.
-    fireEvent.click(screen.getByText(/submit/i));
+    await user.click(await screen.findByText(/submit/i));
 
-    expect(auth.resetPasswordWithWebauthn).toHaveBeenCalledWith({
-      tokenId: '5182',
-      password: 'pwd_value',
-      deviceName: 'webauthn-device',
-    });
+    expect(auth.resetPasswordWithWebauthn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        req: {
+          tokenId: '5182',
+          password: 'pwd_value_123',
+          deviceName: 'webauthn-device',
+        },
+      })
+    );
   });
 
   it('reset password with passwordless', async () => {
@@ -202,19 +273,34 @@ describe('teleport/components/Welcome', () => {
       .spyOn(cfg, 'getPrimaryAuthType')
       .mockImplementation(() => 'passwordless');
     jest
+      .spyOn(auth, 'createNewWebAuthnDevice')
+      .mockResolvedValueOnce({ id: 'dummy', type: 'public-key' });
+    jest
       .spyOn(auth, 'resetPasswordWithWebauthn')
       .mockImplementation(() => new Promise(() => null));
 
     renderInvite();
 
-    // Trigger submit.
-    fireEvent.click(await screen.findByText(/submit/i));
+    // Create a WebAuthn credential.
+    await user.click(await screen.findByText(/create a passkey/i));
 
-    expect(auth.resetPasswordWithWebauthn).toHaveBeenCalledWith({
+    expect(auth.createNewWebAuthnDevice).toHaveBeenCalledWith({
       tokenId: '5182',
-      password: '',
-      deviceName: 'passwordless-device',
+      deviceUsage: 'passwordless',
     });
+
+    // Trigger submit.
+    await user.click(await screen.findByText(/submit/i));
+
+    expect(auth.resetPasswordWithWebauthn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        req: {
+          tokenId: '5182',
+          password: '',
+          deviceName: 'passwordless-device',
+        },
+      })
+    );
   });
 
   it('switch between primary password to passwordless and vice versa', async () => {
@@ -257,20 +343,24 @@ describe('teleport/components/Welcome', () => {
     // Fill out password to get to the next screen.
     const pwdField = await screen.findByPlaceholderText('Password');
     const pwdConfirmField = screen.getByPlaceholderText('Confirm Password');
-    fireEvent.change(pwdField, { target: { value: 'pwd_value' } });
-    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value' } });
+    fireEvent.change(pwdField, { target: { value: 'pwd_value_123' } });
+    fireEvent.change(pwdConfirmField, { target: { value: 'pwd_value_123' } });
     fireEvent.click(screen.getByText(/next/i));
 
     // Default radio selection should be webauthn.
-    expect(screen.getByDisplayValue('webauthn-device')).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        'You can use Touch ID, Face ID, Windows Hello, a hardware device, or an authenticator app as an MFA method.'
+      )
+    ).toBeInTheDocument();
 
     // Switch to otp.
-    fireEvent.click(screen.getByText(/authenticator/i));
+    fireEvent.click(screen.getByRole('radio', { name: /authenticator app/i }));
     expect(screen.getByDisplayValue('otp-device')).toBeInTheDocument();
     expect(screen.getByPlaceholderText('123 456')).toBeInTheDocument();
 
     // Switch to none.
-    fireEvent.click(screen.getByText(/none/i));
+    fireEvent.click(screen.getByRole('radio', { name: /none/i }));
     expect(
       screen.queryByDisplayValue('webauthn-device')
     ).not.toBeInTheDocument();
@@ -279,11 +369,30 @@ describe('teleport/components/Welcome', () => {
 });
 
 function renderInvite(url = inviteContinuePath) {
-  render(
-    <MemoryRouter initialEntries={[url]}>
-      <Route path={cfg.routes.userInviteContinue}>
-        <Welcome />
+  const router = createMemoryRouter(
+    [
+      {
+        path: '*',
+        element: renderWelcomeRoutes(),
+      },
+    ],
+    {
+      initialEntries: [url],
+    }
+  );
+
+  render(<RouterProvider router={router} />);
+}
+
+function renderWelcomeRoutes() {
+  return (
+    <Switch>
+      <Route path={cfg.routes.userInvite}>
+        <Welcome NewCredentials={NewCredentials} />
       </Route>
-    </MemoryRouter>
+      <Route path={cfg.routes.userReset}>
+        <Welcome NewCredentials={NewCredentials} />
+      </Route>
+    </Switch>
   );
 }

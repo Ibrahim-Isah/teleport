@@ -1,25 +1,25 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package transportv1
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -39,15 +39,23 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
+	scopesv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/scopes/v1"
 	transportv1pb "github.com/gravitational/teleport/api/gen/proto/go/teleport/transport/v1"
+	apissh "github.com/gravitational/teleport/api/ssh"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/grpc/interceptors"
 	streamutils "github.com/gravitational/teleport/api/utils/grpc/stream"
+	"github.com/gravitational/teleport/lib/agentless"
+	"github.com/gravitational/teleport/lib/authz"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/teleagent"
+	"github.com/gravitational/teleport/lib/sshagent"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
 
 func TestMain(m *testing.M) {
-	utils.InitLoggerForTests()
+	logtest.InitLogger(testing.Verbose)
 
 	os.Exit(m.Run())
 }
@@ -93,26 +101,45 @@ func (c *echoConn) Close() error {
 }
 
 // fakeDialer implements [Dialer] with a static map of
-// site and host to connections.
+// site, host and desktops to connections.
 type fakeDialer struct {
-	siteConns map[string]net.Conn
-	hostConns map[string]net.Conn
+	siteConns           map[string]net.Conn
+	hostConns           map[string]net.Conn
+	windowsDesktopConns map[windowsDesktopConnKey]net.Conn
 }
 
-func (f fakeDialer) DialSite(ctx context.Context, clusterName string) (net.Conn, error) {
+type windowsDesktopConnKey struct {
+	clusterName string
+	desktopName string
+}
+
+func (f fakeDialer) DialSite(ctx context.Context, clusterName string, clientSrcAddr, clientDstAddr net.Addr) (net.Conn, error) {
 	conn, ok := f.siteConns[clusterName]
 	if !ok {
-		return nil, trace.NotFound(clusterName)
+		return nil, trace.NotFound("%s", clusterName)
 	}
 
 	return conn, nil
 }
 
-func (f fakeDialer) DialHost(ctx context.Context, from net.Addr, host, port, clusterName string, accessChecker services.AccessChecker, agentGetter teleagent.Getter) (net.Conn, error) {
-	key := fmt.Sprintf("%s.%s.%s", host, port, clusterName)
+func (f fakeDialer) DialHost(ctx context.Context, scopePin *scopesv1.Pin, clientSrcAddr, clientDstAddr net.Addr, host, port, cluster string, clusterAccessChecker func(types.RemoteCluster) error, agentGetter sshagent.ClientGetter, singer agentless.SignerCreator) (_ net.Conn, err error) {
+	key := fmt.Sprintf("%s.%s.%s", host, port, cluster)
 	conn, ok := f.hostConns[key]
 	if !ok {
-		return nil, trace.NotFound(key)
+		return nil, trace.NotFound("%s", key)
+	}
+
+	return conn, nil
+}
+
+func (f fakeDialer) DialWindowsDesktop(ctx context.Context, clientSrcAddr, clientDstAddr net.Addr, desktopName, cluster string, clusterAccessChecker func(types.RemoteCluster) error) (net.Conn, error) {
+	key := windowsDesktopConnKey{
+		clusterName: cluster,
+		desktopName: desktopName,
+	}
+	conn, ok := f.windowsDesktopConns[key]
+	if !ok {
+		return nil, trace.NotFound("%+v", key)
 	}
 
 	return conn, nil
@@ -124,19 +151,54 @@ type testPack struct {
 	Server *Service
 }
 
+type listenerWithAddr struct {
+	*bufconn.Listener
+	localAddr net.Addr
+}
+
+func (l *listenerWithAddr) Addr() net.Addr {
+	return l.localAddr
+}
+
+func (l *listenerWithAddr) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	return &connWithAddr{
+		Conn: conn,
+		addr: l.localAddr,
+	}, err
+}
+
+type connWithAddr struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (c *connWithAddr) RemoteAddr() net.Addr {
+	return c.addr
+}
+
+func (c *connWithAddr) LocalAddr() net.Addr {
+	return c.addr
+}
+
 // newServer creates a [Service] with the provided config and
 // an authenticated client to exercise various RPCs on the [Service].
 func newServer(t *testing.T, cfg ServerConfig) testPack {
 	// gRPC testPack.
 	const bufSize = 100 // arbitrary
+	var lisWithAddr net.Listener
 	lis := bufconn.Listen(bufSize)
+	lisWithAddr = &listenerWithAddr{
+		Listener:  lis,
+		localAddr: utils.MustParseAddr("127.0.0.1:4242"),
+	}
 	t.Cleanup(func() {
 		require.NoError(t, lis.Close())
 	})
 
 	s := grpc.NewServer(
-		grpc.StreamInterceptor(utils.GRPCServerStreamErrorInterceptor),
-		grpc.UnaryInterceptor(utils.GRPCServerUnaryErrorInterceptor),
+		grpc.StreamInterceptor(interceptors.GRPCServerStreamErrorInterceptor),
+		grpc.UnaryInterceptor(interceptors.GRPCServerUnaryErrorInterceptor),
 	)
 	t.Cleanup(func() {
 		s.GracefulStop()
@@ -151,7 +213,7 @@ func newServer(t *testing.T, cfg ServerConfig) testPack {
 
 	// Start.
 	go func() {
-		if err := s.Serve(lis); err != nil {
+		if err := s.Serve(lisWithAddr); err != nil {
 			panic(fmt.Sprintf("Serve returned err = %v", err))
 		}
 	}()
@@ -161,11 +223,15 @@ func newServer(t *testing.T, cfg ServerConfig) testPack {
 	defer cancel()
 	cc, err := grpc.DialContext(ctx, "unused",
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
-			return lis.DialContext(ctx)
+			conn, err := lis.DialContext(ctx)
+			return &connWithAddr{
+				Conn: conn,
+				addr: utils.MustParseAddr("127.0.0.1:8484"),
+			}, err
 		}),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithStreamInterceptor(utils.GRPCClientStreamErrorInterceptor),
-		grpc.WithUnaryInterceptor(utils.GRPCClientUnaryErrorInterceptor),
+		grpc.WithStreamInterceptor(interceptors.GRPCClientStreamErrorInterceptor),
+		grpc.WithUnaryInterceptor(interceptors.GRPCClientUnaryErrorInterceptor),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -176,6 +242,18 @@ func newServer(t *testing.T, cfg ServerConfig) testPack {
 		Client: transportv1pb.NewTransportServiceClient(cc),
 		Server: srv,
 	}
+}
+
+func fakeSigner(_ context.Context, _ *authz.ScopedContext, _ string) (agentless.SignerCreator, error) {
+	return func(_ context.Context, _ agentless.LocalAccessPoint, _ string) (ssh.Signer, error) {
+		return nil, nil
+	}, nil
+}
+
+type fakeMonitor struct{}
+
+func (f fakeMonitor) MonitorConn(ctx context.Context, authCtx *authz.Context, conn net.Conn) (context.Context, net.Conn, error) {
+	return ctx, conn, nil
 }
 
 // TestService_GetClusterDetails validates that a [Service] returns
@@ -196,17 +274,20 @@ func TestService_GetClusterDetails(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			srv := newServer(t, ServerConfig{
-				Dialer: fakeDialer{},
-				FIPS:   test.FIPS,
+				Dialer:            fakeDialer{},
+				Logger:            logtest.NewLogger(),
+				FIPS:              test.FIPS,
+				SignerFn:          fakeSigner,
+				ConnectionMonitor: fakeMonitor{},
+				LocalAddr:         utils.MustParseAddr("127.0.0.1:4242"),
 			})
 
 			resp, err := srv.Client.GetClusterDetails(context.Background(), &transportv1pb.GetClusterDetailsRequest{})
 			require.NoError(t, err)
-			require.Equal(t, test.FIPS, resp.Details.FipsEnabled)
+			require.Equal(t, test.FIPS, resp.GetDetails().GetFipsEnabled())
 		})
 	}
 }
@@ -224,16 +305,16 @@ func TestService_ProxyCluster(t *testing.T) {
 		{
 			name: "transport established to cluster",
 			fn: func(t *testing.T, stream transportv1pb.TransportService_ProxyClusterClient, conn *echoConn) {
-				require.NoError(t, stream.Send(&transportv1pb.ProxyClusterRequest{Cluster: cluster}))
+				require.NoError(t, stream.Send(transportv1pb.ProxyClusterRequest_builder{Cluster: cluster}.Build()))
 
-				var msg = []byte("hello")
-				require.NoError(t, stream.Send(&transportv1pb.ProxyClusterRequest{Frame: &transportv1pb.Frame{Payload: msg}}))
+				msg := []byte("hello")
+				require.NoError(t, stream.Send(transportv1pb.ProxyClusterRequest_builder{Frame: transportv1pb.Frame_builder{Payload: msg}.Build()}.Build()))
 
 				resp, err := stream.Recv()
 				require.NoError(t, err)
 				require.NotNil(t, resp)
-				require.NotNil(t, resp.Frame)
-				require.Equal(t, msg, resp.Frame.Payload)
+				require.NotNil(t, resp.GetFrame())
+				require.Equal(t, msg, resp.GetFrame().GetPayload())
 
 				require.NoError(t, stream.CloseSend())
 			},
@@ -241,11 +322,11 @@ func TestService_ProxyCluster(t *testing.T) {
 		{
 			name: "terminated connection ends stream",
 			fn: func(t *testing.T, stream transportv1pb.TransportService_ProxyClusterClient, conn *echoConn) {
-				require.NoError(t, stream.Send(&transportv1pb.ProxyClusterRequest{Cluster: cluster}))
+				require.NoError(t, stream.Send(transportv1pb.ProxyClusterRequest_builder{Cluster: cluster}.Build()))
 
 				require.NoError(t, conn.Close())
-				var msg = []byte("hello")
-				require.NoError(t, stream.Send(&transportv1pb.ProxyClusterRequest{Frame: &transportv1pb.Frame{Payload: msg}}))
+				msg := []byte("hello")
+				require.NoError(t, stream.Send(transportv1pb.ProxyClusterRequest_builder{Frame: transportv1pb.Frame_builder{Payload: msg}.Build()}.Build()))
 
 				resp, err := stream.Recv()
 				require.Error(t, err)
@@ -258,7 +339,7 @@ func TestService_ProxyCluster(t *testing.T) {
 		{
 			name: "unknown cluster",
 			fn: func(t *testing.T, stream transportv1pb.TransportService_ProxyClusterClient, conn *echoConn) {
-				require.NoError(t, stream.Send(&transportv1pb.ProxyClusterRequest{Cluster: uuid.NewString()}))
+				require.NoError(t, stream.Send(transportv1pb.ProxyClusterRequest_builder{Cluster: uuid.NewString()}.Build()))
 				resp, err := stream.Recv()
 				require.Error(t, err)
 				require.True(t, trace.IsNotFound(err))
@@ -268,7 +349,6 @@ func TestService_ProxyCluster(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -280,6 +360,10 @@ func TestService_ProxyCluster(t *testing.T) {
 						cluster: conn,
 					},
 				},
+				Logger:            logtest.NewLogger(),
+				SignerFn:          fakeSigner,
+				ConnectionMonitor: fakeMonitor{},
+				LocalAddr:         utils.MustParseAddr("127.0.0.1:4242"),
 			})
 
 			stream, err := srv.Client.ProxyCluster(context.Background())
@@ -324,10 +408,10 @@ func TestService_ProxySSH_Errors(t *testing.T) {
 				return fakeChecker{}, nil
 			},
 			fn: func(t *testing.T, stream transportv1pb.TransportService_ProxySSHClient, conn *echoConn) {
-				require.NoError(t, stream.Send(&transportv1pb.ProxySSHRequest{DialTarget: &transportv1pb.TargetHost{
+				require.NoError(t, stream.Send(transportv1pb.ProxySSHRequest_builder{DialTarget: transportv1pb.TargetHost_builder{
 					HostPort: "1234",
 					Cluster:  "test",
-				}}))
+				}.Build()}.Build()))
 
 				resp, err := stream.Recv()
 				require.True(t, trace.IsBadParameter(err))
@@ -340,14 +424,33 @@ func TestService_ProxySSH_Errors(t *testing.T) {
 				return nil, trace.AccessDenied("no access checker")
 			},
 			fn: func(t *testing.T, stream transportv1pb.TransportService_ProxySSHClient, conn *echoConn) {
-				require.NoError(t, stream.Send(&transportv1pb.ProxySSHRequest{DialTarget: &transportv1pb.TargetHost{
+				err := stream.Send(transportv1pb.ProxySSHRequest_builder{DialTarget: transportv1pb.TargetHost_builder{
 					HostPort: "1234",
 					Cluster:  "test",
-				}}))
+				}.Build()}.Build())
+				switch {
+				// The server will attempt to get the authz context prior to receiving the first
+				// message from the client which may terminate the stream and result in an EOF.
+				case errors.Is(err, io.EOF):
+					return
+				default:
+					require.NoError(t, err)
+				}
 
 				resp, err := stream.Recv()
-				require.ErrorIs(t, err, trace.AccessDenied("no access checker"))
 				require.Nil(t, resp)
+				switch {
+				// The server will attempt to get the authz context prior to receiving the first
+				// message from the client which may terminate the stream and result in an EOF.
+				case errors.Is(err, io.EOF):
+				// The client send may be completed prior to the server getting the authz context
+				// which will result in the client actually receiving the error from getting the
+				// authz context instead of an EOF.
+				case errors.Is(err, trace.AccessDenied("no access checker")):
+				// All other errors indicate that something went wrong
+				default:
+					t.Fatalf("expected either EOF or Access Denied, got %v", err)
+				}
 			},
 		},
 		{
@@ -356,20 +459,20 @@ func TestService_ProxySSH_Errors(t *testing.T) {
 				return fakeChecker{}, nil
 			},
 			fn: func(t *testing.T, stream transportv1pb.TransportService_ProxySSHClient, conn *echoConn) {
-				require.NoError(t, stream.Send(&transportv1pb.ProxySSHRequest{DialTarget: &transportv1pb.TargetHost{
+				require.NoError(t, stream.Send(transportv1pb.ProxySSHRequest_builder{DialTarget: transportv1pb.TargetHost_builder{
 					HostPort: "test:0",
 					Cluster:  "test",
-				}}))
+				}.Build()}.Build()))
 
 				// get cluster details
 				resp, err := stream.Recv()
 				require.NoError(t, err)
-				require.NotNil(t, resp.Details)
+				require.NotNil(t, resp.GetDetails())
 				require.Nil(t, resp.Frame)
 
 				require.NoError(t, conn.Close())
-				var msg = []byte("hello")
-				require.NoError(t, stream.Send(&transportv1pb.ProxySSHRequest{Frame: &transportv1pb.ProxySSHRequest_Ssh{Ssh: &transportv1pb.Frame{Payload: msg}}}))
+				msg := []byte("hello")
+				require.NoError(t, stream.Send(transportv1pb.ProxySSHRequest_builder{Ssh: transportv1pb.Frame_builder{Payload: msg}.Build()}.Build()))
 
 				resp, err = stream.Recv()
 				require.Error(t, err)
@@ -385,10 +488,10 @@ func TestService_ProxySSH_Errors(t *testing.T) {
 				return fakeChecker{}, nil
 			},
 			fn: func(t *testing.T, stream transportv1pb.TransportService_ProxySSHClient, conn *echoConn) {
-				require.NoError(t, stream.Send(&transportv1pb.ProxySSHRequest{DialTarget: &transportv1pb.TargetHost{
+				require.NoError(t, stream.Send(transportv1pb.ProxySSHRequest_builder{DialTarget: transportv1pb.TargetHost_builder{
 					HostPort: "test:100",
 					Cluster:  "test",
-				}}))
+				}.Build()}.Build()))
 				resp, err := stream.Recv()
 				require.Error(t, err)
 				require.True(t, trace.IsNotFound(err))
@@ -398,10 +501,7 @@ func TestService_ProxySSH_Errors(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
 			conn := newEchoConn()
 
 			srv := newServer(t, ServerConfig{
@@ -410,14 +510,24 @@ func TestService_ProxySSH_Errors(t *testing.T) {
 						fakeHost: conn,
 					},
 				},
-				accessCheckerFn: test.checkerFn,
+				SignerFn:          fakeSigner,
+				ConnectionMonitor: fakeMonitor{},
+				Logger:            logtest.NewLogger(),
+				LocalAddr:         utils.MustParseAddr("127.0.0.1:4242"),
+				authzContextFn: func(info credentials.AuthInfo) (*authz.ScopedContext, error) {
+					checker, err := test.checkerFn(info)
+					if err != nil {
+						return nil, trace.Wrap(err)
+					}
+
+					return authz.ScopedContextFromUnscopedContext(&authz.Context{Checker: checker}), nil
+				},
 			})
 
 			stream, err := srv.Client.ProxySSH(context.Background())
 			require.NoError(t, err)
 
 			test.fn(t, stream, conn)
-
 		})
 	}
 }
@@ -463,9 +573,13 @@ func TestService_ProxySSH(t *testing.T) {
 	// create a server that will open a new connection to the
 	// ssh server created above on each dial request
 	srv := newServer(t, ServerConfig{
-		Dialer: sshSrv,
-		agentGetterFn: func(rw io.ReadWriter) teleagent.Getter {
-			return func() (teleagent.Agent, error) {
+		Dialer:            sshSrv,
+		SignerFn:          fakeSigner,
+		Logger:            logtest.NewLogger(),
+		LocalAddr:         utils.MustParseAddr("127.0.0.1:4242"),
+		ConnectionMonitor: fakeMonitor{},
+		agentGetterFn: func(rw io.ReadWriter) sshagent.ClientGetter {
+			return func() (sshagent.Client, error) {
 				srw, ok := rw.(*streamutils.ReadWriter)
 				if !ok {
 					return nil, trace.BadParameter("rw must be a streamutils.ReadWriter")
@@ -476,8 +590,8 @@ func TestService_ProxySSH(t *testing.T) {
 				}, nil
 			}
 		},
-		accessCheckerFn: func(info credentials.AuthInfo) (services.AccessChecker, error) {
-			return fakeChecker{}, nil
+		authzContextFn: func(info credentials.AuthInfo) (*authz.ScopedContext, error) {
+			return authz.ScopedContextFromUnscopedContext(&authz.Context{Checker: fakeChecker{}}), nil
 		},
 	})
 
@@ -489,28 +603,28 @@ func TestService_ProxySSH(t *testing.T) {
 	// each connection will be to the same server. this test
 	// solely cares that a connection is made and protocols are
 	// multiplexed, not that we are dialing our target.
-	require.NoError(t, stream.Send(&transportv1pb.ProxySSHRequest{
-		DialTarget: &transportv1pb.TargetHost{
+	require.NoError(t, stream.Send(transportv1pb.ProxySSHRequest_builder{
+		DialTarget: transportv1pb.TargetHost_builder{
 			HostPort: "test:0",
 			Cluster:  "test",
-		},
-	}))
+		}.Build(),
+	}.Build()))
 
 	// wait for the response indicating that the connection
 	// was established
 	resp, err := stream.Recv()
 	require.NoError(t, err)
-	require.NotNil(t, resp.Details)
+	require.NotNil(t, resp.GetDetails())
 	require.Nil(t, resp.Frame)
 
 	// create a stream for agent protocol
 	agentStream := newClientStream(stream, func(payload []byte) *transportv1pb.ProxySSHRequest {
-		return &transportv1pb.ProxySSHRequest{Frame: &transportv1pb.ProxySSHRequest_Agent{Agent: &transportv1pb.Frame{Payload: payload}}}
+		return transportv1pb.ProxySSHRequest_builder{Agent: transportv1pb.Frame_builder{Payload: payload}.Build()}.Build()
 	})
 
 	// create a stream for ssh protocol
 	sshStream := newClientStream(stream, func(payload []byte) *transportv1pb.ProxySSHRequest {
-		return &transportv1pb.ProxySSHRequest{Frame: &transportv1pb.ProxySSHRequest_Ssh{Ssh: &transportv1pb.Frame{Payload: payload}}}
+		return transportv1pb.ProxySSHRequest_builder{Ssh: transportv1pb.Frame_builder{Payload: payload}.Build()}.Build()
 	})
 
 	// multiplex the frames to the correct handlers
@@ -525,11 +639,11 @@ func TestService_ProxySSH(t *testing.T) {
 				return
 			}
 
-			switch frame := req.Frame.(type) {
-			case *transportv1pb.ProxySSHResponse_Ssh:
-				sshStream.incomingC <- frame.Ssh.Payload
-			case *transportv1pb.ProxySSHResponse_Agent:
-				agentStream.incomingC <- frame.Agent.Payload
+			switch req.WhichFrame() {
+			case transportv1pb.ProxySSHResponse_Ssh_case:
+				sshStream.incomingC <- req.GetSsh().GetPayload()
+			case transportv1pb.ProxySSHResponse_Agent_case:
+				agentStream.incomingC <- req.GetAgent().GetPayload()
 			default:
 				continue
 			}
@@ -546,19 +660,21 @@ func TestService_ProxySSH(t *testing.T) {
 
 	// create a new ssh client connection over a stream conn
 	addr := &utils.NetAddr{Addr: "127.0.0.1", AddrNetwork: "tcp"}
-	sshconn, chans, reqs, err := ssh.NewClientConn(
+	client, err := apissh.NewClient(
+		t.Context(),
 		streamutils.NewConn(sshRW, addr, sshSrv.listener.Addr()),
 		addr.String(),
-		sshSrv.clientConfig())
+		sshSrv.clientConfig(),
+	)
 	require.NoError(t, err)
-
-	// create the ssh client
-	client := ssh.NewClient(sshconn, chans, reqs)
+	t.Cleanup(func() {
+		client.Close()
+	})
 
 	// send an ssh request to our server which will echo the payload
 	// back in the response.
-	var msg = []byte("hello")
-	ok, response, err := client.SendRequest("echo", true, msg)
+	msg := []byte("hello")
+	ok, response, err := client.SendRequest(t.Context(), "echo", true, msg)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, msg, response)
@@ -568,6 +684,214 @@ func TestService_ProxySSH(t *testing.T) {
 	keys, err := agent.NewClient(agentRW).List()
 	require.NoError(t, err)
 	require.Len(t, keys, 2)
+}
+
+// TestService_ProxyWindowsDesktopSession tests:
+// * if the stream is terminated if various error conditions occur,
+// * if raw messages are proxied over the stream.
+func TestService_ProxyWindowsDesktopSession(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		checkerFn func(info credentials.AuthInfo) (services.AccessChecker, error)
+		fn        func(t *testing.T, stream transportv1pb.TransportService_ProxyWindowsDesktopSessionClient, conn *echoConn)
+	}{
+		{
+			name: "missing dial target terminates stream",
+			checkerFn: func(info credentials.AuthInfo) (services.AccessChecker, error) {
+				return fakeChecker{}, nil
+			},
+			fn: func(t *testing.T, stream transportv1pb.TransportService_ProxyWindowsDesktopSessionClient, conn *echoConn) {
+				require.NoError(t, stream.Send(&transportv1pb.ProxyWindowsDesktopSessionRequest{}))
+
+				resp, err := stream.Recv()
+				require.True(t, trace.IsBadParameter(err))
+				require.Nil(t, resp)
+			},
+		},
+		{
+			name: "no access checker terminates stream",
+			checkerFn: func(info credentials.AuthInfo) (services.AccessChecker, error) {
+				return nil, trace.AccessDenied("no access checker")
+			},
+			fn: func(t *testing.T, stream transportv1pb.TransportService_ProxyWindowsDesktopSessionClient, conn *echoConn) {
+				err := stream.Send(transportv1pb.ProxyWindowsDesktopSessionRequest_builder{DialTarget: transportv1pb.TargetWindowsDesktop_builder{
+					DesktopName: "win_desktop",
+					Cluster:     "test",
+				}.Build()}.Build())
+				switch {
+				// The server will attempt to get the authz context prior to receiving the first
+				// message from the client which may terminate the stream and result in an EOF.
+				case errors.Is(err, io.EOF):
+					return
+				default:
+					require.NoError(t, err)
+				}
+
+				resp, err := stream.Recv()
+				require.Nil(t, resp)
+				switch {
+				// The server will attempt to get the authz context prior to receiving the first
+				// message from the client which may terminate the stream and result in an EOF.
+				case errors.Is(err, io.EOF):
+				// The client send may be completed prior to the server getting the authz context
+				// which will result in the client actually receiving the error from getting the
+				// authz context instead of an EOF.
+				case errors.Is(err, trace.AccessDenied("no access checker")):
+				// All other errors indicate that something went wrong
+				default:
+					t.Fatalf("expected either EOF or Access Denied, got %v", err)
+				}
+			},
+		},
+		{
+			name: "terminated connection ends stream",
+			checkerFn: func(info credentials.AuthInfo) (services.AccessChecker, error) {
+				return fakeChecker{}, nil
+			},
+			fn: func(t *testing.T, stream transportv1pb.TransportService_ProxyWindowsDesktopSessionClient, conn *echoConn) {
+				require.NoError(t, stream.Send(transportv1pb.ProxyWindowsDesktopSessionRequest_builder{DialTarget: transportv1pb.TargetWindowsDesktop_builder{
+					DesktopName: "win_desktop",
+					Cluster:     "test",
+				}.Build()}.Build()))
+
+				require.NoError(t, conn.Close())
+				msg := []byte("hello")
+				require.NoError(t, stream.Send(transportv1pb.ProxyWindowsDesktopSessionRequest_builder{Data: msg}.Build()))
+
+				resp, err := stream.Recv()
+				require.Error(t, err)
+				require.ErrorIs(t, err, io.EOF)
+				require.Nil(t, resp)
+
+				require.NoError(t, stream.CloseSend())
+			},
+		},
+		{
+			name: "error while dialing windows desktop service terminates stream",
+			checkerFn: func(info credentials.AuthInfo) (services.AccessChecker, error) {
+				return fakeChecker{}, nil
+			},
+			fn: func(t *testing.T, stream transportv1pb.TransportService_ProxyWindowsDesktopSessionClient, conn *echoConn) {
+				require.NoError(t, stream.Send(transportv1pb.ProxyWindowsDesktopSessionRequest_builder{DialTarget: transportv1pb.TargetWindowsDesktop_builder{
+					DesktopName: "nonexisting",
+					Cluster:     "test",
+				}.Build()}.Build()))
+				resp, err := stream.Recv()
+				require.Error(t, err)
+				require.True(t, trace.IsNotFound(err))
+				require.Nil(t, resp)
+			},
+		},
+		{
+			name: "raw messages are proxied",
+			checkerFn: func(info credentials.AuthInfo) (services.AccessChecker, error) {
+				return fakeChecker{}, nil
+			},
+			fn: func(t *testing.T, stream transportv1pb.TransportService_ProxyWindowsDesktopSessionClient, conn *echoConn) {
+				require.NoError(t, stream.Send(transportv1pb.ProxyWindowsDesktopSessionRequest_builder{DialTarget: transportv1pb.TargetWindowsDesktop_builder{
+					DesktopName: "win_desktop",
+					Cluster:     "test",
+				}.Build()}.Build()))
+
+				msg := []byte("hello")
+				err := stream.Send(transportv1pb.ProxyWindowsDesktopSessionRequest_builder{Data: msg}.Build())
+				require.NoError(t, err)
+
+				resp, err := stream.Recv()
+				require.NoError(t, err)
+				// The mocked server implementation echoes the message.
+				require.Equal(t, msg, resp.GetData())
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			conn := newEchoConn()
+
+			srv := newServer(t, ServerConfig{
+				Dialer: fakeDialer{
+					windowsDesktopConns: map[windowsDesktopConnKey]net.Conn{
+						windowsDesktopConnKey{
+							clusterName: "test",
+							desktopName: "win_desktop",
+						}: conn,
+					},
+				},
+				SignerFn:          fakeSigner,
+				ConnectionMonitor: fakeMonitor{},
+				Logger:            logtest.NewLogger(),
+				LocalAddr:         utils.MustParseAddr("127.0.0.1:4243"),
+				authzContextFn: func(info credentials.AuthInfo) (*authz.ScopedContext, error) {
+					checker, err := test.checkerFn(info)
+					if err != nil {
+						return nil, trace.Wrap(err)
+					}
+
+					return authz.ScopedContextFromUnscopedContext(&authz.Context{Checker: checker}), nil
+				},
+			})
+
+			stream, err := srv.Client.ProxyWindowsDesktopSession(context.Background())
+			require.NoError(t, err)
+
+			test.fn(t, stream, conn)
+		})
+	}
+}
+
+func TestGetDestinationAddress(t *testing.T) {
+	testCases := []struct {
+		listenerAddr string
+		srcAddr      string
+		expected     string
+	}{
+		{
+			srcAddr:      "4.3.2.1:65",
+			listenerAddr: "1.2.3.4:56",
+			expected:     "1.2.3.4:56",
+		},
+		{
+			srcAddr:      "4.3.2.1:65",
+			listenerAddr: "[2601:602:8700:4470:a3:813c:1d8c:30b9]:56",
+			expected:     "127.0.0.1:56",
+		},
+		{
+			srcAddr:      "[2601:602:8700:4470:a3:813c:1d8c:30b9]:65",
+			listenerAddr: "1.2.3.4:56",
+			expected:     "[::1]:56",
+		},
+		{
+			srcAddr:      "4.3.2.1:65",
+			listenerAddr: "0.0.0.0:56",
+			expected:     "127.0.0.1:56",
+		},
+		{
+			srcAddr:      "4.3.2.1:65",
+			listenerAddr: "[::]:56",
+			expected:     "127.0.0.1:56",
+		},
+		{
+			srcAddr:      "[2601:602:8700:4470:a3:813c:1d8c:30b9]:65",
+			listenerAddr: "[::]:56",
+			expected:     "[::1]:56",
+		},
+		{
+			srcAddr:      "[2601:602:8700:4470:a3:813c:1d8c:30b9]:65",
+			listenerAddr: "0.0.0.0:56",
+			expected:     "[::1]:56",
+		},
+	}
+
+	for i, tt := range testCases {
+		t.Run(fmt.Sprintf("Test #%d", i), func(t *testing.T) {
+			res, err := getDestinationAddress(utils.MustParseAddr(tt.srcAddr), utils.MustParseAddr(tt.listenerAddr))
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, res.String())
+		})
+	}
 }
 
 // clientStream implements the [streamutils.Source] interface
@@ -621,7 +945,7 @@ type sshServer struct {
 }
 
 // DialSite returns a connection to the sshServer
-func (s *sshServer) DialSite(context.Context, string) (net.Conn, error) {
+func (s *sshServer) DialSite(ctx context.Context, clusterName string, clientSrcAddr, clientDstAddr net.Addr) (net.Conn, error) {
 	conn, err := s.dial()
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -634,7 +958,7 @@ func (s *sshServer) DialSite(context.Context, string) (net.Conn, error) {
 // nil and is of type testAgent, then the server will serve its keyring
 // over the underlying [streamutils.ReadWriter] so that tests can exercise
 // ssh agent multiplexing.
-func (s *sshServer) DialHost(ctx context.Context, from net.Addr, host, port, clusterName string, accessChecker services.AccessChecker, agentGetter teleagent.Getter) (net.Conn, error) {
+func (s *sshServer) DialHost(ctx context.Context, scopePin *scopesv1.Pin, clientSrcAddr, clientDstAddr net.Addr, host, port, cluster string, clusterAccessChecker func(types.RemoteCluster) error, agentGetter sshagent.ClientGetter, singer agentless.SignerCreator) (_ net.Conn, err error) {
 	conn, err := s.dial()
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -659,6 +983,11 @@ func (s *sshServer) DialHost(ctx context.Context, from net.Addr, host, port, clu
 	}()
 
 	return conn, nil
+}
+
+// DialWindowsDesktop returns a connection to the windows desktop.
+func (s *sshServer) DialWindowsDesktop(ctx context.Context, clientSrcAddr, clientDstAddr net.Addr, desktopName, cluster string, clusterAccessChecker func(types.RemoteCluster) error) (net.Conn, error) {
+	return nil, nil
 }
 
 func (s *sshServer) Run() {
@@ -686,13 +1015,11 @@ func (s *sshServer) Stop() error {
 }
 
 func generateSigner(t *testing.T, keyring agent.Agent) ssh.Signer {
-	private, err := rsa.GenerateKey(rand.Reader, 2048)
+	private, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.Ed25519)
 	require.NoError(t, err)
 
-	block := &pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(private),
-	}
+	signer, err := ssh.NewSignerFromSigner(private)
+	require.NoError(t, err)
 
 	require.NoError(t, keyring.Add(agent.AddedKey{
 		PrivateKey:   private,
@@ -700,16 +1027,17 @@ func generateSigner(t *testing.T, keyring agent.Agent) ssh.Signer {
 		LifetimeSecs: math.MaxUint32,
 	}))
 
-	privatePEM := pem.EncodeToMemory(block)
-	signer, err := ssh.ParsePrivateKey(privatePEM)
-	require.NoError(t, err)
-
 	return signer
 }
 
-func (s *sshServer) clientConfig() *ssh.ClientConfig {
-	return &ssh.ClientConfig{
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(s.cSigner)},
+func (s *sshServer) clientConfig() apissh.ClientConfig {
+	return apissh.ClientConfig{
+		User: "alice",
+		PublicKeyAuth: apissh.PublicKeyAuthConfig{
+			Signers: func() ([]ssh.Signer, error) {
+				return []ssh.Signer{s.cSigner}, nil
+			},
+		},
 		HostKeyCallback: ssh.FixedHostKey(s.hSigner.PublicKey()),
 	}
 }

@@ -1,22 +1,28 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { useAppContext } from 'teleterm/ui/appContextProvider';
+import { useCallback } from 'react';
+
+import { LoggedInUser } from 'gen-proto-ts/teleport/lib/teleterm/v1/cluster_pb';
+
 import { useWorkspaceContext } from 'teleterm/ui/Documents';
-import { LoggedInUser } from 'teleterm/services/tshd/types';
+
+import { useStoreSelector } from './useStoreSelector';
 
 /**
  * useLoggedInUser returns the user logged into the root cluster of the active workspace. The return
@@ -25,21 +31,22 @@ import { LoggedInUser } from 'teleterm/services/tshd/types';
  * It should be used within components that reside outside of WorkspaceContext, typically anything
  * that's outside of Document-type components.
  *
- * It might return undefined if there's no active workspace or during the logout procedure because
- * ClustersService state is cleared up before WorkspacesService state.
+ * It might return undefined if there's no active workspace.
  */
 export function useLoggedInUser(): LoggedInUser | undefined {
-  const { clustersService, workspacesService } = useAppContext();
-  clustersService.useState();
-  workspacesService.useState();
+  const rootClusterUri = useStoreSelector(
+    'workspacesService',
+    useCallback(store => store.rootClusterUri, [])
+  );
+  const loggedInUser = useStoreSelector(
+    'clustersService',
+    useCallback(
+      state => state.clusters.get(rootClusterUri)?.loggedInUser,
+      [rootClusterUri]
+    )
+  );
 
-  const clusterUri = workspacesService.getRootClusterUri();
-  if (!clusterUri) {
-    return;
-  }
-
-  const cluster = clustersService.findCluster(clusterUri);
-  return cluster?.loggedInUser;
+  return loggedInUser;
 }
 
 /**
@@ -51,17 +58,19 @@ export function useLoggedInUser(): LoggedInUser | undefined {
  * rendered inside of them.
  *
  * In general, the callsite should always assume that this function might return undefined.
- * One case where it will for sure return undefined is during the logout process as
- * ClustersService state is cleared up before WorkspacesService state. On top of that, each
- * workspace is always rendered, even when the cluster is not connected, with at least the default
- * document. In that scenario useWorkspaceLoggedInUser could return undefined when used within the
+ * Each workspace is always rendered, even when the cluster is not connected, with at least the default
+ * document. In that scenario, useWorkspaceLoggedInUser could return undefined when used within the
  * default document.
  */
 export function useWorkspaceLoggedInUser(): LoggedInUser | undefined {
-  const { clustersService } = useAppContext();
-  clustersService.useState();
   const { rootClusterUri } = useWorkspaceContext();
+  const loggedInUser = useStoreSelector(
+    'clustersService',
+    useCallback(
+      state => state.clusters.get(rootClusterUri)?.loggedInUser,
+      [rootClusterUri]
+    )
+  );
 
-  const cluster = clustersService.findCluster(rootClusterUri);
-  return cluster?.loggedInUser;
+  return loggedInUser;
 }

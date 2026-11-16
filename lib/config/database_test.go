@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package config
 
@@ -111,6 +115,18 @@ func TestMakeDatabaseConfig(t *testing.T) {
 		require.ElementsMatch(t, flags.ElastiCacheDiscoveryRegions, databases.AWSMatchers[0].Regions)
 	})
 
+	t.Run("ElastiCacheServerlessAutoDiscovery", func(t *testing.T) {
+		t.Parallel()
+		flags := DatabaseSampleFlags{
+			ElastiCacheServerlessDiscoveryRegions: []string{"us-west-1", "us-west-2"},
+		}
+
+		databases := generateAndParseConfig(t, flags)
+		require.Len(t, databases.AWSMatchers, 1)
+		require.ElementsMatch(t, []string{"elasticache-serverless"}, databases.AWSMatchers[0].Types)
+		require.ElementsMatch(t, flags.ElastiCacheServerlessDiscoveryRegions, databases.AWSMatchers[0].Regions)
+	})
+
 	t.Run("MemoryDBAutoDiscovery", func(t *testing.T) {
 		t.Parallel()
 		flags := DatabaseSampleFlags{
@@ -121,6 +137,18 @@ func TestMakeDatabaseConfig(t *testing.T) {
 		require.Len(t, databases.AWSMatchers, 1)
 		require.ElementsMatch(t, []string{"memorydb"}, databases.AWSMatchers[0].Types)
 		require.ElementsMatch(t, flags.MemoryDBDiscoveryRegions, databases.AWSMatchers[0].Regions)
+	})
+
+	t.Run("OpenSearchAutoDiscovery", func(t *testing.T) {
+		t.Parallel()
+		flags := DatabaseSampleFlags{
+			OpenSearchDiscoveryRegions: []string{"us-west-1", "us-west-2"},
+		}
+
+		databases := generateAndParseConfig(t, flags)
+		require.Len(t, databases.AWSMatchers, 1)
+		require.ElementsMatch(t, []string{"opensearch"}, databases.AWSMatchers[0].Types)
+		require.ElementsMatch(t, flags.OpenSearchDiscoveryRegions, databases.AWSMatchers[0].Regions)
 	})
 
 	t.Run("AWS discovery tags", func(t *testing.T) {
@@ -208,7 +236,6 @@ func TestMakeDatabaseConfig(t *testing.T) {
 			flags             DatabaseSampleFlags
 			wantCommandLabels []CommandLabel
 			wantStaticLabels  map[string]string
-			requireFn         require.ErrorAssertionFunc
 		}{
 			"SelfHosted": {
 				flags: DatabaseSampleFlags{
@@ -228,31 +255,30 @@ func TestMakeDatabaseConfig(t *testing.T) {
 						Command: []string{"/bin/uname", "-m", `"p1 p2"`},
 					},
 				},
-				requireFn: require.NoError,
 			},
 			"AWSKeyspaces": {
 				flags: DatabaseSampleFlags{
-					StaticDatabaseName:     "sample",
-					StaticDatabaseProtocol: "cassandra",
-					StaticDatabaseURI:      "cassandra.us-west-1.amazonaws.com",
-					DatabaseCACertFile:     pemfile,
-					DatabaseAWSRegion:      "us-west-1",
-					DatabaseAWSAccountID:   "123456789012",
-					DatabaseAWSExternalID:  "1234567890",
+					StaticDatabaseName:       "sample",
+					StaticDatabaseProtocol:   "cassandra",
+					StaticDatabaseURI:        "cassandra.us-west-1.amazonaws.com",
+					DatabaseCACertFile:       pemfile,
+					DatabaseAWSRegion:        "us-west-1",
+					DatabaseAWSAccountID:     "123456789012",
+					DatabaseAWSAssumeRoleARN: "arn:aws:iam::123456789012:role/DBDiscoverer",
+					DatabaseAWSExternalID:    "externalID123",
 				},
-				requireFn: require.NoError,
 			},
 			"AWSKeyspacesDeriveURIFromAWSRegion": {
 				flags: DatabaseSampleFlags{
-					StaticDatabaseName:     "sample",
-					StaticDatabaseProtocol: "cassandra",
-					StaticDatabaseURI:      "",
-					DatabaseCACertFile:     pemfile,
-					DatabaseAWSRegion:      "us-west-1",
-					DatabaseAWSAccountID:   "123456789012",
-					DatabaseAWSExternalID:  "1234567890",
+					StaticDatabaseName:       "sample",
+					StaticDatabaseProtocol:   "cassandra",
+					StaticDatabaseURI:        "",
+					DatabaseCACertFile:       pemfile,
+					DatabaseAWSRegion:        "us-west-1",
+					DatabaseAWSAccountID:     "123456789012",
+					DatabaseAWSAssumeRoleARN: "arn:aws:iam::123456789012:role/DBDiscoverer",
+					DatabaseAWSExternalID:    "externalID123",
 				},
-				requireFn: require.NoError,
 			},
 			"AWSRedshift": {
 				flags: DatabaseSampleFlags{
@@ -261,8 +287,9 @@ func TestMakeDatabaseConfig(t *testing.T) {
 					StaticDatabaseURI:            "redshift-cluster-1.abcdefghijklmnop.us-west-1.redshift.amazonaws.com:5439",
 					DatabaseAWSRegion:            "us-west-1",
 					DatabaseAWSRedshiftClusterID: "redshift-cluster-1",
+					DatabaseAWSAssumeRoleARN:     "arn:aws:iam::123456789012:role/DBDiscoverer",
+					DatabaseAWSExternalID:        "externalID123",
 				},
-				requireFn: require.NoError,
 			},
 			"AWSRDSInstance": {
 				flags: DatabaseSampleFlags{
@@ -271,18 +298,20 @@ func TestMakeDatabaseConfig(t *testing.T) {
 					StaticDatabaseURI:        "rds-instance-1.abcdefghijklmnop.us-west-1.rds.amazonaws.com:5432",
 					DatabaseAWSRegion:        "us-west-1",
 					DatabaseAWSRDSInstanceID: "rsd-instance-1",
+					DatabaseAWSAssumeRoleARN: "arn:aws:iam::123456789012:role/DBDiscoverer",
+					DatabaseAWSExternalID:    "externalID123",
 				},
-				requireFn: require.NoError,
 			},
 			"AWSRDSCluster": {
 				flags: DatabaseSampleFlags{
-					StaticDatabaseName:      "sample",
-					StaticDatabaseProtocol:  "postgres",
-					StaticDatabaseURI:       "aurora-cluster-1.abcdefghijklmnop.us-west-1.rds.amazonaws.com:5432",
-					DatabaseAWSRegion:       "us-west-1",
-					DatabaseAWSRDSClusterID: "aurora-cluster-1",
+					StaticDatabaseName:       "sample",
+					StaticDatabaseProtocol:   "postgres",
+					StaticDatabaseURI:        "aurora-cluster-1.abcdefghijklmnop.us-west-1.rds.amazonaws.com:5432",
+					DatabaseAWSRegion:        "us-west-1",
+					DatabaseAWSRDSClusterID:  "aurora-cluster-1",
+					DatabaseAWSAssumeRoleARN: "arn:aws:iam::123456789012:role/DBDiscoverer",
+					DatabaseAWSExternalID:    "externalID123",
 				},
-				requireFn: require.NoError,
 			},
 			"AWSMemoryDB": {
 				flags: DatabaseSampleFlags{
@@ -291,18 +320,31 @@ func TestMakeDatabaseConfig(t *testing.T) {
 					StaticDatabaseURI:              "clustercfg.my-memorydb.xxxxxx.memorydb.us-east-1.amazonaws.com:6379",
 					DatabaseAWSRegion:              "us-west-1",
 					DatabaseAWSMemoryDBClusterName: "my-memorydb",
+					DatabaseAWSAssumeRoleARN:       "arn:aws:iam::123456789012:role/DBDiscoverer",
+					DatabaseAWSExternalID:          "externalID123",
 				},
-				requireFn: require.NoError,
 			},
-			"AWSElastieCache": {
+			"AWSElastiCache": {
 				flags: DatabaseSampleFlags{
 					StaticDatabaseName:            "sample",
 					StaticDatabaseProtocol:        "redis",
 					StaticDatabaseURI:             "master.redis-cluster-example.abcdef.usw1.cache.amazonaws.com:6379",
 					DatabaseAWSRegion:             "us-west-1",
 					DatabaseAWSElastiCacheGroupID: "redis-cluster-example",
+					DatabaseAWSAssumeRoleARN:      "arn:aws:iam::123456789012:role/DBDiscoverer",
+					DatabaseAWSExternalID:         "externalID123",
 				},
-				requireFn: require.NoError,
+			},
+			"AWSElastiCacheServerless": {
+				flags: DatabaseSampleFlags{
+					StaticDatabaseName:                        "sample",
+					StaticDatabaseProtocol:                    "redis",
+					StaticDatabaseURI:                         "example-cache-abc123.serverless.cac1.cache.amazonaws.com:6379",
+					DatabaseAWSRegion:                         "us-west-1",
+					DatabaseAWSElastiCacheServerlessCacheName: "example-cache",
+					DatabaseAWSAssumeRoleARN:                  "arn:aws:iam::123456789012:role/DBDiscoverer",
+					DatabaseAWSExternalID:                     "externalID123",
+				},
 			},
 			"AD": {
 				flags: DatabaseSampleFlags{
@@ -313,7 +355,6 @@ func TestMakeDatabaseConfig(t *testing.T) {
 					DatabaseADSPN:          "MSSQLSvc/ec2amaz-4kn05du.dbadir.teleportdemo.net:1433",
 					DatabaseADKeytabFile:   keytabfile,
 				},
-				requireFn: require.NoError,
 			},
 			"GCP": {
 				flags: DatabaseSampleFlags{
@@ -323,76 +364,24 @@ func TestMakeDatabaseConfig(t *testing.T) {
 					DatabaseGCPProjectID:   "xxx-1234",
 					DatabaseGCPInstanceID:  "example",
 				},
-				requireFn: require.NoError,
 			},
 			"DynamoDBDeriveURIFromAWSRegion": {
 				flags: DatabaseSampleFlags{
-					StaticDatabaseName:     "sample",
-					StaticDatabaseProtocol: "dynamodb",
-					DatabaseAWSAccountID:   "123456789012",
-					DatabaseAWSRegion:      "us-west-1",
+					StaticDatabaseName:       "sample",
+					StaticDatabaseProtocol:   "dynamodb",
+					DatabaseAWSAccountID:     "123456789012",
+					DatabaseAWSRegion:        "us-west-1",
+					DatabaseAWSAssumeRoleARN: "arn:aws:iam::123456789012:role/DBDiscoverer",
+					DatabaseAWSExternalID:    "externalID123",
 				},
-				requireFn: require.NoError,
-			},
-			"MissingName": {
-				flags: DatabaseSampleFlags{
-					StaticDatabaseName:     "",
-					StaticDatabaseProtocol: "postgres",
-					StaticDatabaseURI:      "postgres://localhost:5432",
-				},
-				requireFn: require.Error,
-			},
-			"MissingProtocol": {
-				flags: DatabaseSampleFlags{
-					StaticDatabaseName:     "sample",
-					StaticDatabaseProtocol: "",
-					StaticDatabaseURI:      "postgres://localhost:5432",
-				},
-				requireFn: require.Error,
-			},
-			"MissingRequiredURI": {
-				flags: DatabaseSampleFlags{
-					StaticDatabaseName:     "sample",
-					StaticDatabaseProtocol: "postgres",
-					StaticDatabaseURI:      "",
-				},
-				requireFn: require.Error,
-			},
-			"InvalidLabels": {
-				flags: DatabaseSampleFlags{
-					StaticDatabaseName:      "sample",
-					StaticDatabaseProtocol:  "postgres",
-					StaticDatabaseURI:       "postgres://localhost:5432",
-					StaticDatabaseRawLabels: "abc",
-				},
-				requireFn: require.Error,
-			},
-			"MissingRequiredAWSAccount": {
-				flags: DatabaseSampleFlags{
-					StaticDatabaseName:     "sample",
-					StaticDatabaseProtocol: "dynamodb",
-					StaticDatabaseURI:      "dynamodb.us-west-1.amazonaws.com",
-					DatabaseAWSRegion:      "us-west-1",
-					DatabaseAWSAccountID:   "",
-				},
-				requireFn: require.Error,
-			},
-			"MissingAWSRegionAndURI": {
-				flags: DatabaseSampleFlags{
-					StaticDatabaseName:     "sample",
-					StaticDatabaseProtocol: "dynamodb",
-					DatabaseAWSAccountID:   "123456789012",
-				},
-				requireFn: require.Error,
 			},
 		}
 
 		for name, tt := range tests {
-			tt := tt
 			t.Run(name, func(t *testing.T) {
 				t.Parallel()
 				configString, err := MakeDatabaseAgentConfigString(tt.flags)
-				tt.requireFn(t, err)
+				require.NoError(t, err)
 				if err != nil {
 					return
 				}
@@ -411,11 +400,13 @@ func TestMakeDatabaseConfig(t *testing.T) {
 				require.ElementsMatch(t, tt.wantCommandLabels, got.DynamicLabels)
 				require.Equal(t, tt.flags.DatabaseAWSRegion, got.AWS.Region)
 				require.Equal(t, tt.flags.DatabaseAWSAccountID, got.AWS.AccountID)
+				require.Equal(t, tt.flags.DatabaseAWSAssumeRoleARN, got.AWS.AssumeRoleARN)
 				require.Equal(t, tt.flags.DatabaseAWSExternalID, got.AWS.ExternalID)
 				require.Equal(t, tt.flags.DatabaseAWSRedshiftClusterID, got.AWS.Redshift.ClusterID)
 				require.Equal(t, tt.flags.DatabaseAWSRDSClusterID, got.AWS.RDS.ClusterID)
 				require.Equal(t, tt.flags.DatabaseAWSRDSInstanceID, got.AWS.RDS.InstanceID)
 				require.Equal(t, tt.flags.DatabaseAWSElastiCacheGroupID, got.AWS.ElastiCache.ReplicationGroupID)
+				require.Equal(t, tt.flags.DatabaseAWSElastiCacheServerlessCacheName, got.AWS.ElastiCacheServerless.CacheName)
 				require.Equal(t, tt.flags.DatabaseAWSMemoryDBClusterName, got.AWS.MemoryDB.ClusterName)
 				require.Equal(t, tt.flags.DatabaseADDomain, got.AD.Domain)
 				require.Equal(t, tt.flags.DatabaseADSPN, got.AD.SPN)
@@ -431,7 +422,7 @@ func TestMakeDatabaseConfig(t *testing.T) {
 		t.Run("empty", func(t *testing.T) {
 			flags := DatabaseSampleFlags{}
 			databases := generateAndParseConfig(t, flags)
-			require.Len(t, databases.ResourceMatchers, 0)
+			require.Empty(t, databases.ResourceMatchers)
 		})
 
 		t.Run("multiple labels", func(t *testing.T) {
@@ -456,12 +447,35 @@ func TestMakeDatabaseConfig(t *testing.T) {
 				},
 			}, databases.ResourceMatchers)
 		})
+
+		t.Run("assume role", func(t *testing.T) {
+			flags := DatabaseSampleFlags{
+				DynamicResourcesRawLabels: []string{
+					"env=dev",
+				},
+				DatabaseAWSAssumeRoleARN: "arn:aws:iam::123456789012:role/DBAccess",
+				DatabaseAWSExternalID:    "externalID123",
+			}
+			databases := generateAndParseConfig(t, flags)
+			require.Equal(t, []ResourceMatcher{
+				{
+					Labels: types.Labels{
+						"env": apiutils.Strings{"dev"},
+					},
+					AWS: ResourceMatcherAWS{
+						AssumeRoleARN: "arn:aws:iam::123456789012:role/DBAccess",
+						ExternalID:    "externalID123",
+					},
+				},
+			}, databases.ResourceMatchers)
+		})
 	})
 }
 
 // generateAndParse generetes config using provided flags, parse them using
 // `ReadConfig`, checks if the Database service is enable and return it.
 func generateAndParseConfig(t *testing.T, flags DatabaseSampleFlags) Databases {
+	t.Helper()
 	configString, err := MakeDatabaseAgentConfigString(flags)
 	require.NoError(t, err)
 

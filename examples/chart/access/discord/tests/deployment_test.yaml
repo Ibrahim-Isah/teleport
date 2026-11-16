@@ -1,0 +1,15 @@
+suite: Test deployment
+templates:
+  - deployment.yaml
+# Override chart version so snapshots are stable across releases.
+chart:
+  version: "99.0.0"
+  appVersion: "99.0.0"
+tests:
+  - it: should match the snapshot
+    set:
+      image:
+        repository: gcr.io/overridden/repository
+        tag: v98.76.54
+    asserts:
+      - matchSnapshot: {}

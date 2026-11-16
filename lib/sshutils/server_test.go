@@ -1,25 +1,29 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package sshutils
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,19 +32,21 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 
+	apissh "github.com/gravitational/teleport/api/ssh"
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/cert"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
 
 func TestMain(m *testing.M) {
-	utils.InitLoggerForTests()
+	logtest.InitLogger(testing.Verbose)
 	os.Exit(m.Run())
 }
 
 func TestStartStop(t *testing.T) {
 	t.Parallel()
 
-	_, signer, err := cert.CreateCertificate("foo", ssh.HostCert)
+	_, signer, err := cert.CreateTestEd25519Certificate("foo", ssh.HostCert)
 	require.NoError(t, err)
 
 	called := false
@@ -55,8 +61,8 @@ func TestStartStop(t *testing.T) {
 		"test",
 		utils.NetAddr{AddrNetwork: "tcp", Addr: "localhost:0"},
 		fn,
-		[]ssh.Signer{signer},
-		AuthMethods{Password: pass("abc123")},
+		StaticHostSigners(signer),
+		AuthMethods{PublicKey: pubkeyAuth(signer.PublicKey())},
 	)
 	require.NoError(t, err)
 	require.NoError(t, srv.Start())
@@ -70,17 +76,22 @@ func TestStartStop(t *testing.T) {
 		require.NoError(t, ctx.Err())
 	})
 
-	clientConfig := &ssh.ClientConfig{
-		Auth:            []ssh.AuthMethod{ssh.Password("abc123")},
+	clientConfig := apissh.ClientConfig{
+		User: "alice",
+		PublicKeyAuth: apissh.PublicKeyAuthConfig{
+			Signers: func() ([]ssh.Signer, error) {
+				return []ssh.Signer{signer}, nil
+			},
+		},
 		HostKeyCallback: ssh.FixedHostKey(signer.PublicKey()),
 	}
-	clt, err := ssh.Dial("tcp", srv.Addr(), clientConfig)
+	clt, err := apissh.Dial(t.Context(), "tcp", srv.Addr(), clientConfig)
 	require.NoError(t, err)
 	defer clt.Close()
 
 	// Call new session to initiate opening new channel. This should get
 	// rejected and fail.
-	_, err = clt.NewSession()
+	_, err = clt.NewSession(t.Context())
 	require.Error(t, err)
 	require.ErrorContains(t, err, "nothing to see here")
 	require.True(t, called)
@@ -92,10 +103,10 @@ func TestStartStop(t *testing.T) {
 func TestShutdown(t *testing.T) {
 	t.Parallel()
 
-	_, signer, err := cert.CreateCertificate("foo", ssh.HostCert)
+	_, signer, err := cert.CreateTestEd25519Certificate("foo", ssh.HostCert)
 	require.NoError(t, err)
 
-	closeContext, cancel := context.WithCancel(context.TODO())
+	closeContext, cancel := context.WithCancel(t.Context())
 	fn := NewChanHandlerFunc(func(_ context.Context, ccx *ConnectionContext, nch ssh.NewChannel) {
 		ch, _, err := nch.Accept()
 		require.NoError(t, err)
@@ -109,38 +120,43 @@ func TestShutdown(t *testing.T) {
 		"test",
 		utils.NetAddr{AddrNetwork: "tcp", Addr: "localhost:0"},
 		fn,
-		[]ssh.Signer{signer},
-		AuthMethods{Password: pass("abc123")},
+		StaticHostSigners(signer),
+		AuthMethods{PublicKey: pubkeyAuth(signer.PublicKey())},
 		SetShutdownPollPeriod(10*time.Millisecond),
 	)
 	require.NoError(t, err)
 	require.NoError(t, srv.Start())
 
-	clientConfig := &ssh.ClientConfig{
-		Auth:            []ssh.AuthMethod{ssh.Password("abc123")},
+	clientConfig := apissh.ClientConfig{
+		User: "alice",
+		PublicKeyAuth: apissh.PublicKeyAuthConfig{
+			Signers: func() ([]ssh.Signer, error) {
+				return []ssh.Signer{signer}, nil
+			},
+		},
 		HostKeyCallback: ssh.FixedHostKey(signer.PublicKey()),
 	}
-	clt, err := ssh.Dial("tcp", srv.Addr(), clientConfig)
+	clt, err := apissh.Dial(t.Context(), "tcp", srv.Addr(), clientConfig)
 	require.NoError(t, err)
 	defer clt.Close()
 
 	// call new session to initiate opening new channel
-	_, err = clt.NewSession()
+	_, err = clt.NewSession(t.Context())
 	require.NoError(t, err)
 
 	// context will timeout because there is a connection around
-	ctx, ctxc := context.WithTimeout(context.TODO(), 50*time.Millisecond)
+	ctx, ctxc := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer ctxc()
 	require.True(t, trace.IsConnectionProblem(srv.Shutdown(ctx)))
 
 	// now shutdown will return
 	cancel()
-	ctx2, ctxc2 := context.WithTimeout(context.TODO(), time.Second)
+	ctx2, ctxc2 := context.WithTimeout(t.Context(), time.Second)
 	defer ctxc2()
 	require.NoError(t, srv.Shutdown(ctx2))
 
 	// shutdown is re-entrable
-	ctx3, ctxc3 := context.WithTimeout(context.TODO(), time.Second)
+	ctx3, ctxc3 := context.WithTimeout(t.Context(), time.Second)
 	defer ctxc3()
 	require.NoError(t, srv.Shutdown(ctx3))
 }
@@ -148,7 +164,7 @@ func TestShutdown(t *testing.T) {
 func TestConfigureCiphers(t *testing.T) {
 	t.Parallel()
 
-	_, signer, err := cert.CreateCertificate("foo", ssh.HostCert)
+	_, signer, err := cert.CreateTestEd25519Certificate("foo", ssh.HostCert)
 	require.NoError(t, err)
 
 	fn := NewChanHandlerFunc(func(_ context.Context, _ *ConnectionContext, nch ssh.NewChannel) {
@@ -161,33 +177,43 @@ func TestConfigureCiphers(t *testing.T) {
 		"test",
 		utils.NetAddr{AddrNetwork: "tcp", Addr: "localhost:0"},
 		fn,
-		[]ssh.Signer{signer},
-		AuthMethods{Password: pass("abc123")},
+		StaticHostSigners(signer),
+		AuthMethods{PublicKey: pubkeyAuth(signer.PublicKey())},
 		SetCiphers([]string{"aes128-ctr"}),
 	)
 	require.NoError(t, err)
 	require.NoError(t, srv.Start())
 
 	// client only speaks aes256-ctr, should fail
-	cc := ssh.ClientConfig{
-		Config: ssh.Config{
+	cc := apissh.ClientConfig{
+		SSHConfig: ssh.Config{
 			Ciphers: []string{"aes256-ctr"},
 		},
-		Auth:            []ssh.AuthMethod{ssh.Password("abc123")},
+		User: "alice",
+		PublicKeyAuth: apissh.PublicKeyAuthConfig{
+			Signers: func() ([]ssh.Signer, error) {
+				return []ssh.Signer{signer}, nil
+			},
+		},
 		HostKeyCallback: ssh.FixedHostKey(signer.PublicKey()),
 	}
-	_, err = ssh.Dial("tcp", srv.Addr(), &cc)
+	_, err = apissh.Dial(t.Context(), "tcp", srv.Addr(), cc)
 	require.Error(t, err, "cipher mismatch, should fail, got nil")
 
 	// client only speaks aes128-ctr, should succeed
-	cc = ssh.ClientConfig{
-		Config: ssh.Config{
+	cc = apissh.ClientConfig{
+		SSHConfig: ssh.Config{
 			Ciphers: []string{"aes128-ctr"},
 		},
-		Auth:            []ssh.AuthMethod{ssh.Password("abc123")},
+		User: "alice",
+		PublicKeyAuth: apissh.PublicKeyAuthConfig{
+			Signers: func() ([]ssh.Signer, error) {
+				return []ssh.Signer{signer}, nil
+			},
+		},
 		HostKeyCallback: ssh.FixedHostKey(signer.PublicKey()),
 	}
-	clt, err := ssh.Dial("tcp", srv.Addr(), &cc)
+	clt, err := apissh.Dial(t.Context(), "tcp", srv.Addr(), cc)
 	require.NoError(t, err)
 	defer clt.Close()
 }
@@ -197,10 +223,13 @@ func TestConfigureCiphers(t *testing.T) {
 func TestHostSignerFIPS(t *testing.T) {
 	t.Parallel()
 
-	_, signer, err := cert.CreateCertificate("foo", ssh.HostCert)
+	_, signer, err := cert.CreateTestRSACertificate("foo", ssh.HostCert)
 	require.NoError(t, err)
 
-	_, ellipticSigner, err := cert.CreateEllipticCertificate("foo", ssh.HostCert)
+	_, ellipticSigner, err := cert.CreateTestECDSACertificate("foo", ssh.HostCert)
+	require.NoError(t, err)
+
+	_, ed25519Signer, err := cert.CreateTestEd25519Certificate("foo", ssh.HostCert)
 	require.NoError(t, err)
 
 	fn := NewChanHandlerFunc(func(_ context.Context, _ *ConnectionContext, nch ssh.NewChannel) {
@@ -208,21 +237,33 @@ func TestHostSignerFIPS(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	var tests = []struct {
+	tests := []struct {
 		inSigner ssh.Signer
 		inFIPS   bool
 		assert   require.ErrorAssertionFunc
 	}{
-		// ECDSA when in FIPS mode should fail.
+		// Ed25519 when in FIPS mode should fail.
+		{
+			inSigner: ed25519Signer,
+			inFIPS:   true,
+			assert:   require.Error,
+		},
+		// ECDSA when in FIPS mode is okay.
 		{
 			inSigner: ellipticSigner,
 			inFIPS:   true,
-			assert:   require.Error,
+			assert:   require.NoError,
 		},
 		// RSA when in FIPS mode is okay.
 		{
 			inSigner: signer,
 			inFIPS:   true,
+			assert:   require.NoError,
+		},
+		// Ed25519 when in not FIPS mode should succeed.
+		{
+			inSigner: ed25519Signer,
+			inFIPS:   false,
 			assert:   require.NoError,
 		},
 		// ECDSA when in not FIPS mode should succeed.
@@ -243,8 +284,8 @@ func TestHostSignerFIPS(t *testing.T) {
 			"test",
 			utils.NetAddr{AddrNetwork: "tcp", Addr: "localhost:0"},
 			fn,
-			[]ssh.Signer{tt.inSigner},
-			AuthMethods{Password: pass("abc123")},
+			StaticHostSigners(tt.inSigner),
+			AuthMethods{Password: pass("abcdef123456")},
 			SetCiphers([]string{"aes128-ctr"}),
 			SetFIPS(tt.inFIPS),
 		)
@@ -262,5 +303,72 @@ func pass(need string) PasswordFunc {
 			}, nil
 		}
 		return nil, fmt.Errorf("passwords don't match")
+	}
+}
+
+func TestDynamicHostSigners(t *testing.T) {
+	t.Parallel()
+
+	certFoo, signerFoo, err := cert.CreateTestEd25519Certificate("foo", ssh.HostCert)
+	require.NoError(t, err)
+
+	certBar, signerBar, err := cert.CreateTestEd25519Certificate("bar", ssh.HostCert)
+	require.NoError(t, err)
+
+	var activeSigner atomic.Pointer[ssh.Signer]
+	activeSigner.Store(&signerFoo)
+
+	srv, err := NewServer(
+		"test",
+		utils.NetAddr{AddrNetwork: "tcp", Addr: "localhost:0"},
+		NewChanHandlerFunc(func(_ context.Context, _ *ConnectionContext, nc ssh.NewChannel) {
+			err := nc.Reject(ssh.UnknownChannelType, ssh.UnknownChannelType.String())
+			assert.NoError(t, err)
+		}),
+		func() []ssh.Signer { return []ssh.Signer{*activeSigner.Load()} },
+		AuthMethods{NoClient: true},
+		SetShutdownPollPeriod(10*time.Millisecond),
+	)
+	require.NoError(t, err)
+	require.NoError(t, srv.Start())
+	t.Cleanup(func() { _ = srv.Close() })
+
+	dial := func(pub ssh.PublicKey) error {
+		clt, err := apissh.Dial(t.Context(), "tcp", srv.Addr(), apissh.ClientConfig{
+			User: "alice",
+			PublicKeyAuth: apissh.PublicKeyAuthConfig{
+				Signers: func() ([]ssh.Signer, error) {
+					return []ssh.Signer{signerFoo}, nil
+				},
+			},
+			HostKeyCallback: ssh.FixedHostKey(pub),
+		})
+		if clt != nil {
+			defer clt.Close()
+		}
+		return err
+	}
+
+	require.NoError(t, dial(certFoo))
+	require.ErrorContains(t, dial(certBar), "ssh: host key mismatch")
+
+	activeSigner.Store(&signerBar)
+
+	require.NoError(t, dial(certBar))
+	require.ErrorContains(t, dial(certFoo), "ssh: host key mismatch")
+}
+
+// pubkeyAuth returns a PublicKeyFunc that checks if the provided public key matches the expected one.
+func pubkeyAuth(need ssh.PublicKey) PublicKeyFunc {
+	return func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+		if bytes.Equal(key.Marshal(), need.Marshal()) {
+			return &ssh.Permissions{
+				Extensions: map[string]string{
+					utils.ExtIntCertType: utils.ExtIntCertTypeUser,
+				},
+			}, nil
+		}
+
+		return nil, trace.BadParameter("public keys don't match")
 	}
 }

@@ -1,27 +1,35 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"testing"
+	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/testing/protocmp"
 
+	headerv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/header/v1"
+	"github.com/gravitational/teleport/api/gen/proto/go/teleport/vnet/v1"
 	"github.com/gravitational/teleport/api/types"
+	scopedaccess "github.com/gravitational/teleport/lib/scopes/access"
 )
 
 // TestParseShortcut will test parsing of shortcuts.
@@ -63,6 +71,11 @@ func TestParseShortcut(t *testing.T) {
 		"cert_authorities": {expectedOutput: types.KindCertAuthority},
 		"cas":              {expectedOutput: types.KindCertAuthority},
 
+		"cert_authority_override":  {expectedOutput: types.KindCertAuthorityOverride},
+		"cert_authority_overrides": {expectedOutput: types.KindCertAuthorityOverride},
+		"ca_override":              {expectedOutput: types.KindCertAuthorityOverride},
+		"ca_overrides":             {expectedOutput: types.KindCertAuthorityOverride},
+
 		"tunnel":          {expectedOutput: types.KindReverseTunnel},
 		"reverse_tunnels": {expectedOutput: types.KindReverseTunnel},
 		"rts":             {expectedOutput: types.KindReverseTunnel},
@@ -101,9 +114,6 @@ func TestParseShortcut(t *testing.T) {
 		"kube_cluster":  {expectedOutput: types.KindKubernetesCluster},
 		"kube_clusters": {expectedOutput: types.KindKubernetesCluster},
 
-		"kube_service":  {expectedOutput: types.KindKubeService},
-		"kube_services": {expectedOutput: types.KindKubeService},
-
 		"kube_server":  {expectedOutput: types.KindKubeServer},
 		"kube_servers": {expectedOutput: types.KindKubeServer},
 
@@ -127,6 +137,13 @@ func TestParseShortcut(t *testing.T) {
 		"windows_desktop": {expectedOutput: types.KindWindowsDesktop},
 		"win_desktop":     {expectedOutput: types.KindWindowsDesktop},
 
+		"dynamic_windows_desktop": {expectedOutput: types.KindDynamicWindowsDesktop},
+		"dynamic_win_desktop":     {expectedOutput: types.KindDynamicWindowsDesktop},
+		"dynamic_desktop":         {expectedOutput: types.KindDynamicWindowsDesktop},
+
+		"linux_desktop":  {expectedOutput: types.KindLinuxDesktop},
+		"linux_desktops": {expectedOutput: types.KindLinuxDesktop},
+
 		"token":  {expectedOutput: types.KindToken},
 		"tokens": {expectedOutput: types.KindToken},
 
@@ -148,7 +165,36 @@ func TestParseShortcut(t *testing.T) {
 		"usergroup":   {expectedOutput: types.KindUserGroup},
 		"usergroups":  {expectedOutput: types.KindUserGroup},
 
+		"device":  {expectedOutput: types.KindDevice},
+		"devices": {expectedOutput: types.KindDevice},
+
+		"okta_import_rule":  {expectedOutput: types.KindOktaImportRule},
+		"okta_import_rules": {expectedOutput: types.KindOktaImportRule},
+		"oktaimportrule":    {expectedOutput: types.KindOktaImportRule},
+		"oktaimportrules":   {expectedOutput: types.KindOktaImportRule},
+
+		"okta_assignment":  {expectedOutput: types.KindOktaAssignment},
+		"okta_assignments": {expectedOutput: types.KindOktaAssignment},
+		"oktaassignment":   {expectedOutput: types.KindOktaAssignment},
+		"oktaassignments":  {expectedOutput: types.KindOktaAssignment},
+
+		"access_list":  {expectedOutput: types.KindAccessList},
+		"access_lists": {expectedOutput: types.KindAccessList},
+		"accesslist":   {expectedOutput: types.KindAccessList},
+		"accesslists":  {expectedOutput: types.KindAccessList},
+
 		"SamL_IDP_sERVICe_proVidER": {expectedOutput: types.KindSAMLIdPServiceProvider},
+
+		"access_request":  {expectedOutput: types.KindAccessRequest},
+		"access_requests": {expectedOutput: types.KindAccessRequest},
+		"accessrequest":   {expectedOutput: types.KindAccessRequest},
+		"accessrequests":  {expectedOutput: types.KindAccessRequest},
+
+		"scoped_role_assignment":  {expectedOutput: scopedaccess.KindScopedRoleAssignment},
+		"scoped_role_assignments": {expectedOutput: scopedaccess.KindScopedRoleAssignment},
+		"scopedroleassignment":    {expectedOutput: scopedaccess.KindScopedRoleAssignment},
+		"scopedroleassignments":   {expectedOutput: scopedaccess.KindScopedRoleAssignment},
+		"sra":                     {expectedOutput: scopedaccess.KindScopedRoleAssignment},
 
 		"unknown_type": {expectedErr: true},
 	}
@@ -163,6 +209,109 @@ func TestParseShortcut(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, test.expectedOutput, output)
 			}
+		})
+	}
+}
+
+func Test_setResourceName(t *testing.T) {
+	tests := []struct {
+		name           string
+		meta           types.Metadata
+		overrideLabels []string
+		firstNamePart  string
+		extraNameParts []string
+		want           types.Metadata
+	}{
+		{
+			name:           "no override, one part name",
+			meta:           types.Metadata{},
+			firstNamePart:  "foo",
+			extraNameParts: nil,
+			want:           types.Metadata{Name: "foo"},
+		},
+		{
+			name:           "no override, multi part name",
+			meta:           types.Metadata{},
+			firstNamePart:  "foo",
+			extraNameParts: []string{"bar", "baz"},
+			want:           types.Metadata{Name: "foo-bar-baz"},
+		},
+		{
+			name:           "override by generic cloud label, one part name",
+			meta:           types.Metadata{Labels: map[string]string{types.AWSDatabaseNameOverrideLabels[0]: "gizmo"}},
+			overrideLabels: types.AWSDatabaseNameOverrideLabels,
+			firstNamePart:  "foo",
+			extraNameParts: nil,
+			want:           types.Metadata{Name: "gizmo", Labels: map[string]string{types.AWSDatabaseNameOverrideLabels[0]: "gizmo"}},
+		},
+		{
+			name:           "override by original AWS label, one part name",
+			meta:           types.Metadata{Labels: map[string]string{types.AWSDatabaseNameOverrideLabels[1]: "gizmo"}},
+			overrideLabels: types.AWSDatabaseNameOverrideLabels,
+			firstNamePart:  "foo",
+			extraNameParts: nil,
+			want:           types.Metadata{Name: "gizmo", Labels: map[string]string{types.AWSDatabaseNameOverrideLabels[1]: "gizmo"}},
+		},
+		{
+			name:           "override, multi part name",
+			meta:           types.Metadata{Labels: map[string]string{types.AzureDatabaseNameOverrideLabel: "gizmo"}},
+			overrideLabels: []string{types.AzureDatabaseNameOverrideLabel},
+			firstNamePart:  "foo",
+			extraNameParts: []string{"bar", "baz"},
+			want:           types.Metadata{Name: "gizmo-bar-baz", Labels: map[string]string{types.AzureDatabaseNameOverrideLabel: "gizmo"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := setResourceName(tt.overrideLabels, tt.meta, tt.firstNamePart, tt.extraNameParts...)
+			require.Equal(t, tt.want, result)
+		})
+	}
+}
+
+func TestProtoResourceRoundtrip(t *testing.T) {
+	t.Parallel()
+
+	resource := vnet.VnetConfig_builder{
+		Metadata: headerv1.Metadata_builder{
+			Name: "vnet_config",
+		}.Build(),
+		Spec: vnet.VnetConfigSpec_builder{
+			Ipv4CidrRange: "100.64.0.0/10",
+		}.Build(),
+	}.Build()
+
+	for _, tc := range []struct {
+		desc          string
+		marshalFunc   func(*vnet.VnetConfig, ...MarshalOption) ([]byte, error)
+		unmarshalFunc func([]byte, ...MarshalOption) (*vnet.VnetConfig, error)
+	}{
+		{
+			desc:          "deprecated",
+			marshalFunc:   FastMarshalProtoResourceDeprecated[*vnet.VnetConfig],
+			unmarshalFunc: FastUnmarshalProtoResourceDeprecated[*vnet.VnetConfig],
+		},
+		{
+			desc:          "new",
+			marshalFunc:   MarshalProtoResource[*vnet.VnetConfig],
+			unmarshalFunc: UnmarshalProtoResource[*vnet.VnetConfig],
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			marshaled, err := tc.marshalFunc(resource)
+			require.NoError(t, err)
+
+			unmarshalled, err := tc.unmarshalFunc(marshaled)
+			require.NoError(t, err)
+			require.Empty(t, cmp.Diff(resource, unmarshalled, protocmp.Transform()))
+
+			revision := "123"
+			expires := time.Now()
+			unmarshalled, err = tc.unmarshalFunc(marshaled,
+				WithRevision(revision), WithExpires(expires))
+			require.NoError(t, err)
+			require.Equal(t, revision, unmarshalled.GetMetadata().GetRevision())
+			require.WithinDuration(t, expires, unmarshalled.GetMetadata().GetExpires().AsTime(), time.Millisecond)
 		})
 	}
 }

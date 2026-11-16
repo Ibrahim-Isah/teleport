@@ -1,18 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package httplib implements common utility functions for writing
 // classic HTTP handlers
@@ -21,9 +23,86 @@ package httplib
 import (
 	"fmt"
 	"net/http"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/gravitational/teleport/api/utils"
 )
+
+// CSPMap holds a map of Content Security Policy directives.
+type CSPMap map[string][]string
+
+var (
+	defaultContentSecurityPolicy = CSPMap{
+		"default-src": {"'self'"},
+		"script-src":  {"'self'"},
+		// specify CSP directives not covered by `default-src`
+		"base-uri":        {"'self'"},
+		"form-action":     {"'self'"},
+		"frame-ancestors": {"'none'"},
+		// additional default restrictions
+		"object-src": {"'none'"},
+		"img-src":    {"'self'", "data:", "blob:"},
+		"style-src":  {"'self'", "'unsafe-inline'"},
+	}
+	defaultFontSrc     = CSPMap{"font-src": {"'self'", "data:"}}
+	defaultConnectSrc  = CSPMap{"connect-src": {"'self'", "wss:"}}
+	wasmSecurityPolicy = CSPMap{"script-src": {"'self'", "'wasm-unsafe-eval'"}}
+
+	// stripeSecurityPolicy grants the origins Stripe.js and the Payment Element
+	// need to load and communicate with Stripe. Applied only to stripe-managed
+	// tenants — see getIndexContentSecurityPolicyString.
+	// https://docs.stripe.com/security/guide#content-security-policy
+	stripeSecurityPolicy = CSPMap{
+		"script-src":  {"https://js.stripe.com", "https://*.js.stripe.com"},
+		"frame-src":   {"https://js.stripe.com", "https://*.js.stripe.com", "https://hooks.stripe.com"},
+		"connect-src": {"https://api.stripe.com"},
+	}
+)
+
+// combineCSPMaps combines multiple CSP maps into a single map.
+// When multiple of the input CSPMap have the same key, their
+// respective lists are concatenated.
+func combineCSPMaps(cspMaps ...CSPMap) CSPMap {
+	combinedMap := make(CSPMap)
+
+	for _, cspMap := range cspMaps {
+		for key, value := range cspMap {
+			combinedMap[key] = append(combinedMap[key], value...)
+			combinedMap[key] = utils.Deduplicate(combinedMap[key])
+		}
+	}
+
+	return combinedMap
+}
+
+// GetContentSecurityPolicyString combines multiple CSP maps into a single
+// CSP string, alphabetically sorted by the directive key.
+// When multiple of the input cspMaps have the same key, their
+// respective lists are concatenated.
+func GetContentSecurityPolicyString(cspMaps ...CSPMap) string {
+	combined := combineCSPMaps(cspMaps...)
+
+	keys := make([]string, 0, len(combined))
+	for k := range combined {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var cspStringBuilder strings.Builder
+	for _, k := range keys {
+		cspStringBuilder.WriteString(k)
+		for _, v := range combined[k] {
+			cspStringBuilder.WriteString(" ")
+			cspStringBuilder.WriteString(v)
+		}
+		cspStringBuilder.WriteString("; ")
+	}
+
+	return strings.TrimSpace(cspStringBuilder.String())
+}
 
 // SetNoCacheHeaders tells proxies and browsers do not cache the content
 func SetNoCacheHeaders(h http.Header) {
@@ -35,6 +114,13 @@ func SetNoCacheHeaders(h http.Header) {
 // SetCacheHeaders tells proxies and browsers to cache the content
 func SetCacheHeaders(h http.Header, maxAge time.Duration) {
 	h.Set("Cache-Control", fmt.Sprintf("max-age=%.f, immutable", maxAge.Seconds()))
+}
+
+// SetEntityTagCacheHeaders tells proxies and browsers to cache the content
+// and sets an ETag based on teleport version which can be used to check for modifications
+func SetEntityTagCacheHeaders(h http.Header, etag string) {
+	h.Set("Cache-Control", "no-cache")
+	h.Set("ETag", etag)
 }
 
 // SetDefaultSecurityHeaders adds headers that should generally be considered safe defaults.  It is expected that all
@@ -61,58 +147,94 @@ func SetDefaultSecurityHeaders(h http.Header) {
 	h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 }
 
-// SetIndexContentSecurityPolicy sets the Content-Security-Policy header for main index.html page
-func SetIndexContentSecurityPolicy(h http.Header) {
-	var cspValue = strings.Join([]string{
-		GetDefaultContentSecurityPolicy(),
-		// 'unsafe-inline' is required by CSS-in-JS to work
-		"style-src 'self' 'unsafe-inline'",
-		"img-src 'self' data: blob:",
-		"font-src 'self' data:",
-		"connect-src 'self' wss:",
-	}, ";")
+type cspOption int
 
-	h.Set("Content-Security-Policy", cspValue)
+const (
+	withWASM cspOption = iota
+	withStripe
+)
+
+func getIndexContentSecurityPolicy(options ...cspOption) CSPMap {
+	cspMaps := []CSPMap{defaultContentSecurityPolicy, defaultFontSrc, defaultConnectSrc}
+	for _, option := range options {
+		switch option {
+		case withWASM:
+			cspMaps = append(cspMaps, wasmSecurityPolicy)
+		case withStripe:
+			cspMaps = append(cspMaps, stripeSecurityPolicy)
+		}
+	}
+
+	return combineCSPMaps(cspMaps...)
 }
 
-// SetAppLaunchContentSecurityPolicy sets the Content-Security-Policy header for /web/launch
-func SetAppLaunchContentSecurityPolicy(h http.Header, applicationURL string) {
-	var cspValue = strings.Join([]string{
-		GetDefaultContentSecurityPolicy(),
-		// 'unsafe-inline' is required by CSS-in-JS to work
-		"style-src 'self' 'unsafe-inline'",
-		"img-src 'self' data: blob:",
-		"font-src 'self' data:",
-		fmt.Sprintf("connect-src 'self' %s", applicationURL),
-	}, ";")
+var (
+	// desktopSessionRe is a regex that matches /web/cluster/:clusterId/desktops/:desktopName/:username
+	// which is a route to a Windows desktop session that uses WASM.
+	desktopSessionRe = regexp.MustCompile(`^/web/cluster/[^/]+/desktops/[^/]+/[^/]+$`)
 
-	h.Set("Content-Security-Policy", cspValue)
+	// linuxDesktopSessionRe is a regex that matches /web/cluster/:clusterId/linux_desktops/:desktopName/:username
+	// which is a route to a Linux desktop session that uses WASM.
+	linuxDesktopSessionRe = regexp.MustCompile(`^/web/cluster/[^/]+/linux_desktops/[^/]+/[^/]+$`)
+
+	// recordingRe is a regex for the recordings endpoint /web/cluster/:clusterId/session/:sid
+	// which is a route to a desktop recording that uses WASM.
+	recordingRe = regexp.MustCompile(`^/web/cluster/[^/]+/session/[^/]+$`)
+
+	// sshSessionRe is a regex for the ssh terminal endpoint /web/cluster/:clusterId/console/node/:sid/:login
+	// which is a route to a SSH session that uses WASM.
+	// (Note: the WASM dependency comes from xterm.js extensions)
+	sshSessionRe = regexp.MustCompile(`^/web/cluster/[^/]+/console/node/[^/]+/[^/]+$`)
+)
+
+const (
+	cspHeaderName         = "Content-Security-Policy"
+	contentTypeHeaderName = "Content-Type"
+)
+
+var (
+	indexCSPWithWASM          = GetContentSecurityPolicyString(getIndexContentSecurityPolicy(withWASM))
+	indexCSPWithoutWASM       = GetContentSecurityPolicyString(getIndexContentSecurityPolicy())
+	indexCSPStripeWithWASM    = GetContentSecurityPolicyString(getIndexContentSecurityPolicy(withStripe, withWASM))
+	indexCSPStripeWithoutWASM = GetContentSecurityPolicyString(getIndexContentSecurityPolicy(withStripe))
+)
+
+func getIndexContentSecurityPolicyString(withStripe bool, urlPath string) string {
+	wasm := desktopSessionRe.MatchString(urlPath) ||
+		linuxDesktopSessionRe.MatchString(urlPath) ||
+		recordingRe.MatchString(urlPath) ||
+		sshSessionRe.MatchString(urlPath)
+	switch {
+	case wasm && withStripe:
+		return indexCSPStripeWithWASM
+	case wasm:
+		return indexCSPWithWASM
+	case withStripe:
+		return indexCSPStripeWithoutWASM
+	default:
+		return indexCSPWithoutWASM
+	}
 }
 
-// GetDefaultContentSecurityPolicy provides a starting Content Security Policy with safe defaults.
-func GetDefaultContentSecurityPolicy() string {
-	return strings.Join([]string{
-		"default-src 'self'",
-		// specify CSP directives not covered by `default-src`
-		"base-uri 'self'",
-		"form-action 'self'",
-		"frame-ancestors 'none'",
-		// additional default restrictions
-		"object-src 'none'",
-	}, ";")
+// SetIndexContentSecurityPolicy sets the Content-Security-Policy header for main index.html page.
+// withStripe should be true for stripe-managed tenants so that Stripe.js and the Payment Element
+// can load in the cloud panel.
+func SetIndexContentSecurityPolicy(h http.Header, withStripe bool, urlPath string) {
+	h.Set(cspHeaderName, getIndexContentSecurityPolicyString(withStripe, urlPath))
 }
 
-// SetDefaultContentSecurityPolicy provides a starting Content Security Policy with safe defaults.
-func SetDefaultContentSecurityPolicy(h http.Header) {
-	h.Set("Content-Security-Policy", GetDefaultContentSecurityPolicy())
+// SetRedirectPageContentSecurityPolicy sets the Content-Security-Policy header
+// for when Teleport serves a redirect.
+func SetRedirectPageContentSecurityPolicy(h http.Header, scriptSrc string) {
+	h.Set(
+		cspHeaderName,
+		GetContentSecurityPolicyString(
+			defaultContentSecurityPolicy,
+			CSPMap{"script-src": {"'" + scriptSrc + "'"}},
+		))
 }
 
-// SetWebConfigHeaders sets headers for webConfig.js
-func SetWebConfigHeaders(h http.Header) {
-	h.Set("Content-Type", "application/javascript")
-}
-
-// SetScriptHeaders sets headers for the teleport install script
+// SetScriptHeaders sets headers for Teleport install scripts.
 func SetScriptHeaders(h http.Header) {
-	h.Set("Content-Type", "text/x-shellscript")
+	h.Set(contentTypeHeaderName, "text/x-shellscript")
 }

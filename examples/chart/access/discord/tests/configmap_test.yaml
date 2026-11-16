@@ -1,0 +1,25 @@
+suite: Test deployment
+templates:
+  - configmap.yaml
+# Override chart version so snapshots are stable across releases.
+chart:
+  version: "99.0.0"
+  appVersion: "99.0.0"
+tests:
+  - it: should match the snapshot
+    set:
+      teleport:
+        address: teleport.example.com:1234
+      slack:
+        token: test-api-key
+      roleToRecipients:
+        dev:
+          - dev-access-requests
+          - example-user@example.com
+        "*":
+          - dev-access-requests
+      log:
+        output: /var/log/teleport-discord.log
+        severity: DEBUG
+    asserts:
+      - matchSnapshot: {}

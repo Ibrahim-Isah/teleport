@@ -1,33 +1,34 @@
 /*
-Copyright 2020-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package postgres
 
 import (
 	"context"
 	"crypto/tls"
+	"log/slog"
 	"net"
 
 	"github.com/gravitational/trace"
-	"github.com/jackc/pgproto3/v2"
-	"github.com/sirupsen/logrus"
+	"github.com/jackc/pgx/v5/pgproto3"
 
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/limiter"
-	"github.com/gravitational/teleport/lib/srv/alpnproxy"
 	"github.com/gravitational/teleport/lib/srv/db/common"
 	"github.com/gravitational/teleport/lib/srv/ingress"
 	"github.com/gravitational/teleport/lib/utils"
@@ -41,11 +42,11 @@ type Proxy struct {
 	// TLSConfig is the proxy TLS configuration.
 	TLSConfig *tls.Config
 	// Middleware is the auth middleware.
-	Middleware *auth.Middleware
+	Middleware *authz.Middleware
 	// Service is used to connect to a remote database service.
 	Service common.Service
 	// Log is used for logging.
-	Log logrus.FieldLogger
+	Log *slog.Logger
 	// Limiter limits the number of active connections per client IP.
 	Limiter *limiter.Limiter
 	// IngressReporter reports new and active connections.
@@ -64,14 +65,19 @@ func (p *Proxy) HandleConnection(ctx context.Context, clientConn net.Conn) (err 
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	defer func() {
-		if err != nil {
-			if err := backend.Send(toErrorResponse(err)); err != nil {
-				p.Log.WithError(err).Warn("Failed to send error to backend.")
-			}
+	if err := p.handleConnection(ctx, tlsConn, startupMessage); err != nil {
+		backend.Send(toErrorResponse(err))
+		if serr := backend.Flush(); serr != nil {
+			p.Log.WarnContext(ctx, "Failed to send error to backend.", "error", serr)
 		}
-	}()
+		return trace.Wrap(err)
+	}
+	return nil
+}
 
+// handleConnection dials database service, sends the postgres startup
+// message, and begins proxying the connection.
+func (p *Proxy) handleConnection(ctx context.Context, clientConn utils.TLSConn, startupMessage pgproto3.FrontendMessage) error {
 	clientIP, err := utils.ClientIPFromConn(clientConn)
 	if err != nil {
 		return trace.Wrap(err)
@@ -84,7 +90,7 @@ func (p *Proxy) HandleConnection(ctx context.Context, clientConn net.Conn) (err 
 	}
 	defer releaseConn()
 
-	proxyCtx, err := p.Service.Authorize(ctx, tlsConn, common.ConnectParams{
+	proxyCtx, err := p.Service.Authorize(ctx, clientConn, common.ConnectParams{
 		ClientIP: clientIP,
 	})
 	if err != nil {
@@ -102,13 +108,13 @@ func (p *Proxy) HandleConnection(ctx context.Context, clientConn net.Conn) (err 
 	}
 	defer serviceConn.Close()
 	// Frontend acts as a client for the Postgres wire protocol.
-	frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(serviceConn), serviceConn)
+	frontend := pgproto3.NewFrontend(serviceConn, serviceConn)
 	// Pass the startup message along to the Teleport database server.
-	err = frontend.Send(startupMessage)
-	if err != nil {
+	frontend.Send(startupMessage)
+	if err = frontend.Flush(); err != nil {
 		return trace.Wrap(err)
 	}
-	err = p.Service.Proxy(ctx, proxyCtx, tlsConn, serviceConn)
+	err = p.Service.Proxy(ctx, proxyCtx, clientConn, serviceConn)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -120,17 +126,29 @@ func (p *Proxy) HandleConnection(ctx context.Context, clientConn net.Conn) (err 
 //
 // Returns the startup message that contains initial connect parameters and
 // the upgraded TLS connection.
-func (p *Proxy) handleStartup(ctx context.Context, clientConn net.Conn) (*pgproto3.StartupMessage, utils.TLSConn, *pgproto3.Backend, error) {
+func (p *Proxy) handleStartup(ctx context.Context, clientConn net.Conn) (pgproto3.FrontendMessage, utils.TLSConn, *pgproto3.Backend, error) {
 	receivedSSLRequest := false
 	receivedGSSEncRequest := false
 	for {
 		// Backend acts as a server for the Postgres wire protocol.
-		backend := pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn)
+		backend := pgproto3.NewBackend(clientConn, clientConn)
 		startupMessage, err := backend.ReceiveStartupMessage()
 		if err != nil {
 			return nil, nil, nil, trace.Wrap(err)
 		}
-		p.Log.Debugf("Received startup message: %#v.", startupMessage)
+
+		// We don't want to log the cancel request secret key, so we handle
+		// this case separately.
+		if m, ok := startupMessage.(*pgproto3.CancelRequest); ok {
+			p.Log.DebugContext(ctx, "Received cancel request for pid.", "pid", m.ProcessID)
+			tlsConn, ok := clientConn.(utils.TLSConn)
+			if !ok {
+				return nil, nil, nil, trace.BadParameter(
+					"expected tls connection, got %T", clientConn)
+			}
+			return m, tlsConn, backend, nil
+		}
+
 		// When initiating an encrypted connection, psql will first check with
 		// the server whether it supports TLS by sending an SSLRequest message.
 		//
@@ -139,6 +157,7 @@ func (p *Proxy) handleStartup(ctx context.Context, clientConn net.Conn) (*pgprot
 		// user name, database name, etc.
 		//
 		// https://www.postgresql.org/docs/13/protocol-flow.html#id-1.10.5.7.11
+		p.Log.DebugContext(ctx, "Received startup message.", "message", startupMessage)
 		switch m := startupMessage.(type) {
 		case *pgproto3.SSLRequest:
 			if receivedSSLRequest {
@@ -185,15 +204,12 @@ func (p *Proxy) handleStartup(ctx context.Context, clientConn net.Conn) (*pgprot
 		case *pgproto3.StartupMessage:
 			// TLS connection between the client and this proxy has been
 			// established, just return the startup message.
-			switch tlsConn := clientConn.(type) {
-			case *tls.Conn:
-				return m, tlsConn, backend, nil
-			case *alpnproxy.PingConn:
-				return m, tlsConn, backend, nil
-			default:
+			tlsConn, ok := clientConn.(utils.TLSConn)
+			if !ok {
 				return nil, nil, nil, trace.BadParameter(
 					"expected tls connection, got %T", clientConn)
 			}
+			return m, tlsConn, backend, nil
 		}
 		return nil, nil, nil, trace.BadParameter(
 			"unsupported startup message: %#v", startupMessage)

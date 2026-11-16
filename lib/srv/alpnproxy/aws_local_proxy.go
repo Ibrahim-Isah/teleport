@@ -1,29 +1,37 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package alpnproxy
 
 import (
+	"bytes"
+	"encoding/xml"
+	"log/slog"
 	"net/http"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	smithyxml "github.com/aws/smithy-go/encoding/xml"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	awsapiutils "github.com/gravitational/teleport/api/utils/aws"
 	appcommon "github.com/gravitational/teleport/lib/srv/app/common"
 	"github.com/gravitational/teleport/lib/utils"
@@ -32,10 +40,13 @@ import (
 
 // AWSAccessMiddleware verifies the requests to AWS proxy are properly signed.
 type AWSAccessMiddleware struct {
-	// AWSCredentials are AWS Credentials used by LocalProxy for request's signature verification.
-	AWSCredentials *credentials.Credentials
+	DefaultLocalProxyHTTPMiddleware
 
-	Log logrus.FieldLogger
+	// AWSCredentialsProvider provides credentials for local proxy request
+	// signature verification.
+	AWSCredentialsProvider aws.CredentialsProvider
+
+	Log *slog.Logger
 
 	assumedRoles utils.SyncMap[string, *sts.AssumeRoleOutput]
 }
@@ -44,11 +55,11 @@ var _ LocalProxyHTTPMiddleware = &AWSAccessMiddleware{}
 
 func (m *AWSAccessMiddleware) CheckAndSetDefaults() error {
 	if m.Log == nil {
-		m.Log = logrus.WithField(trace.Component, "aws_access")
+		m.Log = slog.With(teleport.ComponentKey, "aws_access")
 	}
 
-	if m.AWSCredentials == nil {
-		return trace.BadParameter("missing AWSCredentials")
+	if m.AWSCredentialsProvider == nil {
+		return trace.BadParameter("missing AWS credentials")
 	}
 
 	return nil
@@ -105,7 +116,7 @@ func (m *AWSAccessMiddleware) CheckAndSetDefaults() error {
 func (m *AWSAccessMiddleware) HandleRequest(rw http.ResponseWriter, req *http.Request) bool {
 	sigV4, err := awsutils.ParseSigV4(req.Header.Get(awsutils.AuthorizationHeader))
 	if err != nil {
-		m.Log.WithError(err).Error("Failed to parse AWS request authorization header.")
+		m.Log.ErrorContext(req.Context(), "Failed to parse AWS request authorization header", "error", err)
 		rw.WriteHeader(http.StatusForbidden)
 		return true
 	}
@@ -115,7 +126,7 @@ func (m *AWSAccessMiddleware) HandleRequest(rw http.ResponseWriter, req *http.Re
 	//
 	// Note that currently this is only supported in HTTPS proxy mode where the
 	// Host is a valid AWS endpoint.
-	if awsapiutils.IsAWSEndpoint(req.Host) {
+	if awsapiutils.IsAWSOwnedEndpoint(req.Host) {
 		if assumedRole, found := m.assumedRoles.Load(sigV4.KeyID); found {
 			return m.handleRequestByAssumedRole(rw, req, assumedRole)
 		}
@@ -126,8 +137,8 @@ func (m *AWSAccessMiddleware) HandleRequest(rw http.ResponseWriter, req *http.Re
 }
 
 func (m *AWSAccessMiddleware) handleCommonRequest(rw http.ResponseWriter, req *http.Request) bool {
-	if err := awsutils.VerifyAWSSignature(req, m.AWSCredentials); err != nil {
-		m.Log.WithError(err).Error("AWS signature verification failed.")
+	if err := awsutils.VerifyAWSSignature(req, m.AWSCredentialsProvider); err != nil {
+		m.Log.ErrorContext(req.Context(), "AWS signature verification failed", "error", err)
 		rw.WriteHeader(http.StatusForbidden)
 		return true
 	}
@@ -135,22 +146,22 @@ func (m *AWSAccessMiddleware) handleCommonRequest(rw http.ResponseWriter, req *h
 }
 
 func (m *AWSAccessMiddleware) handleRequestByAssumedRole(rw http.ResponseWriter, req *http.Request, assumedRole *sts.AssumeRoleOutput) bool {
-	credentials := credentials.NewStaticCredentials(
-		aws.StringValue(assumedRole.Credentials.AccessKeyId),
-		aws.StringValue(assumedRole.Credentials.SecretAccessKey),
-		aws.StringValue(assumedRole.Credentials.SessionToken),
+	credentials := credentials.NewStaticCredentialsProvider(
+		aws.ToString(assumedRole.Credentials.AccessKeyId),
+		aws.ToString(assumedRole.Credentials.SecretAccessKey),
+		aws.ToString(assumedRole.Credentials.SessionToken),
 	)
 
 	if err := awsutils.VerifyAWSSignature(req, credentials); err != nil {
-		m.Log.WithError(err).Error("AWS signature verification failed.")
+		m.Log.ErrorContext(req.Context(), "AWS signature verification failed", "error", err)
 		rw.WriteHeader(http.StatusForbidden)
 		return true
 	}
 
-	m.Log.Debugf("Rewriting headers for AWS request by assumed role %q.", aws.StringValue(assumedRole.AssumedRoleUser.Arn))
+	m.Log.DebugContext(req.Context(), "Rewriting headers for AWS request by assumed role", "assumed_role", aws.ToString(assumedRole.AssumedRoleUser.Arn))
 
 	// Add a custom header for marking the special request.
-	req.Header.Add(appcommon.TeleportAWSAssumedRole, aws.StringValue(assumedRole.AssumedRoleUser.Arn))
+	req.Header.Add(appcommon.TeleportAWSAssumedRole, aws.ToString(assumedRole.AssumedRoleUser.Arn))
 
 	// Rename the original authorization header to ensure older app agents
 	// (that don't support the requests by assumed roles) will fail.
@@ -170,11 +181,11 @@ func (m *AWSAccessMiddleware) HandleResponse(response *http.Response) error {
 
 	sigV4, err := awsutils.ParseSigV4(authHeader)
 	if err != nil {
-		m.Log.WithError(err).Error("Failed to parse AWS request authorization header.")
+		m.Log.ErrorContext(response.Request.Context(), "Failed to parse AWS request authorization header", "error", err)
 		return nil
 	}
 
-	if strings.EqualFold(sigV4.Service, sts.EndpointsID) {
+	if strings.EqualFold(sigV4.Service, "sts") {
 		return trace.Wrap(m.handleSTSResponse(response))
 	}
 	return nil
@@ -197,23 +208,23 @@ func (m *AWSAccessMiddleware) handleSTSResponse(response *http.Response) error {
 	assumedRole, err := unmarshalAssumeRoleResponse(body)
 	if err != nil {
 		if !trace.IsNotFound(err) {
-			m.Log.Warnf("Failed to unmarshal AssumeRoleResponse: %v.", err)
+			m.Log.WarnContext(response.Request.Context(), "Failed to unmarshal AssumeRoleResponse", "error", err)
 		}
 		return nil
 	}
 
-	m.assumedRoles.Store(aws.StringValue(assumedRole.Credentials.AccessKeyId), assumedRole)
-	m.Log.Debugf("Saved credentials for assumed role %q.", aws.StringValue(assumedRole.AssumedRoleUser.Arn))
+	m.assumedRoles.Store(aws.ToString(assumedRole.Credentials.AccessKeyId), assumedRole)
+	m.Log.DebugContext(response.Request.Context(), "Saved credentials for assumed role", "assumed_role", aws.ToString(assumedRole.AssumedRoleUser.Arn))
 	return nil
 }
 
 func unmarshalAssumeRoleResponse(body []byte) (*sts.AssumeRoleOutput, error) {
-	if !awsutils.IsXMLOfLocalName(body, "AssumeRoleResponse") {
+	if !isXMLOfLocalName(body, "AssumeRoleResponse") {
 		return nil, trace.NotFound("not AssumeRoleResponse")
 	}
 
 	var assumedRole sts.AssumeRoleOutput
-	if err := awsutils.UnmarshalXMLChildNode(&assumedRole, body, "AssumeRoleResult"); err != nil {
+	if err := unmarshalXMLChildNode(&assumedRole, body, "AssumeRoleResult"); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	if assumedRole.AssumedRoleUser == nil {
@@ -223,4 +234,31 @@ func unmarshalAssumeRoleResponse(body []byte) (*sts.AssumeRoleOutput, error) {
 		return nil, trace.BadParameter("missing Credentials in AssumeRoleResponse %v", string(body))
 	}
 	return &assumedRole, nil
+}
+
+// isXMLOfLocalName returns true if the root XML has the provided (local) name.
+func isXMLOfLocalName(data []byte, wantLocalName string) bool {
+	st, err := smithyxml.FetchRootElement(xml.NewDecoder(bytes.NewReader(data)))
+	if err == nil && st.Name.Local == wantLocalName {
+		return true
+	}
+
+	return false
+}
+
+// unmarshalXMLChildNode decodes the XML-encoded data and stores the child node
+// with the specified name to v, where v is a pointer to an AWS SDK v2 struct.
+func unmarshalXMLChildNode(v any, data []byte, childName string) error {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	st, err := smithyxml.FetchRootElement(decoder)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	nodeDecoder := smithyxml.WrapNodeDecoder(decoder, st)
+	childElem, err := nodeDecoder.GetElement(childName)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	return trace.Wrap(decoder.DecodeElement(v, &childElem))
 }

@@ -1,43 +1,86 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import path, { delimiter } from 'path';
+import { delimiter } from 'path';
 
+import { makeCustomShellFromPath, Shell } from 'teleterm/mainProcess/shell';
 import { RuntimeSettings } from 'teleterm/mainProcess/types';
+import {
+  TSH_AUTOUPDATE_ENV_VAR,
+  TSH_AUTOUPDATE_OFF,
+} from 'teleterm/node/tshAutoupdate';
+import { CUSTOM_SHELL_ID } from 'teleterm/services/config/appConfigSchema';
 import { PtyProcessOptions } from 'teleterm/sharedProcess/ptyHost';
+import { assertUnreachable } from 'teleterm/ui/utils';
 
 import {
   PtyCommand,
   PtyProcessCreationStatus,
-  TshKubeLoginCommand,
+  ShellCommand,
+  SshOptions,
+  WindowsPty,
 } from '../types';
-
 import {
   resolveShellEnvCached,
   ResolveShellEnvTimeoutError,
 } from './resolveShellEnv';
 
-export async function buildPtyOptions(
-  settings: RuntimeSettings,
-  cmd: PtyCommand
-): Promise<{
+export type PtyConfigOptions = {
+  ssh: SshOptions;
+  windowsPty: Pick<WindowsPty, 'useConpty'>;
+  customShellPath: string;
+  tshHome: string;
+  setTeleportAuthServerEnvVar: boolean;
+};
+
+const WSLENV_VAR = 'WSLENV';
+
+export async function buildPtyOptions({
+  settings,
+  options,
+  cmd,
+  processEnv = process.env,
+}: {
+  settings: RuntimeSettings;
+  options: PtyConfigOptions;
+  cmd: PtyCommand;
+  processEnv?: typeof process.env;
+}): Promise<{
   processOptions: PtyProcessOptions;
+  shell: Shell;
   creationStatus: PtyProcessCreationStatus;
 }> {
-  return resolveShellEnvCached(settings.defaultShell)
+  const defaultShell = settings.availableShells.find(
+    s => s.id === settings.defaultOsShellId
+  );
+  let shell = defaultShell;
+  let failedToResolveShell = false;
+
+  if (cmd.kind === 'pty.shell') {
+    const resolvedShell = await resolveShell(cmd, settings, options);
+    if (!resolvedShell) {
+      failedToResolveShell = true;
+    } else {
+      shell = resolvedShell;
+    }
+  }
+
+  return resolveShellEnvCached(shell.binPath)
     .then(resolvedEnv => ({
       shellEnv: resolvedEnv,
       creationStatus: PtyProcessCreationStatus.Ok,
@@ -52,28 +95,84 @@ export async function buildPtyOptions(
       throw error;
     })
     .then(({ shellEnv, creationStatus }) => {
-      const combinedEnv = {
-        ...process.env,
+      // combinedEnv is going to be used as env by every command coming out of buildPtyOptions. Some
+      // commands might add extra variables, but they shouldn't remove any of the env vars that are
+      // added here.
+      const combinedEnv: Record<string, string> = {
+        ...processEnv,
         ...shellEnv,
-        TELEPORT_HOME: settings.tshd.homeDir,
+        TERM_PROGRAM: 'Teleport_Connect',
+        TERM_PROGRAM_VERSION: settings.appVersion,
+        COLORTERM: 'truecolor',
+        TELEPORT_HOME: options.tshHome,
         TELEPORT_CLUSTER: cmd.clusterName,
         TELEPORT_PROXY: cmd.proxyHost,
+        [TSH_AUTOUPDATE_ENV_VAR]: TSH_AUTOUPDATE_OFF,
       };
 
+      if (options.setTeleportAuthServerEnvVar) {
+        // Makes tctl operate on the root cluster of the current workspace.
+        combinedEnv['TELEPORT_AUTH_SERVER'] = cmd.proxyHost;
+      }
+
+      // The regular env vars are not available in WSL,
+      // they need to be passed via the special variable WSLENV.
+      // Note that path variables have /p postfix which translates the paths from Win32 to WSL.
+      // https://devblogs.microsoft.com/commandline/share-environment-vars-between-wsl-and-windows/
+      if (settings.platform === 'win32' && shell.binName === 'wsl.exe') {
+        const wslEnv = [
+          'KUBECONFIG/p',
+          'TERM_PROGRAM',
+          'TERM_PROGRAM_VERSION',
+          'COLORTERM',
+          'TELEPORT_CLUSTER',
+          'TELEPORT_PROXY',
+          'TELEPORT_HOME/p',
+          TSH_AUTOUPDATE_ENV_VAR,
+        ];
+        if (options.setTeleportAuthServerEnvVar) {
+          wslEnv.push('TELEPORT_AUTH_SERVER');
+        }
+
+        // Preserve the user defined WSLENV and add ours (ours takes precedence).
+        combinedEnv[WSLENV_VAR] = [combinedEnv[WSLENV_VAR], wslEnv]
+          .flat()
+          .join(':');
+      }
+
       return {
-        processOptions: getPtyProcessOptions(settings, cmd, combinedEnv),
-        creationStatus,
+        processOptions: getPtyProcessOptions({
+          settings: settings,
+          options: options,
+          cmd: cmd,
+          env: combinedEnv,
+          shellBinPath: shell.binPath,
+        }),
+        shell,
+        creationStatus: failedToResolveShell
+          ? PtyProcessCreationStatus.ShellNotResolved
+          : creationStatus,
       };
     });
 }
 
-function getPtyProcessOptions(
-  settings: RuntimeSettings,
-  cmd: PtyCommand,
-  env: typeof process.env
-): PtyProcessOptions {
+export function getPtyProcessOptions({
+  settings,
+  options,
+  cmd,
+  env,
+  shellBinPath,
+}: {
+  settings: RuntimeSettings;
+  options: PtyConfigOptions;
+  cmd: PtyCommand;
+  env: typeof process.env;
+  shellBinPath: string;
+}): PtyProcessOptions {
+  const useConpty = options.windowsPty?.useConpty;
+
   switch (cmd.kind) {
-    case 'pty.shell':
+    case 'pty.shell': {
       // Teleport Connect bundles a tsh binary, but the user might have one already on their system.
       // Since we use our own TELEPORT_HOME which might differ in format with the version that the
       // user has installed, let's prepend our bin directory to PATH.
@@ -88,55 +187,49 @@ function getPtyProcessOptions(
       }
 
       return {
-        path: settings.defaultShell,
+        path: shellBinPath,
         args: [],
         cwd: cmd.cwd,
-        env,
-        initCommand: cmd.initCommand,
-      };
-
-    case 'pty.tsh-kube-login': {
-      const isWindows = settings.platform === 'win32';
-
-      // backtick (PowerShell) and backslash (Bash) are used to escape a whitespace
-      const escapedBinaryPath = settings.tshd.binaryPath.replaceAll(
-        ' ',
-        isWindows ? '` ' : '\\ '
-      );
-      const kubeLoginCommand = [
-        escapedBinaryPath,
-        `--proxy=${cmd.rootClusterId}`,
-        `kube login ${cmd.kubeId} --cluster=${cmd.clusterName}`,
-        settings.tshd.insecure && '--insecure',
-      ]
-        .filter(Boolean)
-        .join(' ');
-      const bashCommandArgs = ['-c', `${kubeLoginCommand};$SHELL`];
-      const powershellCommandArgs = ['-NoExit', '-c', kubeLoginCommand];
-      return {
-        path: settings.defaultShell,
-        args: isWindows ? powershellCommandArgs : bashCommandArgs,
-        env: { ...env, KUBECONFIG: getKubeConfigFilePath(cmd, settings) },
+        env: { ...env, ...cmd.env },
+        initMessage: cmd.initMessage,
+        useConpty,
       };
     }
 
-    case 'pty.tsh-login':
+    case 'pty.tsh-login': {
       const loginHost = cmd.login
         ? `${cmd.login}@${cmd.serverId}`
         : cmd.serverId;
 
+      const args = [
+        `--proxy=${cmd.rootClusterId}`,
+        'ssh',
+        ...(options.ssh.noResume ? ['--no-resume'] : []),
+        ...(options.ssh.forwardAgent ? ['--forward-agent'] : []),
+        loginHost,
+      ];
+
       return {
         path: settings.tshd.binaryPath,
-        args: [
-          `--proxy=${cmd.rootClusterId}`,
-          'ssh',
-          '--forward-agent',
-          loginHost,
-        ],
+        args,
         env,
+        useConpty,
       };
+    }
+
+    case 'pty.gateway-cli-client': {
+      // TODO(ravicious): Set argv0 when node-pty adds support for it.
+      // https://github.com/microsoft/node-pty/issues/472
+      return {
+        path: cmd.path,
+        args: cmd.args,
+        env: { ...env, ...cmd.env },
+        useConpty,
+      };
+    }
+
     default:
-      throw Error(`Unknown pty command: ${cmd}`);
+      assertUnreachable(cmd);
   }
 }
 
@@ -149,16 +242,44 @@ function prependBinDirToPath(
   //
   // Windows seems to construct Path by first taking the system Path env var and adding to it the
   // user Path env var.
-  const pathName = settings.platform === 'win32' ? 'Path' : 'PATH';
-  env[pathName] = [settings.binDir, env[pathName]]
+  //
+  // For process.env on Windows, Path and PATH are the same (case insensitivity).
+  // Node.js have special setters and getters, so no matter what property you set,
+  // the single underlying value is updated. However, since we merge many sources
+  // of env vars into a single object with the object spread (let env = { ...process.env }),
+  // theses setters and getters are lost.
+  // The problem happens when user variables and system variables use different
+  // casing for PATH and Node.js merges them into a single variable, and we have
+  // to figure out its casing.
+  // vscode does it the same way.
+  const pathKey = getPropertyCaseInsensitive(env, 'PATH');
+  env[pathKey] = [settings.binDir, env[pathKey]]
     .map(path => path?.trim())
     .filter(Boolean)
     .join(delimiter);
 }
 
-function getKubeConfigFilePath(
-  command: TshKubeLoginCommand,
-  settings: RuntimeSettings
-): string {
-  return path.join(settings.kubeConfigsDir, command.kubeConfigRelativePath);
+async function resolveShell(
+  cmd: ShellCommand,
+  settings: RuntimeSettings,
+  ptyOptions: PtyConfigOptions
+): Promise<Shell | undefined> {
+  if (cmd.shellId !== CUSTOM_SHELL_ID) {
+    return settings.availableShells.find(s => s.id === cmd.shellId);
+  }
+
+  const { customShellPath } = ptyOptions;
+  if (customShellPath) {
+    return makeCustomShellFromPath(customShellPath);
+  }
+}
+
+function getPropertyCaseInsensitive(
+  env: Record<string, string>,
+  key: string
+): string | undefined {
+  const pathKeys = Object.keys(env).filter(
+    k => k.toLowerCase() === key.toLowerCase()
+  );
+  return pathKeys.length > 0 ? pathKeys[0] : key;
 }

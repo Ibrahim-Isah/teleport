@@ -22,23 +22,20 @@ import (
 	"github.com/gravitational/teleport/api/types"
 )
 
-//go:embed installer.sh.tmpl
-var defaultInstallScript string
-
 //go:embed agentless-installer.sh.tmpl
 var defaultAgentlessInstallScript string
 
 // InstallerScriptName is the name of the by default populated, EC2
 // installer script
-const InstallerScriptName = "default-installer"
+const InstallerScriptName = types.DefaultInstallerScriptName
 
 // InstallerScriptName is the name of the by default populated, EC2
 // installer script when agentless mode is enabled for a matcher
-const InstallerScriptNameAgentless = "default-agentless-installer"
+const InstallerScriptNameAgentless = types.DefaultInstallerScriptNameAgentless
 
-// DefaultInstaller represents a the default installer script provided
-// by teleport
-var DefaultInstaller = types.MustNewInstallerV1(InstallerScriptName, defaultInstallScript)
+// InstallerScriptNameWindowsAuthPackage is the name of the default populated Windows
+// auth package installer script
+const InstallerScriptNameWindowsAuthPackage = types.DefaultInstallerScriptNameWindowsAuthPackage
 
 // DefaultAgentlessInstaller represents a the default agentless installer script provided
 // by teleport
@@ -51,4 +48,37 @@ type Template struct {
 	PublicProxyAddr string
 	// MajorVersion is the major version of the Teleport auth node
 	MajorVersion string
+	// TeleportPackage is the teleport package to use. `teleport` or
+	// `teleport-ent` depending on if the cluster is enterprise or not.
+	TeleportPackage string
+	// RepoChannel is the repo's channel name to install.
+	RepoChannel string
+	// AutomaticUpgrades indicates whether Automatic Upgrades are enabled or disabled.
+	// Its value is either `true` or `false`.
+	AutomaticUpgrades string
+	// AzureClientID is the client ID of the managed identity to use when joining
+	// the cluster. Only applicable for the azure join method.
+	AzureClientID string
+	// AuthPackageVersion is the full version of Teleport auth package e.g. 18.9.2
+	AuthPackageVersion string
+	// RestartAfterEnrollment indicates whether the Windows auth package installer
+	// should schedule a system restart after enrollment. A restart is required
+	// for smartcard authentication to work, but the user may choose to restart
+	// later.
+	RestartAfterEnrollment bool
+	// WindowsInstallerDownloadFailure is the exit code for when the Windows
+	// auth package installer fails to download the authentication package.
+	WindowsInstallerDownloadFailure int
+	// WindowsInstallerExecutionFailure is the exit code for when the Windows
+	// auth package installer fails to execute the authentication package installer.
+	WindowsInstallerExecutionFailure int
+	// WindowsInstallerStagingDirUnsafe is the exit code for when the Windows
+	// auth package installer staging directory under %WINDIR%\SystemTemp is a
+	// reparse point (symlink or junction) and may redirect to an untrusted
+	// location.
+	WindowsInstallerStagingDirUnsafe int
+	// WindowsInstallerChecksumMismatch is the exit code for when the downloaded
+	// Windows authentication package installer fails SHA256 checksum
+	// verification against the checksum published alongside it.
+	WindowsInstallerChecksumMismatch int
 }

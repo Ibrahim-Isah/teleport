@@ -1,20 +1,20 @@
 /*
-
- Copyright 2022 Gravitational, Inc.
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package elasticsearch
 
@@ -26,12 +26,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
-	elastic "github.com/elastic/go-elasticsearch/v8/typedapi/types"
-	"github.com/ghodss/yaml"
 	"github.com/gravitational/trace"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/gravitational/teleport"
 	apievents "github.com/gravitational/teleport/api/types/events"
@@ -70,8 +70,18 @@ func (e *Engine) SendError(err error) {
 		return
 	}
 
+	// ErrorCause type.
+	//
+	// https://github.com/elastic/elasticsearch-specification/blob/f6a370d0fba975752c644fc730f7c45610e28f36/specification/_types/Errors.ts#L25-L50
+	type ErrorCause struct {
+		// Reason A human-readable explanation of the error, in English.
+		Reason *string `json:"reason,omitempty"`
+		// Type The type of error
+		Type string `json:"type"`
+	}
+
 	reason := err.Error()
-	cause := elastic.ErrorCause{
+	cause := ErrorCause{
 		Reason: &reason,
 		Type:   "internal_server_error_exception",
 	}
@@ -85,7 +95,7 @@ func (e *Engine) SendError(err error) {
 
 	jsonBody, err := json.Marshal(cause)
 	if err != nil {
-		e.Log.WithError(err).Error("failed to marshal error response")
+		e.Log.ErrorContext(e.Context, "failed to marshal error response", "error", err)
 		return
 	}
 
@@ -101,7 +111,7 @@ func (e *Engine) SendError(err error) {
 	}
 
 	if err := response.Write(e.clientConn); err != nil {
-		e.Log.Errorf("elasticsearch error: %+v", trace.Unwrap(err))
+		e.Log.ErrorContext(e.Context, "elasticsearch error", "error", err)
 		return
 	}
 }
@@ -109,29 +119,37 @@ func (e *Engine) SendError(err error) {
 // HandleConnection authorizes the incoming client connection, connects to the
 // target Elasticsearch server and starts proxying requests between client/server.
 func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Session) error {
+	observe := common.GetConnectionSetupTimeObserver(sessionCtx.Database)
+
 	if err := e.authorizeConnection(ctx); err != nil {
+		e.Audit.OnSessionStart(e.Context, sessionCtx, err)
 		return trace.Wrap(err)
 	}
-
-	e.Audit.OnSessionStart(e.Context, sessionCtx, nil)
-	defer e.Audit.OnSessionEnd(e.Context, sessionCtx)
-
 	clientConnReader := bufio.NewReader(e.clientConn)
 
 	if sessionCtx.Identity.RouteToDatabase.Username == "" {
 		return trace.BadParameter("database username required for Elasticsearch")
 	}
 
-	tlsConfig, err := e.Auth.GetTLSConfig(ctx, sessionCtx)
+	tlsConfig, err := e.Auth.GetTLSConfig(ctx, sessionCtx.GetExpiry(), sessionCtx.Database, sessionCtx.DatabaseUser)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	client := &http.Client{
+		// TODO(gavin): use an http proxy env var respecting transport
 		Transport: &http.Transport{
 			TLSClientConfig: tlsConfig,
 		},
 	}
+
+	e.Audit.OnSessionStart(e.Context, sessionCtx, nil)
+	defer e.Audit.OnSessionEnd(e.Context, sessionCtx)
+
+	observe()
+
+	msgFromClient := common.GetMessagesFromClientMetric(e.sessionCtx.Database)
+	msgFromServer := common.GetMessagesFromServerMetric(e.sessionCtx.Database)
 
 	for {
 		req, err := http.ReadRequest(clientConnReader)
@@ -139,196 +157,76 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 			return trace.Wrap(err)
 		}
 
-		err = e.process(ctx, sessionCtx, req, client)
+		err = e.process(ctx, sessionCtx, req, client, msgFromClient, msgFromServer)
 		if err != nil {
 			return trace.Wrap(err)
 		}
 	}
 }
 
-func copyRequest(ctx context.Context, req *http.Request, body io.Reader) (*http.Request, error) {
-	reqCopy, err := http.NewRequestWithContext(ctx, req.Method, req.URL.String(), body)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	reqCopy.Header = req.Header.Clone()
-
-	return reqCopy, nil
-}
-
 // process reads request from connected elasticsearch client, processes the requests/responses and send data back
 // to the client.
-func (e *Engine) process(ctx context.Context, sessionCtx *common.Session, req *http.Request, client *http.Client) error {
-	body, err := io.ReadAll(io.LimitReader(req.Body, teleport.MaxHTTPRequestSize))
+func (e *Engine) process(ctx context.Context, sessionCtx *common.Session, req *http.Request, client *http.Client, msgFromClient prometheus.Counter, msgFromServer prometheus.Counter) error {
+	msgFromClient.Inc()
+
+	if req.Body != nil {
+		// make sure we close the incoming request's body. ignore any close error.
+		defer req.Body.Close()
+		req.Body = io.NopCloser(utils.LimitReader(req.Body, teleport.MaxHTTPRequestSize))
+	}
+	payload, err := utils.GetAndReplaceRequestBody(req)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	reqCopy, err := copyRequest(ctx, req, bytes.NewReader(body))
+	copiedReq := req.Clone(ctx)
+	copiedReq.RequestURI = ""
+	copiedReq.Body = io.NopCloser(bytes.NewReader(payload))
+
+	// rewrite request URL
+	u, err := parseURI(sessionCtx.Database.GetURI())
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	defer req.Body.Close()
+	copiedReq.URL.Scheme = u.Scheme
+	copiedReq.URL.Host = u.Host
+	copiedReq.Host = u.Host
 
-	e.emitAuditEvent(reqCopy, body)
-
-	// force HTTPS, set host URL.
-	reqCopy.URL.Scheme = "https"
-	reqCopy.URL.Host = sessionCtx.Database.GetURI()
+	// emit an audit event regardless of failure
+	var responseStatusCode uint32
+	defer func() {
+		e.emitAuditEvent(copiedReq, payload, responseStatusCode, err == nil)
+	}()
 
 	// Send the request to elasticsearch API
-	resp, err := client.Do(reqCopy)
+	resp, err := client.Do(copiedReq)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	defer resp.Body.Close()
+	responseStatusCode = uint32(resp.StatusCode)
+
+	msgFromServer.Inc()
 
 	return trace.Wrap(e.sendResponse(resp))
 }
 
-// parsePath returns (optional) target of query as well as the event category.
-func parsePath(path string) (string, apievents.ElasticsearchCategory) {
-	parts := strings.Split(path, "/")
-
-	if len(parts) < 2 {
-		return "", apievents.ElasticsearchCategory_GENERAL
-	}
-
-	// first term starts with _
-	switch parts[1] {
-	case "_security", "_ssl":
-		return "", apievents.ElasticsearchCategory_SECURITY
-	case
-		"_search",       // https://www.elastic.co/guide/en/elasticsearch/reference/master/search-search.html
-		"_async_search", // https://www.elastic.co/guide/en/elasticsearch/reference/master/async-search.html
-		"_pit",          // https://www.elastic.co/guide/en/elasticsearch/reference/master/point-in-time-api.html
-		"_msearch",      // https://www.elastic.co/guide/en/elasticsearch/reference/master/multi-search-template.html, https://www.elastic.co/guide/en/elasticsearch/reference/master/search-multi-search.html
-		"_render",       // https://www.elastic.co/guide/en/elasticsearch/reference/master/render-search-template-api.html
-		"_field_caps":   // https://www.elastic.co/guide/en/elasticsearch/reference/master/search-field-caps.html
-		return "", apievents.ElasticsearchCategory_SEARCH
-	case "_sql":
-		return "", apievents.ElasticsearchCategory_SQL
-	}
-
-	// starts with _, but we don't handle it explicitly
-	if strings.HasPrefix("_", parts[1]) {
-		return "", apievents.ElasticsearchCategory_GENERAL
-	}
-
-	if len(parts) < 3 {
-		return "", apievents.ElasticsearchCategory_GENERAL
-	}
-
-	// a number of APIs are invoked by providing a target first, e.g. /<target>/_search, where <target> is an index or expression matching a group of indices.
-	switch parts[2] {
-	case
-		"_search",        // https://www.elastic.co/guide/en/elasticsearch/reference/master/search-search.html
-		"_async_search",  // https://www.elastic.co/guide/en/elasticsearch/reference/master/async-search.html
-		"_pit",           // https://www.elastic.co/guide/en/elasticsearch/reference/master/point-in-time-api.html
-		"_knn_search",    // https://www.elastic.co/guide/en/elasticsearch/reference/master/knn-search-api.html
-		"_msearch",       // https://www.elastic.co/guide/en/elasticsearch/reference/master/multi-search-template.html, https://www.elastic.co/guide/en/elasticsearch/reference/master/search-multi-search.html
-		"_search_shards", // https://www.elastic.co/guide/en/elasticsearch/reference/master/search-shards.html
-		"_count",         // https://www.elastic.co/guide/en/elasticsearch/reference/master/search-count.html
-		"_validate",      // https://www.elastic.co/guide/en/elasticsearch/reference/master/search-validate.html
-		"_terms_enum",    // https://www.elastic.co/guide/en/elasticsearch/reference/master/search-terms-enum.html
-		"_explain",       // https://www.elastic.co/guide/en/elasticsearch/reference/master/search-explain.html
-		"_field_caps",    // https://www.elastic.co/guide/en/elasticsearch/reference/master/search-field-caps.html
-		"_rank_eval",     // https://www.elastic.co/guide/en/elasticsearch/reference/master/search-rank-eval.html
-		"_mvt":           // https://www.elastic.co/guide/en/elasticsearch/reference/master/search-vector-tile-api.html
-		return parts[1], apievents.ElasticsearchCategory_SEARCH
-	}
-
-	return "", apievents.ElasticsearchCategory_GENERAL
-}
-
-// getQueryFromRequestBody attempts to find the actual query from the request body, to be shown to the interested user.
-func (e *Engine) getQueryFromRequestBody(contentType string, body []byte) string {
-	// Elasticsearch APIs have no shared schema, but the ones we support have the query either
-	// as 'query' or as 'knn'.
-	// We will attempt to deserialize the query as 'q' to discover these fields.
-	// The type for those is 'any': both strings and objects can be found.
-	var q struct {
-		Query any `json:"query" yaml:"query"`
-		Knn   any `json:"knn" yaml:"knn"`
-	}
-
-	switch contentType {
-	// CBOR and Smile are officially supported by Elasticsearch:
-	// https://www.elastic.co/guide/en/elasticsearch/reference/master/api-conventions.html#_content_type_requirements
-	// We don't support introspection of these content types, at least for now.
-	case "application/cbor":
-		e.Log.Warnf("Content type not supported: %q.", contentType)
-		return ""
-
-	case "application/smile":
-		e.Log.Warnf("Content type not supported: %q.", contentType)
-		return ""
-
-	case "application/yaml":
-		if len(body) == 0 {
-			e.Log.WithField("content-type", contentType).Infof("Empty request body.")
-			return ""
-		}
-		err := yaml.Unmarshal(body, &q)
-		if err != nil {
-			e.Log.WithError(err).Warnf("Error decoding request body as %q.", contentType)
-			return ""
-		}
-
-	case "application/json":
-		if len(body) == 0 {
-			e.Log.WithField("content-type", contentType).Infof("Empty request body.")
-			return ""
-		}
-		err := json.Unmarshal(body, &q)
-		if err != nil {
-			e.Log.WithError(err).Warnf("Error decoding request body as %q.", contentType)
-			return ""
-		}
-
-	default:
-		e.Log.Warnf("Unknown or missing 'Content-Type': %q, assuming 'application/json'.", contentType)
-		if len(body) == 0 {
-			e.Log.WithField("content-type", contentType).Infof("Empty request body.")
-			return ""
-		}
-
-		err := json.Unmarshal(body, &q)
-		if err != nil {
-			e.Log.WithError(err).Warnf("Error decoding request body as %q.", contentType)
-			return ""
-		}
-	}
-
-	result := q.Query
-	if result == nil {
-		result = q.Knn
-	}
-
-	if result == nil {
-		return ""
-	}
-
-	switch qt := result.(type) {
-	case string:
-		return qt
-	default:
-		marshal, err := json.Marshal(result)
-		if err != nil {
-			e.Log.WithError(err).Warnf("Error encoding query to json; body: %x, content type: %v.", body, contentType)
-			return ""
-		}
-		return string(marshal)
-	}
-}
-
 // emitAuditEvent writes the request and response to audit stream.
-func (e *Engine) emitAuditEvent(req *http.Request, body []byte) {
+func (e *Engine) emitAuditEvent(req *http.Request, body []byte, statusCode uint32, noErr bool) {
+	var eventCode string
+	if noErr && statusCode != 0 {
+		eventCode = events.ElasticsearchRequestCode
+	} else {
+		eventCode = events.ElasticsearchRequestFailureCode
+	}
+
+	// Normally the query is passed as request body, and body content type as a header.
+	// Yet it can also be passed as `source` and `source_content_type` URL params, and we handle that here.
 	contentType := req.Header.Get("Content-Type")
+
 	source := req.URL.Query().Get("source")
 	if len(source) > 0 {
-		e.Log.Infof("'source' parameter found, overriding request body.")
+		e.Log.InfoContext(e.Context, "'source' parameter found, overriding request body.")
 		body = []byte(source)
 		contentType = req.URL.Query().Get("source_content_type")
 	}
@@ -342,25 +240,25 @@ func (e *Engine) emitAuditEvent(req *http.Request, body []byte) {
 	// - we may not support given content encoding
 	query := req.URL.Query().Get("q")
 	if query == "" {
-		query = e.getQueryFromRequestBody(contentType, body)
+		query = GetQueryFromRequestBody(e.EngineConfig, contentType, body)
 	}
 
 	ev := &apievents.ElasticsearchRequest{
 		Metadata: common.MakeEventMetadata(e.sessionCtx,
 			events.DatabaseSessionElasticsearchRequestEvent,
-			events.ElasticsearchRequestCode),
+			eventCode),
 		UserMetadata:     common.MakeUserMetadata(e.sessionCtx),
 		SessionMetadata:  common.MakeSessionMetadata(e.sessionCtx),
 		DatabaseMetadata: common.MakeDatabaseMetadata(e.sessionCtx),
+		StatusCode:       statusCode,
 		Method:           req.Method,
 		Path:             req.URL.Path,
 		RawQuery:         req.URL.RawQuery,
 		Body:             body,
 		Headers:          wrappers.Traits(req.Header),
-
-		Category: category,
-		Target:   target,
-		Query:    query,
+		Category:         category,
+		Target:           target,
+		Query:            query,
 	}
 
 	e.Audit.EmitEvent(req.Context(), ev)
@@ -384,19 +282,29 @@ func (e *Engine) authorizeConnection(ctx context.Context) error {
 	}
 
 	state := e.sessionCtx.GetAccessState(authPref)
-	dbRoleMatchers := role.DatabaseRoleMatchers(
-		e.sessionCtx.Database,
-		e.sessionCtx.DatabaseUser,
-		e.sessionCtx.DatabaseName,
-	)
+	dbRoleMatchers := role.GetDatabaseRoleMatchers(role.RoleMatchersConfig{
+		Database:     e.sessionCtx.Database,
+		DatabaseUser: e.sessionCtx.DatabaseUser,
+		DatabaseName: e.sessionCtx.DatabaseName,
+	})
 	err = e.sessionCtx.Checker.CheckAccess(
 		e.sessionCtx.Database,
 		state,
 		dbRoleMatchers...,
 	)
-	if err != nil {
-		e.Audit.OnSessionStart(e.Context, e.sessionCtx, err)
-		return trace.Wrap(err)
+
+	return trace.Wrap(err)
+}
+
+func parseURI(uri string) (*url.URL, error) {
+	if !strings.Contains(uri, "://") {
+		uri = "https://" + uri
 	}
-	return nil
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	// force HTTPS
+	u.Scheme = "https"
+	return u, nil
 }

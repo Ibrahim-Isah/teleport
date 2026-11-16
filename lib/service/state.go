@@ -1,32 +1,36 @@
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package service
 
 import (
 	"fmt"
+	"net/http"
+	"os"
 	"sync"
 	"time"
 
-	"github.com/gravitational/trace"
+	"github.com/gravitational/roundtrip"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/lib/client/debug"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/observability/metrics"
 )
 
 type componentStateEnum byte
@@ -58,9 +62,12 @@ func init() {
 
 // processState tracks the state of the Teleport process.
 type processState struct {
-	process *TeleportProcess
-	mu      sync.Mutex
-	states  map[string]*componentState
+	mu        sync.Mutex
+	states    map[string]*componentState
+	callbacks []func(healthy bool)
+	// lastState stores the last state sent to callbacks. this is used to determine
+	// whether the next state change should be sent to callbacks.
+	lastState componentStateEnum
 }
 
 type componentState struct {
@@ -68,42 +75,44 @@ type componentState struct {
 	state        componentStateEnum
 }
 
-// newProcessState returns a new FSM that tracks the state of the Teleport process.
-func newProcessState(process *TeleportProcess) (*processState, error) {
-	err := metrics.RegisterPrometheusCollectors(stateGauge)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+type updateResult int
 
-	return &processState{
-		process: process,
-		states:  make(map[string]*componentState),
-	}, nil
-}
+const (
+	_ updateResult = iota
 
-// update the state of a Teleport component.
-func (f *processState) update(event Event) {
+	updateStarting
+	updateStarted
+	updateDegraded
+	updateRecovering
+	updateRecovered
+)
+
+// update the state of a Teleport component. Returns a value depending on what
+// changed in the state of the component if something changed, or 0 if nothing
+// changed.
+func (f *processState) update(now time.Time, event, component string) updateResult {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	defer f.updateGauge()
+	defer f.updateCallbacksLocked()
 
-	component, ok := event.Payload.(string)
-	if !ok {
-		f.process.log.Errorf("%v broadcasted without component name, this is a bug!", event.Name)
-		return
-	}
 	s, ok := f.states[component]
 	if !ok {
+		if f.states == nil {
+			f.states = make(map[string]*componentState)
+		}
 		// Register a new component.
-		s = &componentState{recoveryTime: f.process.Clock.Now(), state: stateStarting}
+		s = &componentState{recoveryTime: now, state: stateStarting}
 		f.states[component] = s
 	}
 
-	switch event.Name {
+	switch event {
+	case TeleportStartingEvent:
+		return updateStarting
 	// If a degraded event was received, always change the state to degraded.
 	case TeleportDegradedEvent:
 		s.state = stateDegraded
-		f.process.log.Infof("Detected Teleport component %q is running in a degraded state.", component)
+		return updateDegraded
 	// If the current state is degraded, and a OK event has been
 	// received, change the state to recovering. If the current state is
 	// recovering and a OK events is received, if it's been longer
@@ -113,18 +122,19 @@ func (f *processState) update(event Event) {
 		switch s.state {
 		case stateStarting:
 			s.state = stateOK
-			f.process.log.Debugf("Teleport component %q has started.", component)
+			return updateStarted
 		case stateDegraded:
 			s.state = stateRecovering
-			s.recoveryTime = f.process.Clock.Now()
-			f.process.log.Infof("Teleport component %q is recovering from a degraded state.", component)
+			s.recoveryTime = now
+			return updateRecovering
 		case stateRecovering:
-			if f.process.Clock.Since(s.recoveryTime) > defaults.HeartbeatCheckPeriod*2 {
+			if now.Sub(s.recoveryTime) > defaults.HeartbeatCheckPeriod*2 {
 				s.state = stateOK
-				f.process.log.Infof("Teleport component %q has recovered from a degraded state.", component)
+				return updateRecovered
 			}
 		}
 	}
+	return 0
 }
 
 // getStateLocked returns the overall process state based on the state of
@@ -168,4 +178,50 @@ func (f *processState) getState() componentStateEnum {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.getStateLocked()
+}
+
+func (f *processState) registerCallback(fn func(healthy bool)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callbacks = append(f.callbacks, fn)
+	fn(f.getStateLocked() == stateOK)
+}
+
+func (f *processState) updateCallbacksLocked() {
+	state := f.getStateLocked()
+	if state == f.lastState {
+		return
+	}
+	for _, fn := range f.callbacks {
+		fn(state == stateOK)
+	}
+	f.lastState = state
+}
+
+func (f *processState) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	switch f.getState() {
+	// 503
+	case stateDegraded:
+		roundtrip.ReplyJSON(w, http.StatusServiceUnavailable, debug.Readiness{
+			Status: "teleport is in a degraded state, check logs for details",
+			PID:    os.Getpid(),
+		})
+	// 400
+	case stateRecovering:
+		roundtrip.ReplyJSON(w, http.StatusBadRequest, debug.Readiness{
+			Status: "teleport is recovering from a degraded state, check logs for details",
+			PID:    os.Getpid(),
+		})
+	case stateStarting:
+		roundtrip.ReplyJSON(w, http.StatusBadRequest, debug.Readiness{
+			Status: "teleport is starting and hasn't joined the cluster yet",
+			PID:    os.Getpid(),
+		})
+	// 200
+	case stateOK:
+		roundtrip.ReplyJSON(w, http.StatusOK, debug.Readiness{
+			Status: "ok",
+			PID:    os.Getpid(),
+		})
+	}
 }

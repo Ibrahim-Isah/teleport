@@ -1,63 +1,59 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
 import styled from 'styled-components';
+
 import { Cell } from 'design/DataTable';
-import Icon, * as Icons from 'design/Icon/Icon';
+import Flex from 'design/Flex';
+import * as Icons from 'design/Icon';
+import Text from 'design/Text/Text';
 
-import { eventCodes, Event, EventCode } from 'teleport/services/audit';
-import cfg from 'teleport/config';
+import { Event, EventCode, eventCodes } from 'teleport/services/audit';
 
-const EventIconMap: Record<EventCode, React.FC> = {
+const EventIconMap: Record<EventCode, any> = {
   [eventCodes.AUTH_ATTEMPT_FAILURE]: Icons.Info,
   [eventCodes.EXEC_FAILURE]: Icons.Cli,
   [eventCodes.EXEC]: Icons.Cli,
   [eventCodes.TRUSTED_CLUSTER_TOKEN_CREATED]: Icons.Info,
   [eventCodes.TRUSTED_CLUSTER_CREATED]: Icons.Info,
   [eventCodes.TRUSTED_CLUSTER_DELETED]: Icons.Info,
+  [eventCodes.PROVISION_TOKEN_CREATED]: Icons.Info,
   [eventCodes.GITHUB_CONNECTOR_CREATED]: Icons.Info,
   [eventCodes.GITHUB_CONNECTOR_DELETED]: Icons.Info,
+  [eventCodes.GITHUB_CONNECTOR_UPDATED]: Icons.Info,
   [eventCodes.OIDC_CONNECTOR_CREATED]: Icons.Info,
   [eventCodes.OIDC_CONNECTOR_DELETED]: Icons.Info,
-  [eventCodes.SAML_CONNECTOR_CREATED]: Icons.Info,
+  [eventCodes.OIDC_CONNECTOR_UPDATED]: Icons.Info,
   [eventCodes.SAML_CONNECTOR_CREATED]: Icons.Info,
   [eventCodes.SAML_CONNECTOR_DELETED]: Icons.Info,
+  [eventCodes.SAML_CONNECTOR_UPDATED]: Icons.Info,
   [eventCodes.ROLE_CREATED]: Icons.Info,
   [eventCodes.ROLE_DELETED]: Icons.Info,
+  [eventCodes.ROLE_UPDATED]: Icons.Info,
   [eventCodes.SCP_DOWNLOAD_FAILURE]: Icons.Download,
   [eventCodes.SCP_DOWNLOAD]: Icons.Download,
   [eventCodes.SCP_UPLOAD_FAILURE]: Icons.Upload,
   [eventCodes.SCP_UPLOAD]: Icons.Upload,
+  [eventCodes.SCP_DISALLOWED]: Icons.FolderPlus,
   [eventCodes.SFTP_OPEN_FAILURE]: Icons.FolderPlus,
   [eventCodes.SFTP_OPEN]: Icons.FolderPlus,
-  [eventCodes.SFTP_CLOSE_FAILURE]: Icons.FolderPlus,
-  [eventCodes.SFTP_CLOSE]: Icons.FolderPlus,
-  [eventCodes.SFTP_READ_FAILURE]: Icons.FolderPlus,
-  [eventCodes.SFTP_READ]: Icons.FolderPlus,
-  [eventCodes.SFTP_WRITE_FAILURE]: Icons.FolderPlus,
-  [eventCodes.SFTP_WRITE]: Icons.FolderPlus,
-  [eventCodes.SFTP_LSTAT_FAILURE]: Icons.FolderPlus,
-  [eventCodes.SFTP_LSTAT]: Icons.FolderPlus,
-  [eventCodes.SFTP_FSTAT_FAILURE]: Icons.FolderPlus,
-  [eventCodes.SFTP_FSTAT]: Icons.FolderPlus,
   [eventCodes.SFTP_SETSTAT_FAILURE]: Icons.FolderPlus,
   [eventCodes.SFTP_SETSTAT]: Icons.FolderPlus,
-  [eventCodes.SFTP_FSETSTAT_FAILURE]: Icons.FolderPlus,
-  [eventCodes.SFTP_FSETSTAT]: Icons.FolderPlus,
   [eventCodes.SFTP_OPENDIR_FAILURE]: Icons.FolderPlus,
   [eventCodes.SFTP_OPENDIR]: Icons.FolderPlus,
   [eventCodes.SFTP_READDIR_FAILURE]: Icons.FolderPlus,
@@ -68,20 +64,24 @@ const EventIconMap: Record<EventCode, React.FC> = {
   [eventCodes.SFTP_MKDIR]: Icons.FolderPlus,
   [eventCodes.SFTP_RMDIR_FAILURE]: Icons.FolderPlus,
   [eventCodes.SFTP_RMDIR]: Icons.FolderPlus,
-  [eventCodes.SFTP_REALPATH_FAILURE]: Icons.FolderPlus,
-  [eventCodes.SFTP_REALPATH]: Icons.FolderPlus,
-  [eventCodes.SFTP_STAT_FAILURE]: Icons.FolderPlus,
-  [eventCodes.SFTP_STAT]: Icons.FolderPlus,
   [eventCodes.SFTP_RENAME_FAILURE]: Icons.FolderPlus,
   [eventCodes.SFTP_RENAME]: Icons.FolderPlus,
-  [eventCodes.SFTP_READLINK_FAILURE]: Icons.FolderPlus,
-  [eventCodes.SFTP_READLINK]: Icons.FolderPlus,
   [eventCodes.SFTP_SYMLINK_FAILURE]: Icons.FolderPlus,
   [eventCodes.SFTP_SYMLINK]: Icons.FolderPlus,
+  [eventCodes.SFTP_LINK]: Icons.FolderPlus,
+  [eventCodes.SFTP_LINK_FAILURE]: Icons.FolderPlus,
+  [eventCodes.SFTP_DISALLOWED]: Icons.FolderPlus,
   [eventCodes.APP_SESSION_CHUNK]: Icons.Info,
   [eventCodes.APP_SESSION_START]: Icons.Info,
+  [eventCodes.APP_SESSION_START_FAILURE]: Icons.Warning,
   [eventCodes.APP_SESSION_END]: Icons.Info,
+  [eventCodes.APP_SESSION_HTTP_REQUEST]: Icons.Info,
+  [eventCodes.APP_SESSION_HTTP_REQUEST_BODY_CHUNK]: Icons.Info,
+  [eventCodes.APP_SESSION_HTTP_RESPONSE]: Icons.Info,
+  [eventCodes.APP_SESSION_HTTP_RESPONSE_BODY_CHUNK]: Icons.Info,
+  [eventCodes.APP_SESSION_TARGET_DIAL_DENIED]: Icons.Warning,
   [eventCodes.APP_SESSION_DYNAMODB_REQUEST]: Icons.Database,
+  [eventCodes.APP_SESSION_REQUEST_DENIED]: Icons.Warning,
   [eventCodes.APP_CREATED]: Icons.Code,
   [eventCodes.APP_UPDATED]: Icons.Code,
   [eventCodes.APP_DELETED]: Icons.Code,
@@ -98,9 +98,20 @@ const EventIconMap: Record<EventCode, React.FC> = {
   [eventCodes.SESSION_COMMAND]: Icons.Cli,
   [eventCodes.SESSION_PROCESS_EXIT]: Icons.Cli,
   [eventCodes.SESSION_CONNECT]: Icons.Cli,
-  [eventCodes.USER_CREATED]: Icons.Info,
-  [eventCodes.USER_UPDATED]: Icons.Info,
-  [eventCodes.USER_DELETED]: Icons.Info,
+  [eventCodes.USER_CREATED]: Icons.User,
+  [eventCodes.USER_UPDATED]: Icons.User,
+  [eventCodes.USER_DELETED]: Icons.User,
+  [eventCodes.BOT_CREATED]: Icons.Info,
+  [eventCodes.BOT_UPDATED]: Icons.Info,
+  [eventCodes.BOT_DELETED]: Icons.Info,
+  [eventCodes.WORKLOAD_IDENTITY_CREATE]: Icons.Info,
+  [eventCodes.WORKLOAD_IDENTITY_UPDATE]: Icons.Info,
+  [eventCodes.WORKLOAD_IDENTITY_DELETE]: Icons.Info,
+  [eventCodes.WORKLOAD_IDENTITY_X509_ISSUER_OVERRIDE_CREATE]: Icons.Info,
+  [eventCodes.WORKLOAD_IDENTITY_X509_ISSUER_OVERRIDE_DELETE]: Icons.Info,
+  [eventCodes.SIGSTORE_POLICY_CREATE]: Icons.Info,
+  [eventCodes.SIGSTORE_POLICY_UPDATE]: Icons.Info,
+  [eventCodes.SIGSTORE_POLICY_DELETE]: Icons.Info,
   [eventCodes.RESET_PASSWORD_TOKEN_CREATED]: Icons.Info,
   [eventCodes.USER_PASSWORD_CHANGED]: Icons.Info,
   [eventCodes.ACCESS_REQUEST_CREATED]: Icons.Info,
@@ -108,12 +119,20 @@ const EventIconMap: Record<EventCode, React.FC> = {
   [eventCodes.ACCESS_REQUEST_REVIEWED]: Icons.Info,
   [eventCodes.ACCESS_REQUEST_DELETED]: Icons.Info,
   [eventCodes.ACCESS_REQUEST_RESOURCE_SEARCH]: Icons.Info,
+  [eventCodes.ACCESS_REQUEST_EXPIRED]: Icons.Info,
   [eventCodes.USER_LOCAL_LOGIN]: Icons.Info,
   [eventCodes.USER_LOCAL_LOGINFAILURE]: Icons.Info,
   [eventCodes.USER_SSO_LOGIN]: Icons.Info,
   [eventCodes.USER_SSO_LOGINFAILURE]: Icons.Info,
   [eventCodes.USER_SSO_TEST_FLOW_LOGIN]: Icons.Info,
   [eventCodes.USER_SSO_TEST_FLOW_LOGINFAILURE]: Icons.Info,
+  [eventCodes.USER_HEADLESS_LOGIN_REQUESTED]: Icons.Info,
+  [eventCodes.USER_HEADLESS_LOGIN_APPROVED]: Icons.Info,
+  [eventCodes.USER_HEADLESS_LOGIN_APPROVEDFAILURE]: Icons.Info,
+  [eventCodes.USER_HEADLESS_LOGIN_REJECTED]: Icons.Info,
+  [eventCodes.CREATE_MFA_AUTH_CHALLENGE]: Icons.Info,
+  [eventCodes.VALIDATE_MFA_AUTH_RESPONSE]: Icons.Info,
+  [eventCodes.VALIDATE_MFA_AUTH_RESPONSEFAILURE]: Icons.Info,
   [eventCodes.KUBE_REQUEST]: Icons.Kubernetes,
   [eventCodes.KUBE_CREATED]: Icons.Kubernetes,
   [eventCodes.KUBE_UPDATED]: Icons.Kubernetes,
@@ -124,6 +143,11 @@ const EventIconMap: Record<EventCode, React.FC> = {
   [eventCodes.DATABASE_SESSION_QUERY]: Icons.Database,
   [eventCodes.DATABASE_SESSION_QUERY_FAILURE]: Icons.Database,
   [eventCodes.DATABASE_SESSION_MALFORMED_PACKET]: Icons.Database,
+  [eventCodes.DATABASE_SESSION_PERMISSIONS_UPDATE]: Icons.Database,
+  [eventCodes.DATABASE_SESSION_USER_CREATE]: Icons.Database,
+  [eventCodes.DATABASE_SESSION_USER_CREATE_FAILURE]: Icons.Database,
+  [eventCodes.DATABASE_SESSION_USER_DEACTIVATE]: Icons.Database,
+  [eventCodes.DATABASE_SESSION_USER_DEACTIVATE_FAILURE]: Icons.Database,
   [eventCodes.DATABASE_CREATED]: Icons.Database,
   [eventCodes.DATABASE_UPDATED]: Icons.Database,
   [eventCodes.DATABASE_DELETED]: Icons.Database,
@@ -152,11 +176,20 @@ const EventIconMap: Record<EventCode, React.FC> = {
   [eventCodes.CASSANDRA_PREPARE_EVENT]: Icons.Database,
   [eventCodes.CASSANDRA_REGISTER_EVENT]: Icons.Database,
   [eventCodes.ELASTICSEARCH_REQUEST]: Icons.Database,
+  [eventCodes.ELASTICSEARCH_REQUEST_FAILURE]: Icons.Database,
+  [eventCodes.OPENSEARCH_REQUEST]: Icons.Database,
+  [eventCodes.OPENSEARCH_REQUEST_FAILURE]: Icons.Database,
   [eventCodes.DYNAMODB_REQUEST]: Icons.Database,
   [eventCodes.DYNAMODB_REQUEST_FAILURE]: Icons.Database,
+  [eventCodes.SPANNER_RPC]: Icons.Database,
+  [eventCodes.SPANNER_RPC_DENIED]: Icons.Database,
+  [eventCodes.ACCESS_GRAPH_PATH_CHANGED]: Icons.Info,
   [eventCodes.DESKTOP_SESSION_STARTED]: Icons.Desktop,
   [eventCodes.DESKTOP_SESSION_STARTED_FAILED]: Icons.Desktop,
   [eventCodes.DESKTOP_SESSION_ENDED]: Icons.Desktop,
+  [eventCodes.LINUX_DESKTOP_SESSION_STARTED]: Icons.Desktop,
+  [eventCodes.LINUX_DESKTOP_SESSION_STARTED_FAILED]: Icons.Desktop,
+  [eventCodes.LINUX_DESKTOP_SESSION_ENDED]: Icons.Desktop,
   [eventCodes.DESKTOP_CLIPBOARD_SEND]: Icons.Clipboard,
   [eventCodes.DESKTOP_CLIPBOARD_RECEIVE]: Icons.Clipboard,
   [eventCodes.DESKTOP_SHARED_DIRECTORY_START]: Icons.FolderShared,
@@ -171,15 +204,24 @@ const EventIconMap: Record<EventCode, React.FC> = {
   [eventCodes.DEVICE_ENROLL]: Icons.Info,
   [eventCodes.DEVICE_ENROLL_TOKEN_CREATE]: Icons.Info,
   [eventCodes.DEVICE_ENROLL_TOKEN_SPENT]: Icons.Info,
+  [eventCodes.DEVICE_UPDATE]: Icons.Info,
+  [eventCodes.DEVICE_WEB_TOKEN_CREATE]: Icons.Info,
+  [eventCodes.DEVICE_AUTHENTICATE_CONFIRM]: Icons.Info,
+  [eventCodes.DEVICE_ENROLL_PAIRING_REQUEST]: Icons.Info,
+  [eventCodes.DEVICE_ENROLL_PAIRING_REQUEST_FAILURE]: Icons.Info,
+  [eventCodes.DEVICE_ENROLL_PAIRING_APPROVE]: Icons.Info,
+  [eventCodes.DEVICE_ENROLL_PAIRING_APPROVE_FAILURE]: Icons.Info,
+  [eventCodes.DEVICE_ENROLL_PAIRING_DENY]: Icons.Info,
   [eventCodes.MFA_DEVICE_ADD]: Icons.Info,
   [eventCodes.MFA_DEVICE_DELETE]: Icons.Info,
-  [eventCodes.BILLING_CARD_CREATE]: Icons.CreditCardAlt2,
-  [eventCodes.BILLING_CARD_DELETE]: Icons.CreditCardAlt2,
-  [eventCodes.BILLING_CARD_UPDATE]: Icons.CreditCardAlt2,
-  [eventCodes.BILLING_INFORMATION_UPDATE]: Icons.CreditCardAlt2,
+  [eventCodes.BILLING_CARD_CREATE]: Icons.CreditCard,
+  [eventCodes.BILLING_CARD_DELETE]: Icons.CreditCard,
+  [eventCodes.BILLING_CARD_UPDATE]: Icons.CreditCard,
+  [eventCodes.BILLING_INFORMATION_UPDATE]: Icons.CreditCard,
   [eventCodes.CLIENT_DISCONNECT]: Icons.Info,
   [eventCodes.PORTFORWARD]: Icons.Info,
   [eventCodes.PORTFORWARD_FAILURE]: Icons.Info,
+  [eventCodes.PORTFORWARD_STOP]: Icons.Info,
   [eventCodes.SUBSYSTEM]: Icons.Info,
   [eventCodes.SUBSYSTEM_FAILURE]: Icons.Info,
   [eventCodes.LOCK_CREATED]: Icons.Lock,
@@ -191,96 +233,215 @@ const EventIconMap: Record<EventCode, React.FC> = {
   [eventCodes.PRIVILEGE_TOKEN_CREATED]: Icons.Info,
   [eventCodes.X11_FORWARD]: Icons.Info,
   [eventCodes.X11_FORWARD_FAILURE]: Icons.Info,
+  [eventCodes.AGENT_FORWARD]: Icons.Info,
+  [eventCodes.AGENT_FORWARD_FAILURE]: Icons.Info,
   [eventCodes.CERTIFICATE_CREATED]: Icons.Keypair,
   [eventCodes.UPGRADE_WINDOW_UPDATED]: Icons.Info,
+  [eventCodes.ENVIRONMENT_PROFILE_UPDATED]: Icons.Info,
+  [eventCodes.ACCESS_GRAPH_SETTINGS_UPDATE]: Icons.Info,
   [eventCodes.SESSION_RECORDING_ACCESS]: Icons.Info,
   [eventCodes.SSMRUN_SUCCESS]: Icons.Info,
-  [eventCodes.SSMRUN_FAIL]: Icons.Info,
+  [eventCodes.SSMRUN_FAIL]: Icons.Warning,
+  [eventCodes.AZURERUN_SUCCESS]: Icons.Info,
+  [eventCodes.AZURERUN_FAIL]: Icons.Warning,
   [eventCodes.BOT_JOIN]: Icons.Info,
+  [eventCodes.BOT_JOIN_FAILURE]: Icons.Warning,
+  [eventCodes.BOT_JOIN_LIMIT]: Icons.Warning,
   [eventCodes.INSTANCE_JOIN]: Icons.Info,
+  [eventCodes.INSTANCE_JOIN_FAILURE]: Icons.Warning,
+  [eventCodes.INSTANCE_JOIN_LIMIT]: Icons.Warning,
   [eventCodes.LOGIN_RULE_CREATE]: Icons.Info,
   [eventCodes.LOGIN_RULE_DELETE]: Icons.Info,
+  [eventCodes.SAML_IDP_AUTH_ATTEMPT]: Icons.Info,
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_CREATE]: Icons.Info,
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_CREATE_FAILURE]: Icons.Info,
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_UPDATE]: Icons.Info,
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_UPDATE_FAILURE]: Icons.Info,
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_DELETE]: Icons.Info,
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_DELETE_FAILURE]: Icons.Info,
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_DELETE_ALL]: Icons.Info,
+  [eventCodes.SAML_IDP_SERVICE_PROVIDER_DELETE_ALL_FAILURE]: Icons.Info,
+  [eventCodes.OKTA_GROUPS_UPDATE]: Icons.Info,
+  [eventCodes.OKTA_APPLICATIONS_UPDATE]: Icons.Info,
+  [eventCodes.OKTA_SYNC_FAILURE]: Icons.Warning,
+  [eventCodes.OKTA_ASSIGNMENT_PROCESS]: Icons.Info,
+  [eventCodes.OKTA_ASSIGNMENT_PROCESS_FAILURE]: Icons.Warning,
+  [eventCodes.OKTA_ASSIGNMENT_CLEANUP]: Icons.Info,
+  [eventCodes.OKTA_ASSIGNMENT_CLEANUP_FAILURE]: Icons.Warning,
+  [eventCodes.OKTA_USER_SYNC]: Icons.Info,
+  [eventCodes.OKTA_USER_SYNC_FAILURE]: Icons.Warning,
+  [eventCodes.OKTA_ACCESS_LIST_SYNC]: Icons.Info,
+  [eventCodes.OKTA_ACCESS_LIST_SYNC_FAILURE]: Icons.Warning,
+  [eventCodes.ACCESS_LIST_CREATE]: Icons.Info,
+  [eventCodes.ACCESS_LIST_CREATE_FAILURE]: Icons.Warning,
+  [eventCodes.ACCESS_LIST_UPDATE]: Icons.Info,
+  [eventCodes.ACCESS_LIST_UPDATE_FAILURE]: Icons.Warning,
+  [eventCodes.ACCESS_LIST_DELETE]: Icons.Info,
+  [eventCodes.ACCESS_LIST_DELETE_FAILURE]: Icons.Warning,
+  [eventCodes.ACCESS_LIST_REVIEW]: Icons.Info,
+  [eventCodes.ACCESS_LIST_REVIEW_FAILURE]: Icons.Warning,
+  [eventCodes.ACCESS_LIST_MEMBER_CREATE]: Icons.User,
+  [eventCodes.ACCESS_LIST_MEMBER_CREATE_FAILURE]: Icons.Warning,
+  [eventCodes.ACCESS_LIST_MEMBER_UPDATE]: Icons.User,
+  [eventCodes.ACCESS_LIST_MEMBER_UPDATE_FAILURE]: Icons.Warning,
+  [eventCodes.ACCESS_LIST_MEMBER_DELETE]: Icons.User,
+  [eventCodes.ACCESS_LIST_MEMBER_DELETE_FAILURE]: Icons.Warning,
+  [eventCodes.ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST]: Icons.User,
+  [eventCodes.ACCESS_LIST_MEMBER_DELETE_ALL_FOR_ACCESS_LIST_FAILURE]:
+    Icons.Warning,
+  [eventCodes.USER_LOGIN_INVALID_ACCESS_LIST]: Icons.Warning,
+  [eventCodes.SECURITY_REPORT_AUDIT_QUERY_RUN]: Icons.Info,
+  [eventCodes.SECURITY_REPORT_RUN]: Icons.Info,
+  [eventCodes.EXTERNAL_AUDIT_STORAGE_ENABLE]: Icons.Database,
+  [eventCodes.EXTERNAL_AUDIT_STORAGE_DISABLE]: Icons.Database,
+  [eventCodes.SPIFFE_SVID_ISSUED]: Icons.Keypair,
+  [eventCodes.SPIFFE_SVID_ISSUED_FAILURE]: Icons.Warning,
+  [eventCodes.SPIFFE_FEDERATION_CREATE]: Icons.Info,
+  [eventCodes.SPIFFE_FEDERATION_DELETE]: Icons.Info,
+  [eventCodes.AUTH_PREFERENCE_UPDATE]: Icons.Info,
+  [eventCodes.CLUSTER_NETWORKING_CONFIG_UPDATE]: Icons.Info,
+  [eventCodes.SESSION_RECORDING_CONFIG_UPDATE]: Icons.Info,
+  [eventCodes.DISCOVERY_CONFIG_CREATE]: Icons.Info,
+  [eventCodes.DISCOVERY_CONFIG_UPDATE]: Icons.Info,
+  [eventCodes.DISCOVERY_CONFIG_DELETE]: Icons.Info,
+  [eventCodes.DISCOVERY_CONFIG_DELETE_ALL]: Icons.Info,
+  [eventCodes.INTEGRATION_CREATE]: Icons.Info,
+  [eventCodes.INTEGRATION_UPDATE]: Icons.Info,
+  [eventCodes.INTEGRATION_DELETE]: Icons.Info,
+  [eventCodes.STATIC_HOST_USER_CREATE]: Icons.User,
+  [eventCodes.STATIC_HOST_USER_UPDATE]: Icons.User,
+  [eventCodes.STATIC_HOST_USER_DELETE]: Icons.User,
+  [eventCodes.CROWN_JEWEL_CREATE]: Icons.Info,
+  [eventCodes.CROWN_JEWEL_UPDATE]: Icons.Info,
+  [eventCodes.CROWN_JEWEL_DELETE]: Icons.Info,
+  [eventCodes.USER_TASK_CREATE]: Icons.Info,
+  [eventCodes.USER_TASK_UPDATE]: Icons.Info,
+  [eventCodes.USER_TASK_DELETE]: Icons.Info,
+  [eventCodes.SFTP_SUMMARY]: Icons.FolderPlus,
+  [eventCodes.PLUGIN_CREATE]: Icons.Info,
+  [eventCodes.PLUGIN_UPDATE]: Icons.Info,
+  [eventCodes.PLUGIN_DELETE]: Icons.Info,
+  [eventCodes.CONTACT_CREATE]: Icons.Info,
+  [eventCodes.CONTACT_DELETE]: Icons.Info,
   [eventCodes.UNKNOWN]: Icons.Question,
+  [eventCodes.GIT_COMMAND]: Icons.GitHub,
+  [eventCodes.GIT_COMMAND_FAILURE]: Icons.GitHub,
+  [eventCodes.STABLE_UNIX_USER_CREATE]: Icons.Info,
+  [eventCodes.AWS_IC_RESOURCE_SYNC_SUCCESS]: Icons.AmazonAws,
+  [eventCodes.AWS_IC_RESOURCE_SYNC_FAILURE]: Icons.Warning,
+  [eventCodes.AUTOUPDATE_CONFIG_CREATE]: Icons.Info,
+  [eventCodes.AUTOUPDATE_CONFIG_UPDATE]: Icons.Info,
+  [eventCodes.AUTOUPDATE_CONFIG_DELETE]: Icons.Info,
+  [eventCodes.AUTOUPDATE_VERSION_CREATE]: Icons.Info,
+  [eventCodes.AUTOUPDATE_VERSION_UPDATE]: Icons.Info,
+  [eventCodes.AUTOUPDATE_VERSION_DELETE]: Icons.Info,
+  [eventCodes.HEALTH_CHECK_CONFIG_CREATE]: Icons.Info,
+  [eventCodes.HEALTH_CHECK_CONFIG_UPDATE]: Icons.Info,
+  [eventCodes.HEALTH_CHECK_CONFIG_DELETE]: Icons.Info,
+  [eventCodes.AUTOUPDATE_AGENT_ROLLOUT_TRIGGER]: Icons.RocketLaunch,
+  [eventCodes.AUTOUPDATE_AGENT_ROLLOUT_FORCE_DONE]: Icons.Checks,
+  [eventCodes.AUTOUPDATE_AGENT_ROLLOUT_ROLLBACK]: Icons.Restore,
+  [eventCodes.MCP_SESSION_START]: Icons.ModelContextProtocol,
+  [eventCodes.MCP_SESSION_END]: Icons.ModelContextProtocol,
+  [eventCodes.MCP_SESSION_END_FAILURE]: Icons.Warning,
+  [eventCodes.MCP_SESSION_REQUEST]: Icons.ModelContextProtocol,
+  [eventCodes.MCP_SESSION_REQUEST_FAILURE]: Icons.Warning,
+  [eventCodes.MCP_SESSION_NOTIFICATION]: Icons.ModelContextProtocol,
+  [eventCodes.MCP_SESSION_NOTIFICATION_FAILURE]: Icons.Warning,
+  [eventCodes.MCP_SESSION_LISTEN_SSE_STREAM]: Icons.ModelContextProtocol,
+  [eventCodes.MCP_SESSION_LISTEN_SSE_STREAM_FAILURE]: Icons.Warning,
+  [eventCodes.MCP_SESSION_INVALID_HTTP_REQUEST]: Icons.Warning,
+  [eventCodes.BOUND_KEYPAIR_RECOVERY]: Icons.Info,
+  [eventCodes.BOUND_KEYPAIR_ROTATION]: Icons.Info,
+  [eventCodes.BOUND_KEYPAIR_JOIN_STATE_VERIFICATION_FAILED]: Icons.Warning,
+  [eventCodes.SCIM_RESOURCE_CREATE]: Icons.Info,
+  [eventCodes.SCIM_RESOURCE_CREATE_FAILURE]: Icons.Warning,
+  [eventCodes.SCIM_RESOURCE_UPDATE]: Icons.Info,
+  [eventCodes.SCIM_RESOURCE_UPDATE_FAILURE]: Icons.Warning,
+  [eventCodes.SCIM_RESOURCE_DELETE]: Icons.Info,
+  [eventCodes.SCIM_RESOURCE_DELETE_FAILURE]: Icons.Warning,
+  [eventCodes.SCIM_RESOURCE_GET]: Icons.Info,
+  [eventCodes.SCIM_RESOURCE_GET_FAILURE]: Icons.Warning,
+  [eventCodes.SCIM_RESOURCE_LIST]: Icons.Info,
+  [eventCodes.SCIM_RESOURCE_LIST_FAILURE]: Icons.Warning,
+  [eventCodes.SCIM_RESOURCE_PATCH]: Icons.Info,
+  [eventCodes.SCIM_RESOURCE_PATCH_FAILURE]: Icons.Warning,
+  [eventCodes.CLIENT_IP_RESTRICTIONS_UPDATE]: Icons.Info,
+  [eventCodes.VNET_CONFIG_CREATE]: Icons.Info,
+  [eventCodes.VNET_CONFIG_UPDATE]: Icons.Info,
+  [eventCodes.VNET_CONFIG_DELETE]: Icons.Info,
+  [eventCodes.WORKLOAD_CLUSTER_CREATE]: Icons.Info,
+  [eventCodes.WORKLOAD_CLUSTER_CREATE_FAILURE]: Icons.Warning,
+  [eventCodes.WORKLOAD_CLUSTER_UPDATE]: Icons.Info,
+  [eventCodes.WORKLOAD_CLUSTER_UPDATE_FAILURE]: Icons.Warning,
+  [eventCodes.WORKLOAD_CLUSTER_DELETE]: Icons.Info,
+  [eventCodes.WORKLOAD_CLUSTER_DELETE_FAILURE]: Icons.Warning,
+  [eventCodes.INFERENCE_MODEL_CREATE]: Icons.Info,
+  [eventCodes.INFERENCE_MODEL_UPDATE]: Icons.Info,
+  [eventCodes.INFERENCE_MODEL_DELETE]: Icons.Info,
+  [eventCodes.INFERENCE_SECRET_CREATE]: Icons.Info,
+  [eventCodes.INFERENCE_SECRET_UPDATE]: Icons.Info,
+  [eventCodes.INFERENCE_SECRET_DELETE]: Icons.Info,
+  [eventCodes.INFERENCE_POLICY_CREATE]: Icons.Info,
+  [eventCodes.INFERENCE_POLICY_UPDATE]: Icons.Info,
+  [eventCodes.INFERENCE_POLICY_DELETE]: Icons.Info,
+  [eventCodes.RETRIEVAL_MODEL_CREATE]: Icons.Info,
+  [eventCodes.RETRIEVAL_MODEL_UPDATE]: Icons.Info,
+  [eventCodes.RETRIEVAL_MODEL_DELETE]: Icons.Info,
+  [eventCodes.CLASSIFIER_CREATE]: Icons.Info,
+  [eventCodes.CLASSIFIER_CREATE_FAILURE]: Icons.Warning,
+  [eventCodes.CLASSIFIER_UPDATE]: Icons.Info,
+  [eventCodes.CLASSIFIER_UPDATE_FAILURE]: Icons.Warning,
+  [eventCodes.CLASSIFIER_DELETE]: Icons.Info,
+  [eventCodes.CLASSIFIER_DELETE_FAILURE]: Icons.Warning,
+  [eventCodes.SESSION_SUMMARIZED]: Icons.Info,
+  [eventCodes.SESSION_SUMMARIZED_FAILURE]: Icons.Warning,
+  [eventCodes.CERT_AUTH_OVERRIDE_CREATE]: Icons.Info,
+  [eventCodes.CERT_AUTH_OVERRIDE_UPDATE]: Icons.Info,
+  [eventCodes.CERT_AUTH_OVERRIDE_UPSERT]: Icons.Info,
+  [eventCodes.CERT_AUTH_OVERRIDE_DELETE]: Icons.Info,
+  [eventCodes.BEAMS_CONFIG_CREATE]: Icons.Info,
+  [eventCodes.BEAMS_CONFIG_UPDATE]: Icons.Info,
+  [eventCodes.BEAMS_CONFIG_DELETE]: Icons.Info,
+  [eventCodes.SCOPED_TOKEN_CREATE]: Icons.Info,
+  [eventCodes.SCOPED_TOKEN_UPSERT]: Icons.Info,
+  [eventCodes.SCOPED_TOKEN_UPDATE]: Icons.Info,
+  [eventCodes.SCOPED_TOKEN_DELETE]: Icons.Info,
+  [eventCodes.SCOPED_TOKEN_CREATE_FAILURE]: Icons.Warning,
+  [eventCodes.SCOPED_TOKEN_UPSERT_FAILURE]: Icons.Warning,
+  [eventCodes.SCOPED_TOKEN_UPDATE_FAILURE]: Icons.Warning,
+  [eventCodes.SCOPED_TOKEN_DELETE_FAILURE]: Icons.Warning,
 };
 
-export default function renderTypeCell(event: Event, clusterId: string) {
-  const IconType = EventIconMap[event.code] || Icons.List;
+export default function renderTypeCell(event: Event) {
+  const Icon = EventIconMap[event.code] || Icons.ListThin;
 
   const iconProps = {
-    p: '1',
-    mr: '3',
-    fontSize: '3',
+    p: 2,
+    mr: 3,
   };
-
-  // use button for interactive ssh sessions
-  if (
-    event.code === eventCodes.SESSION_END &&
-    event.raw.interactive &&
-    event.raw.session_recording !== 'off'
-  ) {
-    return (
-      <Cell style={{ verticalAlign: 'inherit' }}>
-        <StyledEventType>
-          <a
-            title="Open Session Player"
-            href={cfg.getPlayerRoute(
-              {
-                clusterId,
-                sid: event.raw.sid,
-              },
-              {
-                recordingType: 'ssh',
-              }
-            )}
-            target="_blank"
-            style={{ textDecoration: 'none' }}
-          >
-            <StyledCliIcon {...iconProps} />
-          </a>
-          {event.codeDesc}
-        </StyledEventType>
-      </Cell>
-    );
-  }
 
   return (
     <Cell style={{ verticalAlign: 'inherit' }}>
       <StyledEventType>
-        <Icon {...iconProps} as={IconType} />
-        {event.codeDesc}
+        <Icon {...iconProps} size="medium" />
+        <Flex
+          gap={0}
+          flexDirection="column"
+          minHeight={64}
+          justifyContent="center"
+        >
+          <Text typography="body2" fontWeight={500} mb={0}>
+            {event.raw.event}
+          </Text>
+          <Text typography="body2" color="text.muted">
+            {event.codeDesc}
+          </Text>
+        </Flex>
       </StyledEventType>
     </Cell>
   );
 }
-
-const StyledCliIcon = styled(Icons.Cli)(
-  props => `
-  background: ${props.theme.colors.dark};
-  border: 2px solid ${props.theme.colors.accent};
-  color: ${props.theme.colors.text.primary};
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  padding: 0;
-  border-radius: 100px;
-  transition: all 0.3s;
-
-  &:hover,
-  &:active,
-  &:focus {
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.24);
-    color: ${props.theme.colors.light};
-  }
-
-  &:active {
-    box-shadow: none;
-    opacity: 0.56;
-  }
-`
-);
 
 const StyledEventType = styled.div`
   display: flex;

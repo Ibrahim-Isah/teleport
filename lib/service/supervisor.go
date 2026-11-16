@@ -1,31 +1,40 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
+	"github.com/jonboulle/clockwork"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/lib/observability/metrics"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // Supervisor implements the simple service logic - registering
@@ -82,6 +91,10 @@ type Supervisor interface {
 	// value immediately. The broadcasting will stop when the context is done.
 	ListenForEvents(ctx context.Context, name string, eventC chan<- Event)
 
+	// ListenForNewEvents arranges for eventC to receive new events with the
+	// specified name. The broadcasting will stop when the context is done.
+	ListenForNewEvents(ctx context.Context, name string, eventC chan<- Event)
+
 	// RegisterEventMapping registers event mapping -
 	// when the sequence in the event mapping triggers, the
 	// outbound event will be generated.
@@ -95,9 +108,13 @@ type Supervisor interface {
 	// a graceful or hard TeleportExitEvent is broadcast.
 	GracefulExitContext() context.Context
 
-	// ReloadContext returns context that will be closed when
-	// TeleportReloadEvent is broadcasted.
-	ReloadContext() context.Context
+	// HandleReadiness is the HTTP handler for "/readyz".
+	HandleReadiness(http.ResponseWriter, *http.Request)
+
+	// RegisterProcessStateCallback registers a function which is called immediately
+	// upon registering and then each time the health of the process state changes.
+	// The function must not call back into the supervisor or block in any way.
+	RegisterProcessStateCallback(func(healthy bool))
 }
 
 // EventMapping maps a sequence of incoming
@@ -114,20 +131,23 @@ func (e EventMapping) String() string {
 	return fmt.Sprintf("EventMapping(in=%v, out=%v)", e.In, e.Out)
 }
 
-func (e EventMapping) matches(currentEvent string, m map[string]Event) bool {
+// matches indicates whether the event mapping has been satisfied.
+// If returns an error only if the mapping is unsatisified because
+// we are still waiting on one or more events.
+func (e EventMapping) matches(currentEvent string, m map[string]Event) (bool, error) {
 	// existing events that have been fired should match
 	for _, in := range e.In {
 		if _, ok := m[in]; !ok {
-			return false
+			return false, fmt.Errorf("still waiting for %v", in)
 		}
 	}
 	// current event that is firing should match one of the expected events
-	for _, in := range e.In {
-		if currentEvent == in {
-			return true
-		}
+	if slices.Contains(e.In, currentEvent) {
+		return true, nil
 	}
-	return false
+
+	// mapping not satisfied, and this event is not part of the mapping
+	return false, nil
 }
 
 // LocalSupervisor is a Teleport's implementation of the Supervisor interface.
@@ -151,18 +171,27 @@ type LocalSupervisor struct {
 	gracefulExitContext context.Context
 	signalGracefulExit  context.CancelFunc
 
-	reloadContext context.Context
-	signalReload  context.CancelFunc
-
 	eventMappings []EventMapping
 	id            string
 
 	// log specifies the logger
-	log logrus.FieldLogger
+	log *slog.Logger
+
+	// clock is used as a source of time, to support fake clocks in tests.
+	clock clockwork.Clock
+
+	// processState is the process state machine tracking if the process is
+	// healthy or not.
+	processState processState
 }
 
 // NewSupervisor returns new instance of initialized supervisor
-func NewSupervisor(id string, parentLog logrus.FieldLogger) Supervisor {
+func NewSupervisor(id string, parentLog *slog.Logger, clock clockwork.Clock) (*LocalSupervisor, error) {
+	// used by processState
+	if err := metrics.RegisterPrometheusCollectors(stateGauge); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	ctx := context.TODO()
 
 	closeContext, cancel := context.WithCancel(ctx)
@@ -173,7 +202,9 @@ func NewSupervisor(id string, parentLog logrus.FieldLogger) Supervisor {
 	// in the event of graceful exit must also terminate in the event of an immediate exit.
 	gracefulExitContext, signalGracefulExit := context.WithCancel(exitContext)
 
-	reloadContext, signalReload := context.WithCancel(ctx)
+	if clock == nil {
+		clock = clockwork.NewRealClock()
+	}
 
 	srv := &LocalSupervisor{
 		state:        stateCreated,
@@ -191,19 +222,20 @@ func NewSupervisor(id string, parentLog logrus.FieldLogger) Supervisor {
 		gracefulExitContext: gracefulExitContext,
 		signalGracefulExit:  signalGracefulExit,
 
-		reloadContext: reloadContext,
-		signalReload:  signalReload,
-		log:           parentLog.WithField(trace.Component, teleport.Component(teleport.ComponentProcess, id)),
+		log: parentLog.With(teleport.ComponentKey, teleport.Component(teleport.ComponentProcess, id)),
+
+		clock: clock,
 	}
+
 	go srv.fanOut()
-	return srv
+	return srv, nil
 }
 
 // Event is a special service event that can be generated
 // by various goroutines in the supervisor
 type Event struct {
 	Name    string
-	Payload interface{}
+	Payload any
 }
 
 func (e *Event) String() string {
@@ -211,7 +243,7 @@ func (e *Event) String() string {
 }
 
 func (s *LocalSupervisor) Register(srv Service) {
-	s.log.WithField("service", srv.Name()).Debug("Adding service to supervisor.")
+	s.log.Log(s.closeContext, logutils.TraceLevel, "Adding service to supervisor", "service", srv.Name())
 	s.Lock()
 	defer s.Unlock()
 	s.services = append(s.services, srv)
@@ -243,17 +275,17 @@ func (s *LocalSupervisor) RegisterCriticalFunc(name string, fn Func) {
 
 // RemoveService removes service from supervisor tracking list
 func (s *LocalSupervisor) RemoveService(srv Service) error {
-	l := s.log.WithField("service", srv.Name())
+	l := s.log.With("service", srv.Name())
 	s.Lock()
 	defer s.Unlock()
 	for i, el := range s.services {
 		if el == srv {
-			s.services = append(s.services[:i], s.services[i+1:]...)
-			l.Debug("Service is completed and removed.")
+			s.services = slices.Delete(s.services, i, i+1)
+			l.Log(s.closeContext, logutils.TraceLevel, "Service is completed and removed")
 			return nil
 		}
 	}
-	l.Warning("Service is completed but not found.")
+	l.WarnContext(s.closeContext, "Service is completed but not found")
 	return trace.NotFound("service %v is not found", srv)
 }
 
@@ -266,19 +298,71 @@ type ExitEventPayload struct {
 	Error error
 }
 
+var metricsServicesRunning = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Namespace: teleport.MetricNamespace,
+		Name:      teleport.MetricTeleportServices,
+		Help:      "Teleport services currently enabled and running",
+	},
+	[]string{teleport.TagServiceName},
+)
+
+var metricsServicesRunningMap = map[string]string{
+	"discovery.init":       "discovery_service",
+	"ssh.node":             "ssh_service",
+	"auth.tls":             "auth_service",
+	"proxy.web":            "proxy_service",
+	"relay.run":            "relay_service",
+	"kube.init":            "kubernetes_service",
+	"apps.start":           "application_service",
+	"db.init":              "database_service",
+	"windows_desktop.init": "windows_desktop_service",
+	"linux_desktop.init":   "linux_desktop_service",
+	"okta.init":            "okta_service",
+	"jamf.init":            "jamf_service",
+}
+
+// isShuttingDown returns true if the supervisor is in the process of shutting down
+// either gracefully or immediately.
+// Should be called with the lock held to make sure the state doesn't change
+func (s *LocalSupervisor) isShuttingDown() bool {
+	select {
+	case <-s.exitContext.Done():
+		return true
+	case <-s.gracefulExitContext.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// server starts the service in a separate goroutine.
+// Should be called with the lock held.
 func (s *LocalSupervisor) serve(srv Service) {
+	if s.isShuttingDown() {
+		s.log.WarnContext(s.closeContext, "Not starting new service, process is shutting down")
+		return
+	}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		defer s.RemoveService(srv)
-		l := s.log.WithField("service", srv.Name())
-		l.Debug("Service has started.")
+
+		if label, ok := metricsServicesRunningMap[srv.Name()]; ok {
+			metricsServicesRunning.WithLabelValues(label).Inc()
+			defer metricsServicesRunning.WithLabelValues(label).Dec()
+		}
+
+		l := s.log.With("service", srv.Name())
+		l.Log(s.closeContext, logutils.TraceLevel, "Service has started")
 		err := srv.Serve()
 		if err != nil {
-			if err == ErrTeleportExited {
-				l.Info("Teleport process has shut down.")
+			if errors.Is(err, ErrTeleportExited) {
+				l.InfoContext(s.closeContext, "Teleport process has shut down")
 			} else {
-				l.WithError(err).Warning("Teleport process has exited with error.")
+				if s.ExitContext().Err() == nil {
+					l.WarnContext(s.closeContext, "Teleport process has exited with error", "error", err)
+				}
 				s.BroadcastEvent(Event{
 					Name:    ServiceExitedWithErrorEvent,
 					Payload: ExitEventPayload{Service: srv, Error: err},
@@ -294,8 +378,12 @@ func (s *LocalSupervisor) Start() error {
 	s.state = stateStarted
 
 	if len(s.services) == 0 {
-		s.log.Warning("Supervisor has no services to run. Exiting.")
+		s.log.WarnContext(s.closeContext, "Supervisor has no services to run - exiting")
 		return nil
+	}
+
+	if err := metrics.RegisterPrometheusCollectors(metricsServicesRunning); err != nil {
+		return trace.Wrap(err)
 	}
 
 	for _, srv := range s.services {
@@ -317,6 +405,9 @@ func (s *LocalSupervisor) Services() []string {
 	return out
 }
 
+// Wait blocks until all registered services have exited.
+// It is invoked during process shutdown to ensure
+// that all registered services have exited.
 func (s *LocalSupervisor) Wait() error {
 	defer s.signalClose()
 	s.wg.Wait()
@@ -342,10 +433,9 @@ func (s *LocalSupervisor) GracefulExitContext() context.Context {
 	return s.gracefulExitContext
 }
 
-// ReloadContext returns context that will be closed when
-// TeleportReloadEvent is broadcasted.
-func (s *LocalSupervisor) ReloadContext() context.Context {
-	return s.reloadContext
+// HandleReadiness implements [Supervisor].
+func (s *LocalSupervisor) HandleReadiness(w http.ResponseWriter, r *http.Request) {
+	s.processState.handleReadiness(w, r)
 }
 
 // BroadcastEvent generates event and broadcasts it to all
@@ -354,6 +444,10 @@ func (s *LocalSupervisor) BroadcastEvent(event Event) {
 	s.Lock()
 	defer s.Unlock()
 
+	// some events have additional handling here because they affect the
+	// behavior or status of the process as a whole: Exit begins the shutdown by
+	// causing contexts to be closed, and Degraded/OK/Starting update the
+	// process' health.
 	switch event.Name {
 	case TeleportExitEvent:
 		// if exit event includes a context payload, it is a "graceful" exit, and
@@ -371,8 +465,25 @@ func (s *LocalSupervisor) BroadcastEvent(event Event) {
 		} else {
 			s.signalExit()
 		}
-	case TeleportReloadEvent:
-		s.signalReload()
+	case TeleportDegradedEvent, TeleportOKEvent, TeleportStartingEvent:
+		componentName, ok := event.Payload.(string)
+		if !ok {
+			s.log.ErrorContext(s.closeContext, "Received event broadcast without component name, this is a bug!", "event", event.Name)
+			break
+		}
+		updateResult := s.processState.update(s.clock.Now(), event.Name, componentName)
+		switch updateResult {
+		case updateStarting:
+			s.log.DebugContext(s.closeContext, "Teleport component is starting", "component", componentName)
+		case updateStarted:
+			s.log.DebugContext(s.closeContext, "Teleport component has started.", "component", componentName)
+		case updateDegraded:
+			s.log.InfoContext(s.closeContext, "Detected Teleport component is running in a degraded state.", "component", componentName)
+		case updateRecovering:
+			s.log.InfoContext(s.closeContext, "Teleport component is recovering from a degraded state.", "component", componentName)
+		case updateRecovered:
+			s.log.InfoContext(s.closeContext, "Teleport component has recovered from a degraded state.", "component", componentName)
+		}
 	}
 
 	s.events[event.Name] = event
@@ -380,7 +491,7 @@ func (s *LocalSupervisor) BroadcastEvent(event Event) {
 	// Log all events other than recovered events to prevent the logs from
 	// being flooded.
 	if event.String() != TeleportOKEvent {
-		s.log.WithField("event", event.String()).Debug("Broadcasting event.")
+		s.log.DebugContext(s.closeContext, "Broadcasting event", "event", logutils.StringerAttr(&event))
 	}
 
 	go func() {
@@ -392,7 +503,7 @@ func (s *LocalSupervisor) BroadcastEvent(event Event) {
 	}()
 
 	for _, m := range s.eventMappings {
-		if m.matches(event.Name, s.events) {
+		if matches, err := m.matches(event.Name, s.events); matches && err == nil {
 			mappedEvent := Event{Name: m.Out}
 			s.events[mappedEvent.Name] = mappedEvent
 			go func(e Event) {
@@ -402,12 +513,21 @@ func (s *LocalSupervisor) BroadcastEvent(event Event) {
 					return
 				}
 			}(mappedEvent)
-			s.log.WithFields(logrus.Fields{
-				"in":  event.String(),
-				"out": m.String(),
-			}).Debug("Broadcasting mapped event.")
+			s.log.DebugContext(s.closeContext, "Broadcasting mapped event",
+				"in", logutils.StringerAttr(&event),
+				"out", logutils.StringerAttr(m),
+			)
+		} else if err != nil {
+			s.log.DebugContext(s.closeContext, "Teleport not yet ready", "error", err)
 		}
 	}
+}
+
+// RegisterProcessStateCallback registers a function which is called immediately
+// upon registering and then each time the health of the process state changes.
+// The function must not call back into the supervisor or block in any way.
+func (s *LocalSupervisor) RegisterProcessStateCallback(fn func(healthy bool)) {
+	s.processState.registerCallback(fn)
 }
 
 // RegisterEventMapping registers event mapping -
@@ -447,7 +567,11 @@ func (s *LocalSupervisor) WaitForEvent(ctx context.Context, name string) (Event,
 func (s *LocalSupervisor) WaitForEventTimeout(timeout time.Duration, name string) (Event, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return s.WaitForEvent(ctx, name)
+	event, err := s.WaitForEvent(ctx, name)
+	if err != nil && ctx.Err() != nil {
+		return event, trace.Errorf("timeout waiting for event %q (%s)", name, timeout)
+	}
+	return event, trace.Wrap(err)
 }
 
 func (s *LocalSupervisor) ListenForEvents(ctx context.Context, name string, eventC chan<- Event) {
@@ -459,6 +583,14 @@ func (s *LocalSupervisor) ListenForEvents(ctx context.Context, name string, even
 	if ok {
 		go waiter.notify(event)
 	}
+	s.eventWaiters[name] = append(s.eventWaiters[name], waiter)
+}
+
+func (s *LocalSupervisor) ListenForNewEvents(ctx context.Context, name string, eventC chan<- Event) {
+	s.Lock()
+	defer s.Unlock()
+
+	waiter := &waiter{eventC: eventC, context: ctx}
 	s.eventWaiters[name] = append(s.eventWaiters[name], waiter)
 }
 

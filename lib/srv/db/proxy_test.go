@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
@@ -26,7 +28,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
@@ -196,12 +198,19 @@ func TestProxyProtocolPostgresStartup(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "handles cancel request and closes connection",
+			tasks: []task{
+				{
+					sendMsg: &pgproto3.CancelRequest{},
+					wantErr: io.EOF,
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		for _, proxy := range proxyTargets {
-			proxy := proxy
 			testName := fmt.Sprintf("%s %s", proxy.name, tt.name)
 			t.Run(testName, func(t *testing.T) {
 				t.Parallel()
@@ -209,10 +218,12 @@ func TestProxyProtocolPostgresStartup(t *testing.T) {
 				require.NoError(t, err)
 				defer conn.Close()
 				for _, task := range tt.tasks {
-					payload := task.sendMsg.Encode(nil)
+					payload, err := task.sendMsg.Encode(nil)
+					require.NoError(t, err, "FrontendMessage.Encode failed")
+
 					nWritten, err := conn.Write(payload)
 					require.NoError(t, err)
-					require.Equal(t, len(payload), nWritten, "failed to fully write payload")
+					require.Len(t, payload, nWritten, "failed to fully write payload")
 
 					var checkResponse responseChecker
 					var needsTLSUpgrade bool
@@ -227,6 +238,9 @@ func TestProxyProtocolPostgresStartup(t *testing.T) {
 					case *pgproto3.Terminate:
 						// try to read one byte to check for expected EOF
 						checkResponse = checkNextMessage(conn, []byte("x"))
+					case *pgproto3.CancelRequest:
+						// try to read one byte to check for expected EOF
+						checkResponse = checkNextMessage(conn, []byte("x"))
 					default:
 						require.FailNow(t, "unexpected encoder used in test case")
 					}
@@ -236,7 +250,7 @@ func TestProxyProtocolPostgresStartup(t *testing.T) {
 					}
 					if needsTLSUpgrade {
 						tlsConn := tls.Client(conn, clientTLSCfg)
-						require.NoError(t, tlsConn.Handshake())
+						require.NoError(t, tlsConn.HandshakeContext(ctx))
 						conn = tlsConn
 					}
 				}
@@ -264,7 +278,7 @@ func checkNextMessage(conn net.Conn, wantMsg []byte) responseChecker {
 
 // checkReceiveReadyMessage checks that a pgproto3.ReadyForQuery message is eventually received.
 func checkReceiveReadyMessage(t *testing.T, conn net.Conn, wantErr error) {
-	frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(conn), conn)
+	frontend := pgproto3.NewFrontend(conn, conn)
 	for {
 		msg, err := frontend.Receive()
 		if wantErr != nil {
@@ -391,8 +405,10 @@ func TestProxyClientDisconnectDueToIdleConnection(t *testing.T) {
 	testCtx.clock.Advance(idleClientTimeout + connMonitorDisconnectTimeBuff)
 
 	waitForEvent(t, testCtx, events.ClientDisconnectCode)
-	err = mysql.Ping()
-	require.Error(t, err)
+	require.Eventually(t, func() bool {
+		err := mysql.Ping()
+		return err != nil
+	}, 5*time.Second, 100*time.Millisecond, "failed to disconnect client conn")
 }
 
 // TestProxyClientDisconnectDueToCertExpiration ensures that if the DisconnectExpiredCert cluster flag is enabled
@@ -419,8 +435,10 @@ func TestProxyClientDisconnectDueToCertExpiration(t *testing.T) {
 	testCtx.clock.Advance(ttlClientCert)
 
 	waitForEvent(t, testCtx, events.ClientDisconnectCode)
-	err = mysql.Ping()
-	require.Error(t, err)
+	require.Eventually(t, func() bool {
+		err := mysql.Ping()
+		return err != nil
+	}, 5*time.Second, 100*time.Millisecond, "failed to disconnect client conn")
 }
 
 // TestProxyClientDisconnectDueToLockInForce ensures that clients will be
@@ -448,28 +466,30 @@ func TestProxyClientDisconnectDueToLockInForce(t *testing.T) {
 	require.NoError(t, err)
 
 	waitForEvent(t, testCtx, events.ClientDisconnectCode)
-	err = mysql.Ping()
-	require.Error(t, err)
+	require.Eventually(t, func() bool {
+		err := mysql.Ping()
+		return err != nil
+	}, 5*time.Second, 100*time.Millisecond, "failed to disconnect client conn")
 }
 
 func setConfigClientIdleTimoutAndDisconnectExpiredCert(ctx context.Context, t *testing.T, auth *auth.Server, timeout time.Duration) {
 	authPref, err := auth.GetAuthPreference(ctx)
 	require.NoError(t, err)
 	authPref.SetDisconnectExpiredCert(true)
-	err = auth.SetAuthPreference(ctx, authPref)
+	_, err = auth.UpsertAuthPreference(ctx, authPref)
 	require.NoError(t, err)
 
 	netConfig, err := auth.GetClusterNetworkingConfig(ctx)
 	require.NoError(t, err)
 	netConfig.SetClientIdleTimeout(timeout)
-	err = auth.SetClusterNetworkingConfig(ctx, netConfig)
+	_, err = auth.UpsertClusterNetworkingConfig(ctx, netConfig)
 	require.NoError(t, err)
 }
 
 func TestExtractMySQLVersion(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	testCtx := setupTestContext(ctx, t, withSelfHostedMySQL("mysql", mysql.WithServerVersion("8.0.25")))
+	testCtx := setupTestContext(ctx, t, withSelfHostedMySQL("mysql", withMySQLServerVersion("8.0.25")))
 	go testCtx.startHandlingConnections()
 
 	testCtx.createUserAndRole(ctx, t, "alice", "admin", []string{"root"}, []string{types.Wildcard})

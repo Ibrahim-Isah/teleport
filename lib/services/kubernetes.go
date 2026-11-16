@@ -1,67 +1,72 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"context"
-	"fmt"
-	"strings"
+	"iter"
 
-	"github.com/aws/aws-sdk-go-v2/aws/arn"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/eks"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/exp/maps"
 
+	presencev1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/presence/v1"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/cloud/azure"
-	"github.com/gravitational/teleport/lib/cloud/gcp"
+	"github.com/gravitational/teleport/lib/scopes"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
-// KubernetesGetter defines interface for fetching kubernetes cluster resources.
-type KubernetesGetter interface {
+// KubernetesClusterGetter defines interface for fetching kubernetes cluster resources.
+type KubernetesClusterGetter interface {
 	// GetKubernetesClusters returns all kubernetes cluster resources.
 	GetKubernetesClusters(context.Context) ([]types.KubeCluster, error)
-	// GetKubernetesCluster returns the specified kubernetes cluster resource.
-	GetKubernetesCluster(ctx context.Context, name string) (types.KubeCluster, error)
+	// ListKubeClusters returns a page of registered kube clusters with the ability to apply
+	// scope filters.
+	ListKubeClusters(ctx context.Context, req *presencev1.ListKubeClustersRequest) ([]types.KubeCluster, string, error)
+	// RangeKubeClusters returns a sequence of kube clusters filtered by the given
+	// [*presencev1.ListKubeClustersRequest].
+	RangeKubeClusters(ctx context.Context, req *presencev1.ListKubeClustersRequest) iter.Seq2[types.KubeCluster, error]
+	// GetKubeCluster returns the specified kube cluster resource by scope and name.
+	GetKubeCluster(ctx context.Context, req *presencev1.GetKubeClusterRequest) (types.KubeCluster, error)
+}
+
+// KubernetesServerGetter defines interface for fetching kubernetes server resources.
+type KubernetesServerGetter interface {
+	// GetKubernetesServers returns all kubernetes server resources.
+	GetKubernetesServers(context.Context) ([]types.KubeServer, error)
 }
 
 // Kubernetes defines an interface for managing kubernetes clusters resources.
 type Kubernetes interface {
-	// KubernetesGetter provides methods for fetching kubernetes resources.
-	KubernetesGetter
+	// KubernetesClusterGetter provides methods for fetching kubernetes resources.
+	KubernetesClusterGetter
 	// CreateKubernetesCluster creates a new kubernetes cluster resource.
 	CreateKubernetesCluster(context.Context, types.KubeCluster) error
 	// UpdateKubernetesCluster updates an existing kubernetes cluster resource.
 	UpdateKubernetesCluster(context.Context, types.KubeCluster) error
-	// DeleteKubernetesCluster removes the specified kubernetes cluster resource.
-	DeleteKubernetesCluster(ctx context.Context, name string) error
 	// DeleteAllKubernetesClusters removes all kubernetes resources.
 	DeleteAllKubernetesClusters(context.Context) error
+	// DeleteKubeCluster removes the specified kube cluster resource with
+	// respect to its scope.
+	DeleteKubeCluster(ctx context.Context, req *presencev1.DeleteKubeClusterRequest) error
 }
 
 // MarshalKubeServer marshals the KubeServer resource to JSON.
 func MarshalKubeServer(kubeServer types.KubeServer, opts ...MarshalOption) ([]byte, error) {
-	if err := kubeServer.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	cfg, err := CollectOptions(opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -69,12 +74,11 @@ func MarshalKubeServer(kubeServer types.KubeServer, opts ...MarshalOption) ([]by
 
 	switch server := kubeServer.(type) {
 	case *types.KubernetesServerV3:
-		if !cfg.PreserveResourceID {
-			copy := *server
-			copy.SetResourceID(0)
-			server = &copy
+		if err := server.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		return utils.FastMarshal(server)
+
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, server))
 	default:
 		return nil, trace.BadParameter("unsupported kube server resource %T", server)
 	}
@@ -97,13 +101,13 @@ func UnmarshalKubeServer(data []byte, opts ...MarshalOption) (types.KubeServer, 
 	case types.V3:
 		var s types.KubernetesServerV3
 		if err := utils.FastUnmarshal(data, &s); err != nil {
-			return nil, trace.BadParameter(err.Error())
+			return nil, trace.BadParameter("%s", err)
 		}
 		if err := s.CheckAndSetDefaults(); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		if cfg.ID != 0 {
-			s.SetResourceID(cfg.ID)
+		if cfg.Revision != "" {
+			s.SetRevision(cfg.Revision)
 		}
 		if !cfg.Expires.IsZero() {
 			s.SetExpiry(cfg.Expires)
@@ -115,23 +119,22 @@ func UnmarshalKubeServer(data []byte, opts ...MarshalOption) (types.KubeServer, 
 
 // MarshalKubeCluster marshals the KubeCluster resource to JSON.
 func MarshalKubeCluster(kubeCluster types.KubeCluster, opts ...MarshalOption) ([]byte, error) {
-	if err := kubeCluster.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	cfg, err := CollectOptions(opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
+	if c, ok := kubeCluster.(types.DiscoveredEKSCluster); ok {
+		kubeCluster = c.GetKubeCluster()
+	}
+
 	switch cluster := kubeCluster.(type) {
 	case *types.KubernetesClusterV3:
-		if !cfg.PreserveResourceID {
-			copy := *cluster
-			copy.SetResourceID(0)
-			cluster = &copy
+		if err := cluster.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		return utils.FastMarshal(cluster)
+
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, cluster))
 	default:
 		return nil, trace.BadParameter("unsupported kube cluster resource %T", cluster)
 	}
@@ -154,13 +157,13 @@ func UnmarshalKubeCluster(data []byte, opts ...MarshalOption) (types.KubeCluster
 	case types.V3:
 		var s types.KubernetesClusterV3
 		if err := utils.FastUnmarshal(data, &s); err != nil {
-			return nil, trace.BadParameter(err.Error())
+			return nil, trace.BadParameter("%s", err)
 		}
 		if err := s.CheckAndSetDefaults(); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		if cfg.ID != 0 {
-			s.SetResourceID(cfg.ID)
+		if cfg.Revision != "" {
+			s.SetRevision(cfg.Revision)
 		}
 		if !cfg.Expires.IsZero() {
 			s.SetExpiry(cfg.Expires)
@@ -170,148 +173,15 @@ func UnmarshalKubeCluster(data []byte, opts ...MarshalOption) (types.KubeCluster
 	return nil, trace.BadParameter("unsupported kube cluster resource version %q", h.Version)
 }
 
-const (
-	// labelTeleportKubeClusterName is the label key containing the kubernetes cluster name override.
-	labelTeleportKubeClusterName = types.TeleportNamespace + "/kubernetes-name"
-)
-
-// setKubeName modifies the types.Metadata argument in place, setting the kubernetes cluster name.
-// The name is calculated based on nameParts arguments which are joined by hyphens "-".
-// If the kube_cluster name override label is present (setKubeName), it will replace the *first* name part.
-func setKubeName(meta types.Metadata, firstNamePart string, extraNameParts ...string) types.Metadata {
-	nameParts := append([]string{firstNamePart}, extraNameParts...)
-
-	// apply override
-	if override, found := meta.Labels[labelTeleportKubeClusterName]; found && override != "" {
-		nameParts[0] = override
-	}
-
-	meta.Name = strings.Join(nameParts, "-")
-
-	return meta
+// GetCursorForKubeCluster returns the backend key for a kube cluster with
+// consideration for whether or not it is scoped.
+func GetCursorForKubeCluster(cluster types.KubeCluster) string {
+	return scopes.MakeResourceCursor(cluster.GetScope(), cluster.GetName())
 }
 
-// NewKubeClusterFromAzureAKS creates a kube_cluster resource from an AKSCluster.
-func NewKubeClusterFromAzureAKS(cluster *azure.AKSCluster) (types.KubeCluster, error) {
-	labels := labelsFromAzureKubeCluster(cluster)
-	return types.NewKubernetesClusterV3(
-		setKubeName(types.Metadata{
-			Description: fmt.Sprintf("Azure AKS cluster %q in %v",
-				cluster.Name,
-				cluster.Location),
-			Labels: labels,
-		}, cluster.Name),
-		types.KubernetesClusterSpecV3{
-			Azure: types.KubeAzure{
-				ResourceName:   cluster.Name,
-				ResourceGroup:  cluster.GroupName,
-				TenantID:       cluster.TenantID,
-				SubscriptionID: cluster.SubscriptionID,
-			},
-		})
+// GetCursorForKubeServer returns the resource cursor identifying a kube server
+// in the logical resource stream: "<host-id>/<cluster-name>" for unscoped kube servers
+// and "~scoped/<encoded-scope>/<host-id>/<cluster-name>" for scoped kube servers.
+func GetCursorForKubeServer(server types.KubeServer) string {
+	return scopes.MakeResourceCursorWithHost(server.GetScope(), server.GetHostID(), server.GetName())
 }
-
-// labelsFromAzureKubeCluster creates kube cluster labels.
-func labelsFromAzureKubeCluster(cluster *azure.AKSCluster) map[string]string {
-	labels := azureTagsToLabels(cluster.Tags)
-	labels[types.OriginLabel] = types.OriginCloud
-	labels[types.CloudLabel] = types.CloudAzure
-	labels[labelRegion] = cluster.Location
-
-	labels[labelResourceGroup] = cluster.GroupName
-	labels[labelSubscriptionID] = cluster.SubscriptionID
-	return labels
-}
-
-// NewKubeClusterFromGCPGKE creates a kube_cluster resource from an GKE cluster.
-func NewKubeClusterFromGCPGKE(cluster gcp.GKECluster) (types.KubeCluster, error) {
-	return types.NewKubernetesClusterV3(
-		setKubeName(types.Metadata{
-			Description: getOrSetDefaultGCPDescription(cluster),
-			Labels:      labelsFromGCPKubeCluster(cluster),
-		}, cluster.Name),
-		types.KubernetesClusterSpecV3{
-			GCP: types.KubeGCP{
-				Name:      cluster.Name,
-				ProjectID: cluster.ProjectID,
-				Location:  cluster.Location,
-			},
-		})
-}
-
-// getOrSetDefaultGCPDescription gets the default GKE cluster description if available,
-// otherwise returns a default one.
-func getOrSetDefaultGCPDescription(cluster gcp.GKECluster) string {
-	if len(cluster.Description) > 0 {
-		return cluster.Description
-	}
-	return fmt.Sprintf("GKE cluster %q in %s",
-		cluster.Name,
-		cluster.Location)
-}
-
-// labelsFromGCPKubeCluster creates kube cluster labels.
-func labelsFromGCPKubeCluster(cluster gcp.GKECluster) map[string]string {
-	labels := maps.Clone(cluster.Labels)
-	labels[types.OriginLabel] = types.OriginCloud
-	labels[types.CloudLabel] = types.CloudGCP
-	labels[labelLocation] = cluster.Location
-
-	labels[labelProjectID] = cluster.ProjectID
-	return labels
-}
-
-// NewKubeClusterFromAWSEKS creates a kube_cluster resource from an EKS cluster.
-func NewKubeClusterFromAWSEKS(cluster *eks.Cluster) (types.KubeCluster, error) {
-	parsedARN, err := arn.Parse(aws.StringValue(cluster.Arn))
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	labels := labelsFromAWSKubeCluster(cluster, parsedARN)
-
-	return types.NewKubernetesClusterV3(
-		setKubeName(types.Metadata{
-			Description: fmt.Sprintf("AWS EKS cluster %q in %s",
-				aws.StringValue(cluster.Name),
-				parsedARN.Region),
-			Labels: labels,
-		}, aws.StringValue(cluster.Name)),
-		types.KubernetesClusterSpecV3{
-			AWS: types.KubeAWS{
-				Name:      aws.StringValue(cluster.Name),
-				AccountID: parsedARN.AccountID,
-				Region:    parsedARN.Region,
-			},
-		})
-}
-
-// labelsFromAWSKubeCluster creates kube cluster labels.
-func labelsFromAWSKubeCluster(cluster *eks.Cluster, parsedARN arn.ARN) map[string]string {
-	labels := awsEKSTagsToLabels(cluster.Tags)
-	labels[types.OriginLabel] = types.OriginCloud
-	labels[types.CloudLabel] = types.CloudAWS
-	labels[labelRegion] = parsedARN.Region
-
-	labels[labelAccountID] = parsedARN.AccountID
-	return labels
-}
-
-// awsEKSTagsToLabels converts AWS tags to a labels map.
-func awsEKSTagsToLabels(tags map[string]*string) map[string]string {
-	labels := make(map[string]string)
-	for key, val := range tags {
-		if types.IsValidLabelKey(key) {
-			labels[key] = aws.StringValue(val)
-		} else {
-			log.Debugf("Skipping EKS tag %q, not a valid label key.", key)
-		}
-	}
-	return labels
-}
-
-const (
-	// labelProjectID is the label key for GCP project ID.
-	labelProjectID = "project-id"
-	// labelLocation is the label key for GCP location.
-	labelLocation = "location"
-)

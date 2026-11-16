@@ -1,25 +1,27 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
 	"testing"
 
-	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestSyncMap(t *testing.T) {
@@ -29,8 +31,8 @@ func TestSyncMap(t *testing.T) {
 
 	// Nothing stored yet.
 	v, ok := m.Load("key1")
-	require.Nil(t, v)
-	require.False(t, ok)
+	assert.Nil(t, v)
+	assert.False(t, ok)
 
 	// Store some values.
 	value1 := NewRealUID()
@@ -40,20 +42,39 @@ func TestSyncMap(t *testing.T) {
 
 	// Check stored values.
 	v, ok = m.Load("key1")
-	require.Equal(t, value1, v)
-	require.True(t, ok)
+	assert.Equal(t, value1, v)
+	assert.True(t, ok)
 
 	v, ok = m.Load("key2")
-	require.Equal(t, value2, v)
-	require.True(t, ok)
+	assert.Equal(t, value2, v)
+	assert.True(t, ok)
+
+	// Iterate stored values with Range.
+	var keys []string
+	var values []UID
+	m.Range(func(key string, value UID) bool {
+		keys = append(keys, key)
+		values = append(values, value)
+		return true
+	})
+	assert.ElementsMatch(t, []string{"key1", "key2"}, keys)
+	assert.ElementsMatch(t, []UID{value1, value2}, values)
 
 	// Delete one.
 	m.Delete("key1")
 	v, ok = m.Load("key1")
-	require.Nil(t, v)
-	require.False(t, ok)
+	assert.Nil(t, v)
+	assert.False(t, ok)
 
 	v, ok = m.Load("key2")
-	require.Equal(t, value2, v)
-	require.True(t, ok)
+	assert.Equal(t, value2, v)
+	assert.True(t, ok)
+
+	// Load and delete.
+	v, ok = m.LoadAndDelete("key2")
+	assert.Equal(t, value2, v)
+	assert.True(t, ok)
+	v, ok = m.LoadAndDelete("key2")
+	assert.Nil(t, v)
+	assert.False(t, ok)
 }

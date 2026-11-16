@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package proxy
 
@@ -21,43 +23,55 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"sort"
 	"testing"
 	"time"
 
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/healthcheck"
 	testingkubemock "github.com/gravitational/teleport/lib/kube/proxy/testing/kube_server"
 	"github.com/gravitational/teleport/lib/reversetunnel"
 	"github.com/gravitational/teleport/lib/tlsca"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
+
+func TestServeConfigureError(t *testing.T) {
+	srv := &TLSServer{Server: &http.Server{TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, CipherSuites: []uint16{}}}, closeContext: context.Background()}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+
+	err = srv.Serve(listener)
+	require.Error(t, err) // expected due to incompatible ciphers
+
+	require.True(t, srv.mu.TryLock()) // verify that lock was released despite error
+}
 
 func TestMTLSClientCAs(t *testing.T) {
 	ap := &mockAccessPoint{
 		cas: make(map[string]types.CertAuthority),
 	}
 	// Reuse the same CA private key for performance.
-	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
 	addCA := func(t *testing.T, name string) (key, cert []byte) {
 		cert, err := tlsca.GenerateSelfSignedCAWithSigner(caKey, pkix.Name{CommonName: name}, nil, time.Minute)
 		require.NoError(t, err)
-		_, key, err = utils.MarshalPrivateKey(caKey)
+		key, err = keys.MarshalPrivateKey(caKey)
 		require.NoError(t, err)
 		ca, err := types.NewCertAuthority(types.CertAuthoritySpecV2{
 			Type:        types.HostCA,
@@ -90,19 +104,17 @@ func TestMTLSClientCAs(t *testing.T) {
 			DNSNames:  sans,
 		})
 		require.NoError(t, err)
-		keyRaw, err := x509.MarshalECPrivateKey(userHostKey)
+		keyPEM, err := keys.MarshalPrivateKey(userHostKey)
 		require.NoError(t, err)
-		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyRaw})
 		cert, err := tls.X509KeyPair(certRaw, keyPEM)
 		require.NoError(t, err)
 		return cert
 	}
 	hostCert := genCert(t, "localhost", "localhost", "127.0.0.1", "::1")
 	userCert := genCert(t, "user")
-	log := logrus.New()
 	srv := &TLSServer{
 		TLSServerConfig: TLSServerConfig{
-			Log: log,
+			Log: logtest.NewLogger(),
 			ForwarderConfig: ForwarderConfig{
 				ClusterName: mainClusterName,
 			},
@@ -111,9 +123,10 @@ func TestMTLSClientCAs(t *testing.T) {
 				ClientAuth:   tls.RequireAndVerifyClientCert,
 				Certificates: []tls.Certificate{hostCert},
 			},
-			GetRotation: func(role types.SystemRole) (*types.Rotation, error) { return &types.Rotation{}, nil },
+			GetRotation:          func(role types.SystemRole) (*types.Rotation, error) { return &types.Rotation{}, nil },
+			ConnectedProxyGetter: reversetunnel.NewConnectedProxyGetter(),
 		},
-		log: logrus.NewEntry(log),
+		log: logtest.NewLogger(),
 	}
 
 	lis, err := net.Listen("tcp", "localhost:0")
@@ -170,7 +183,7 @@ func TestMTLSClientCAs(t *testing.T) {
 	// 100 additional CAs registered, all CAs should be sent to the client in
 	// the handshake.
 	t.Run("100 CAs", func(t *testing.T) {
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			addCA(t, fmt.Sprintf("cluster-%d", i))
 		}
 		testDial(t, 101)
@@ -190,12 +203,12 @@ func TestGetServerInfo(t *testing.T) {
 		cas: make(map[string]types.CertAuthority),
 	}
 
-	listener, err := net.Listen("tcp", "")
+	listener, err := net.Listen("tcp", "localhost:")
 	require.NoError(t, err)
 
 	srv := &TLSServer{
 		TLSServerConfig: TLSServerConfig{
-			Log: logrus.New(),
+			Log: logtest.NewLogger(),
 			ForwarderConfig: ForwarderConfig{
 				Clock:       clockwork.NewFakeClock(),
 				ClusterName: "kube-cluster",
@@ -203,8 +216,9 @@ func TestGetServerInfo(t *testing.T) {
 			},
 			AccessPoint:          ap,
 			TLS:                  &tls.Config{},
-			ConnectedProxyGetter: reversetunnel.NewConnectedProxyGetter(),
 			GetRotation:          func(role types.SystemRole) (*types.Rotation, error) { return &types.Rotation{}, nil },
+			ConnectedProxyGetter: reversetunnel.NewConnectedProxyGetter(),
+			HealthCheckManager:   &mockHealthCheckManager{},
 		},
 		fwd: &Forwarder{
 			cfg: ForwarderConfig{},
@@ -218,24 +232,16 @@ func TestGetServerInfo(t *testing.T) {
 	}
 
 	t.Run("GetServerInfo gets listener addr with PublicAddr unset", func(t *testing.T) {
-		serverInfo, err := srv.getServerInfo("kube-cluster")
+		kubeServer, err := srv.GetServerInfo("kube-cluster")
 		require.NoError(t, err)
-
-		kubeServer, ok := serverInfo.(types.KubeServer)
-		require.True(t, ok)
-
 		require.Equal(t, listener.Addr().String(), kubeServer.GetHostname())
 	})
 
 	t.Run("GetServerInfo gets correct public addr with PublicAddr set", func(t *testing.T) {
 		srv.TLSServerConfig.ForwarderConfig.PublicAddr = "k8s.example.com"
 
-		serverInfo, err := srv.getServerInfo("kube-cluster")
+		kubeServer, err := srv.GetServerInfo("kube-cluster")
 		require.NoError(t, err)
-
-		kubeServer, ok := serverInfo.(types.KubeServer)
-		require.True(t, ok)
-
 		require.Equal(t, "k8s.example.com", kubeServer.GetHostname())
 	})
 }
@@ -260,7 +266,7 @@ func TestHeartbeat(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, testCtx.Close()) })
 
 	type args struct {
-		kubeClusterGetter func(auth.ClientI) []string
+		kubeClusterGetter func(authclient.ClientI) []string
 	}
 	tests := []struct {
 		name      string
@@ -268,33 +274,9 @@ func TestHeartbeat(t *testing.T) {
 		wantEmpty bool
 	}{
 		{
-			// DELETE IN 13.0.0
-			name: "List KubeServices (legacy)",
-			args: args{
-				kubeClusterGetter: func(authClient auth.ClientI) []string {
-					rsp, err := authClient.ListResources(testCtx.Context, proto.ListResourcesRequest{
-						ResourceType: types.KindKubeService,
-						Limit:        10,
-					})
-					require.NoError(t, err)
-					clusters := []string{}
-					for _, resource := range rsp.Resources {
-						srv, ok := resource.(types.Server)
-						require.Truef(t, ok, "type is %T; expected types.Server", srv)
-						for _, kubeCluster := range srv.GetKubernetesClusters() {
-							clusters = append(clusters, kubeCluster.Name)
-						}
-					}
-					sort.Strings(clusters)
-					return clusters
-				},
-			},
-			wantEmpty: true,
-		},
-		{
 			name: "List KubeServers",
 			args: args{
-				kubeClusterGetter: func(authClient auth.ClientI) []string {
+				kubeClusterGetter: func(authClient authclient.ClientI) []string {
 					rsp, err := authClient.ListResources(testCtx.Context, proto.ListResourcesRequest{
 						ResourceType: types.KindKubeServer,
 						Limit:        10,
@@ -323,3 +305,64 @@ func TestHeartbeat(t *testing.T) {
 		})
 	}
 }
+
+func TestTLSServerConfig_validateLabelsKey(t *testing.T) {
+	type fields struct {
+		staticLabels map[string]string
+	}
+	tests := []struct {
+		name           string
+		fields         fields
+		errorAssertion require.ErrorAssertionFunc
+	}{
+		{
+			name: "valid labels",
+			fields: fields{
+				staticLabels: map[string]string{
+					"key1": "value1",
+					"key2": "value2",
+				},
+			},
+			errorAssertion: require.NoError,
+		},
+		{
+			name: "invalid labels",
+			fields: fields{
+				staticLabels: map[string]string{
+					"key 1": "value1",
+					"key2":  "value2",
+				},
+			},
+			errorAssertion: require.Error,
+		},
+		{
+			name: "invalid labels",
+			fields: fields{
+				staticLabels: map[string]string{
+					"key\\1": "value1",
+					"key2":   "value2",
+				},
+			},
+			errorAssertion: require.Error,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &TLSServerConfig{
+				StaticLabels: tt.fields.staticLabels,
+			}
+			err := c.validateLabelKeys()
+			tt.errorAssertion(t, err)
+		})
+	}
+}
+
+type mockHealthCheckManager struct{}
+
+func (m *mockHealthCheckManager) Start(ctx context.Context) error               { return nil }
+func (m *mockHealthCheckManager) AddTarget(target healthcheck.Target) error     { return nil }
+func (m *mockHealthCheckManager) RemoveTarget(r types.ResourceWithLabels) error { return nil }
+func (m *mockHealthCheckManager) GetTargetHealth(r types.ResourceWithLabels) (*types.TargetHealth, error) {
+	return nil, nil
+}
+func (m *mockHealthCheckManager) Close() error { return nil }

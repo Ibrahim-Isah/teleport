@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package secrets
 
@@ -21,16 +23,19 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/lib/cloud/mocks"
 )
 
 func TestAWSSecretsManager(t *testing.T) {
 	createFunc := func(_ context.Context) (Secrets, error) {
 		secrets, err := NewAWSSecretsManager(AWSSecretsManagerConfig{
-			Client: NewMockSecretsManagerClient(MockSecretsManagerClientConfig{}),
+			Client:      mocks.NewSecretsManagerClient(mocks.SecretsManagerClientConfig{}),
+			ClusterName: "example.teleport.sh",
 		})
 		if err != nil {
 			return nil, trace.Wrap(err)
@@ -66,33 +71,35 @@ func TestAWSSecretsManager(t *testing.T) {
 		t.Cleanup(cancel)
 
 		// Create secret for the first time with default KMS.
-		client := NewMockSecretsManagerClient(MockSecretsManagerClientConfig{})
+		client := mocks.NewSecretsManagerClient(mocks.SecretsManagerClientConfig{})
 		secrets, err := NewAWSSecretsManager(AWSSecretsManagerConfig{
-			Client: client,
+			Client:      client,
+			ClusterName: "example.teleport.sh",
 		})
 		require.NoError(t, err)
 		require.NoError(t, secrets.CreateOrUpdate(ctx, "key", "value"))
 
-		output1, err := client.DescribeSecretWithContext(ctx, &secretsmanager.DescribeSecretInput{
+		output1, err := client.DescribeSecret(ctx, &secretsmanager.DescribeSecretInput{
 			SecretId: aws.String("teleport/key"),
 		})
 		require.NoError(t, err)
-		require.Equal(t, "arn:aws:kms:us-east-1:123456789012:alias/aws/secretsmanager", aws.StringValue(output1.KmsKeyId))
+		require.Equal(t, "arn:aws:kms:us-east-1:123456789012:alias/aws/secretsmanager", aws.ToString(output1.KmsKeyId))
 
 		// Create secret for the second time with custom KMS. Create returns
 		// IsAlreadyExists but KMSKeyID should be updated.
 		secrets, err = NewAWSSecretsManager(AWSSecretsManagerConfig{
-			Client:   client,
-			KMSKeyID: "customKMS",
+			Client:      client,
+			KMSKeyID:    "customKMS",
+			ClusterName: "example.teleport.sh",
 		})
 		require.NoError(t, err)
 		require.True(t, trace.IsAlreadyExists(secrets.CreateOrUpdate(ctx, "key", "value")))
 
-		output2, err := client.DescribeSecretWithContext(ctx, &secretsmanager.DescribeSecretInput{
+		output2, err := client.DescribeSecret(ctx, &secretsmanager.DescribeSecretInput{
 			SecretId: aws.String("teleport/key"),
 		})
 		require.NoError(t, err)
-		require.Equal(t, "customKMS", aws.StringValue(output2.KmsKeyId))
+		require.Equal(t, "customKMS", aws.ToString(output2.KmsKeyId))
 
 		// Verify the versions are kept.
 		require.Equal(t, output1.VersionIdsToStages, output2.VersionIdsToStages)

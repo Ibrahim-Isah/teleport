@@ -1,27 +1,31 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package azure
 
 import (
+	"context"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,12 +38,14 @@ func TestClientMap(t *testing.T) {
 		}
 		return nil, trace.BadParameter("failed to create")
 	}
-	clientMap := NewClientMap(mockNewClientFunc)
+	clock := clockwork.NewFakeClock()
+	clientMap, err := NewClientMap(mockNewClientFunc, withClock(clock))
+	require.NoError(t, err)
 
 	// Note that some test cases (e.g. "get from cache") depend on previous
 	// test cases. Thus running in sequence.
 	t.Run("get credentials failed", func(t *testing.T) {
-		client, err := clientMap.Get("some-sub", func() (azcore.TokenCredential, error) {
+		client, err := clientMap.Get(t.Context(), "some-sub", func(ctx context.Context) (azcore.TokenCredential, error) {
 			return nil, trace.AccessDenied("failed to get credentials")
 		})
 		require.ErrorIs(t, err, trace.AccessDenied("failed to get credentials"))
@@ -47,7 +53,7 @@ func TestClientMap(t *testing.T) {
 	})
 
 	t.Run("create client failed", func(t *testing.T) {
-		client, err := clientMap.Get("bad-sub", func() (azcore.TokenCredential, error) {
+		client, err := clientMap.Get(t.Context(), "bad-sub", func(ctx context.Context) (azcore.TokenCredential, error) {
 			return nil, nil
 		})
 		require.ErrorIs(t, err, trace.BadParameter("failed to create"))
@@ -55,7 +61,7 @@ func TestClientMap(t *testing.T) {
 	})
 
 	t.Run("create client succeed", func(t *testing.T) {
-		client, err := clientMap.Get("good-sub", func() (azcore.TokenCredential, error) {
+		client, err := clientMap.Get(t.Context(), "good-sub", func(ctx context.Context) (azcore.TokenCredential, error) {
 			return nil, nil
 		})
 		require.NoError(t, err)
@@ -66,11 +72,28 @@ func TestClientMap(t *testing.T) {
 	t.Run("get from cache", func(t *testing.T) {
 		// Return an error for getCredentials but it shouldn't even be called
 		// as the client is returned from existing cache.
-		client, err := clientMap.Get("good-sub", func() (azcore.TokenCredential, error) {
+		client, err := clientMap.Get(t.Context(), "good-sub", func(ctx context.Context) (azcore.TokenCredential, error) {
 			return nil, trace.AccessDenied("failed to get credentials")
 		})
 		require.NoError(t, err)
 		require.NotNil(t, client)
 		require.IsType(t, NewRedisClientByAPI(nil), client)
 	})
+
+	t.Run("expire from cache", func(t *testing.T) {
+		oldClient, err := clientMap.Get(t.Context(), "good-sub", func(ctx context.Context) (azcore.TokenCredential, error) {
+			return nil, nil
+		})
+		require.NoError(t, err)
+		require.NotNil(t, oldClient)
+
+		clock.Advance(2 * clientExpireTime)
+		newClient, err := clientMap.Get(t.Context(), "good-sub", func(ctx context.Context) (azcore.TokenCredential, error) {
+			return nil, nil
+		})
+		require.NoError(t, err)
+		require.NotNil(t, newClient)
+		require.NotSame(t, oldClient, newClient)
+	})
+
 }

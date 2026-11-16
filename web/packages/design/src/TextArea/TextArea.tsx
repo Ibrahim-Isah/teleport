@@ -1,53 +1,159 @@
 /**
-Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import React, {
+  forwardRef,
+  HTMLAttributes,
+  HTMLInputAutoCompleteAttribute,
+} from 'react';
+import styled, { CSSObject } from 'styled-components';
+import {
+  color,
+  ColorProps,
+  height,
+  HeightProps,
+  space,
+  SpaceProps,
+  width,
+  WidthProps,
+} from 'styled-system';
 
-    http://www.apache.org/licenses/LICENSE-2.0
+import { Theme } from 'design/theme/themes/types';
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+export type TextAreaSize = 'large' | 'medium' | 'small';
 
-import React, { CSSProperties } from 'react';
-import styled from 'styled-components';
-import { space, width, color, height } from 'styled-system';
-
-export interface TextAreaProps extends React.ComponentPropsWithRef<'textarea'> {
+export interface TextAreaProps
+  extends ColorProps, SpaceProps, WidthProps, HeightProps {
+  size?: TextAreaSize;
   hasError?: boolean;
   resizable?: boolean;
 
-  // TS: temporary handles ...styles
-  [key: string]: any;
+  // TextArea element attributes
+  autoFocus?: boolean;
+  disabled?: boolean;
+  id?: string;
+  name?: string;
+  readOnly?: boolean;
+  value?: string;
+  defaultValue?: string;
+  placeholder?: string;
+  autoComplete?: HTMLInputAutoCompleteAttribute;
+  spellCheck?: boolean;
+  style?: React.CSSProperties;
+
+  'aria-invalid'?: HTMLAttributes<'textarea'>['aria-invalid'];
+  'aria-describedby'?: HTMLAttributes<'textarea'>['aria-describedby'];
+
+  onChange?: React.ChangeEventHandler<HTMLInputElement>;
+  onKeyPress?: React.KeyboardEventHandler<HTMLInputElement>;
+  onKeyDown?: React.KeyboardEventHandler<HTMLInputElement>;
+  onFocus?: React.FocusEventHandler<HTMLInputElement>;
+  onBlur?: React.FocusEventHandler<HTMLInputElement>;
+  onClick?: React.MouseEventHandler<HTMLInputElement>;
 }
 
-export const TextArea: React.FC<TextAreaProps> = styled.textarea`
+const textAreaGeometry: {
+  [s in TextAreaSize]: {
+    height: number;
+    typography: keyof Theme['typography'];
+  };
+} = {
+  large: {
+    height: 96,
+    typography: 'body1',
+  },
+  medium: {
+    height: 84,
+    typography: 'body2',
+  },
+  small: {
+    height: 76,
+    typography: 'body3',
+  },
+};
+
+export const TextArea = forwardRef<HTMLTextAreaElement, TextAreaProps>(
+  ({ size = 'medium', ...rest }, ref) => (
+    <StyledTextArea ref={ref} taSize={size} {...rest} />
+  )
+);
+
+type StyledTextAreaProps = Omit<TextAreaProps, 'size'> & {
+  taSize: TextAreaSize;
+};
+
+const StyledTextArea = styled.textarea<StyledTextAreaProps>`
   appearance: none;
-  border: none;
+  border: 1px solid;
+  border-color: ${props => props.theme.colors.interactive.tonal.neutral[2]};
   border-radius: 4px;
-  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.24);
   box-sizing: border-box;
-  min-height: 50px;
-  height: 80px;
-  font-size: 16px;
-  padding: 16px;
+  display: block;
+  min-height: ${props => textAreaGeometry[props.taSize].height}px;
+  height: ${props => textAreaGeometry[props.taSize].height}px;
+  padding: 8px 16px;
   outline: none;
   width: 100%;
+  background-color: transparent;
+  color: ${props => props.theme.colors.text.main};
 
-  ::placeholder {
-    opacity: 0.4;
+  ${props => props.theme.typography[textAreaGeometry[props.taSize].typography]}
+
+  &:hover {
+    border: 1px solid ${props => props.theme.colors.text.muted};
   }
 
-  :read-only {
+  &:focus-visible {
+    border-color: ${props =>
+      props.theme.colors.interactive.solid.primary.default};
+  }
+
+  &::placeholder {
+    color: ${props => props.theme.colors.text.muted};
+    opacity: 1;
+  }
+
+  &:read-only {
     cursor: not-allowed;
+
+    &:hover {
+      border: 1px solid
+        ${props => props.theme.colors.interactive.tonal.neutral[2]};
+    }
+
+    &:focus-visible {
+      border-color: ${props => props.theme.colors.interactive.tonal.neutral[2]};
+    }
   }
 
-  ${color} ${space} ${width} ${height} ${error} ${resize};
+  &:disabled {
+    background-color: ${props =>
+      props.theme.colors.interactive.tonal.neutral[0]};
+    color: ${props => props.theme.colors.text.disabled};
+    border-color: transparent;
+  }
+
+  ${color}
+  ${space}
+  ${width}
+  ${height}
+  ${error}
+  ${resize}
 `;
 
 function error({
@@ -55,19 +161,19 @@ function error({
   theme,
 }: Pick<TextAreaProps, 'hasError'> & {
   theme: any;
-}): CSSProperties {
+}) {
   if (!hasError) {
     return;
   }
 
   return {
-    border: `2px solid ${theme.colors.error.main}`,
-    padding: '10px 14px',
+    borderColor: theme.colors.interactive.solid.danger.default,
+    '&:hover': {
+      borderColor: theme.colors.interactive.solid.danger.default,
+    },
   };
 }
 
-function resize({
-  resizable,
-}: Pick<TextAreaProps, 'resizable'>): CSSProperties {
+function resize({ resizable }: Pick<TextAreaProps, 'resizable'>): CSSObject {
   return { resize: resizable ? 'vertical' : 'none' };
 }

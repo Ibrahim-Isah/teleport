@@ -1,32 +1,44 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package s3sessions
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/modules/modulestest"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
 
 func TestMain(m *testing.M) {
-	utils.InitLoggerForTests()
+	logtest.InitLogger(testing.Verbose)
 	os.Exit(m.Run())
 }
 
@@ -103,6 +115,37 @@ func TestConfig_SetFromURL(t *testing.T) {
 				require.Equal(t, types.ClusterAuditConfigSpecV2_FIPS_DISABLED, config.UseFIPSEndpoint)
 			},
 		},
+		{
+			name: "path style addressing enabled via url",
+			url:  "s3://path/bucket/adit?use_s3_virtual_style_addressing=false",
+			cfgAssertion: func(t *testing.T, config Config) {
+				require.False(t, config.UseVirtualStyleAddressing)
+			},
+		},
+		{
+			name: "path style addressing enabled by default",
+			url:  "s3://path/bucket/audit",
+			cfgAssertion: func(t *testing.T, config Config) {
+				require.False(t, config.UseVirtualStyleAddressing)
+			},
+		},
+		{
+			name: "path style addressing disabled via url",
+			url:  "s3://path/bucket/audit?use_s3_virtual_style_addressing=true",
+			cfgAssertion: func(t *testing.T, config Config) {
+				require.True(t, config.UseVirtualStyleAddressing)
+			},
+		},
+		{
+			name: "complete initiators",
+			url:  "s3://path/bucket/audit?complete_initiators=dev-usw2-role/tenant-foo&complete_initiators=dev-usw2-role/tenant-bar",
+			cfgAssertion: func(t *testing.T, config Config) {
+				require.ElementsMatch(t, config.CompleteInitiators, []string{
+					"dev-usw2-role/tenant-foo",
+					"dev-usw2-role/tenant-bar",
+				})
+			},
+		},
 	}
 
 	for _, tt := range cases {
@@ -112,6 +155,98 @@ func TestConfig_SetFromURL(t *testing.T) {
 			require.NoError(t, tt.cfg.SetFromURL(uri, "us-east-1"))
 
 			tt.cfgAssertion(t, tt.cfg)
+		})
+	}
+}
+
+func TestUploadMetadata(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}))
+
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	handler, err := NewHandler(context.Background(), Config{
+		Region:   "us-west-1",
+		Path:     "/test/",
+		Bucket:   "teleport-unit-tests",
+		Endpoint: server.URL,
+		CredentialsProvider: aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+			return aws.Credentials{}, nil
+		}),
+	})
+	require.NoError(t, err)
+	defer handler.Close()
+
+	meta := handler.GetUploadMetadata("test-session-id")
+	require.Equal(t, "s3://teleport-unit-tests/test/test-session-id", meta.URL)
+}
+
+func TestEndpoints(t *testing.T) {
+	tests := []struct {
+		name string
+		fips bool
+	}{
+		{
+			name: "fips",
+			fips: true,
+		},
+		{
+			name: "without fips",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fips := types.ClusterAuditConfigSpecV2_FIPS_DISABLED
+			if tt.fips {
+				fips = types.ClusterAuditConfigSpecV2_FIPS_ENABLED
+				modulestest.SetTestModules(t, modulestest.Modules{
+					FIPS: true,
+				})
+			}
+
+			var request *http.Request
+			var once sync.Once
+			mux := http.NewServeMux()
+			mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				once.Do(func() { request = r.Clone(context.Background()) })
+				w.WriteHeader(http.StatusTeapot)
+			}))
+
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+
+			handler, err := NewHandler(context.Background(), Config{
+				Region: "us-west-1",
+				Path:   "/test/",
+				Bucket: "teleport-unit-tests",
+				// The prefix is intentionally removed to validate that a scheme
+				// is applied automatically. This validates backwards compatible behavior
+				// with existing configurations and the behavior change from aws-sdk-go to aws-sdk-go-v2.
+				Endpoint:        strings.TrimPrefix(server.URL, "http://"),
+				UseFIPSEndpoint: fips,
+				Insecure:        true,
+				CredentialsProvider: aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+					return aws.Credentials{}, nil
+				}),
+			})
+			// FIPS mode should fail because it is a violation to enable FIPS
+			// while also setting a custom endpoint.
+			if tt.fips {
+				assert.Error(t, err)
+				require.ErrorContains(t, err, "FIPS")
+				return
+			}
+
+			require.NoError(t, err)
+			defer handler.Close()
+			require.NotNil(t, request.URL)
+			require.Equal(t, "/teleport-unit-tests", request.URL.Path)
 		})
 	}
 }

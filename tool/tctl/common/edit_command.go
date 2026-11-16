@@ -1,72 +1,114 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
 
-	"github.com/gravitational/kingpin"
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/gravitational/trace"
 	kyaml "k8s.io/apimachinery/pkg/util/yaml"
 
 	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/api/mfa"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/service"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
+	commonclient "github.com/gravitational/teleport/tool/tctl/common/client"
+	tctlcfg "github.com/gravitational/teleport/tool/tctl/common/config"
+	"github.com/gravitational/teleport/tool/tctl/common/resources"
 )
 
 // EditCommand implements the `tctl edit` command for modifying
 // Teleport resources.
 type EditCommand struct {
-	app    *kingpin.Application
-	cmd    *kingpin.CmdClause
-	config *service.Config
-	ref    services.Ref
+	app     *kingpin.Application
+	cmd     *kingpin.CmdClause
+	config  *servicecfg.Config
+	ref     string
+	id      string
+	confirm bool
+
+	// Editor is used by tests to inject the editing mechanism
+	// so that different scenarios can be asserted.
+	Editor func(filename string) error
 }
 
-func (e *EditCommand) Initialize(app *kingpin.Application, config *service.Config) {
+func (e *EditCommand) Initialize(app *kingpin.Application, _ *tctlcfg.GlobalCLIFlags, config *servicecfg.Config) {
 	e.app = app
 	e.config = config
-	e.cmd = app.Command("edit", "Edit a Teleport resource")
-	e.cmd.Arg("resource type/resource name", `Resource to update
-	<resource type>  Type of a resource [for example: rc]
-	<resource name>  Resource name to update
-	
-	Example:
-	$ tctl edit rc/remote`).SetValue(&e.ref)
+	e.cmd = app.Command("edit", "Edit a Teleport resource.")
+	e.cmd.Arg("resource type/resource name", `Resource to update, e.g., "user/myuser"`).StringVar(&e.ref)
+	e.cmd.Arg("id", `Resource identifier: scope-qualified name (e.g. "/staging/west::myrole") or bare name for unscoped kinds`).StringVar(&e.id)
+	e.cmd.Flag("confirm", "Confirm an unsafe or temporary resource update").Hidden().BoolVar(&e.confirm)
 }
 
-func (e *EditCommand) TryRun(ctx context.Context, cmd string, client auth.ClientI) (match bool, err error) {
+func (e *EditCommand) TryRun(ctx context.Context, cmd string, clientFunc commonclient.InitFunc) (bool, error) {
 	if cmd != e.cmd.FullCommand() {
 		return false, nil
 	}
+	client, closeFn, err := clientFunc(ctx)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+	defer closeFn(ctx)
+	err = e.editResource(ctx, client)
+	return true, trace.Wrap(err)
+}
 
+func (e *EditCommand) runEditor(ctx context.Context, name string) error {
+	if e.Editor != nil {
+		return trace.Wrap(e.Editor(name))
+	}
+
+	textEditor := getTextEditor()
+	args := strings.Fields(textEditor)
+	editorCmd := exec.CommandContext(ctx, args[0], append(args[1:], name)...)
+	editorCmd.Stdin = os.Stdin
+	editorCmd.Stdout = os.Stdout
+	editorCmd.Stderr = os.Stderr
+	if err := editorCmd.Start(); err != nil {
+		return trace.BadParameter("could not start editor %v: %v", textEditor, err)
+	}
+	if err := editorCmd.Wait(); err != nil {
+		return trace.BadParameter("skipping resource update, editor did not complete successfully: %v", err)
+	}
+
+	return nil
+}
+
+func (e *EditCommand) editResource(ctx context.Context, client *authclient.Client) error {
 	f, err := os.CreateTemp("", "teleport-resource*.yaml")
 	if err != nil {
-		return true, trace.Wrap(err)
+		return trace.Wrap(err)
 	}
 
 	defer func() {
@@ -76,74 +118,206 @@ func (e *EditCommand) TryRun(ctx context.Context, cmd string, client auth.Client
 	}()
 
 	rc := &ResourceCommand{
-		refs:        services.Refs{e.ref},
+		ref:         e.ref,
+		id:          e.id,
 		format:      teleport.YAML,
-		stdout:      f,
+		Stdout:      f,
 		filename:    f.Name(),
 		force:       true,
 		withSecrets: true,
+		confirm:     e.confirm,
 	}
-	rc.Initialize(e.app, e.config)
+	rc.Initialize(e.app, nil, e.config)
+
+	// Prompt for admin action MFA if required, before getting any
+	// resources with secrets and before the update/editor below.
+	if mfaResponse, err := mfa.PerformAdminActionMFACeremony(ctx, client.PerformMFACeremony, true /*allowReuse*/); err == nil {
+		ctx = mfa.ContextWithMFAResponse(ctx, mfaResponse)
+	} else if !errors.Is(err, &mfa.ErrMFANotRequired) && !errors.Is(err, &mfa.ErrMFANotSupported) {
+		return trace.Wrap(err)
+	}
+
+	// Build a user-facing resource descriptor that includes the id (SQN or bare
+	// name) when one was provided, so error messages reflect what the user typed.
+	resourceDesc := e.ref
+	if e.id != "" {
+		resourceDesc = e.ref + " " + e.id
+	}
 
 	err = rc.Get(ctx, client)
 	if closeErr := f.Close(); closeErr != nil {
-		return true, trace.Wrap(err)
+		return trace.Wrap(err)
 	}
 	if err != nil {
-		return true, trace.Wrap(err, "could not get resource %v: %v", rc.ref.String(), err)
+		return trace.Wrap(err, "could not get resource %v", resourceDesc)
 	}
 
 	originalSum, err := checksum(f.Name())
 	if err != nil {
-		return true, trace.Wrap(err)
+		return trace.Wrap(err)
 	}
 
-	originalName, err := resourceName(f.Name())
+	originalResources, err := editResources(f.Name())
 	if err != nil {
-		return true, trace.Wrap(err)
+		return trace.Wrap(err)
 	}
 
-	args := strings.Fields(editor())
-	editorCmd := exec.CommandContext(ctx, args[0], append(args[1:], f.Name())...)
-	editorCmd.Stdin = os.Stdin
-	editorCmd.Stdout = os.Stdout
-	editorCmd.Stderr = os.Stderr
-	if err := editorCmd.Start(); err != nil {
-		return true, trace.BadParameter("could not start editor %v: %v", editor(), err)
+	key := func(r services.UnknownResource) string {
+		return r.Kind + "/" + r.SubKind + "/" + r.GetName()
 	}
-	if err := editorCmd.Wait(); err != nil {
-		return true, trace.BadParameter("skipping resource update, editor did not complete successfully: %v", err)
+	originalResourcesMap := make(map[string][]byte)
+	for _, r := range originalResources {
+		originalResourcesMap[key(r)] = r.Raw
+	}
+	if len(originalResourcesMap) != len(originalResources) {
+		slog.DebugContext(ctx, "tctl edit clobbered resources on originalResourcesMap",
+			"ref", e.ref,
+			"id", e.id,
+			"original_resources_map_len", len(originalResourcesMap),
+			"original_resources_len", len(originalResources),
+		)
+		return trace.BadParameter(
+			"tctl edit cannot handle multiple resources of kind %q, please specify a single resource to edit",
+			e.ref,
+		)
+	}
+
+	if err := e.runEditor(ctx, f.Name()); err != nil {
+		return trace.Wrap(err)
 	}
 
 	newSum, err := checksum(f.Name())
 	if err != nil {
-		return true, trace.Wrap(err)
+		return trace.Wrap(err)
 	}
 
 	// nothing to do if the resource was not modified
 	if newSum == originalSum {
 		fmt.Println("edit canceled, no changes made")
-		return true, nil
+		return nil
 	}
 
-	newName, err := resourceName(f.Name())
+	newResources, err := editResources(f.Name())
 	if err != nil {
-		return true, trace.Wrap(err)
+		return trace.Wrap(err)
+	}
+	if len(newResources) != len(originalResources) {
+		return trace.BadParameter("one or more resources were added or removed, renaming resources is not supported with tctl edit")
 	}
 
-	if originalName != newName {
-		return true, trace.NotImplemented("renaming resources is not supported with tctl edit")
+	// Verify keying of new resources, similarly to originalResources.
+	newResourcesMap := make(map[string]struct{}, len(newResources))
+	for _, r := range newResources {
+		newResourcesMap[key(r)] = struct{}{}
+	}
+	if len(newResourcesMap) != len(newResources) {
+		return trace.BadParameter(
+			"one or more edited resources have duplicate kind/sub_kind/name keys, each resource must be unique")
 	}
 
-	if err := rc.Create(ctx, client); err != nil {
-		return true, trace.Wrap(err)
+	for _, newResource := range newResources {
+		// Ensure the resource name and kind was not changed.
+		origRaw, ok := originalResourcesMap[key(newResource)]
+		if !ok {
+			return trace.BadParameter("resource %s/%s was added or removed, renaming resources is not supported with tctl edit", newResource.Kind, newResource.Metadata.Name)
+		}
+
+		if bytes.Equal(origRaw, newResource.Raw) {
+			// Nothing changed for this resource, continue to the next one.
+			slog.DebugContext(ctx, "Resource was not modified", "resource", key(newResource))
+			continue
+		}
+
+		opts := resources.CreateOpts{
+			Force:   rc.force,
+			Confirm: rc.confirm,
+		}
+
+		// Try looking for a resource handler
+		if resourceHandler, found := resources.Handlers()[newResource.Kind]; found {
+			if err := editUpdateWithFallback(ctx, client, resourceHandler, newResource, opts); err != nil {
+				return trace.Wrap(err)
+			}
+			continue
+		}
+
+		// Try looking for a scoped resource handler
+		if scopedHandler, found := resources.ScopedHandlers()[newResource.Kind]; found {
+			if err := editUpdateWithFallbackScoped(ctx, client, scopedHandler, newResource, opts); err != nil {
+				return trace.Wrap(err)
+			}
+			continue
+		}
+
+		// Else fallback to the legacy logic
+
+		// Use the UpdateHandler if the resource has one, otherwise fallback to using
+		// the CreateHandler. UpdateHandlers are preferred over CreateHandler because an update
+		// will not forcibly overwrite a resource unlike with create which requires the force
+		// flag to be set to update an existing resource.
+		if updator, found := rc.UpdateHandlers[newResource.Kind]; found {
+			if err := updator(ctx, client, newResource); err != nil {
+				return trace.Wrap(err)
+			}
+			continue
+		}
+
+		// TODO(tross) remove the fallback to CreateHandlers once all the resources
+		// have been updated to implement an UpdateHandler.
+		if creator, found := rc.CreateHandlers[newResource.Kind]; found {
+			if err := creator(ctx, client, newResource); err != nil {
+				return trace.Wrap(err)
+			}
+			continue
+		}
+		return trace.BadParameter("updating resources of type %q is not supported", newResource.Kind)
 	}
 
-	return true, nil
+	return nil
 }
 
-// editor gets the text editor to be used for editing the resource
-func editor() string {
+func editUpdateWithFallback(
+	ctx context.Context,
+	client *authclient.Client,
+	resourceHandler resources.Handler,
+	resource services.UnknownResource,
+	opts resources.CreateOpts,
+) error {
+	err := resourceHandler.Update(ctx, client, resource, opts)
+	if err == nil || !trace.IsNotImplemented(err) {
+		return trace.Wrap(err)
+	}
+
+	// TODO(tross) remove the fallback to CreateHandlers once all the resources
+	// have been updated to implement an UpdateHandler.
+	if err := resourceHandler.Create(ctx, client, resource, opts); trace.IsNotImplemented(err) {
+		return trace.BadParameter("updating resources of type %q is not supported", resource.Kind)
+	} else {
+		return trace.Wrap(err)
+	}
+}
+
+func editUpdateWithFallbackScoped(
+	ctx context.Context,
+	client *authclient.Client,
+	handler resources.ScopedHandler,
+	resource services.UnknownResource,
+	opts resources.CreateOpts,
+) error {
+	err := handler.Update(ctx, client, resource, opts)
+	if err == nil || !trace.IsNotImplemented(err) {
+		return trace.Wrap(err)
+	}
+
+	if err := handler.Create(ctx, client, resource, opts); trace.IsNotImplemented(err) {
+		return trace.BadParameter("updating resources of type %q is not supported", resource.Kind)
+	} else {
+		return trace.Wrap(err)
+	}
+}
+
+// getTextEditor returns the text editor to be used for editing the resource.
+func getTextEditor() string {
 	for _, v := range []string{"TELEPORT_EDITOR", "VISUAL", "EDITOR"} {
 		if value := os.Getenv(v); value != "" {
 			return value
@@ -153,7 +327,7 @@ func editor() string {
 }
 
 func checksum(filename string) (string, error) {
-	f, err := utils.OpenFile(filename)
+	f, err := utils.OpenFileAllowingUnsafeLinks(filename)
 	if err != nil {
 		return "", trace.Wrap(err)
 	}
@@ -167,19 +341,26 @@ func checksum(filename string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func resourceName(filename string) (string, error) {
-	f, err := utils.OpenFile(filename)
+func editResources(filename string) ([]services.UnknownResource, error) {
+	f, err := utils.OpenFileAllowingUnsafeLinks(filename)
 	if err != nil {
-		return "", trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
 	defer f.Close()
 
 	decoder := kyaml.NewYAMLOrJSONDecoder(f, defaults.LookaheadBufSize)
 
-	var raw services.UnknownResource
-	if err := decoder.Decode(&raw); err != nil {
-		return "", trace.Wrap(err)
-	}
+	names := make([]services.UnknownResource, 0)
+	for {
+		var raw services.UnknownResource
+		switch err := decoder.Decode(&raw); {
+		case errors.Is(err, io.EOF):
+			return names, nil
+		case err != nil:
+			return nil, trace.Wrap(err)
+		default:
+			names = append(names, raw)
+		}
 
-	return raw.GetName(), nil
+	}
 }

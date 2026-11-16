@@ -18,30 +18,55 @@ package types
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/gravitational/trace"
 
+	"github.com/gravitational/teleport/api/types/compare"
 	"github.com/gravitational/teleport/api/utils"
 )
+
+var _ compare.IsEqual[UserGroup] = (*UserGroupV1)(nil)
 
 // UserGroup specifies an externally sourced group.
 type UserGroup interface {
 	ResourceWithLabels
+
+	// GetApplications will return a list of application IDs associated with the user group.
+	GetApplications() []string
+	// SetApplications will set the list of application IDs associated with the user group.
+	SetApplications([]string)
+	// Clone creates a copy of the group.
+	Clone() UserGroup
+	// IsEqual determines if two user group resources are equivalent to one another.
+	IsEqual(UserGroup) bool
 }
 
 var _ ResourceWithLabels = (*UserGroupV1)(nil)
 
 // NewUserGroup returns a new UserGroup.
-func NewUserGroup(metadata Metadata) (UserGroup, error) {
+func NewUserGroup(metadata Metadata, spec UserGroupSpecV1) (UserGroup, error) {
 	g := &UserGroupV1{
 		ResourceHeader: ResourceHeader{
 			Metadata: metadata,
 		},
+		Spec: spec,
 	}
 	if err := g.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return g, nil
+}
+
+// GetApplications will return a list of application IDs associated with the user group.
+func (g *UserGroupV1) GetApplications() []string {
+	return g.Spec.Applications
+}
+
+// SetApplications will set the list of application IDs associated with the user group.
+func (g *UserGroupV1) SetApplications(applications []string) {
+	g.Spec.Applications = applications
 }
 
 // String returns the user group string representation.
@@ -53,7 +78,7 @@ func (g *UserGroupV1) String() string {
 // MatchSearch goes through select field values and tries to
 // match against the list of search values.
 func (g *UserGroupV1) MatchSearch(values []string) bool {
-	fieldVals := append(utils.MapToStrings(g.GetAllLabels()), g.GetName())
+	fieldVals := append(utils.MapToStrings(g.GetAllLabels()), g.GetName(), g.GetMetadata().Description)
 	return MatchSearch(fieldVals, values, nil)
 }
 
@@ -73,6 +98,19 @@ func (g *UserGroupV1) CheckAndSetDefaults() error {
 	return nil
 }
 
+// IsEqual determines if two user group resources are equivalent to one another.
+func (g *UserGroupV1) IsEqual(i UserGroup) bool {
+	if other, ok := i.(*UserGroupV1); ok {
+		return deriveTeleportEqualUserGroupV1(g, other)
+	}
+	return false
+}
+
+// Clone creates a copy of the group.
+func (g *UserGroupV1) Clone() UserGroup {
+	return utils.CloneProtoMsg(g)
+}
+
 // UserGroups is a list of UserGroup resources.
 type UserGroups []UserGroup
 
@@ -83,6 +121,56 @@ func (g UserGroups) AsResources() []ResourceWithLabels {
 		resources[i] = group
 	}
 	return resources
+}
+
+// SortByCustom custom sorts by given sort criteria.
+func (g UserGroups) SortByCustom(sortBy SortBy) error {
+	if sortBy.Field == "" {
+		return nil
+	}
+
+	isDesc := sortBy.IsDesc
+	switch sortBy.Field {
+	case ResourceMetadataName:
+		sort.SliceStable(g, func(i, j int) bool {
+			groupA := g[i]
+			groupB := g[j]
+
+			groupAName := FriendlyName(groupA)
+			groupBName := FriendlyName(groupB)
+
+			if groupAName == "" {
+				groupAName = groupA.GetName()
+			}
+			if groupBName == "" {
+				groupBName = groupB.GetName()
+			}
+
+			return stringCompare(strings.ToLower(groupAName), strings.ToLower(groupBName), isDesc)
+		})
+	case ResourceSpecDescription:
+		sort.SliceStable(g, func(i, j int) bool {
+			groupA := g[i]
+			groupB := g[j]
+
+			groupADescription := groupA.GetMetadata().Description
+			groupBDescription := groupB.GetMetadata().Description
+
+			if oktaDescription, ok := groupA.GetLabel(OktaGroupDescriptionLabel); ok {
+				groupADescription = oktaDescription
+			}
+			if oktaDescription, ok := groupB.GetLabel(OktaGroupDescriptionLabel); ok {
+				groupBDescription = oktaDescription
+			}
+
+			return stringCompare(strings.ToLower(groupADescription), strings.ToLower(groupBDescription), isDesc)
+		})
+
+	default:
+		return trace.NotImplemented("sorting by field %q for resource %q is not supported", sortBy.Field, KindKubeServer)
+	}
+
+	return nil
 }
 
 // Len returns the slice length.

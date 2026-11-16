@@ -6,6 +6,7 @@
         "authentication",
         "enterprise",
         "operator",
+        "global",
         "podSecurityPolicy",
         "labels",
         "chartMode",
@@ -19,6 +20,7 @@
         "affinity",
         "nodeSelector",
         "annotations",
+        "extraContainers",
         "extraVolumes",
         "extraVolumeMounts",
         "imagePullPolicy",
@@ -32,6 +34,20 @@
             "$id": "#/properties/clusterName",
             "type": "string",
             "default": ""
+        },
+        "nameOverride": {
+            "$id": "#/properties/nameOverride",
+            "type": "string",
+            "default": ""
+        },
+        "proxyProtocol": {
+            "$id": "#/properties/proxyProtocol",
+            "type": "string",
+            "default": "",
+            "enum": [
+                "off",
+                "on"
+            ]
         },
         "auth": {
             "$id": "#/properties/auth",
@@ -49,7 +65,9 @@
         "podMonitor": {
             "$id": "#/properties/podMonitor",
             "type": "object",
-            "required": ["enabled"],
+            "required": [
+                "enabled"
+            ],
             "properties": {
                 "enabled": {
                     "$id": "#/properties/podMonitor/enabled",
@@ -59,8 +77,12 @@
                 "additionalLabels": {
                     "$id": "#/properties/podMonitor/additionalLabels",
                     "type": "object",
-                    "default": {"prometheus": "default"},
-                    "additionalProperties": {"type": "string"}
+                    "default": {
+                        "prometheus": "default"
+                    },
+                    "additionalProperties": {
+                        "type": "string"
+                    }
                 },
                 "interval": {
                     "$id": "#/properties/podMonitor/interval",
@@ -72,7 +94,10 @@
         "authentication": {
             "$id": "#/properties/authentication",
             "type": "object",
-            "required": ["type", "localAuth"],
+            "required": [
+                "type",
+                "localAuth"
+            ],
             "properties": {
                 "type": {
                     "$id": "#/properties/authentication/properties/type",
@@ -97,8 +122,27 @@
                 "secondFactor": {
                     "$id": "#/properties/authentication/properties/secondFactor",
                     "type": "string",
-                    "enum": ["off", "on", "otp", "optional", "webauthn"],
+                    "enum": [
+                        "off",
+                        "on",
+                        "otp",
+                        "optional",
+                        "webauthn"
+                    ],
                     "default": "otp"
+                },
+                "secondFactors": {
+                    "$id": "#/properties/authentication/properties/secondFactors",
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "otp",
+                            "sso",
+                            "webauthn"
+                        ]
+                    },
+                    "default": []
                 },
                 "webauthn": {
                     "$id": "#/properties/authentication/properties/webauthn",
@@ -131,7 +175,13 @@
                 "secondFactor": {
                     "$id": "#/properties/authenticationSecondFactor/properties/secondFactor",
                     "type": "string",
-                    "enum": ["off", "on", "otp", "optional", "webauthn"],
+                    "enum": [
+                        "off",
+                        "on",
+                        "otp",
+                        "optional",
+                        "webauthn"
+                    ],
                     "default": "otp"
                 },
                 "webauthn": {
@@ -254,14 +304,35 @@
             "type": "boolean",
             "default": false
         },
+        "licenseSecretName": {
+            "$id": "#/properties/licenseSecretName",
+            "type": "string",
+            "default": "license"
+        },
         "installCRDs": {
             "$id": "#/properties/installCRDs",
             "type": "boolean"
         },
+        "global": {
+            "$id": "#/properties/global",
+            "type": "object",
+            "required": [
+                "clusterDomain"
+            ],
+            "properties": {
+                "clusterDomain": {
+                    "$id": "#/properties/global/properties/clusterDomain",
+                    "type": "string",
+                    "default": "cluster.local"
+                }
+            }
+        },
         "operator": {
             "$id": "#/properties/operator",
             "type": "object",
-            "required": ["enabled"],
+            "required": [
+                "enabled"
+            ],
             "properties": {
                 "enabled": {
                     "$id": "#/properties/operator/properties/enabled",
@@ -305,6 +376,7 @@
             "enum": [
                 "standalone",
                 "aws",
+                "azure",
                 "gcp",
                 "scratch"
             ],
@@ -349,6 +421,11 @@
                 },
                 "existingClaimName": {
                     "$id": "#/properties/persistence/properties/existingClaimName",
+                    "type": "string",
+                    "default": ""
+                },
+                "storageClassName": {
+                    "$id": "#/properties/persistence/properties/storageClassName",
                     "type": "string",
                     "default": ""
                 },
@@ -463,6 +540,52 @@
                 }
             }
         },
+        "azure": {
+            "$id": "#/properties/azure",
+            "type": "object",
+            "properties": {
+                "databaseHost": {
+                    "$id": "#/properties/azure/properties/databaseHost",
+                    "type": "string",
+                    "default": ""
+                },
+                "databaseUser": {
+                    "$id": "#/properties/azure/properties/databaseUser",
+                    "type": "string",
+                    "default": ""
+                },
+                "backendDatabase": {
+                    "$id": "#/properties/azure/properties/backendDatabase",
+                    "type": "string",
+                    "default": "teleport_backend"
+                },
+                "auditLogDatabase": {
+                    "$id": "#/properties/azure/properties/auditLogDatabase",
+                    "type": "string",
+                    "default": "teleport_audit"
+                },
+                "auditLogMirrorOnStdout": {
+                    "$id": "#/properties/azure/properties/auditLogMirrorOnStdout",
+                    "type": "boolean",
+                    "default": false
+                },
+                "sessionRecordingStorageAccount": {
+                    "$id": "#/properties/azure/properties/sessionRecordingStorageAccount",
+                    "type": "string",
+                    "default": ""
+                },
+                "clientID": {
+                    "$id": "#/properties/azure/properties/clientID",
+                    "type": "string",
+                    "default": ""
+                },
+                "databasePoolMaxConnections": {
+                    "$id": "#/properties/azure/properties/databasePoolMaxConnections",
+                    "type": "integer",
+                    "default": 0
+                }
+            }
+        },
         "gcp": {
             "$id": "#/properties/gcp",
             "type": "object",
@@ -535,6 +658,11 @@
                             "type": "boolean",
                             "default": "false"
                         },
+                        "addPublicAddrs": {
+                            "$id": "#/properties/highAvailability/properties/certManager/properties/addPublicAddrs",
+                            "type": "boolean",
+                            "default": "false"
+                        },
                         "enabled": {
                             "$id": "#/properties/highAvailability/properties/certManager/properties/enabled",
                             "type": "boolean",
@@ -589,7 +717,8 @@
             "type": "object",
             "required": [
                 "existingSecretName",
-                "existingCASecretName"
+                "existingCASecretName",
+                "existingCASecretKeyName"
             ],
             "properties": {
                 "existingSecretName": {
@@ -601,18 +730,28 @@
                     "$id": "#/properties/tls/properties/existingCASecretName",
                     "type": "string",
                     "default": ""
+                },
+                "existingCASecretKeyName": {
+                    "$id": "#/properties/tls/properties/existingCASecretKeyName",
+                    "type": "string",
+                    "default": "ca.pem"
                 }
             }
         },
         "image": {
             "$id": "#/properties/image",
             "type": "string",
-            "default": "public.ecr.aws/gravitational/teleport"
+            "default": "public.ecr.aws/gravitational/teleport-distroless"
         },
         "enterpriseImage": {
             "$id": "#/properties/enterpriseImage",
             "type": "string",
-            "default": "public.ecr.aws/gravitational/teleport-ent"
+            "default": "public.ecr.aws/gravitational/teleport-ent-distroless"
+        },
+        "imagePullSecrets": {
+            "$id": "#/properties/imagePullSecrets",
+            "type": "array",
+            "default": []
         },
         "logLevel": {
             "$id": "#/properties/logLevel",
@@ -638,23 +777,29 @@
                 "level": {
                     "$id": "#/properties/log/properties/level",
                     "type": "string",
-                    "enum": ["DEBUG", "INFO", "WARN", "WARNING", "ERROR"],
+                    "enum": [
+                        "DEBUG",
+                        "INFO",
+                        "WARN",
+                        "WARNING",
+                        "ERROR"
+                    ],
                     "default": "INFO"
                 },
-                "deployment": {
+                "output": {
                     "$id": "#/properties/log/properties/output",
                     "type": "string",
-                    "default": {}
+                    "default": "stderr"
                 },
-                "pod": {
+                "format": {
                     "$id": "#/properties/log/properties/format",
                     "type": "string",
-                    "default": {}
+                    "default": "text"
                 },
-                "service": {
+                "extraFields": {
                     "$id": "#/properties/log/properties/extraFields",
                     "type": "array",
-                    "default": {}
+                    "default": ["timestamp","level","component","caller"]
                 }
             }
         },
@@ -677,7 +822,8 @@
                 "pod",
                 "service",
                 "serviceAccount",
-                "certSecret"
+                "certSecret",
+                "ingress"
             ],
             "properties": {
                 "config": {
@@ -709,6 +855,11 @@
                     "$id": "#/properties/annotations/properties/certSecret",
                     "type": "object",
                     "default": {}
+                },
+                "ingress": {
+                    "$id": "#/properties/annotations/properties/ingress",
+                    "type": "object",
+                    "default": {}
                 }
             }
         },
@@ -729,6 +880,28 @@
                     "type": "object",
                     "default": {}
                 }
+            }
+        },
+        "ingress": {
+            "enabled": {
+                "$id": "#/properties/ingress/enabled",
+                "type": "boolean",
+                "default": false
+            },
+            "suppressAutomaticWildcards": {
+                "$id": "#/properties/ingress/suppressAutomaticWildcards",
+                "type": "boolean",
+                "default": false
+            },
+            "useExisting": {
+                "$id": "#/properties/ingress/useExisting",
+                "type": "boolean",
+                "default": false
+            },
+            "spec": {
+                "$id": "#/properties/ingress/spec",
+                "type": "object",
+                "default": {}
             }
         },
         "serviceAccount": {
@@ -770,6 +943,11 @@
             "type": "array",
             "default": []
         },
+        "extraContainers": {
+            "$id": "#/properties/extraContainers",
+            "type": "array",
+            "default": []
+        },
         "extraVolumes": {
             "$id": "#/properties/extraVolumes",
             "type": "array",
@@ -779,6 +957,11 @@
             "$id": "#/properties/extraVolumeMounts",
             "type": "array",
             "default": []
+        },
+        "extraLabels": {
+            "$id": "#/properties/extraLabels",
+            "type": "object",
+            "default": {}
         },
         "imagePullPolicy": {
             "$id": "#/properties/imagePullPolicy",
@@ -819,6 +1002,21 @@
             "type": "object",
             "default": {}
         },
+        "jobResources": {
+            "$id": "#/properties/jobResources",
+            "type": "object",
+            "default": {}
+        },
+        "goMemLimitRatio": {
+            "$id": "#/properties/goMemLimitRatio",
+            "type": "number",
+            "default": 0.9
+        },
+        "podSecurityContext": {
+            "$id": "#/properties/podSecurityContext",
+            "type": "object",
+            "default": {}
+        },
         "securityContext": {
             "$id": "#/properties/securityContext",
             "type": "object",
@@ -828,6 +1026,11 @@
             "$id": "#/properties/tolerations",
             "type": "array",
             "default": []
+        },
+        "disableTopologySpreadConstraints": {
+            "$id": "#/properties/disableTopologySpreadConstraints",
+            "type": "boolean",
+            "default": false
         },
         "priorityClassName": {
             "$id": "#/properties/priorityClassName",
@@ -843,6 +1046,38 @@
             "$id": "#/properties/terminationGracePeriodSeconds",
             "type": "integer",
             "default": 60
+        },
+        "topologySpreadConstraints": {
+            "$id": "#/properties/topologySpreadConstraints",
+            "type": "array",
+            "default": []
+        },
+        "readinessProbe": {
+            "$id": "#/properties/readinessProbe",
+            "type": "object",
+            "default": {},
+            "properties": {
+                "initialDelaySeconds": {
+                    "$id": "#/properties/readinessProbe/properties/initialDelaySeconds",
+                    "type": "integer",
+                    "default": 5
+                },
+                "periodSeconds": {
+                    "$id": "#/properties/readinessProbe/properties/periodSeconds",
+                    "type": "integer",
+                    "default": 5
+                },
+                "failureThreshold": {
+                    "$id": "#/properties/readinessProbe/properties/failureThreshold",
+                    "type": "integer",
+                    "default": 12
+                },
+                "successThreshold": {
+                    "$id": "#/properties/readinessProbe/properties/successThreshold",
+                    "type": "integer",
+                    "default": 1
+                }
+            }
         }
     }
 }

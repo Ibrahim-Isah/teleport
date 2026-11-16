@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package service
 
@@ -34,6 +36,7 @@ var (
 	ListenerDiagnostic = ListenerType(teleport.ComponentDiagnostic)
 	ListenerProxyKube  = ListenerType(teleport.Component(teleport.ComponentProxy, "kube"))
 	ListenerKube       = ListenerType(teleport.ComponentKube)
+	ListenerDebug      = ListenerType(teleport.ComponentDebug)
 	// Proxy can use the same listener for tunnels and web interface
 	// (multiplexing the requests).
 	ListenerProxyTunnelAndWeb = ListenerType(teleport.Component(teleport.ComponentProxy, "tunnel", "web"))
@@ -45,7 +48,21 @@ var (
 	ListenerProxyPeer         = ListenerType(teleport.Component(teleport.ComponentProxy, "peer"))
 	ListenerMetrics           = ListenerType(teleport.ComponentMetrics)
 	ListenerWindowsDesktop    = ListenerType(teleport.ComponentWindowsDesktop)
+	ListenerLinuxDesktop      = ListenerType(teleport.ComponentLinuxDesktop)
+	ListenerRelayTransport    = ListenerType(teleport.Component(teleport.ComponentRelay, "transport"))
+	ListenerRelayPeer         = ListenerType(teleport.Component(teleport.ComponentRelay, "peer"))
+	ListenerRelayTunnel       = ListenerType(teleport.Component(teleport.ComponentRelay, "tunnel"))
 )
+
+// Network returns the network used by the listener.
+func (l ListenerType) Network() string {
+	switch l {
+	case ListenerDebug:
+		return "unix"
+	default:
+		return "tcp"
+	}
+}
 
 // AuthAddr returns auth server endpoint, if configured and started.
 func (process *TeleportProcess) AuthAddr() (*utils.NetAddr, error) {

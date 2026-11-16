@@ -20,11 +20,13 @@ package types
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"time"
 
 	"github.com/gravitational/trace"
 
+	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/utils"
 )
 
@@ -49,9 +51,19 @@ type AccessRequest interface {
 	// GetAccessExpiry gets the expiration time for the elevated certificate
 	// that will be issued if the Access Request is approved.
 	GetAccessExpiry() time.Time
+	// GetAssumeStartTime gets the time the roles can be assumed
+	// if the Access Request is approved.
+	GetAssumeStartTime() *time.Time
+	// SetAssumeStartTime sets the time the roles can be assumed
+	// if the Access Request is approved.
+	SetAssumeStartTime(time.Time)
 	// SetAccessExpiry sets the expiration time for the elevated certificate
 	// that will be issued if the Access Request is approved.
 	SetAccessExpiry(time.Time)
+	// GetSessionTLL gets the session TTL for generated certificates.
+	GetSessionTLL() time.Time
+	// SetSessionTLL sets the session TTL for generated certificates.
+	SetSessionTLL(time.Time)
 	// GetRequestReason gets the reason for the request's creation.
 	GetRequestReason() string
 	// SetRequestReason sets the reason for the request's creation.
@@ -86,10 +98,25 @@ type AccessRequest interface {
 	GetReviews() []AccessReview
 	// SetReviews sets the list of currently applied access reviews (internal use only).
 	SetReviews([]AccessReview)
+	// GetPromotedAccessListName returns the access list name that this access request
+	// was promoted to.
+	GetPromotedAccessListName() string
+	// SetPromotedAccessListName sets the access list name that this access request
+	// was promoted to.
+	SetPromotedAccessListName(name string)
+	// GetPromotedAccessListTitle returns the access list title that this access request
+	// was promoted to.
+	GetPromotedAccessListTitle() string
+	// SetPromotedAccessListTitle sets the access list title that this access request
+	// was promoted to.
+	SetPromotedAccessListTitle(string)
 	// GetSuggestedReviewers gets the suggested reviewer list.
 	GetSuggestedReviewers() []string
 	// SetSuggestedReviewers sets the suggested reviewer list.
 	SetSuggestedReviewers([]string)
+	// GetReferencedUsers returns the usernames referenced by this request: the
+	// requester, review authors, and suggested reviewers.
+	GetReferencedUsers() []string
 	// GetRequestedResourceIDs gets the resource IDs to which access is being requested.
 	GetRequestedResourceIDs() []ResourceID
 	// SetRequestedResourceIDs sets the resource IDs to which access is being requested.
@@ -98,35 +125,151 @@ type AccessRequest interface {
 	GetLoginHint() string
 	// SetLoginHint sets the requested login hint.
 	SetLoginHint(string)
+	// GetMaxDuration gets the maximum time at which the access should be approved for.
+	GetMaxDuration() time.Time
+	// SetMaxDuration sets the maximum time at which the access should be approved for.
+	SetMaxDuration(time.Time)
 	// GetDryRun returns true if this request should not be created and is only
 	// a dry run to validate request capabilities.
 	GetDryRun() bool
 	// SetDryRun sets the dry run flag on the request.
 	SetDryRun(bool)
+	// GetDryRunEnrichment gets the dry run enrichment data.
+	GetDryRunEnrichment() *AccessRequestDryRunEnrichment
+	// SetDryRunEnrichment sets the dry run enrichment data.
+	SetDryRunEnrichment(*AccessRequestDryRunEnrichment)
+	// GetRequestKind gets the kind of request.
+	GetRequestKind() AccessRequestKind
+	// SetRequestKind sets the kind (short/long-term) of request.
+	SetRequestKind(AccessRequestKind)
+	// Copy returns a copy of the access request resource.
+	Copy() AccessRequest
+	// GetLongTermResourceGrouping gets the long-term resource grouping, if present.
+	GetLongTermResourceGrouping() *LongTermResourceGrouping
+	// SetLongTermResourceGrouping sets the long-term resource grouping.
+	SetLongTermResourceGrouping(*LongTermResourceGrouping)
+	// GetRequestedResourceAccessIDs gets the resourceAccessIDs to which access is being requested.
+	GetRequestedResourceAccessIDs() []ResourceAccessID
+	// SetRequestedResourceAccessIDs sets the resourceAccessIDs to which access is being requested.
+	SetRequestedResourceAccessIDs([]ResourceAccessID)
+	// GetAllRequestedResourceIDs get all requested resources, in [ResourceAccessID]-form.
+	GetAllRequestedResourceIDs() []ResourceAccessID
+	// IsEqual determines if two access requests are equivalent to one another.
+	IsEqual(AccessRequest) bool
 }
 
 // NewAccessRequest assembles an AccessRequest resource.
 func NewAccessRequest(name string, user string, roles ...string) (AccessRequest, error) {
-	return NewAccessRequestWithResources(name, user, roles, []ResourceID{})
+	return NewAccessRequestWithResources(name, user, roles, []ResourceAccessID{})
 }
 
 // NewAccessRequestWithResources assembles an AccessRequest resource with
 // requested resources.
-func NewAccessRequestWithResources(name string, user string, roles []string, resourceIDs []ResourceID) (AccessRequest, error) {
+func NewAccessRequestWithResources(name string, user string, roles []string, resources []ResourceAccessID) (AccessRequest, error) {
+	resourceIDs, resourceAccessIDs := UnwrapResourceAccessIDs(resources)
 	req := AccessRequestV3{
 		Metadata: Metadata{
 			Name: name,
 		},
 		Spec: AccessRequestSpecV3{
-			User:                 user,
-			Roles:                utils.CopyStrings(roles),
-			RequestedResourceIDs: append([]ResourceID{}, resourceIDs...),
+			User:                       user,
+			Roles:                      slices.Clone(roles),
+			RequestedResourceIDs:       append([]ResourceID{}, resourceIDs...),
+			RequestedResourceAccessIDs: append([]ResourceAccessID{}, resourceAccessIDs...),
 		},
 	}
 	if err := req.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return &req, nil
+}
+
+// IsEqual determines if two access requests are equivalent to one another.
+// The Revision field is ignored during comparison.
+func (r *AccessRequestV3) IsEqual(other AccessRequest) bool {
+	if r == nil && other == nil {
+		return true
+	}
+
+	otherv3, ok := other.(*AccessRequestV3)
+	if !ok {
+		return false
+	}
+
+	if r == nil && otherv3 == nil {
+		return true
+	}
+
+	if !deriveTeleportEqualAccessRequestV3(r, otherv3) {
+		return false
+	}
+
+	// The derived equality function skips RequestedResourceAccessIDs entirely
+	// because the ResourceConstraints.Details oneof interface is not handled by
+	// goderive. Compare it manually here.
+	if !resourceAccessIDsEqual(r.Spec.RequestedResourceAccessIDs, otherv3.Spec.RequestedResourceAccessIDs) {
+		return false
+	}
+
+	return true
+}
+
+// resourceAccessIDsEqual compares two ResourceAccessID slices independent of
+// ordering. This is necessary because goderive cannot handle the oneof
+// Details field on ResourceConstraints.
+func resourceAccessIDsEqual(a, b []ResourceAccessID) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for i := range a {
+		if !resourceAccessIDEqual(&a[i], &b[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// resourceAccessIDEqual compares all fields of two ResourceAccessIDs.
+// goderive handles all fields except the Details oneof on ResourceConstraints
+// must be checked manually.
+func resourceAccessIDEqual(a, b *ResourceAccessID) bool {
+	if !deriveTeleportEqualResourceAccessID(a, b) {
+		return false
+	}
+	return resourceConstraintsDetailsEqual(a.Constraints, b.Constraints)
+}
+
+// resourceConstraintsDetailsEqual compares the Details oneof field of two
+// ResourceConstraints. The oneof interface is not handled by goderive, so
+// this must be done manually.
+func resourceConstraintsDetailsEqual(a, b *ResourceConstraints) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	switch av := a.Details.(type) {
+	case *ResourceConstraints_AwsConsole:
+		bv, ok := b.Details.(*ResourceConstraints_AwsConsole)
+		if !ok {
+			return false
+		}
+		if av == nil || bv == nil {
+			return av == bv
+		}
+		return deriveTeleportEqualAWSConsoleResourceConstraints(av.AwsConsole, bv.AwsConsole)
+	case *ResourceConstraints_Ssh:
+		bv, ok := b.Details.(*ResourceConstraints_Ssh)
+		if !ok {
+			return false
+		}
+		if av == nil || bv == nil {
+			return av == bv
+		}
+		return deriveTeleportEqualSSHResourceConstraints(av.Ssh, bv.Ssh)
+	default:
+		return a.Details == nil && b.Details == nil
+	}
 }
 
 // GetUser gets User
@@ -151,12 +294,10 @@ func (r *AccessRequestV3) GetState() RequestState {
 
 // SetState sets State
 func (r *AccessRequestV3) SetState(state RequestState) error {
-	if r.Spec.State.IsDenied() {
-		if state.IsDenied() {
-			return nil
-		}
-		return trace.BadParameter("cannot set request-state %q (already denied)", state.String())
+	if r.GetState() != state && r.GetState().IsResolved() {
+		return trace.BadParameter("cannot set request-state %q (already %s)", state.String(), r.GetState().String())
 	}
+
 	r.Spec.State = state
 	return nil
 }
@@ -168,7 +309,7 @@ func (r *AccessRequestV3) GetCreationTime() time.Time {
 
 // SetCreationTime sets CreationTime
 func (r *AccessRequestV3) SetCreationTime(t time.Time) {
-	r.Spec.Created = t
+	r.Spec.Created = t.UTC()
 }
 
 // GetAccessExpiry gets AccessExpiry
@@ -176,9 +317,29 @@ func (r *AccessRequestV3) GetAccessExpiry() time.Time {
 	return r.Spec.Expires
 }
 
+// GetAssumeStartTime gets AssumeStartTime
+func (r *AccessRequestV3) GetAssumeStartTime() *time.Time {
+	return r.Spec.AssumeStartTime
+}
+
+// SetAssumeStartTime sets AssumeStartTime
+func (r *AccessRequestV3) SetAssumeStartTime(t time.Time) {
+	r.Spec.AssumeStartTime = &t
+}
+
 // SetAccessExpiry sets AccessExpiry
 func (r *AccessRequestV3) SetAccessExpiry(expiry time.Time) {
-	r.Spec.Expires = expiry
+	r.Spec.Expires = expiry.UTC()
+}
+
+// GetSessionTLL gets SessionTLL
+func (r *AccessRequestV3) GetSessionTLL() time.Time {
+	return r.Spec.SessionTTL
+}
+
+// SetSessionTLL sets SessionTLL
+func (r *AccessRequestV3) SetSessionTLL(t time.Time) {
+	r.Spec.SessionTTL = t.UTC()
 }
 
 // GetRequestReason gets RequestReason
@@ -261,7 +422,12 @@ func (r *AccessRequestV3) SetRoleThresholdMapping(rtm map[string]ThresholdIndexS
 
 // SetReviews sets the list of currently applied access reviews.
 func (r *AccessRequestV3) SetReviews(revs []AccessReview) {
-	r.Spec.Reviews = revs
+	utcRevs := make([]AccessReview, len(revs))
+	for i, rev := range revs {
+		utcRevs[i] = rev
+		utcRevs[i].Created = rev.Created.UTC()
+	}
+	r.Spec.Reviews = utcRevs
 }
 
 // GetReviews gets the list of currently applied access reviews.
@@ -277,6 +443,48 @@ func (r *AccessRequestV3) GetSuggestedReviewers() []string {
 // SetSuggestedReviewers sets the suggested reviewer list.
 func (r *AccessRequestV3) SetSuggestedReviewers(reviewers []string) {
 	r.Spec.SuggestedReviewers = reviewers
+}
+
+// GetReferencedUsers returns the usernames referenced by this request: the
+// requester, review authors, and suggested reviewers.
+func (r *AccessRequestV3) GetReferencedUsers() []string {
+	usernames := []string{r.GetUser()}
+	for _, review := range r.GetReviews() {
+		usernames = append(usernames, review.Author)
+	}
+	return append(usernames, r.GetSuggestedReviewers()...)
+}
+
+// GetPromotedAccessListName returns PromotedAccessListName.
+func (r *AccessRequestV3) GetPromotedAccessListName() string {
+	if r.Spec.AccessList == nil {
+		return ""
+	}
+	return r.Spec.AccessList.Name
+}
+
+// SetPromotedAccessListName sets PromotedAccessListName.
+func (r *AccessRequestV3) SetPromotedAccessListName(name string) {
+	if r.Spec.AccessList == nil {
+		r.Spec.AccessList = &PromotedAccessList{}
+	}
+	r.Spec.AccessList.Name = name
+}
+
+// GetPromotedAccessListTitle returns PromotedAccessListTitle.
+func (r *AccessRequestV3) GetPromotedAccessListTitle() string {
+	if r.Spec.AccessList == nil {
+		return ""
+	}
+	return r.Spec.AccessList.Title
+}
+
+// SetPromotedAccessListTitle sets PromotedAccessListTitle.
+func (r *AccessRequestV3) SetPromotedAccessListTitle(title string) {
+	if r.Spec.AccessList == nil {
+		r.Spec.AccessList = &PromotedAccessList{}
+	}
+	r.Spec.AccessList.Title = title
 }
 
 // setStaticFields sets static resource header and metadata fields.
@@ -315,13 +523,26 @@ func (r *AccessRequestV3) CheckAndSetDefaults() error {
 	if r.Spec.RequestedResourceIDs == nil {
 		r.Spec.RequestedResourceIDs = []ResourceID{}
 	}
-	if len(r.GetRoles()) == 0 && len(r.GetRequestedResourceIDs()) == 0 {
+	if r.Spec.RequestedResourceAccessIDs == nil {
+		r.Spec.RequestedResourceAccessIDs = []ResourceAccessID{}
+	}
+	if len(r.GetRoles()) == 0 && len(r.GetAllRequestedResourceIDs()) == 0 {
 		return trace.BadParameter("access request does not specify any roles or resources")
 	}
 
 	// dedupe and sort roles to simplify comparing role lists
 	r.Spec.Roles = utils.Deduplicate(r.Spec.Roles)
 	sort.Strings(r.Spec.Roles)
+
+	// If an Access Request is resource-constrained exclusively via RequestedResourceAccessIDs,
+	// we add a non-matching sentinel ResourceID into RequestedResourceIDs.
+	// This prevents authorization paths that only parse AllowedResourceIDs and ignore AllowedResourceAccessIDs
+	// on certs (e.g., older Auths in mixed-version clusters) from interpreting an empty AllowedResourceIDs slice as
+	// "no resource-specific restrictions".
+	// TODO(kiosion): DELETE in 21.0.0
+	if len(r.Spec.RequestedResourceIDs) == 0 && len(r.Spec.RequestedResourceAccessIDs) > 0 {
+		r.Spec.RequestedResourceIDs = []ResourceID{CreateSentinelResourceID()}
+	}
 
 	return nil
 }
@@ -358,12 +579,17 @@ func (r *AccessRequestV3) SetName(name string) {
 
 // Expiry gets Expiry
 func (r *AccessRequestV3) Expiry() time.Time {
+	// Fallback on existing expiry in metadata if not set in spec.
+	if r.Spec.ResourceExpiry != nil {
+		return *r.Spec.ResourceExpiry
+	}
 	return r.Metadata.Expiry()
 }
 
 // SetExpiry sets Expiry
 func (r *AccessRequestV3) SetExpiry(expiry time.Time) {
-	r.Metadata.SetExpiry(expiry)
+	t := expiry.UTC()
+	r.Spec.ResourceExpiry = &t
 }
 
 // GetMetadata gets Metadata
@@ -371,24 +597,63 @@ func (r *AccessRequestV3) GetMetadata() Metadata {
 	return r.Metadata
 }
 
-// GetResourceID gets ResourceID
-func (r *AccessRequestV3) GetResourceID() int64 {
-	return r.Metadata.GetID()
+// GetRevision returns the revision
+func (r *AccessRequestV3) GetRevision() string {
+	return r.Metadata.GetRevision()
 }
 
-// SetResourceID sets ResourceID
-func (r *AccessRequestV3) SetResourceID(id int64) {
-	r.Metadata.SetID(id)
+// SetRevision sets the revision
+func (r *AccessRequestV3) SetRevision(rev string) {
+	r.Metadata.SetRevision(rev)
 }
 
 // GetRequestedResourceIDs gets the resource IDs to which access is being requested.
 func (r *AccessRequestV3) GetRequestedResourceIDs() []ResourceID {
-	return append([]ResourceID{}, r.Spec.RequestedResourceIDs...)
+	ids := make([]ResourceID, 0, len(r.Spec.RequestedResourceIDs))
+	for _, id := range r.Spec.RequestedResourceIDs {
+		if !IsSentinelResourceID(id) {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // SetRequestedResourceIDs sets the resource IDs to which access is being requested.
 func (r *AccessRequestV3) SetRequestedResourceIDs(ids []ResourceID) {
 	r.Spec.RequestedResourceIDs = append([]ResourceID{}, ids...)
+}
+
+// GetRequestedResourceAccessIDs gets the resourceAccessIDs to which access is being requested.
+func (r *AccessRequestV3) GetRequestedResourceAccessIDs() []ResourceAccessID {
+	return append([]ResourceAccessID{}, r.Spec.RequestedResourceAccessIDs...)
+}
+
+// SetRequestedResourceAccessIDs sets the resourceAccessIDs to which access is being requested.
+func (r *AccessRequestV3) SetRequestedResourceAccessIDs(ids []ResourceAccessID) {
+	r.Spec.RequestedResourceAccessIDs = append([]ResourceAccessID{}, ids...)
+}
+
+// GetAllRequestedResourceIDs gets all [ResourceAccessID]-based representations
+// of requested resources, merging the spec's RequestedResourceIDs and
+// RequestedResourceAccessIDs fields without deduplication. The two spec fields
+// are deduplicated against each other when the request is created, with
+// constrained entries taking precedence. To merge the equivalent parallel
+// fields on API request parameters, which are not validated this way, use
+// [CombineAsResourceAccessIDs] instead.
+func (r *AccessRequestV3) GetAllRequestedResourceIDs() []ResourceAccessID {
+	wrapped := make([]ResourceAccessID, 0, len(r.Spec.RequestedResourceIDs)+len(r.Spec.RequestedResourceAccessIDs))
+	for _, rid := range r.Spec.RequestedResourceIDs {
+		// AllowedResourceIDs may contain a non-matching sentinel whose sole purpose is to prevent
+		// authorization paths (e.g., older versions operating in mixed-version clusters) that ignore
+		// AllowedResourceAccessIDs from treating an otherwise resource-scoped identity as unconstrained.
+		//
+		// It should be filtered out here, as it's not a real "requested resource".
+		if !IsSentinelResourceID(rid) {
+			wrapped = append(wrapped, ResourceAccessID{Id: rid})
+		}
+	}
+	wrapped = append(wrapped, r.Spec.RequestedResourceAccessIDs...)
+	return wrapped
 }
 
 // GetLoginHint gets the requested login hint.
@@ -407,9 +672,71 @@ func (r *AccessRequestV3) GetDryRun() bool {
 	return r.Spec.DryRun
 }
 
+// GetMaxDuration gets the maximum time at which the access should be approved for.
+func (r *AccessRequestV3) GetMaxDuration() time.Time {
+	return r.Spec.MaxDuration
+}
+
+// SetMaxDuration sets the maximum time at which the access should be approved for.
+func (r *AccessRequestV3) SetMaxDuration(t time.Time) {
+	r.Spec.MaxDuration = t
+}
+
 // SetDryRun sets the dry run flag on the request.
 func (r *AccessRequestV3) SetDryRun(dryRun bool) {
 	r.Spec.DryRun = dryRun
+}
+
+// GetDryRunEnrichment gets the dry run enrichment data.
+func (r *AccessRequestV3) GetDryRunEnrichment() *AccessRequestDryRunEnrichment {
+	return r.Spec.DryRunEnrichment
+}
+
+// SetDryRunEnrichment sets the dry run enrichment data.
+func (r *AccessRequestV3) SetDryRunEnrichment(enrichment *AccessRequestDryRunEnrichment) {
+	r.Spec.DryRunEnrichment = enrichment
+}
+
+// GetRequestKind gets the kind of request.
+func (r *AccessRequestV3) GetRequestKind() AccessRequestKind {
+	return r.Spec.RequestKind
+}
+
+// SetRequestKind sets the kind (short/long-term) of request.
+func (r *AccessRequestV3) SetRequestKind(kind AccessRequestKind) {
+	r.Spec.RequestKind = kind
+}
+
+// GetLongTermResourceGrouping gets the long-term resource grouping, if present.
+func (r *AccessRequestV3) GetLongTermResourceGrouping() *LongTermResourceGrouping {
+	return r.Spec.LongTermGrouping
+}
+
+// SetLongTermResourceGrouping sets the long-term resource grouping suggestion.
+func (r *AccessRequestV3) SetLongTermResourceGrouping(grouping *LongTermResourceGrouping) {
+	r.Spec.LongTermGrouping = grouping
+}
+
+// IsLongTerm checks if the request kind is long-term.
+func (a AccessRequestKind) IsLongTerm() bool {
+	return a == AccessRequestKind_LONG_TERM
+}
+
+// IsShortTerm checks if the request kind is explicitly short-term, or is undefined.
+func (a AccessRequestKind) IsShortTerm() bool {
+	return a != AccessRequestKind_LONG_TERM
+}
+
+// Copy returns a copy of the access request resource.
+func (r *AccessRequestV3) Copy() AccessRequest {
+	return utils.CloneProtoMsg(r)
+}
+
+// GetLabel retrieves the label with the provided key. If not found
+// value will be empty and ok will be false.
+func (r *AccessRequestV3) GetLabel(key string) (value string, ok bool) {
+	v, ok := r.Metadata.Labels[key]
+	return v, ok
 }
 
 // GetStaticLabels returns the access request static labels.
@@ -430,8 +757,17 @@ func (r *AccessRequestV3) GetAllLabels() map[string]string {
 // MatchSearch goes through select field values and tries to
 // match against the list of search values.
 func (r *AccessRequestV3) MatchSearch(values []string) bool {
-	fieldVals := append(utils.MapToStrings(r.GetAllLabels()), r.GetName())
-	return MatchSearch(fieldVals, values, nil)
+	return MatchSearch(r.SearchableFields(), values, nil)
+}
+
+// SearchableFields returns the stored access request values used for search.
+func (r *AccessRequestV3) SearchableFields() []string {
+	fieldVals := append(utils.MapToStrings(r.GetAllLabels()), r.GetName(), r.GetUser())
+	fieldVals = append(fieldVals, r.GetRoles()...)
+	for _, resource := range r.GetRequestedResourceIDs() {
+		fieldVals = append(fieldVals, resource.Name)
+	}
+	return fieldVals
 }
 
 // Origin returns the origin value of the resource.
@@ -469,6 +805,27 @@ func (s AccessReview) Check() error {
 	return nil
 }
 
+// GetAccessListName returns the access list name used for the promotion.
+func (s AccessReview) GetAccessListName() string {
+	if s.AccessList == nil {
+		return ""
+	}
+	return s.AccessList.Name
+}
+
+// GetAccessListTitle returns the access list title used for the promotion.
+func (s AccessReview) GetAccessListTitle() string {
+	if s.AccessList == nil {
+		return ""
+	}
+	return s.AccessList.Title
+}
+
+// IsEqual t is equivalent to the provide AccessReviewThreshold.
+func (t *AccessReviewThreshold) IsEqual(o *AccessReviewThreshold) bool {
+	return deriveTeleportEqualAccessReviewThreshold(t, o)
+}
+
 // AccessRequestUpdate encompasses the parameters of a
 // SetAccessRequestState call.
 type AccessRequestUpdate struct {
@@ -489,6 +846,9 @@ type AccessRequestUpdate struct {
 	// and must be a subset of the role list originally
 	// present on the request.
 	Roles []string
+	// AssumeStartTime sets the time the requestor can assume
+	// the requested roles.
+	AssumeStartTime *time.Time
 }
 
 // Check validates the request's fields
@@ -503,6 +863,47 @@ func (u *AccessRequestUpdate) Check() error {
 		return trace.BadParameter("cannot override roles when setting state: %s", u.State)
 	}
 	return nil
+}
+
+// RequestReasonMode can be either "required" or "optional". Empty-string is treated as "optional".
+// If a role has the request reason mode set to "required", then reason is required for all Access
+// Requests requesting roles or resources allowed by this role. It applies only to users who have
+// this role assigned.
+type RequestReasonMode string
+
+const (
+	// RequestReasonModeRequired indicates required mode. See [[RequestReasonMode]] godoc for
+	// more details.
+	RequestReasonModeRequired RequestReasonMode = "required"
+	// RequestReasonModeRequired indicates optional mode. See [[RequestReasonMode]] godoc for
+	// more details.
+	RequestReasonModeOptional RequestReasonMode = "optional"
+)
+
+var allRequestReasonModes = []RequestReasonMode{
+	RequestReasonModeRequired,
+	RequestReasonModeOptional,
+}
+
+// Required checks if this mode is "required". Empty mode is treated as "optional".
+func (m RequestReasonMode) Required() bool {
+	switch m {
+	case RequestReasonModeRequired:
+		return true
+	default:
+		return false
+	}
+}
+
+// Check validates this mode value. Note that an empty value is considered invalid.
+func (m RequestReasonMode) Check() error {
+	for _, x := range allRequestReasonModes {
+		if m == x {
+			return nil
+		}
+	}
+	return trace.BadParameter("unrecognized request reason mode %q, must be one of: %v",
+		m, allRequestReasonModes)
 }
 
 // RequestStrategy is an indicator of how access requests
@@ -546,11 +947,12 @@ func (s RequestStrategy) RequireReason() bool {
 
 // stateVariants allows iteration of the expected variants
 // of RequestState.
-var stateVariants = [4]RequestState{
+var stateVariants = [5]RequestState{
 	RequestState_NONE,
 	RequestState_PENDING,
 	RequestState_APPROVED,
 	RequestState_DENIED,
+	RequestState_PROMOTED,
 }
 
 // Parse attempts to interpret a value as a string representation
@@ -585,9 +987,14 @@ func (s RequestState) IsDenied() bool {
 	return s == RequestState_DENIED
 }
 
+// IsPromoted returns true is the request in the PROMOTED state.
+func (s RequestState) IsPromoted() bool {
+	return s == RequestState_PROMOTED
+}
+
 // IsResolved request state
 func (s RequestState) IsResolved() bool {
-	return s.IsApproved() || s.IsDenied()
+	return s.IsApproved() || s.IsDenied() || s.IsPromoted()
 }
 
 // key values for map encoding of request filter
@@ -631,8 +1038,46 @@ func (f *AccessRequestFilter) FromMap(m map[string]string) error {
 	return nil
 }
 
+func hasReviewed(req AccessRequest, author string) bool {
+	reviews := req.GetReviews()
+	var reviewers []string
+	for _, review := range reviews {
+		reviewers = append(reviewers, review.Author)
+	}
+	return slices.Contains(reviewers, author)
+}
+
 // Match checks if a given access request matches this filter.
 func (f *AccessRequestFilter) Match(req AccessRequest) bool {
+	// only return if the request was made by the api requester
+	if f.Scope == AccessRequestScope_MY_REQUESTS && req.GetUser() != f.Requester {
+		return false
+	}
+	// a user cannot review their own requests
+	if f.Scope == AccessRequestScope_NEEDS_REVIEW {
+		if req.GetUser() == f.Requester {
+			return false
+		}
+		if req.GetState() != RequestState_PENDING {
+			return false
+		}
+		if hasReviewed(req, f.Requester) {
+			return false
+		}
+	}
+	// only match if the api requester has submit a review
+	if f.Scope == AccessRequestScope_REVIEWED {
+		// users cant review their own requests so we can early return
+		if req.GetUser() == f.Requester {
+			return false
+		}
+		if !hasReviewed(req, f.Requester) {
+			return false
+		}
+	}
+	if !req.MatchSearch(f.SearchKeywords) {
+		return false
+	}
 	if f.ID != "" && req.GetName() != f.ID {
 		return false
 	}
@@ -673,3 +1118,36 @@ func (a AccessRequests) Less(i, j int) bool { return a[i].GetName() < a[j].GetNa
 
 // Swap swaps two access requests.
 func (a AccessRequests) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+
+// NewAccessRequestAllowedPromotions returns a new AccessRequestAllowedPromotions resource.
+func NewAccessRequestAllowedPromotions(promotions []*AccessRequestAllowedPromotion) *AccessRequestAllowedPromotions {
+	if promotions == nil {
+		promotions = make([]*AccessRequestAllowedPromotion, 0)
+	}
+
+	return &AccessRequestAllowedPromotions{
+		Promotions: promotions,
+	}
+}
+
+// ValidateAssumeStartTime returns error if start time is in an invalid range.
+func ValidateAssumeStartTime(assumeStartTime time.Time, accessExpiry time.Time, creationTime time.Time) error {
+	// Guard against requesting a start time before the request creation time.
+	if assumeStartTime.Before(creationTime) {
+		return trace.BadParameter("assume start time has to be after %v", creationTime.Format(time.RFC3339))
+	}
+	// Guard against requesting a start time after access expiry.
+	if assumeStartTime.After(accessExpiry) || assumeStartTime.Equal(accessExpiry) {
+		return trace.BadParameter("assume start time must be prior to access expiry time at %v",
+			accessExpiry.Format(time.RFC3339))
+	}
+	// Access expiry can be greater than constants.MaxAssumeStartDuration, but start time
+	// should be on or before constants.MaxAssumeStartDuration.
+	maxAssumableStartTime := creationTime.Add(constants.MaxAssumeStartDuration)
+	if maxAssumableStartTime.Before(accessExpiry) && assumeStartTime.After(maxAssumableStartTime) {
+		return trace.BadParameter("assume start time is too far in the future, latest time allowed is %v",
+			maxAssumableStartTime.Format(time.RFC3339))
+	}
+
+	return nil
+}

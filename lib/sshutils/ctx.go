@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package sshutils
 
@@ -28,7 +30,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 
-	"github.com/gravitational/teleport/lib/teleagent"
+	"github.com/gravitational/teleport/session/networking"
 )
 
 // ConnectionContext manages connection-level state.
@@ -54,6 +56,10 @@ type ConnectionContext struct {
 	// when handling node-side connections for users with MaxSessions applied.
 	sessions int64
 
+	// networkingProcess is a lazily initialized connection to the subprocess that
+	// handles connection-level networking requests. e.g. port/agent forwarding.
+	networkingProcess *networking.Process
+
 	// closers is a list of io.Closer that will be called when session closes
 	// this is handy as sometimes client closes session, in this case resources
 	// will be properly closed and deallocated, otherwise they could be kept hanging.
@@ -67,6 +73,9 @@ type ConnectionContext struct {
 
 	// clientLastActive records the last time there was activity from the client.
 	clientLastActive time.Time
+
+	// UserCreatedByTeleport is true when the system user was created by Teleport user auto-provision.
+	UserCreatedByTeleport bool
 
 	clock clockwork.Clock
 }
@@ -99,16 +108,16 @@ func NewConnectionContext(ctx context.Context, nconn net.Conn, sconn *ssh.Server
 	return ctx, ccx
 }
 
-// agentChannel implements the extended teleteleagent.Agent interface,
-// allowing the underlying ssh.Channel to be closed when the agent
-// is no longer needed.
-type agentChannel struct {
+// AgentChannel implements the [agent.ExtendedAgent] and [io.Closer]
+// interfaces, allowing the underlying ssh.Channel to be closed when
+// the agent is no longer needed.
+type AgentChannel struct {
 	agent.ExtendedAgent
 	ch ssh.Channel
 }
 
 // Close closes the agent channel.
-func (a *agentChannel) Close() error {
+func (a *AgentChannel) Close() error {
 	// For graceful teardown, close the write part of the channel first. This
 	// will send "EOF" packet (type 96) to the other side which will drain and
 	// close the channel.
@@ -129,17 +138,19 @@ func (a *agentChannel) Close() error {
 // StartAgentChannel sets up a new agent forwarding channel against this connection.  The channel
 // is automatically closed when either ConnectionContext, or the supplied context.Context
 // gets canceled.
-func (c *ConnectionContext) StartAgentChannel() (teleagent.Agent, error) {
+func (c *ConnectionContext) StartAgentChannel() (*AgentChannel, error) {
 	// refuse to start an agent if forwardAgent has not yet been set.
 	if !c.GetForwardAgent() {
-		return nil, trace.AccessDenied("agent forwarding required in proxy recording mode")
+		return nil, trace.AccessDenied("agent forwarding has not been requested")
 	}
 	// open a agent channel to client
-	ch, _, err := c.ServerConn.OpenChannel(AuthAgentRequest, nil)
+	ch, reqC, err := c.ServerConn.OpenChannel(AuthAgentRequest, nil)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return &agentChannel{
+	go ssh.DiscardRequests(reqC)
+	go io.Copy(io.Discard, ch.Stderr())
+	return &AgentChannel{
 		ExtendedAgent: agent.NewClient(ch),
 		ch:            ch,
 	}, nil
@@ -234,6 +245,26 @@ func (c *ConnectionContext) AddCloser(closer io.Closer) {
 		return
 	}
 	c.closers = append(c.closers, closer)
+}
+
+// SetNetworkingProcess attempts to registers a networking process. If a
+// different process was concurrently registered, ok is false and the previously
+// registered process is returned.
+func (c *ConnectionContext) SetNetworkingProcess(proc *networking.Process) (*networking.Process, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.networkingProcess != nil {
+		return c.networkingProcess, false
+	}
+	c.networkingProcess = proc
+	return proc, true
+}
+
+// GetNetworkingProcess gets the registered networking process if one exists.
+func (c *ConnectionContext) GetNetworkingProcess() (*networking.Process, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.networkingProcess, c.networkingProcess != nil
 }
 
 // takeClosers returns all resources that should be closed and sets the properties to null

@@ -1,141 +1,155 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { app } from 'electron';
 
-import Logger from 'teleterm/logger';
-import { staticConfig } from 'teleterm/staticConfig';
-
-import { GrpcServerAddresses, RuntimeSettings } from './types';
 import { loadInstallationId } from './loadInstallationId';
+import { getAvailableShells, getDefaultShell } from './shell';
+import { GrpcServerAddresses, RuntimeSettings } from './types';
 
 const { argv, env } = process;
 
 const RESOURCES_PATH = app.isPackaged
   ? process.resourcesPath
-  : path.join(__dirname, '../../../../');
+  : path.join(import.meta.dirname, '../../..');
 
+// Optional root directory for app data; when set, Connect stores `home`, `userData`, and `sessionData` under this path.
+// Used in e2e tests.
+const CONNECT_DATA_DIR_ENV_VAR = 'CONNECT_DATA_DIR';
 const TSH_BIN_ENV_VAR = 'CONNECT_TSH_BIN_PATH';
-// __dirname of this file in dev mode is webapps/packages/teleterm/build/app/dist/main
-// We default to webapps/../teleport/build/tsh.
+// import.meta.dirname of this file in dev mode is teleport/web/packages/teleterm/build/app/main
+// We default to teleport/build/tsh.
 // prettier-ignore
 const TSH_BIN_DEFAULT_PATH_FOR_DEV = path.resolve(
-  __dirname,
-  '..', '..', '..', '..', '..', '..', '..', '..',
-  'teleport', 'build', 'tsh',
+  import.meta.dirname,
+  '..', '..', '..', '..', '..', '..',
+  'build', process.platform === 'win32' ? 'tsh.exe' : 'tsh',
 );
 
-const dev = env.NODE_ENV === 'development' || env.DEBUG_PROD === 'true';
+// Refer to the docs of RuntimeSettings type for an explanation behind dev, debug and insecure.
+const dev = env.NODE_ENV === 'development';
+// --debug is reserved by Node, so we have to use another flag.
+const debug = argv.includes('--connect-debug') || dev;
+const insecure =
+  argv.includes('--insecure') ||
+  // --insecure is already in our docs, but let's add --connect-insecure too in case Node or
+  // Electron reserves it one day.
+  argv.includes('--connect-insecure') ||
+  // The flag is needed because it's not easy to pass a flag to the app in dev mode. `pnpm
+  // start-term` causes a bunch of package scripts to be executed and each would have to pass the
+  // flag one level down.
+  (dev && !!env.CONNECT_INSECURE);
 
-// Allows running tsh in insecure mode (development)
-const isInsecure = dev || argv.includes('--insecure');
-
-function getRuntimeSettings(): RuntimeSettings {
-  const userDataDir = app.getPath('userData');
-  const {
-    tsh: tshAddress,
-    shared: sharedAddress,
-    tshdEvents: tshdEventsAddress,
-  } = requestGrpcServerAddresses();
+export async function getRuntimeSettings(): Promise<RuntimeSettings> {
+  const envDataDir = process.env[CONNECT_DATA_DIR_ENV_VAR];
+  const homeDir = envDataDir
+    ? path.join(envDataDir, 'home')
+    : app.getPath('home');
+  const userDataDir = envDataDir
+    ? path.join(envDataDir, 'userData')
+    : app.getPath('userData');
+  const sessionDataDir = envDataDir
+    ? path.join(envDataDir, 'sessionData')
+    : app.getPath('sessionData');
+  const tempDataDir = app.getPath('temp');
+  const [grpcAddresses, kubeConfigsDir, certsDir, availableShells] =
+    await Promise.all([
+      requestGrpcServerAddresses(),
+      getKubeConfigsDir(userDataDir),
+      getCertsDir(userDataDir),
+      getAvailableShells(),
+    ]);
   const { binDir, tshBinPath } = getBinaryPaths();
+  const { username } = os.userInfo();
+  const hostname = os.hostname();
+  // TODO(ravicious): Replace with app.getPath('logs'). We started storing logs under a custom path.
+  // Before switching to the recommended path, we need to investigate the impact of this change.
+  // https://www.electronjs.org/docs/latest/api/app#appgetpathname
+  const logsDir = path.join(userDataDir, 'logs');
+  const installationId = loadInstallationId(
+    path.resolve(userDataDir, 'installation_id')
+  );
 
   const tshd = {
-    insecure: isInsecure,
     binaryPath: tshBinPath,
-    homeDir: getTshHomeDir(),
-    requestedNetworkAddress: tshAddress,
-    flags: [
-      'daemon',
-      'start',
-      // grpc-js requires us to pass localhost:port for TCP connections,
-      // for tshd we have to specify the protocol as well.
-      `--addr=${tshAddress}`,
-      `--certs-dir=${getCertsDir()}`,
-      `--prehog-addr=${staticConfig.prehogAddress}`,
-    ],
+    defaultHomeDir: path.resolve(homeDir, '.tsh'),
+    requestedNetworkAddress: grpcAddresses.tsh,
   };
   const sharedProcess = {
-    requestedNetworkAddress: sharedAddress,
+    requestedNetworkAddress: grpcAddresses.shared,
   };
   const tshdEvents = {
-    requestedNetworkAddress: tshdEventsAddress,
+    requestedNetworkAddress: grpcAddresses.tshdEvents,
   };
 
-  if (isInsecure) {
-    tshd.flags.unshift('--debug');
-    tshd.flags.unshift('--insecure');
-  }
+  // To start the app in dev mode, we run `electron path_to_main.js`. It means
+  // that the app is run without package.json context, so it can not read the version
+  // from it.
+  // The way we run Electron can be changed (`electron .`), but it has one major
+  // drawback - dev app and bundled app will use the same app data directory.
+  //
+  // A workaround is to read the version from `process.env.npm_package_version`.
+  const appVersion = dev ? process.env.npm_package_version : app.getVersion();
 
   return {
     dev,
+    debug,
+    insecure,
     tshd,
     sharedProcess,
     tshdEvents,
+    homeDir,
     userDataDir,
+    sessionDataDir,
+    tempDataDir,
     binDir,
-    certsDir: getCertsDir(),
-    defaultShell: getDefaultShell(),
-    kubeConfigsDir: getKubeConfigsDir(),
+    agentBinaryPath: path.resolve(sessionDataDir, 'teleport', 'teleport'),
+    certsDir,
+    availableShells,
+    defaultOsShellId: getDefaultShell(availableShells),
+    kubeConfigsDir,
+    logsDir,
     platform: process.platform,
-    installationId: loadInstallationId(
-      path.resolve(app.getPath('userData'), 'installation_id')
-    ),
+    installationId,
     arch: os.arch(),
     osVersion: os.release(),
-    // To start the app in dev mode we run `electron path_to_main.js`. It means
-    // that app is run without package.json context, so it can not read the version
-    // from it.
-    // The way we run Electron can be changed (`electron .`), but it has one major
-    // drawback - dev app and bundled app will use the same app data directory.
-    //
-    // A workaround is to read the version from `process.env.npm_package_version`.
-    appVersion: dev ? process.env.npm_package_version : app.getVersion(),
+    appVersion,
+    isLocalBuild: appVersion === '1.0.0-dev',
+    username,
+    hostname,
   };
 }
 
-function getCertsDir() {
-  const certsPath = path.resolve(app.getPath('userData'), 'certs');
-  if (!fs.existsSync(certsPath)) {
-    fs.mkdirSync(certsPath);
-  }
-  if (fs.readdirSync(certsPath)) {
-    fs.rmSync(certsPath, { force: true, recursive: true });
-    fs.mkdirSync(certsPath);
-  }
+async function getCertsDir(userDataDir: string): Promise<string> {
+  const certsPath = path.resolve(userDataDir, 'certs');
+  await fs.promises.rm(certsPath, { recursive: true, force: true });
+  await fs.promises.mkdir(certsPath, { recursive: true });
   return certsPath;
 }
 
-function getKubeConfigsDir(): string {
-  const kubeConfigsPath = path.resolve(app.getPath('userData'), 'kube');
-  if (!fs.existsSync(kubeConfigsPath)) {
-    fs.mkdirSync(kubeConfigsPath);
-  }
+async function getKubeConfigsDir(userDataDir: string): Promise<string> {
+  const kubeConfigsPath = path.resolve(userDataDir, 'kube');
+  await fs.promises.mkdir(kubeConfigsPath, { recursive: true });
   return kubeConfigsPath;
-}
-
-function getTshHomeDir() {
-  const tshPath = path.resolve(app.getPath('userData'), 'tsh');
-  if (!fs.existsSync(tshPath)) {
-    fs.mkdirSync(tshPath);
-  }
-  return tshPath;
 }
 
 // binDir is used in the packaged version to add tsh to PATH.
@@ -183,37 +197,14 @@ function getBinaryPaths(): { binDir?: string; tshBinPath: string } {
   return { tshBinPath };
 }
 
-function getAssetPath(...paths: string[]): string {
-  return path.join(RESOURCES_PATH, 'assets', ...paths);
-}
-
-function getDefaultShell(): string {
-  const logger = new Logger();
-  switch (process.platform) {
-    case 'linux':
-    case 'darwin': {
-      const fallbackShell = 'bash';
-      const { shell } = os.userInfo();
-
-      if (!shell) {
-        logger.error(
-          `Failed to read ${process.platform} platform default shell, using fallback: ${fallbackShell}.\n`
-        );
-
-        return fallbackShell;
-      }
-
-      return shell;
-    }
-    case 'win32':
-      return 'powershell.exe';
-  }
+export function getAssetPath(...paths: string[]): string {
+  return path.join(RESOURCES_PATH, 'build_resources', ...paths);
 }
 
 /**
  * Describes what addresses the gRPC servers should attempt to obtain on app startup.
  */
-function requestGrpcServerAddresses(): GrpcServerAddresses {
+async function requestGrpcServerAddresses(): Promise<GrpcServerAddresses> {
   switch (process.platform) {
     case 'win32': {
       return {
@@ -224,23 +215,33 @@ function requestGrpcServerAddresses(): GrpcServerAddresses {
     }
     case 'linux':
     case 'darwin':
+      // Sockets are created in a temporary directory to avoid exceeding the
+      // maximum allowed path length for Unix domain sockets.
+      // Limits: macOS - 104 characters, Linux - 108 characters.
+      const tempDir = await getUnixUserTempDir();
       return {
-        tsh: getUnixSocketNetworkAddress('tsh.socket'),
-        shared: getUnixSocketNetworkAddress('shared.socket'),
-        tshdEvents: getUnixSocketNetworkAddress('tshd_events.socket'),
+        tsh: getUnixSocketPath(tempDir, 'tsh.sock'),
+        shared: getUnixSocketPath(tempDir, 'shared.sock'),
+        tshdEvents: getUnixSocketPath(tempDir, 'tshde.sock'),
       };
   }
 }
 
-function getUnixSocketNetworkAddress(socketName: string) {
-  const unixSocketPath = path.resolve(app.getPath('userData'), socketName);
-
-  // try to cleanup after previous process that unexpectedly crashed
-  if (fs.existsSync(unixSocketPath)) {
-    fs.unlinkSync(unixSocketPath);
-  }
-
-  return `unix://${path.resolve(app.getPath('userData'), socketName)}`;
+function getUnixSocketPath(tempDir: string, socketName: string): string {
+  const socketPath = path.join(tempDir, socketName);
+  return `unix://${socketPath}`;
 }
 
-export { getRuntimeSettings, getAssetPath };
+async function getUnixUserTempDir(): Promise<string> {
+  // On macOS, the 'temp' dir is like /var/folders/y5/yqg8xz555_v7xfsr0wn6b4q80000gn/T/.
+  // That dir is per-user and secure by default.
+  // On Linux the temp dir is like /tmp, and it's accessible by anyone.
+  const tempDir = app.getPath('temp');
+  const appName = app.getName();
+  // `mkdtemp` creates a temporary directory with mode 0o700,
+  // ensuring that only the current user can access it (important on Linux).
+  // TODO(gzdunek): Node.js 24 introduced mkdtempDisposable().
+  // Create a global DisposableStack to track all disposable resources
+  // and automatically clean them up when the app exits.
+  return fs.promises.mkdtemp(path.join(tempDir, `${appName}-`));
+}

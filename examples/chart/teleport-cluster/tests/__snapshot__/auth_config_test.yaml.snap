@@ -1,6 +1,7 @@
 adds a proxy token by default:
   1: |
     |
+      ---
       kind: token
       version: v2
       metadata:
@@ -12,13 +13,137 @@ adds a proxy token by default:
         kubernetes:
           allow:
             - service_account: "NAMESPACE:RELEASE-NAME-proxy"
+configures access monitoring when its values are set:
+  1: |
+    |-
+      auth_service:
+        access_monitoring:
+          enabled: true
+          report_results: s3://example-athena-long-term/report_results
+          role_arn: arn:aws:iam::123456789012:role/example_AccessMonitoringRole
+          workgroup: example_access_monitoring_workgroup
+        authentication:
+          local_auth: true
+          second_factors:
+          - otp
+          - webauthn
+          type: local
+          webauthn:
+            rp_id: test-aws-cluster
+        cluster_name: test-aws-cluster
+        enabled: true
+        proxy_listener_mode: separate
+      kubernetes_service:
+        enabled: true
+        kube_cluster_name: test-aws-cluster
+        listen_addr: 0.0.0.0:3026
+        public_addr: RELEASE-NAME-auth.NAMESPACE.svc.cluster.local:3026
+      proxy_service:
+        enabled: false
+      ssh_service:
+        enabled: false
+      teleport:
+        auth_server: 127.0.0.1:3025
+        log:
+          format:
+            extra_fields:
+            - timestamp
+            - level
+            - component
+            - caller
+            output: text
+          output: stderr
+          severity: INFO
+        storage:
+          audit_events_uri:
+          - athena://db.table?topicArn=arn:aws:sns:region:account_id:topic_name
+          audit_sessions_uri: s3://test-s3-session-storage-bucket
+          auto_scaling: false
+          continuous_backups: false
+          region: us-west-2
+          table_name: test-dynamodb-backend-table
+          type: dynamodb
+      version: v3
+keeps the second factor type even when it's "off":
+  1: |
+    |-
+      auth_service:
+        authentication:
+          local_auth: true
+          second_factor: "off"
+          type: local
+        cluster_name: helm-lint
+        enabled: true
+        proxy_listener_mode: separate
+      kubernetes_service:
+        enabled: true
+        kube_cluster_name: helm-lint
+        listen_addr: 0.0.0.0:3026
+        public_addr: RELEASE-NAME-auth.NAMESPACE.svc.cluster.local:3026
+      proxy_service:
+        enabled: false
+      ssh_service:
+        enabled: false
+      teleport:
+        auth_server: 127.0.0.1:3025
+        log:
+          format:
+            extra_fields:
+            - timestamp
+            - level
+            - component
+            - caller
+            output: text
+          output: stderr
+          severity: INFO
+      version: v3
+keeps the session_recording type even when it's "off":
+  1: |
+    |-
+      auth_service:
+        authentication:
+          local_auth: true
+          second_factors:
+          - otp
+          - webauthn
+          type: local
+          webauthn:
+            rp_id: helm-lint
+        cluster_name: helm-lint
+        enabled: true
+        proxy_listener_mode: separate
+        session_recording: "off"
+      kubernetes_service:
+        enabled: true
+        kube_cluster_name: helm-lint
+        listen_addr: 0.0.0.0:3026
+        public_addr: RELEASE-NAME-auth.NAMESPACE.svc.cluster.local:3026
+      proxy_service:
+        enabled: false
+      ssh_service:
+        enabled: false
+      teleport:
+        auth_server: 127.0.0.1:3025
+        log:
+          format:
+            extra_fields:
+            - timestamp
+            - level
+            - component
+            - caller
+            output: text
+          output: stderr
+          severity: INFO
+      version: v3
 matches snapshot for acme-off.yaml:
   1: |
     |-
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-cluster-name
@@ -35,6 +160,7 @@ matches snapshot for acme-off.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -52,7 +178,9 @@ matches snapshot for acme-on.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-acme-cluster
@@ -69,6 +197,7 @@ matches snapshot for acme-on.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -86,7 +215,9 @@ matches snapshot for acme-uri-staging.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-acme-cluster
@@ -103,6 +234,7 @@ matches snapshot for acme-uri-staging.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -121,7 +253,9 @@ matches snapshot for auth-connector-name.yaml:
         authentication:
           connector_name: okta
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: helm-lint
@@ -138,6 +272,7 @@ matches snapshot for auth-connector-name.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -170,6 +305,7 @@ matches snapshot for auth-disable-local.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -188,7 +324,9 @@ matches snapshot for auth-locking-mode.yaml:
         authentication:
           local_auth: true
           locking_mode: strict
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: helm-lint
@@ -205,6 +343,7 @@ matches snapshot for auth-locking-mode.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -240,6 +379,82 @@ matches snapshot for auth-passwordless.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
+        log:
+          format:
+            extra_fields:
+            - timestamp
+            - level
+            - component
+            - caller
+            output: text
+          output: stderr
+          severity: INFO
+      version: v3
+matches snapshot for auth-secondfactors-sso.yaml:
+  1: |
+    |-
+      auth_service:
+        authentication:
+          local_auth: true
+          second_factors:
+          - sso
+          type: local
+        cluster_name: helm-lint
+        enabled: true
+        proxy_listener_mode: separate
+      kubernetes_service:
+        enabled: true
+        kube_cluster_name: helm-lint
+        listen_addr: 0.0.0.0:3026
+        public_addr: RELEASE-NAME-auth.NAMESPACE.svc.cluster.local:3026
+      proxy_service:
+        enabled: false
+      ssh_service:
+        enabled: false
+      teleport:
+        auth_server: 127.0.0.1:3025
+        log:
+          format:
+            extra_fields:
+            - timestamp
+            - level
+            - component
+            - caller
+            output: text
+          output: stderr
+          severity: INFO
+      version: v3
+matches snapshot for auth-secondfactors-webauthn.yaml:
+  1: |
+    |-
+      auth_service:
+        authentication:
+          local_auth: true
+          second_factors:
+          - sso
+          - webauthn
+          type: local
+          webauthn:
+            attestation_allowed_cas:
+            - /etc/ssl/certs/ca-certificates.crt
+            attestation_denied_cas:
+            - /etc/ssl/certs/ca-certificates.crt
+            rp_id: helm-lint
+        cluster_name: helm-lint
+        enabled: true
+        proxy_listener_mode: separate
+      kubernetes_service:
+        enabled: true
+        kube_cluster_name: helm-lint
+        listen_addr: 0.0.0.0:3026
+        public_addr: RELEASE-NAME-auth.NAMESPACE.svc.cluster.local:3026
+      proxy_service:
+        enabled: false
+      ssh_service:
+        enabled: false
+      teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -257,7 +472,9 @@ matches snapshot for auth-type-legacy.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: github
           webauthn:
             rp_id: helm-lint
@@ -274,6 +491,7 @@ matches snapshot for auth-type-legacy.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -291,7 +509,9 @@ matches snapshot for auth-type.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: github
           webauthn:
             rp_id: helm-lint
@@ -308,6 +528,7 @@ matches snapshot for auth-type.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -346,6 +567,7 @@ matches snapshot for auth-webauthn-legacy.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -384,6 +606,7 @@ matches snapshot for auth-webauthn.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -401,7 +624,9 @@ matches snapshot for aws-dynamodb-autoscaling.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-aws-cluster
@@ -418,6 +643,7 @@ matches snapshot for aws-dynamodb-autoscaling.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -433,6 +659,7 @@ matches snapshot for aws-dynamodb-autoscaling.yaml:
           - dynamodb://test-dynamodb-auditlog-table
           audit_sessions_uri: s3://test-s3-session-storage-bucket
           auto_scaling: true
+          billing_mode: provisioned
           continuous_backups: false
           read_max_capacity: 100
           read_min_capacity: 5
@@ -450,7 +677,9 @@ matches snapshot for aws-ha-acme.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-aws-cluster
@@ -469,6 +698,7 @@ matches snapshot for aws-ha-acme.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -495,7 +725,9 @@ matches snapshot for aws-ha-antiaffinity.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-aws-cluster
@@ -514,6 +746,7 @@ matches snapshot for aws-ha-antiaffinity.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -540,7 +773,9 @@ matches snapshot for aws-ha-log.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-aws-cluster
@@ -559,6 +794,7 @@ matches snapshot for aws-ha-log.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -586,7 +822,9 @@ matches snapshot for aws-ha.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-aws-cluster
@@ -605,6 +843,7 @@ matches snapshot for aws-ha.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -631,7 +870,9 @@ matches snapshot for aws.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-aws-cluster
@@ -650,6 +891,7 @@ matches snapshot for aws.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -670,13 +912,105 @@ matches snapshot for aws.yaml:
           table_name: test-dynamodb-backend-table
           type: dynamodb
       version: v3
+matches snapshot for azure.yaml:
+  1: |
+    |-
+      auth_service:
+        authentication:
+          local_auth: true
+          second_factors:
+          - otp
+          - webauthn
+          type: local
+          webauthn:
+            rp_id: test-azure-cluster
+        cluster_name: test-azure-cluster
+        enabled: true
+        proxy_listener_mode: separate
+      kubernetes_service:
+        enabled: true
+        kube_cluster_name: test-azure-cluster
+        listen_addr: 0.0.0.0:3026
+        public_addr: RELEASE-NAME-auth.NAMESPACE.svc.cluster.local:3026
+      proxy_service:
+        enabled: false
+      ssh_service:
+        enabled: false
+      teleport:
+        auth_server: 127.0.0.1:3025
+        log:
+          format:
+            extra_fields:
+            - timestamp
+            - level
+            - component
+            - caller
+            output: text
+          output: stderr
+          severity: INFO
+        storage:
+          audit_events_uri:
+          - postgresql://teleport@mypostgresinstance.postgres.database.azure.com/teleport_audit?sslmode=verify-full#auth_mode=azure
+          - stdout://
+          audit_sessions_uri: azblob://mystorageaccount.blob.core.windows.net
+          auth_mode: azure
+          conn_string: postgresql://teleport@mypostgresinstance.postgres.database.azure.com/teleport_backend?sslmode=verify-full&pool_max_conns=100
+          type: postgresql
+      version: v3
+matches snapshot for azure.yaml without pool_max_conn:
+  1: |
+    |-
+      auth_service:
+        authentication:
+          local_auth: true
+          second_factors:
+          - otp
+          - webauthn
+          type: local
+          webauthn:
+            rp_id: test-azure-cluster
+        cluster_name: test-azure-cluster
+        enabled: true
+        proxy_listener_mode: separate
+      kubernetes_service:
+        enabled: true
+        kube_cluster_name: test-azure-cluster
+        listen_addr: 0.0.0.0:3026
+        public_addr: RELEASE-NAME-auth.NAMESPACE.svc.cluster.local:3026
+      proxy_service:
+        enabled: false
+      ssh_service:
+        enabled: false
+      teleport:
+        auth_server: 127.0.0.1:3025
+        log:
+          format:
+            extra_fields:
+            - timestamp
+            - level
+            - component
+            - caller
+            output: text
+          output: stderr
+          severity: INFO
+        storage:
+          audit_events_uri:
+          - postgresql://teleport@mypostgresinstance.postgres.database.azure.com/teleport_audit?sslmode=verify-full#auth_mode=azure
+          - stdout://
+          audit_sessions_uri: azblob://mystorageaccount.blob.core.windows.net
+          auth_mode: azure
+          conn_string: postgresql://teleport@mypostgresinstance.postgres.database.azure.com/teleport_backend?sslmode=verify-full
+          type: postgresql
+      version: v3
 matches snapshot for existing-tls-secret-with-ca.yaml:
   1: |
     |-
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-cluster-name
@@ -693,6 +1027,7 @@ matches snapshot for existing-tls-secret-with-ca.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -710,7 +1045,9 @@ matches snapshot for existing-tls-secret.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-cluster-name
@@ -727,6 +1064,7 @@ matches snapshot for existing-tls-secret.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -744,7 +1082,9 @@ matches snapshot for gcp-ha-acme.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-gcp-cluster
@@ -763,6 +1103,7 @@ matches snapshot for gcp-ha-acme.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -788,7 +1129,9 @@ matches snapshot for gcp-ha-antiaffinity.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-gcp-cluster
@@ -807,6 +1150,7 @@ matches snapshot for gcp-ha-antiaffinity.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -832,7 +1176,9 @@ matches snapshot for gcp-ha-log.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-gcp-cluster
@@ -851,6 +1197,7 @@ matches snapshot for gcp-ha-log.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -877,7 +1224,9 @@ matches snapshot for gcp.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-gcp-cluster
@@ -896,6 +1245,7 @@ matches snapshot for gcp.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -921,7 +1271,9 @@ matches snapshot for initcontainers.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: helm-lint
@@ -938,6 +1290,7 @@ matches snapshot for initcontainers.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -955,7 +1308,9 @@ matches snapshot for kube-cluster-name.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-aws-cluster
@@ -972,6 +1327,7 @@ matches snapshot for kube-cluster-name.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -989,7 +1345,9 @@ matches snapshot for log-basic.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-log-cluster
@@ -1006,6 +1364,7 @@ matches snapshot for log-basic.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1023,7 +1382,9 @@ matches snapshot for log-extra.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-log-cluster
@@ -1040,6 +1401,7 @@ matches snapshot for log-extra.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1057,7 +1419,9 @@ matches snapshot for log-legacy.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-log-cluster
@@ -1074,6 +1438,7 @@ matches snapshot for log-legacy.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1091,7 +1456,9 @@ matches snapshot for priority-class-name.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: helm-lint
@@ -1108,6 +1475,7 @@ matches snapshot for priority-class-name.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1125,7 +1493,9 @@ matches snapshot for proxy-listener-mode-multiplex.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-proxy-listener-mode
@@ -1142,6 +1512,7 @@ matches snapshot for proxy-listener-mode-multiplex.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1159,7 +1530,9 @@ matches snapshot for proxy-listener-mode-separate.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-proxy-listener-mode
@@ -1176,6 +1549,7 @@ matches snapshot for proxy-listener-mode-separate.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1193,7 +1567,9 @@ matches snapshot for public-addresses.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: helm-lint
@@ -1210,6 +1586,7 @@ matches snapshot for public-addresses.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1227,7 +1604,9 @@ matches snapshot for separate-mongo-listener.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: helm-lint
@@ -1244,6 +1623,7 @@ matches snapshot for separate-mongo-listener.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1261,7 +1641,9 @@ matches snapshot for separate-postgres-listener.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: helm-lint
@@ -1278,6 +1660,7 @@ matches snapshot for separate-postgres-listener.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1295,7 +1678,9 @@ matches snapshot for service.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: helm-lint
@@ -1312,6 +1697,7 @@ matches snapshot for service.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1329,7 +1715,9 @@ matches snapshot for session-recording.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: helm-lint
@@ -1347,6 +1735,7 @@ matches snapshot for session-recording.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1364,7 +1753,9 @@ matches snapshot for standalone-customsize.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-standalone-cluster
@@ -1383,6 +1774,7 @@ matches snapshot for standalone-customsize.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1400,7 +1792,9 @@ matches snapshot for standalone-existingpvc.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-standalone-cluster
@@ -1419,6 +1813,7 @@ matches snapshot for standalone-existingpvc.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1436,7 +1831,9 @@ matches snapshot for tolerations.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-aws-cluster
@@ -1453,6 +1850,7 @@ matches snapshot for tolerations.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1479,7 +1877,9 @@ matches snapshot for version-override.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: test-cluster-name
@@ -1499,6 +1899,7 @@ matches snapshot for version-override.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1516,7 +1917,9 @@ matches snapshot for volumes.yaml:
       auth_service:
         authentication:
           local_auth: true
-          second_factor: "on"
+          second_factors:
+          - otp
+          - webauthn
           type: local
           webauthn:
             rp_id: helm-lint
@@ -1533,6 +1936,7 @@ matches snapshot for volumes.yaml:
       ssh_service:
         enabled: false
       teleport:
+        auth_server: 127.0.0.1:3025
         log:
           format:
             extra_fields:
@@ -1543,4 +1947,243 @@ matches snapshot for volumes.yaml:
             output: text
           output: stderr
           severity: INFO
+      version: v3
+matches snapshot when both secondFactor and secondFactors are set.:
+  1: |
+    |-
+      auth_service:
+        authentication:
+          local_auth: true
+          second_factor: "off"
+          type: local
+        cluster_name: helm-lint
+        enabled: true
+        proxy_listener_mode: separate
+      kubernetes_service:
+        enabled: true
+        kube_cluster_name: helm-lint
+        listen_addr: 0.0.0.0:3026
+        public_addr: RELEASE-NAME-auth.NAMESPACE.svc.cluster.local:3026
+      proxy_service:
+        enabled: false
+      ssh_service:
+        enabled: false
+      teleport:
+        auth_server: 127.0.0.1:3025
+        log:
+          format:
+            extra_fields:
+            - timestamp
+            - level
+            - component
+            - caller
+            output: text
+          output: stderr
+          severity: INFO
+      version: v3
+sets clusterDomain on Configmap:
+  1: |
+    apiVersion: v1
+    data:
+      apply-on-startup.yaml: |
+        ---
+        kind: token
+        version: v2
+        metadata:
+          name: RELEASE-NAME-proxy
+          expires: "2050-01-01T00:00:00Z"
+        spec:
+          roles: [Proxy]
+          join_method: kubernetes
+          kubernetes:
+            allow:
+              - service_account: "NAMESPACE:RELEASE-NAME-proxy"
+      teleport.yaml: |-
+        auth_service:
+          authentication:
+            local_auth: true
+            second_factors:
+            - otp
+            - webauthn
+            type: local
+            webauthn:
+              rp_id: teleport.example.com
+          cluster_name: teleport.example.com
+          enabled: true
+          proxy_listener_mode: separate
+        kubernetes_service:
+          enabled: true
+          kube_cluster_name: teleport.example.com
+          listen_addr: 0.0.0.0:3026
+          public_addr: RELEASE-NAME-auth.NAMESPACE.svc.test.com:3026
+        proxy_service:
+          enabled: false
+        ssh_service:
+          enabled: false
+        teleport:
+          auth_server: 127.0.0.1:3025
+          log:
+            format:
+              extra_fields:
+              - timestamp
+              - level
+              - component
+              - caller
+              output: text
+            output: stderr
+            severity: INFO
+        version: v3
+    kind: ConfigMap
+    metadata:
+      labels:
+        app.kubernetes.io/component: auth
+        app.kubernetes.io/instance: RELEASE-NAME
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/name: teleport-cluster
+        app.kubernetes.io/version: 99.0.0
+        helm.sh/chart: teleport-cluster-99.0.0
+        teleport.dev/majorVersion: "99"
+      name: RELEASE-NAME-auth
+      namespace: NAMESPACE
+uses athena as primary backend when configured:
+  1: |
+    |-
+      auth_service:
+        authentication:
+          local_auth: true
+          second_factors:
+          - otp
+          - webauthn
+          type: local
+          webauthn:
+            rp_id: teleport.example.com
+        cluster_name: teleport.example.com
+        enabled: true
+        proxy_listener_mode: separate
+      kubernetes_service:
+        enabled: true
+        kube_cluster_name: teleport.example.com
+        listen_addr: 0.0.0.0:3026
+        public_addr: RELEASE-NAME-auth.NAMESPACE.svc.cluster.local:3026
+      proxy_service:
+        enabled: false
+      ssh_service:
+        enabled: false
+      teleport:
+        auth_server: 127.0.0.1:3025
+        log:
+          format:
+            extra_fields:
+            - timestamp
+            - level
+            - component
+            - caller
+            output: text
+          output: stderr
+          severity: INFO
+        storage:
+          audit_events_uri:
+          - athena://db.table?topicArn=arn:aws:sns:region:account_id:topic_name
+          - dynamodb://my-dynamodb-table
+          audit_sessions_uri: s3://asd
+          auto_scaling: false
+          continuous_backups: false
+          region: asd
+          table_name: asd
+          type: dynamodb
+      version: v3
+uses athena, dynamo, and stdout when everything is on:
+  1: |
+    |-
+      auth_service:
+        authentication:
+          local_auth: true
+          second_factors:
+          - otp
+          - webauthn
+          type: local
+          webauthn:
+            rp_id: teleport.example.com
+        cluster_name: teleport.example.com
+        enabled: true
+        proxy_listener_mode: separate
+      kubernetes_service:
+        enabled: true
+        kube_cluster_name: teleport.example.com
+        listen_addr: 0.0.0.0:3026
+        public_addr: RELEASE-NAME-auth.NAMESPACE.svc.cluster.local:3026
+      proxy_service:
+        enabled: false
+      ssh_service:
+        enabled: false
+      teleport:
+        auth_server: 127.0.0.1:3025
+        log:
+          format:
+            extra_fields:
+            - timestamp
+            - level
+            - component
+            - caller
+            output: text
+          output: stderr
+          severity: INFO
+        storage:
+          audit_events_uri:
+          - athena://db.table?topicArn=arn:aws:sns:region:account_id:topic_name
+          - dynamodb://my-dynamodb-table
+          - stdout://
+          audit_sessions_uri: s3://asd
+          auto_scaling: false
+          continuous_backups: false
+          region: asd
+          table_name: asd
+          type: dynamodb
+      version: v3
+uses dynamo as primary backend when configured:
+  1: |
+    |-
+      auth_service:
+        authentication:
+          local_auth: true
+          second_factors:
+          - otp
+          - webauthn
+          type: local
+          webauthn:
+            rp_id: teleport.example.com
+        cluster_name: teleport.example.com
+        enabled: true
+        proxy_listener_mode: separate
+      kubernetes_service:
+        enabled: true
+        kube_cluster_name: teleport.example.com
+        listen_addr: 0.0.0.0:3026
+        public_addr: RELEASE-NAME-auth.NAMESPACE.svc.cluster.local:3026
+      proxy_service:
+        enabled: false
+      ssh_service:
+        enabled: false
+      teleport:
+        auth_server: 127.0.0.1:3025
+        log:
+          format:
+            extra_fields:
+            - timestamp
+            - level
+            - component
+            - caller
+            output: text
+          output: stderr
+          severity: INFO
+        storage:
+          audit_events_uri:
+          - dynamodb://my-dynamodb-table
+          - athena://db.table?topicArn=arn:aws:sns:region:account_id:topic_name
+          audit_sessions_uri: s3://asd
+          auto_scaling: false
+          continuous_backups: false
+          region: asd
+          table_name: asd
+          type: dynamodb
       version: v3

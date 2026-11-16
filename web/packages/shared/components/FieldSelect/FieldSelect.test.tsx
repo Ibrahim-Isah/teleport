@@ -1,46 +1,46 @@
 /**
- * Copyright 2020 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
 import { screen } from '@testing-library/react';
+import selectEvent from 'react-select-event';
 
-import { render, fireEvent } from 'design/utils/testing';
+import { fireEvent, render, theme } from 'design/utils/testing';
 
-import theme from '@gravitational/design/src/theme';
+import useRule from '../Validation/useRule';
+import { FieldSelect, FieldSelectAsync } from './FieldSelect';
 
-import * as useRule from '../Validation/useRule';
-
-import FieldSelect from './FieldSelect';
+jest.mock('../Validation/useRule');
+const mockedUseRule = jest.mocked(useRule);
 
 test('valid values and onChange prop', () => {
-  const rule = jest.fn();
   const onChange = jest.fn(e => e);
   const options = [
     { value: 'a', label: 'A' },
     { value: 'b', label: 'B' },
   ];
 
-  jest.spyOn(useRule, 'default').mockReturnValue({ valid: true, message: '' });
+  mockedUseRule.mockReturnValue({ valid: true, message: '' });
 
   render(
     <FieldSelect
       label="labelText"
       placeholder="placeholderText"
       options={options}
-      rule={rule}
       onChange={onChange}
       value={null}
     />
@@ -58,11 +58,9 @@ test('valid values and onChange prop', () => {
 
 test('select element validation error state', () => {
   const rule = jest.fn();
-  const errorColor = theme.colors.error.main;
+  const errorColor = theme.colors.interactive.solid.danger.default;
 
-  jest
-    .spyOn(useRule, 'default')
-    .mockReturnValue({ valid: false, message: 'errorMsg' });
+  mockedUseRule.mockReturnValue({ valid: false, message: 'errorMsg' });
 
   const { container } = render(
     <FieldSelect
@@ -85,5 +83,62 @@ test('select element validation error state', () => {
   const selectEl = container.getElementsByClassName('react-select__control')[0];
   expect(selectEl).toHaveStyle({
     'border-color': errorColor,
+  });
+});
+
+describe('FieldSelectAsync', () => {
+  beforeEach(() => {
+    mockedUseRule.mockReturnValue({ valid: true, message: '' });
+  });
+
+  it('loads options', async () => {
+    const loadOptions = () =>
+      Promise.resolve([
+        { label: 'Apples', value: 'apples' },
+        { label: 'Bananas', value: 'bananas' },
+      ]);
+    render(<FieldSelectAsync loadOptions={loadOptions} />);
+    selectEvent.openMenu(screen.getByRole('combobox'));
+    expect(await screen.findByRole('option', { name: 'Apples' })).toBeVisible();
+    expect(
+      await screen.findByRole('option', { name: 'Bananas' })
+    ).toBeVisible();
+  });
+
+  it('supports empty option lists', async () => {
+    const loadOptions = () => Promise.resolve([]);
+    render(<FieldSelectAsync loadOptions={loadOptions} />);
+    selectEvent.openMenu(screen.getByRole('combobox'));
+    expect(await screen.findByText('No options')).toBeVisible();
+  });
+
+  it('supports void option lists', async () => {
+    // We may never use this case, but react-select allows `loadOptions` to
+    // return void, so we need to be prepared.
+    const loadOptions = () => {};
+    render(<FieldSelectAsync loadOptions={loadOptions} />);
+    selectEvent.openMenu(screen.getByRole('combobox'));
+    expect(await screen.findByText('No options')).toBeVisible();
+  });
+
+  it('displays no options message', async () => {
+    const loadOptions = () => Promise.resolve([]);
+    render(
+      <FieldSelectAsync
+        loadOptions={loadOptions}
+        noOptionsMessage={() => 'This is sad'}
+      />
+    );
+    selectEvent.openMenu(screen.getByRole('combobox'));
+    expect(await screen.findByText('This is sad')).toBeVisible();
+  });
+
+  it('displays error message', async () => {
+    const loadOptions = () => Promise.reject(new Error('oops'));
+    render(<FieldSelectAsync loadOptions={loadOptions} />);
+    selectEvent.openMenu(screen.getByRole('combobox'));
+    expect(
+      await screen.findByText('Could not load options: oops')
+    ).toBeVisible();
   });
 });

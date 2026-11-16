@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package config
 
@@ -24,9 +28,9 @@ import (
 
 // GetEffectiveMode returns the effective device trust mode, considering both
 // `dt` and the current modules.
-func GetEffectiveMode(dt *types.DeviceTrust) string {
+func GetEffectiveMode(dt *types.DeviceTrust, mod modules.Modules) string {
 	// OSS doesn't support device trust.
-	if modules.GetModules().BuildType() == modules.BuildOSS {
+	if mod.IsOSSBuild() {
 		return constants.DeviceTrustModeOff
 	}
 
@@ -38,15 +42,27 @@ func GetEffectiveMode(dt *types.DeviceTrust) string {
 	return dt.Mode
 }
 
+// GetEnforcementMode returns the configured device trust mode, disregarding the
+// provenance of the binary if the mode is set.
+// Used for device enforcement checks. Guarantees that OSS binaries paired with
+// an Enterprise Auth will correctly enforce device trust.
+func GetEnforcementMode(dt *types.DeviceTrust, m modules.Modules) string {
+	// If absent use the defaults from GetEffectiveMode.
+	if dt == nil || dt.Mode == "" {
+		return GetEffectiveMode(dt, m)
+	}
+	return dt.Mode
+}
+
 // ValidateConfigAgainstModules verifies the device trust configuration against
 // the current modules.
 // This method exists to provide feedback to users about invalid configurations,
 // Teleport itself checks the features where appropriate and reacts accordingly.
-func ValidateConfigAgainstModules(dt *types.DeviceTrust) error {
+func ValidateConfigAgainstModules(dt *types.DeviceTrust, m modules.Modules) error {
 	switch {
 	case dt == nil || dt.Mode == "": // OK, always allowed.
 		return nil
-	case GetEffectiveMode(dt) != dt.Mode: // Mismatch means invalid OSS config.
+	case GetEffectiveMode(dt, m) != dt.Mode: // Mismatch means invalid OSS config.
 		return trace.BadParameter("device trust mode %q requires Teleport Enterprise", dt.Mode)
 	default:
 		return nil

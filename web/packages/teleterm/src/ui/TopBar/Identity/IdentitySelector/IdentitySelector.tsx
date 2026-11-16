@@ -1,59 +1,84 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { forwardRef } from 'react';
-import { Box } from 'design';
+import { forwardRef } from 'react';
 
+import { Box } from 'design';
+import { Cluster } from 'gen-proto-ts/teleport/lib/teleterm/v1/cluster_pb';
+
+import { WorkspaceColor } from 'teleterm/ui/services/workspacesService';
+import { ConnectionStatusIndicator } from 'teleterm/ui/TopBar/Connections/ConnectionsFilterableList/ConnectionStatusIndicator';
+import { DeviceTrustStatus } from 'teleterm/ui/TopBar/Identity/Identity';
+import { TopBarButton } from 'teleterm/ui/TopBar/TopBarButton';
+import { routing } from 'teleterm/ui/uri';
 import { getUserWithClusterName } from 'teleterm/ui/utils';
 
-import { TopBarButton } from 'teleterm/ui/TopBar/TopBarButton';
-
+import { getProfileNameLetter } from '../IdentityList/IdentityListItem';
 import { UserIcon } from './UserIcon';
-import { PamIcon } from './PamIcon';
-
-interface IdentitySelectorProps {
-  isOpened: boolean;
-  userName: string;
-  clusterName: string;
-
-  onClick(): void;
-  makeTitle: (userWithClusterName: string | undefined) => string;
-}
 
 export const IdentitySelector = forwardRef<
   HTMLButtonElement,
-  IdentitySelectorProps
+  {
+    open: boolean;
+    activeCluster: Cluster | undefined;
+    onClick(): void;
+    makeTitle(userWithClusterName: string | undefined): string;
+    deviceTrustStatus: DeviceTrustStatus;
+    activeColor: WorkspaceColor;
+  }
 >((props, ref) => {
-  const isSelected = props.userName && props.clusterName;
-  const selectorText = isSelected && getUserWithClusterName(props);
+  const selectorText =
+    props.activeCluster &&
+    getUserWithClusterName({
+      clusterName: routing.parseClusterName(props.activeCluster.uri),
+      userName: props.activeCluster.loggedInUser?.name,
+    });
   const title = props.makeTitle(selectorText);
 
   return (
     <TopBarButton
-      isOpened={props.isOpened}
+      isOpened={props.open}
       ref={ref}
       onClick={props.onClick}
       title={title}
+      css={`
+        position: relative;
+      `}
     >
-      {isSelected ? (
+      {props.activeCluster ? (
         <Box>
-          <UserIcon letter={props.userName[0]} />
+          <UserIcon
+            color={props.activeColor}
+            letter={getProfileNameLetter(props.activeCluster.uri)}
+          />
+          {props.deviceTrustStatus === 'requires-enrollment' && (
+            <ConnectionStatusIndicator
+              status={'warning'}
+              css={`
+                position: absolute;
+                top: 1.5px;
+                right: 1.5px;
+              `}
+            />
+          )}
         </Box>
       ) : (
-        <PamIcon />
+        <UserIcon letter="+" />
       )}
     </TopBarButton>
   );

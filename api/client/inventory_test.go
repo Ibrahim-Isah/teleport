@@ -18,10 +18,11 @@ package client
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
-	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/client/proto"
@@ -39,15 +40,15 @@ func TestInventoryControlStreamPipe(t *testing.T) {
 	defer upstream.Close()
 
 	upMsgs := []proto.UpstreamInventoryMessage{
-		proto.UpstreamInventoryHello{},
-		proto.UpstreamInventoryPong{},
-		proto.InventoryHeartbeat{},
+		new(proto.UpstreamInventoryHello),
+		new(proto.UpstreamInventoryPong),
+		new(proto.InventoryHeartbeat),
 	}
 
 	downMsgs := []proto.DownstreamInventoryMessage{
-		proto.DownstreamInventoryHello{},
-		proto.DownstreamInventoryPing{},
-		proto.DownstreamInventoryPing{}, // duplicate to pad downMsgs to same length as upMsgs
+		new(proto.DownstreamInventoryHello),
+		new(proto.DownstreamInventoryPing),
+		new(proto.DownstreamInventoryPing), // duplicate to pad downMsgs to same length as upMsgs
 	}
 
 	go func() {
@@ -100,5 +101,5 @@ func TestInventoryControlStreamPipe(t *testing.T) {
 		t.Fatal("timeout waiting for close")
 	}
 
-	require.True(t, trace.IsEOF(downstream.Error()))
+	assert.ErrorIs(t, downstream.Error(), io.EOF)
 }

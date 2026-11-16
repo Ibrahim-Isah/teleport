@@ -1,34 +1,38 @@
 /*
-Copyright 2019 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
 import PropTypes from 'prop-types';
-import Dialog, { DialogHeader, DialogTitle } from 'design/Dialog';
+import { useState } from 'react';
+
 import {
   Box,
-  ButtonOutlined,
+  ButtonBorder,
   ButtonPrimary,
   ButtonSecondary,
   Flex,
+  H3,
   LabelInput,
   Text,
 } from 'design';
-import TextEditor from 'shared/components/TextEditor';
 import * as Alerts from 'design/Alert';
-import { useAttempt, useState } from 'shared/hooks';
+import Dialog, { DialogHeader, DialogTitle } from 'design/Dialog';
+import TextEditor from 'shared/components/TextEditor';
+import { useAttempt } from 'shared/hooks';
 
 import { CaptureEvent, userEventService } from 'teleport/services/userEvent';
 
@@ -80,13 +84,11 @@ export default function ResourceEditor(props) {
       <Flex flex="1">
         <Flex flex="1" m={5} flexDirection="column">
           <DialogHeader>
-            <DialogTitle typography="body1" bold>
-              {title}
-            </DialogTitle>
+            <DialogTitle>{title}</DialogTitle>
           </DialogHeader>
           {attempt.isFailed && <Alerts.Danger>{attempt.message}</Alerts.Danger>}
           {!isNew && (
-            <Text mb="2" typography="h4" color="primary.contrastText">
+            <Text mb="2" typography="body1">
               {name}
             </Text>
           )}
@@ -106,7 +108,7 @@ export default function ResourceEditor(props) {
               disabled={attempt.isProcessing}
               onClick={handleClose}
             >
-              CANCEL
+              Cancel
             </ButtonSecondary>
           </Box>
         </Flex>
@@ -117,18 +119,13 @@ export default function ResourceEditor(props) {
             height="100%"
             width="300px"
             p={5}
-            bg="primary.light"
+            bg="levels.surface"
           >
             <Box>
-              <DialogTitle typography="body1" bold>
-                {' '}
-                SETUP INSTRUCTIONS{' '}
-              </DialogTitle>
-              <Text typography="body1" mt={3}>
-                {directions}
-              </Text>
+              <H3>Setup Instructions</H3>
+              <Text mt={3}>{directions}</Text>
             </Box>
-            <ButtonOutlined
+            <ButtonBorder
               size="medium"
               as="a"
               href={docsURL}
@@ -144,8 +141,8 @@ export default function ResourceEditor(props) {
                 }
               }}
             >
-              VIEW DOCUMENTATION
-            </ButtonOutlined>
+              View Documentation
+            </ButtonBorder>
           </Flex>
         )}
       </Flex>

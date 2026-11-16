@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package conntest
 
@@ -24,7 +26,8 @@ import (
 
 	"github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/client"
 )
 
 // TestConnectionRequest contains
@@ -32,6 +35,8 @@ import (
 // - additional paramenters which depend on the actual kind of resource to test
 // As an example, for SSH Node it also includes the User/Principal that will be used to login.
 type TestConnectionRequest struct {
+	// MFAResponse is an optional field that holds a response to a MFA device challenge.
+	MFAResponse client.MFAChallengeResponse `json:"mfa_response"`
 	// ResourceKind describes the type of resource to test.
 	ResourceKind string `json:"resource_kind"`
 	// ResourceName is the identification of the resource's instance to test.
@@ -46,6 +51,20 @@ type TestConnectionRequest struct {
 	// SSHPrincipal is the Linux username to use in a connection test.
 	// Specific to SSHTester.
 	SSHPrincipal string `json:"ssh_principal,omitempty"`
+	// SSHPrincipalSelectionMode is an optional field which describes whether the user has chosen the
+	// principal manually or if it was automatically chosen.
+	//
+	// Used in Connect My Computer where the principal is picked automatically if the Connect My
+	// Computer role contains only a single login.
+	//
+	// Valid values: manual, auto.
+	SSHPrincipalSelectionMode string `json:"ssh_principal_selection_mode,omitempty"`
+	// SSHNodeOS is an optional field which describes the OS the agent runs on.
+	// Valid values: windows, darwin, linux.
+	SSHNodeOS string `json:"ssh_node_os,omitempty"`
+	// SSHNodeSetupMethod is an optional field which describes how an SSH agent was installed.
+	// Valid values: script, connect_my_computer.
+	SSHNodeSetupMethod string `json:"ssh_node_setup_method,omitempty"`
 
 	// KubernetesNamespace is the Kubernetes Namespace to List the Pods in.
 	// Specific to KubernetesTester.
@@ -54,7 +73,7 @@ type TestConnectionRequest struct {
 	// KubernetesImpersonation allows to configure a subset of `kubernetes_users` and
 	// `kubernetes_groups` to impersonate.
 	// Specific to KubernetesTester.
-	KubernetesImpersonation KubernetesImpersonation `json:"kubernetes_impersonation,omitempty"`
+	KubernetesImpersonation KubernetesImpersonation `json:"kubernetes_impersonation"`
 
 	// DatabaseUser is the database User to be tested
 	// Specific to DatabaseTester.
@@ -80,6 +99,20 @@ type KubernetesImpersonation struct {
 	KubernetesGroups []string `json:"kubernetes_groups,omitempty"`
 }
 
+// consts for the SSHNodeSetupMethod field of TestConnectionRequest.
+
+const (
+	SSHNodeSetupMethodScript            = "script"
+	SSHNodeSetupMethodConnectMyComputer = "connect_my_computer"
+)
+
+// consts for the SSHPrincipalSelectionMode field of TestConnectionRequest.
+
+const (
+	SSHPrincipalSelectionModeManual = "manual"
+	SSHPrincipalSelectionModeAuto   = "auto"
+)
+
 // CheckAndSetDefaults validates the Request has the required fields.
 func (r *TestConnectionRequest) CheckAndSetDefaults() error {
 	if r.ResourceKind == "" {
@@ -95,7 +128,7 @@ func (r *TestConnectionRequest) CheckAndSetDefaults() error {
 	}
 
 	if r.DialTimeout <= 0 {
-		r.DialTimeout = defaults.DefaultDialTimeout
+		r.DialTimeout = defaults.DefaultIOTimeout
 	}
 
 	return nil
@@ -123,7 +156,7 @@ type ConnectionTesterConfig struct {
 
 	// UserClient is an auth client that has a User's identity.
 	// This is the user that is running the SSH Connection Test.
-	UserClient auth.ClientI
+	UserClient authclient.ClientI
 
 	// ProxyHostPort is the proxy to use in the `--proxy` format (host:webPort,sshPort)
 	ProxyHostPort string
@@ -168,6 +201,13 @@ func ConnectionTesterForKind(cfg ConnectionTesterConfig) (ConnectionTester, erro
 				UserClient:        cfg.UserClient,
 				PublicProxyAddr:   cfg.PublicProxyAddr,
 				TLSRoutingEnabled: cfg.TLSRoutingEnabled,
+			},
+		)
+		return tester, trace.Wrap(err)
+	case types.KindExternalAuditStorage:
+		tester, err := NewExternalAuditStorageConnectionTester(
+			ExternalAuditStorageConnectionTesterConfig{
+				UserClient: cfg.UserClient,
 			},
 		)
 		return tester, trace.Wrap(err)

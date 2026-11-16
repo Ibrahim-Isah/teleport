@@ -1,39 +1,50 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package config
 
 import (
 	"bytes"
+	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/testing/protocmp"
 	"gopkg.in/yaml.v2"
 
 	"github.com/gravitational/teleport/api/constants"
+	headerv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/header/v1"
+	joiningv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/scopes/joining/v1"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/api/types/installers"
 	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/sshutils/x11"
+	"github.com/gravitational/teleport/lib/events/auditqueue"
+	"github.com/gravitational/teleport/lib/scopes/joining"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
+	"github.com/gravitational/teleport/session/networking/x11"
 )
 
 // minimalConfigFile is a minimal subset of a teleport config file that can be
@@ -55,7 +66,7 @@ discovery_service:
 
 // cfgMap is a shorthand for a type that can hold the nested key-value
 // representation of a parsed YAML file.
-type cfgMap map[interface{}]interface{}
+type cfgMap map[any]any
 
 // editConfig takes the minimal YAML configuration file, de-serializes it into a
 // nested key-value dictionary suitable for manipulation by a test case,
@@ -74,8 +85,8 @@ func editConfig(t *testing.T, mutate func(cfg cfgMap)) []byte {
 
 // requireEqual creates an assertion function with a bound `expected` value
 // for use with table-driven tests
-func requireEqual(expected interface{}) require.ValueAssertionFunc {
-	return func(t require.TestingT, actual interface{}, msgAndArgs ...interface{}) {
+func requireEqual(expected any) require.ValueAssertionFunc {
+	return func(t require.TestingT, actual any, msgAndArgs ...any) {
 		require.Equal(t, expected, actual, msgAndArgs...)
 	}
 }
@@ -207,7 +218,6 @@ func TestAuthenticationSection(t *testing.T) {
 					"second_factor": "otp",
 				}
 			},
-			expectError: require.NoError,
 			expected: &AuthenticationConfig{
 				Type:         "local",
 				SecondFactor: "otp",
@@ -220,7 +230,6 @@ func TestAuthenticationSection(t *testing.T) {
 					"second_factor": "off",
 				}
 			},
-			expectError: require.NoError,
 			expected: &AuthenticationConfig{
 				Type:         "local",
 				SecondFactor: "off",
@@ -233,15 +242,14 @@ func TestAuthenticationSection(t *testing.T) {
 					"second_factor": "u2f",
 					"u2f": cfgMap{
 						"app_id": "https://graviton:3080",
-						"facets": []interface{}{"https://graviton:3080"},
-						"device_attestation_cas": []interface{}{
+						"facets": []any{"https://graviton:3080"},
+						"device_attestation_cas": []any{
 							"testdata/u2f_attestation_ca.pam",
 							"-----BEGIN CERTIFICATE-----\nfake certificate\n-----END CERTIFICATE-----",
 						},
 					},
 				}
 			},
-			expectError: require.NoError,
 			expected: &AuthenticationConfig{
 				Type:         "local",
 				SecondFactor: "u2f",
@@ -264,18 +272,17 @@ func TestAuthenticationSection(t *testing.T) {
 					"second_factor": "webauthn",
 					"webauthn": cfgMap{
 						"rp_id": "example.com",
-						"attestation_allowed_cas": []interface{}{
+						"attestation_allowed_cas": []any{
 							"testdata/u2f_attestation_ca.pam",
 							"-----BEGIN CERTIFICATE-----\nfake certificate1\n-----END CERTIFICATE-----",
 						},
-						"attestation_denied_cas": []interface{}{
+						"attestation_denied_cas": []any{
 							"-----BEGIN CERTIFICATE-----\nfake certificate2\n-----END CERTIFICATE-----",
 							"testdata/u2f_attestation_ca.pam",
 						},
 					},
 				}
 			},
-			expectError: require.NoError,
 			expected: &AuthenticationConfig{
 				Type:         "local",
 				SecondFactor: "webauthn",
@@ -299,7 +306,7 @@ func TestAuthenticationSection(t *testing.T) {
 					"second_factor": "on",
 					"u2f": cfgMap{
 						"app_id": "https://example.com",
-						"facets": []interface{}{
+						"facets": []any{
 							"https://example.com",
 						},
 					},
@@ -308,7 +315,6 @@ func TestAuthenticationSection(t *testing.T) {
 					},
 				}
 			},
-			expectError: require.NoError,
 			expected: &AuthenticationConfig{
 				Type:         "local",
 				SecondFactor: "on",
@@ -333,7 +339,6 @@ func TestAuthenticationSection(t *testing.T) {
 					"connector_name": "passwordless",
 				}
 			},
-			expectError: require.NoError,
 			expected: &AuthenticationConfig{
 				Type:         "local",
 				SecondFactor: "on",
@@ -356,7 +361,6 @@ func TestAuthenticationSection(t *testing.T) {
 					"connector_name": "headless",
 				}
 			},
-			expectError: require.NoError,
 			expected: &AuthenticationConfig{
 				Type:         "local",
 				SecondFactor: "on",
@@ -372,14 +376,173 @@ func TestAuthenticationSection(t *testing.T) {
 				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
 					"device_trust": cfgMap{
 						"mode": "required",
+						"ekcert_allowed_cas": []string{
+							"-----BEGIN CERTIFICATE-----\nfake certificate1\n-----END CERTIFICATE-----",
+						},
 					},
 				}
 			},
-			expectError: require.NoError,
 			expected: &AuthenticationConfig{
 				DeviceTrust: &DeviceTrust{
 					Mode: "required",
+					EKCertAllowedCAs: []string{
+						"-----BEGIN CERTIFICATE-----\nfake certificate1\n-----END CERTIFICATE-----",
+					},
 				},
+			},
+		}, {
+			desc: "Device Trust with auto-enroll",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"device_trust": cfgMap{
+						"mode":        "required",
+						"auto_enroll": "yes",
+					},
+				}
+			},
+			expected: &AuthenticationConfig{
+				DeviceTrust: &DeviceTrust{
+					Mode:       "required",
+					AutoEnroll: "yes",
+				},
+			},
+		}, {
+			desc: "signature suite empty",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"signature_algorithm_suite": "",
+				}
+			},
+			expected: &AuthenticationConfig{
+				SignatureAlgorithmSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_UNSPECIFIED,
+			},
+		}, {
+			desc: "signature suite legacy",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"signature_algorithm_suite": "legacy",
+				}
+			},
+			expected: &AuthenticationConfig{
+				SignatureAlgorithmSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_LEGACY,
+			},
+		}, {
+			desc: "signature suite balanced-v1",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"signature_algorithm_suite": "balanced-v1",
+				}
+			},
+			expected: &AuthenticationConfig{
+				SignatureAlgorithmSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
+			},
+		}, {
+			desc: "signature suite fips-v1",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"signature_algorithm_suite": "fips-v1",
+				}
+			},
+			expected: &AuthenticationConfig{
+				SignatureAlgorithmSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_FIPS_V1,
+			},
+		}, {
+			desc: "signature suite hsm-v1",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"signature_algorithm_suite": "hsm-v1",
+				}
+			},
+			expected: &AuthenticationConfig{
+				SignatureAlgorithmSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_HSM_V1,
+			},
+		}, {
+			desc: "signature suite typo",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"signature_algorithm_suite": "balanced-v0",
+				}
+			},
+			expectError: func(t require.TestingT, err error, msgAndArgs ...any) {
+				require.ErrorContains(t, err, "invalid value: balanced-v0")
+			},
+		}, {
+			desc: "stable unix users",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"stable_unix_user_config": cfgMap{
+						"enabled":   true,
+						"first_uid": 100,
+						"last_uid":  10,
+					},
+				}
+			},
+			expected: &AuthenticationConfig{
+				StableUNIXUserConfig: &StableUNIXUserConfig{
+					Enabled:  true,
+					FirstUID: 100,
+					LastUID:  10,
+				},
+			},
+		}, {
+			desc: "Local auth with browser authentication enabled",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"type": "local",
+					"webauthn": cfgMap{
+						"rp_id": "example.com",
+					},
+					"allow_cli_auth_via_browser": "true",
+				}
+			},
+			expected: &AuthenticationConfig{
+				Type: "local",
+				Webauthn: &Webauthn{
+					RPID: "example.com",
+				},
+				AllowCLIAuthViaBrowser: types.NewBoolOption(true),
+			},
+		}, {
+			desc: "Local auth with browser authentication disabled",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"type": "local",
+					"webauthn": cfgMap{
+						"rp_id": "example.com",
+					},
+					"allow_cli_auth_via_browser": "false",
+				}
+			},
+			expected: &AuthenticationConfig{
+				Type: "local",
+				Webauthn: &Webauthn{
+					RPID: "example.com",
+				},
+				AllowCLIAuthViaBrowser: types.NewBoolOption(false),
+			},
+		}, {
+			desc: "Local auth with browser authentication disabled without WebAuthn",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"type":                       "local",
+					"allow_cli_auth_via_browser": "false",
+				}
+			},
+			expected: &AuthenticationConfig{
+				Type:                   "local",
+				AllowCLIAuthViaBrowser: types.NewBoolOption(false),
+			},
+		}, {
+			desc: "Local auth with browser authentication empty string",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"type":                       "local",
+					"allow_cli_auth_via_browser": "",
+				}
+			},
+			expected: &AuthenticationConfig{
+				Type:                   "local",
+				AllowCLIAuthViaBrowser: &types.BoolOption{},
 			},
 		},
 	}
@@ -387,7 +550,11 @@ func TestAuthenticationSection(t *testing.T) {
 		t.Run(tt.desc, func(t *testing.T) {
 			text := bytes.NewBuffer(editConfig(t, tt.mutate))
 			cfg, err := ReadConfig(text)
-			tt.expectError(t, err)
+			if tt.expectError != nil {
+				tt.expectError(t, err)
+				return
+			}
+			require.NoError(t, err)
 
 			require.Empty(t, cmp.Diff(cfg.Auth.Authentication, tt.expected))
 		})
@@ -469,33 +636,228 @@ ssh_service:
 	}
 }
 
+func TestAuthenticationConfigScopedStaticToken(t *testing.T) {
+	t.Parallel()
+
+	tokenFilePath := filepath.Join(t.TempDir(), "scoped-token.yml")
+	tokenFile, err := os.Create(tokenFilePath)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		tokenFile.Close()
+	})
+	tokenFile.WriteString(`
+name: file_scoped_token
+secret: secret_token_value
+roles: [node]
+scope: /test
+`)
+
+	tests := []struct {
+		desc         string
+		input        string
+		expectError  require.ErrorAssertionFunc
+		expectTokens []*joiningv1.ScopedToken
+	}{
+		{
+			desc: "fully defined static scoped token", input: `
+auth_service:
+  enabled: yes
+  scoped_tokens:
+    - name: fully_defined_token
+      roles: [node]
+      secret: secret_token_value
+      scope: /test
+      immutable_labels:
+        ssh:
+            hello: world
+teleport:
+  nodename: testing
+`,
+			expectError: require.NoError,
+			expectTokens: []*joiningv1.ScopedToken{
+				joiningv1.ScopedToken_builder{
+					Version: types.V1,
+					Kind:    types.KindScopedToken,
+					Metadata: headerv1.Metadata_builder{
+						Name: "fully_defined_token",
+					}.Build(),
+					Scope: "/",
+					Spec: joiningv1.ScopedTokenSpec_builder{
+						Roles:         []string{string(types.RoleNode)},
+						AssignedScope: "/test",
+						JoinMethod:    string(types.JoinMethodToken),
+						UsageMode:     string(joining.TokenUsageModeUnlimited),
+						ImmutableLabels: joiningv1.ImmutableLabels_builder{
+							Ssh: map[string]string{
+								"hello": "world",
+							},
+						}.Build(),
+					}.Build(),
+					Status: joiningv1.ScopedTokenStatus_builder{
+						Secret: "secret_token_value",
+					}.Build(),
+				}.Build(),
+			},
+		},
+		{
+			desc: "file based token", input: fmt.Sprintf(`
+auth_service:
+  enabled: yes
+  scoped_tokens:
+    - path: %s
+teleport:
+  nodename: testing
+`, tokenFilePath),
+			expectError: require.NoError,
+			expectTokens: []*joiningv1.ScopedToken{
+				joiningv1.ScopedToken_builder{
+					Version: types.V1,
+					Kind:    types.KindScopedToken,
+					Metadata: headerv1.Metadata_builder{
+						Name: "file_scoped_token",
+					}.Build(),
+					Scope: "/",
+					Spec: joiningv1.ScopedTokenSpec_builder{
+						Roles:         []string{string(types.RoleNode)},
+						AssignedScope: "/test",
+						JoinMethod:    string(types.JoinMethodToken),
+						UsageMode:     string(joining.TokenUsageModeUnlimited),
+					}.Build(),
+					Status: joiningv1.ScopedTokenStatus_builder{
+						Secret: "secret_token_value",
+					}.Build(),
+				}.Build(),
+			},
+		},
+		{
+			desc: "fully defined token with a path", input: fmt.Sprintf(`
+auth_service:
+  enabled: yes
+  scoped_tokens:
+    - name: fully_defined_token
+      roles: [node]
+      secret: secret_token_value
+      scope: /test
+      path: %s
+teleport:
+  nodename: testing
+`, tokenFilePath),
+			expectError: require.Error,
+		},
+		{
+			desc: "multiple valid tokens", input: fmt.Sprintf(`
+auth_service:
+  enabled: yes
+  scoped_tokens:
+    - name: fully_defined_token
+      roles: [node]
+      secret: secret_token_value
+      scope: /test
+    - path: %s
+teleport:
+  nodename: testing
+`, tokenFilePath),
+			expectError: require.NoError,
+			expectTokens: []*joiningv1.ScopedToken{
+				joiningv1.ScopedToken_builder{
+					Version: types.V1,
+					Kind:    types.KindScopedToken,
+					Metadata: headerv1.Metadata_builder{
+						Name: "fully_defined_token",
+					}.Build(),
+					Scope: "/",
+					Spec: joiningv1.ScopedTokenSpec_builder{
+						Roles:         []string{string(types.RoleNode)},
+						AssignedScope: "/test",
+						JoinMethod:    string(types.JoinMethodToken),
+						UsageMode:     string(joining.TokenUsageModeUnlimited),
+					}.Build(),
+					Status: joiningv1.ScopedTokenStatus_builder{
+						Secret: "secret_token_value",
+					}.Build(),
+				}.Build(),
+				joiningv1.ScopedToken_builder{
+					Version: types.V1,
+					Kind:    types.KindScopedToken,
+					Metadata: headerv1.Metadata_builder{
+						Name: "file_scoped_token",
+					}.Build(),
+					Scope: "/",
+					Spec: joiningv1.ScopedTokenSpec_builder{
+						Roles:         []string{string(types.RoleNode)},
+						AssignedScope: "/test",
+						JoinMethod:    string(types.JoinMethodToken),
+						UsageMode:     string(joining.TokenUsageModeUnlimited),
+					}.Build(),
+					Status: joiningv1.ScopedTokenStatus_builder{
+						Secret: "secret_token_value",
+					}.Build(),
+				}.Build(),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			cfg, err := ReadConfig(strings.NewReader(tt.input))
+			assert.NoError(t, err)
+			tokens, err := cfg.Auth.StaticScopedTokens.Parse()
+			tt.expectError(t, err)
+			assert.Empty(t, cmp.Diff(tt.expectTokens, tokens.GetSpec().GetTokens(), protocmp.Transform()))
+		})
+	}
+}
+
 func TestAuthenticationConfig_Parse_StaticToken(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		desc  string
-		token string
+		desc      string
+		input     string
+		wantRoles []types.SystemRole
+		wantToken string
+		wantError string
 	}{
-		{desc: "file path on windows", token: `C:\path\to\some\file`},
-		{desc: "literal string", token: "some-literal-token"},
+		{
+			desc:      "file path on windows",
+			input:     `Auth,Node,Proxy:C:\path\to\some\file`,
+			wantToken: `C:\path\to\some\file`,
+			wantRoles: []types.SystemRole{
+				types.RoleAuth, types.RoleNode, types.RoleProxy,
+			},
+		},
+		{
+			desc:      "literal string",
+			input:     "Auth,Node,Proxy:some-literal-token",
+			wantToken: "some-literal-token",
+			wantRoles: []types.SystemRole{
+				types.RoleAuth, types.RoleNode, types.RoleProxy,
+			},
+		},
+		{
+			desc:      "reject bot role",
+			input:     "Bot:some-literal-token",
+			wantError: "role \"Bot\" is not allowed in static token configuration",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.desc, func(t *testing.T) {
-			staticToken := StaticToken("Auth,Node,Proxy:" + tt.token)
+			staticToken := StaticToken(tt.input)
 			provisionTokens, err := staticToken.Parse()
+			if tt.wantError != "" {
+				require.ErrorContains(t, err, tt.wantError)
+				return
+			}
 			require.NoError(t, err)
 
 			require.Len(t, provisionTokens, 1)
 			provisionToken := provisionTokens[0]
 
 			want := types.ProvisionTokenV1{
-				Roles: []types.SystemRole{
-					types.RoleAuth, types.RoleNode, types.RoleProxy,
-				},
-				Token:   tt.token,
+				Roles:   tt.wantRoles,
+				Token:   tt.wantToken,
 				Expires: provisionToken.Expires,
 			}
-			require.Equal(t, provisionToken, want)
+			require.Equal(t, want, provisionToken)
 		})
 	}
 }
@@ -591,15 +953,32 @@ func TestAuthenticationConfig_RequireSessionMFA(t *testing.T) {
 			},
 			expectRequireMFAType: types.RequireMFAType_SESSION_AND_HARDWARE_KEY,
 		}, {
-			desc: "RequireSessionMFA hardware_key",
+			desc: "RequireSessionMFA hardware_key_touch",
 			mutate: func(cfg cfgMap) {
 				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
 					"require_session_mfa": types.RequireMFATypeHardwareKeyTouchString,
 				}
 			},
 			expectRequireMFAType: types.RequireMFAType_HARDWARE_KEY_TOUCH,
+		}, {
+			desc: "RequireSessionMFA hardware_key_pin",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"require_session_mfa": types.RequireMFATypeHardwareKeyPINString,
+				}
+			},
+			expectRequireMFAType: types.RequireMFAType_HARDWARE_KEY_PIN,
+		}, {
+			desc: "RequireSessionMFA hardware_key_touch_and_pin",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"require_session_mfa": types.RequireMFATypeHardwareKeyTouchAndPINString,
+				}
+			},
+			expectRequireMFAType: types.RequireMFAType_HARDWARE_KEY_TOUCH_AND_PIN,
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.desc, func(t *testing.T) {
 			text := bytes.NewBuffer(editConfig(t, tt.mutate))
@@ -613,6 +992,147 @@ func TestAuthenticationConfig_RequireSessionMFA(t *testing.T) {
 			require.Empty(t, cmp.Diff(cfg.Auth.Authentication.RequireMFAType, tt.expectRequireMFAType))
 		})
 	}
+}
+
+func TestAuthenticationConfig_Parse_deviceTrustPB(t *testing.T) {
+	t.Parallel()
+	tpmEKCertPath := "testdata/tpm_ekcert_ca.pem"
+	tpmEKCertPEM, err := os.ReadFile(tpmEKCertPath)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name       string
+		configYAML []byte
+		wantErr    bool
+		wantPB     *types.DeviceTrust
+	}{
+		{
+			name: "minimal config",
+			configYAML: editConfig(t, func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"type":          "local",
+					"second_factor": "otp",
+					"device_trust": cfgMap{
+						"mode": "optional",
+					},
+				}
+			}),
+			wantPB: &types.DeviceTrust{
+				Mode: "optional",
+			},
+		},
+		{
+			name: "all fields",
+			configYAML: editConfig(t, func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"type":          "local",
+					"second_factor": "otp",
+					"device_trust": cfgMap{
+						"mode":        "required",
+						"auto_enroll": "yes",
+						"ekcert_allowed_cas": []string{
+							string(tpmEKCertPEM),
+						},
+					},
+				}
+			}),
+			wantPB: &types.DeviceTrust{
+				Mode:       "required",
+				AutoEnroll: true,
+				EKCertAllowedCAs: []string{
+					string(tpmEKCertPEM),
+				},
+			},
+		},
+		{
+			name: "reads ekcert_allowed_cas from path",
+			configYAML: editConfig(t, func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"device_trust": cfgMap{
+						"ekcert_allowed_cas": []string{
+							tpmEKCertPath,
+						},
+					},
+				}
+			}),
+			wantPB: &types.DeviceTrust{
+				EKCertAllowedCAs: []string{
+					string(tpmEKCertPEM),
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid ekcert_allowed_cas entry",
+			configYAML: editConfig(t, func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"device_trust": cfgMap{
+						"ekcert_allowed_cas": []string{
+							"this is not a pem encoded CA",
+						},
+					},
+				}
+			}),
+			wantErr: true,
+		},
+		{
+			name: "auto-enroll invalid",
+			configYAML: editConfig(t, func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"type":          "local",
+					"second_factor": "otp",
+					"device_trust": cfgMap{
+						"mode":        "required",
+						"auto_enroll": "NOT A BOOLEAN", // invalid
+					},
+				}
+			}),
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := ReadConfig(bytes.NewBuffer(test.configYAML))
+			require.NoError(t, err, "ReadConfig failed")
+
+			cap, err := cfg.Auth.Authentication.Parse()
+			if test.wantErr {
+				assert.Error(t, err, "ReadConfig error mismatch")
+				assert.True(t, trace.IsBadParameter(err), "ReadConfig returned non-BadParameter error: %v (%T)", err, err)
+				return
+			}
+			require.NoError(t, err, "Parse failed")
+
+			got := cap.GetDeviceTrust()
+			if diff := cmp.Diff(test.wantPB, got, protocmp.Transform()); diff != "" {
+				t.Errorf("Parse mismatch (-want +got)\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestAuthenticationConfig_Parse_StableUNIXUserConfig(t *testing.T) {
+	text := editConfig(t, func(cfg cfgMap) {
+		cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+			"stable_unix_user_config": nil,
+		}
+	})
+	cfg, err := ReadConfig(bytes.NewBuffer(text))
+	require.NoError(t, err)
+	_, err = cfg.Auth.Authentication.Parse()
+	require.NoError(t, err)
+
+	text = editConfig(t, func(cfg cfgMap) {
+		cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+			"stable_unix_user_config": cfgMap{
+				"enabled": true,
+			},
+		}
+	})
+	cfg, err = ReadConfig(bytes.NewBuffer(text))
+	require.NoError(t, err)
+	_, err = cfg.Auth.Authentication.Parse()
+	require.ErrorContains(t, err, "UID range includes negative or system UIDs")
 }
 
 // TestSSHSection tests the config parser for the SSH config block
@@ -718,356 +1238,115 @@ func TestSSHSection(t *testing.T) {
 	}
 }
 
-func TestDiscoveryConfig(t *testing.T) {
-	t.Parallel()
-	testCases := []struct {
-		desc                     string
-		mutate                   func(cfgMap)
-		expectError              require.ErrorAssertionFunc
-		expectEnabled            require.BoolAssertionFunc
-		expectedDiscoverySection Discovery
+func TestHardwareKeyConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		mutate                  func(cfgMap)
+		expectReadError         require.ErrorAssertionFunc
+		expectParseError        require.ErrorAssertionFunc
+		expectHardwareKeyConfig *types.HardwareKey
 	}{
 		{
-			desc:                     "default",
-			mutate:                   func(cfgMap) {},
-			expectError:              require.NoError,
-			expectEnabled:            require.False,
-			expectedDiscoverySection: Discovery{},
+			name: "OK empty",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"hardware_key": cfgMap{},
+				}
+			},
+			expectHardwareKeyConfig: &types.HardwareKey{},
 		},
 		{
-			desc:          "GCP section without project_ids",
-			expectError:   require.Error,
-			expectEnabled: require.True,
+			name: "OK piv_slot",
 			mutate: func(cfg cfgMap) {
-				cfg["discovery_service"].(cfgMap)["enabled"] = "yes"
-				cfg["discovery_service"].(cfgMap)["gcp"] = []cfgMap{
-					{
-						"types": []string{"gke"},
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"hardware_key": cfgMap{
+						"piv_slot": "9a",
 					},
 				}
 			},
-			expectedDiscoverySection: Discovery{},
+			expectHardwareKeyConfig: &types.HardwareKey{
+				PIVSlot: "9a",
+			},
 		},
 		{
-			desc:          "GCP section is filled with defaults",
-			expectError:   require.NoError,
-			expectEnabled: require.True,
+			name: "NOK piv_slot unsupported slot",
 			mutate: func(cfg cfgMap) {
-				cfg["discovery_service"].(cfgMap)["enabled"] = "yes"
-				cfg["discovery_service"].(cfgMap)["gcp"] = []cfgMap{
-					{
-						"types":       []string{"gke"},
-						"project_ids": []string{"p1", "p2"},
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"hardware_key": cfgMap{
+						"piv_slot": "8f",
 					},
 				}
 			},
-			expectedDiscoverySection: Discovery{
-				GCPMatchers: []GCPMatcher{
-					{
-						Types:     []string{"gke"},
-						Locations: []string{"*"},
-						Tags: map[string]apiutils.Strings{
-							"*": []string{"*"},
+			expectParseError: func(t require.TestingT, err error, i ...any) {
+				require.Error(t, err)
+				require.True(t, trace.IsBadParameter(err), "got err = %v, want BadParameter", err)
+			},
+		},
+		{
+			name: "OK serial_number_validation",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"hardware_key": cfgMap{
+						"serial_number_validation": cfgMap{
+							"enabled":                  true,
+							"serial_number_trait_name": "custom_trait_name",
 						},
-						ProjectIDs: []string{"p1", "p2"},
 					},
+				}
+			},
+			expectHardwareKeyConfig: &types.HardwareKey{
+				SerialNumberValidation: &types.HardwareKeySerialNumberValidation{
+					Enabled:               true,
+					SerialNumberTraitName: "custom_trait_name",
 				},
 			},
 		},
 		{
-			desc:          "GCP section is filled",
-			expectError:   require.NoError,
-			expectEnabled: require.True,
+			name: "OK pin_cache_ttl",
 			mutate: func(cfg cfgMap) {
-				cfg["discovery_service"].(cfgMap)["enabled"] = "yes"
-				cfg["discovery_service"].(cfgMap)["gcp"] = []cfgMap{
-					{
-						"types":     []string{"gke"},
-						"locations": []string{"eucentral1"},
-						"tags": cfgMap{
-							"discover_teleport": "yes",
-						},
-						"project_ids": []string{"p1", "p2"},
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"hardware_key": cfgMap{
+						"pin_cache_ttl": "1m",
 					},
 				}
 			},
-			expectedDiscoverySection: Discovery{
-				GCPMatchers: []GCPMatcher{
-					{
-						Types:     []string{"gke"},
-						Locations: []string{"eucentral1"},
-						Tags: map[string]apiutils.Strings{
-							"discover_teleport": []string{"yes"},
-						},
-						ProjectIDs: []string{"p1", "p2"},
-					},
-				},
+			expectHardwareKeyConfig: &types.HardwareKey{
+				PinCacheTTL: types.Duration(time.Minute),
 			},
 		},
 		{
-			desc:          "Azure section is filled with defaults",
-			expectError:   require.NoError,
-			expectEnabled: require.True,
+			name: "NOK pin_cache_ttl not a duration",
 			mutate: func(cfg cfgMap) {
-				cfg["discovery_service"].(cfgMap)["enabled"] = "yes"
-				cfg["discovery_service"].(cfgMap)["azure"] = []cfgMap{
-					{
-						"types": []string{"aks"},
+				cfg["auth_service"].(cfgMap)["authentication"] = cfgMap{
+					"hardware_key": cfgMap{
+						"pin_cache_ttl": "1minute",
 					},
 				}
 			},
-			expectedDiscoverySection: Discovery{
-				AzureMatchers: []AzureMatcher{
-					{
-						Types:   []string{"aks"},
-						Regions: []string{"*"},
-						ResourceTags: map[string]apiutils.Strings{
-							"*": []string{"*"},
-						},
-						Subscriptions:  []string{"*"},
-						ResourceGroups: []string{"*"},
-					},
-				},
-			},
+			expectReadError: require.Error,
 		},
-		{
-			desc:          "Azure section is filled with values",
-			expectError:   require.NoError,
-			expectEnabled: require.True,
-			mutate: func(cfg cfgMap) {
-				cfg["discovery_service"].(cfgMap)["enabled"] = "yes"
-				cfg["discovery_service"].(cfgMap)["azure"] = []cfgMap{
-					{
-						"types":   []string{"aks"},
-						"regions": []string{"eucentral1"},
-						"tags": cfgMap{
-							"discover_teleport": "yes",
-						},
-						"subscriptions":   []string{"sub1", "sub2"},
-						"resource_groups": []string{"group1", "group2"},
-					},
-				}
-			},
-			expectedDiscoverySection: Discovery{
-				AzureMatchers: []AzureMatcher{
-					{
-						Types:   []string{"aks"},
-						Regions: []string{"eucentral1"},
-						ResourceTags: map[string]apiutils.Strings{
-							"discover_teleport": []string{"yes"},
-						},
-						Subscriptions:  []string{"sub1", "sub2"},
-						ResourceGroups: []string{"group1", "group2"},
-					},
-				},
-			},
-		},
-		{
-			desc:          "AWS section is filled with defaults",
-			expectError:   require.NoError,
-			expectEnabled: require.True,
-			mutate: func(cfg cfgMap) {
-				cfg["discovery_service"].(cfgMap)["enabled"] = "yes"
-				cfg["discovery_service"].(cfgMap)["aws"] = []cfgMap{
-					{
-						"types":   []string{"ec2"},
-						"regions": []string{"eu-central-1"},
-						"tags": cfgMap{
-							"discover_teleport": "yes",
-						},
-					},
-				}
-			},
-			expectedDiscoverySection: Discovery{
-				AWSMatchers: []AWSMatcher{
-					{
-						Types:   []string{"ec2"},
-						Regions: []string{"eu-central-1"},
-						Tags: map[string]apiutils.Strings{
-							"discover_teleport": []string{"yes"},
-						},
-						InstallParams: &InstallParams{
-							JoinParams: JoinParams{
-								TokenName: defaults.IAMInviteTokenName,
-								Method:    types.JoinMethodIAM,
-							},
-							SSHDConfig: "/etc/ssh/sshd_config",
-							ScriptName: installers.InstallerScriptName,
-						},
-						SSM: AWSSSM{DocumentName: defaults.AWSInstallerDocument},
-					},
-				},
-			},
-		},
-		{
-			desc:          "AWS section is filled with custom configs",
-			expectError:   require.NoError,
-			expectEnabled: require.True,
-			mutate: func(cfg cfgMap) {
-				cfg["discovery_service"].(cfgMap)["enabled"] = "yes"
-				cfg["discovery_service"].(cfgMap)["aws"] = []cfgMap{
-					{
-						"types":   []string{"ec2"},
-						"regions": []string{"eu-central-1"},
-						"tags": cfgMap{
-							"discover_teleport": "yes",
-						},
-						"install": cfgMap{
-							"join_params": cfgMap{
-								"token_name": "hello-iam-a-token",
-								"method":     "iam",
-							},
-							"script_name": "installer-custom",
-						},
-						"ssm": cfgMap{
-							"document_name": "hello_document",
-						},
-					},
-				}
-			},
-			expectedDiscoverySection: Discovery{
-				AWSMatchers: []AWSMatcher{
-					{
-						Types:   []string{"ec2"},
-						Regions: []string{"eu-central-1"},
-						Tags: map[string]apiutils.Strings{
-							"discover_teleport": []string{"yes"},
-						},
-						InstallParams: &InstallParams{
-							JoinParams: JoinParams{
-								TokenName: "hello-iam-a-token",
-								Method:    types.JoinMethodIAM,
-							},
-							SSHDConfig: "/etc/ssh/sshd_config",
-							ScriptName: "installer-custom",
-						},
-						SSM: AWSSSM{DocumentName: "hello_document"},
-					},
-				},
-			},
-		},
-		{
-			desc:          "AWS section is filled with invalid region",
-			expectError:   require.Error,
-			expectEnabled: require.True,
-			mutate: func(cfg cfgMap) {
-				cfg["discovery_service"].(cfgMap)["enabled"] = "yes"
-				cfg["discovery_service"].(cfgMap)["aws"] = []cfgMap{
-					{
-						"types":   []string{"ec2"},
-						"regions": []string{"*"},
-						"tags": cfgMap{
-							"discover_teleport": "yes",
-						},
-					},
-				}
-			},
-			expectedDiscoverySection: Discovery{},
-		},
-		{
-			desc:          "AWS section is filled with invalid join method",
-			expectError:   require.Error,
-			expectEnabled: require.True,
-			mutate: func(cfg cfgMap) {
-				cfg["discovery_service"].(cfgMap)["enabled"] = "yes"
-				cfg["discovery_service"].(cfgMap)["aws"] = []cfgMap{
-					{
-						"install": cfgMap{
-							"join_params": cfgMap{
-								"token_name": "hello-iam-a-token",
-								"method":     "token",
-							},
-						},
-					},
-				}
-			},
-			expectedDiscoverySection: Discovery{},
-		},
-		{
-			desc:          "AWS section is filled with no token",
-			expectError:   require.NoError,
-			expectEnabled: require.True,
-			mutate: func(cfg cfgMap) {
-				cfg["discovery_service"].(cfgMap)["enabled"] = "yes"
-				cfg["discovery_service"].(cfgMap)["aws"] = []cfgMap{
-					{
-						"regions": []string{"eu-west-1"},
-						"install": cfgMap{
-							"join_params": cfgMap{
-								"method": "iam",
-							},
-						},
-					},
-				}
-			},
-			expectedDiscoverySection: Discovery{
-				AWSMatchers: []AWSMatcher{
-					{
-						SSM: AWSSSM{
-							DocumentName: defaults.AWSInstallerDocument,
-						},
-						Regions: []string{"eu-west-1"},
-						Tags:    map[string]apiutils.Strings{"*": {"*"}},
-						InstallParams: &InstallParams{
-							JoinParams: JoinParams{
-								TokenName: defaults.IAMInviteTokenName,
-								Method:    types.JoinMethodIAM,
-							},
-							ScriptName: installers.InstallerScriptName,
-							SSHDConfig: "/etc/ssh/sshd_config",
-						},
-					},
-				},
-			},
-		},
-		{
-			desc:          "Azure section is filled with defaults",
-			expectError:   require.NoError,
-			expectEnabled: require.True,
-			mutate: func(cfg cfgMap) {
-				cfg["discovery_service"].(cfgMap)["enabled"] = "yes"
-				cfg["discovery_service"].(cfgMap)["azure"] = []cfgMap{
-					{
-						"types":           []string{"vm"},
-						"regions":         []string{"westcentralus"},
-						"resource_groups": []string{"rg1"},
-						"subscriptions":   []string{"88888888-8888-8888-8888-888888888888"},
-						"tags": cfgMap{
-							"discover_teleport": "yes",
-						},
-					},
-				}
-			},
-			expectedDiscoverySection: Discovery{
-				AzureMatchers: []AzureMatcher{
-					{
-						Types:          []string{"vm"},
-						Regions:        []string{"westcentralus"},
-						ResourceGroups: []string{"rg1"},
-						Subscriptions:  []string{"88888888-8888-8888-8888-888888888888"},
-						ResourceTags: map[string]apiutils.Strings{
-							"discover_teleport": []string{"yes"},
-						},
-					},
-				},
-			},
-		},
-	}
-	for _, testCase := range testCases {
-		t.Run(testCase.desc, func(t *testing.T) {
-			text := bytes.NewBuffer(editConfig(t, testCase.mutate))
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			text := bytes.NewBuffer(editConfig(t, tc.mutate))
+
 			cfg, err := ReadConfig(text)
-			testCase.expectError(t, err)
-			if cfg == nil {
+			if tc.expectReadError != nil {
+				tc.expectReadError(t, err)
 				return
 			}
-			testCase.expectEnabled(t, cfg.Discovery.Enabled())
-			if expectedAWS := testCase.expectedDiscoverySection.AWSMatchers; expectedAWS != nil {
-				require.Equal(t, expectedAWS, cfg.Discovery.AWSMatchers)
+			require.NoError(t, err)
+
+			cap, err := cfg.Auth.Authentication.Parse()
+			if tc.expectParseError != nil {
+				tc.expectParseError(t, err)
+				return
 			}
-			if expectedAzure := testCase.expectedDiscoverySection.AzureMatchers; expectedAzure != nil {
-				require.Equal(t, expectedAzure, cfg.Discovery.AzureMatchers)
-			}
+			require.NoError(t, err)
+
+			hardwareKeyConfig, err := cap.GetHardwareKey()
+			require.NoError(t, err)
+
+			require.Equal(t, tc.expectHardwareKeyConfig, hardwareKeyConfig)
 		})
 	}
 }
@@ -1175,7 +1454,7 @@ func TestX11Config(t *testing.T) {
 					"max_display":    100,
 				}
 			},
-			expectConfigError: func(t require.TestingT, err error, i ...interface{}) {
+			expectConfigError: func(t require.TestingT, err error, i ...any) {
 				require.Error(t, err)
 				require.True(t, trace.IsBadParameter(err), "got err = %v, want BadParameter", err)
 			},
@@ -1200,6 +1479,207 @@ func TestX11Config(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.Equal(t, tc.expectX11Config, serverCfg)
+		})
+	}
+}
+
+func TestBackoffConfig(t *testing.T) {
+	testCases := []struct {
+		desc                   string
+		mutate                 func(cfgMap)
+		expectSvcBackoffConfig *servicecfg.AuthConnectionConfig
+		errorFn                func(t require.TestingT, err error, msgAndArgs ...interface{})
+	}{
+		{
+			desc:   "default",
+			mutate: func(cfg cfgMap) {},
+			expectSvcBackoffConfig: &servicecfg.AuthConnectionConfig{
+				UpperLimitBetweenRetries: 90 * time.Second,
+				InitialConnectionDelay:   9 * time.Second,
+				BackoffStepDuration:      18 * time.Second,
+			},
+			errorFn: require.NoError,
+		},
+		{
+			desc: "negative values use defaults",
+			mutate: func(cfg cfgMap) {
+				cfg["teleport"].(cfgMap)["auth_connection_config"] = cfgMap{
+					"initial_connection_delay":    "-1m",
+					"upper_limit_between_retries": "-5m",
+					"backoff_step_duration":       "-3s",
+				}
+			},
+			expectSvcBackoffConfig: &servicecfg.AuthConnectionConfig{
+				UpperLimitBetweenRetries: 90 * time.Second,
+				InitialConnectionDelay:   9 * time.Second,
+				BackoffStepDuration:      18 * time.Second,
+			},
+			errorFn: require.NoError,
+		},
+		{
+			desc: "use default ratio when only max is given",
+			mutate: func(cfg cfgMap) {
+				cfg["teleport"].(cfgMap)["auth_connection_config"] = cfgMap{
+					"upper_limit_between_retries": "3m",
+				}
+			},
+			expectSvcBackoffConfig: &servicecfg.AuthConnectionConfig{
+				UpperLimitBetweenRetries: 3 * time.Minute,
+				InitialConnectionDelay:   18 * time.Second,
+				BackoffStepDuration:      36 * time.Second,
+			},
+			errorFn: require.NoError,
+		},
+		{
+			desc: "user specified",
+			mutate: func(cfg cfgMap) {
+				cfg["teleport"].(cfgMap)["auth_connection_config"] = cfgMap{
+					"initial_connection_delay":    "1m",
+					"upper_limit_between_retries": "5m",
+					"backoff_step_duration":       "3s",
+				}
+			},
+			expectSvcBackoffConfig: &servicecfg.AuthConnectionConfig{
+				UpperLimitBetweenRetries: 5 * time.Minute,
+				InitialConnectionDelay:   time.Minute,
+				BackoffStepDuration:      3 * time.Second,
+			},
+			errorFn: require.NoError,
+		},
+		{
+			desc: "minimum upper range enforced",
+			mutate: func(cfg cfgMap) {
+				cfg["teleport"].(cfgMap)["auth_connection_config"] = cfgMap{
+					"upper_limit_between_retries": "2ms",
+				}
+			},
+			expectSvcBackoffConfig: nil,
+			errorFn: func(t require.TestingT, err error, msgAndArgs ...interface{}) {
+				require.ErrorContains(t, err, "cannot be set below")
+				require.True(t, trace.IsBadParameter(err))
+			},
+		},
+		{
+			desc: "cannot set initial delay above upper limit",
+			mutate: func(cfg cfgMap) {
+				cfg["teleport"].(cfgMap)["auth_connection_config"] = cfgMap{
+					"initial_connection_delay": "2h",
+				}
+			},
+			expectSvcBackoffConfig: nil,
+			errorFn: func(t require.TestingT, err error, msgAndArgs ...interface{}) {
+				require.ErrorContains(t, err, "cannot be larger than upper_limit_between_retries")
+				require.True(t, trace.IsBadParameter(err))
+			},
+		},
+		{
+			desc: "cannot set step above upper limit",
+			mutate: func(cfg cfgMap) {
+				cfg["teleport"].(cfgMap)["auth_connection_config"] = cfgMap{
+					"backoff_step_duration": "2h",
+				}
+			},
+			expectSvcBackoffConfig: nil,
+			errorFn: func(t require.TestingT, err error, msgAndArgs ...interface{}) {
+				require.ErrorContains(t, err, "cannot be larger than upper_limit_between_retries")
+				require.True(t, trace.IsBadParameter(err))
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			text := bytes.NewBuffer(editConfig(t, tc.mutate))
+
+			cfg, err := ReadConfig(text)
+			require.NoError(t, err)
+
+			svccfg, err := cfg.AuthConnectionConfig.Parse()
+			tc.errorFn(t, err)
+
+			require.Equal(t, tc.expectSvcBackoffConfig, svccfg)
+		})
+	}
+}
+
+func TestBoundKeypairConfig(t *testing.T) {
+	testCases := []struct {
+		desc             string
+		mutate           func(cfgMap)
+		expectJoinParams JoinParams
+	}{
+		{
+			desc:             "empty",
+			mutate:           func(cfg cfgMap) {},
+			expectJoinParams: JoinParams{},
+		},
+		{
+			desc: "bound keypair registration secret value",
+			mutate: func(cfg cfgMap) {
+				cfg["teleport"].(cfgMap)["join_params"] = cfgMap{
+					"token_name": "example",
+					"method":     "bound_keypair",
+					"bound_keypair": cfgMap{
+						"registration_secret_value": "reg-secret",
+					},
+				}
+			},
+			expectJoinParams: JoinParams{
+				TokenName: "example",
+				Method:    types.JoinMethodBoundKeypair,
+				BoundKeypair: BoundKeypairParams{
+					RegistrationSecretValue: "reg-secret",
+				},
+			},
+		},
+		{
+			desc: "bound keypair registration secret path",
+			mutate: func(cfg cfgMap) {
+				cfg["teleport"].(cfgMap)["join_params"] = cfgMap{
+					"token_name": "example",
+					"method":     "bound_keypair",
+					"bound_keypair": cfgMap{
+						"registration_secret_path": "/path/to/secret",
+					},
+				}
+			},
+			expectJoinParams: JoinParams{
+				TokenName: "example",
+				Method:    types.JoinMethodBoundKeypair,
+				BoundKeypair: BoundKeypairParams{
+					RegistrationSecretPath: "/path/to/secret",
+				},
+			},
+		},
+		{
+			desc: "bound keypair registration static key path",
+			mutate: func(cfg cfgMap) {
+				cfg["teleport"].(cfgMap)["join_params"] = cfgMap{
+					"token_name": "example",
+					"method":     "bound_keypair",
+					"bound_keypair": cfgMap{
+						"static_key_path": "/path/to/key",
+					},
+				}
+			},
+			expectJoinParams: JoinParams{
+				TokenName: "example",
+				Method:    types.JoinMethodBoundKeypair,
+				BoundKeypair: BoundKeypairParams{
+					StaticPrivateKeyPath: "/path/to/key",
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			text := bytes.NewBuffer(editConfig(t, tc.mutate))
+
+			cfg, err := ReadConfig(text)
+			require.NoError(t, err)
+
+			require.Equal(t, tc.expectJoinParams, cfg.JoinParams)
 		})
 	}
 }
@@ -1262,6 +1742,49 @@ func TestMakeSampleFileConfig(t *testing.T) {
 		require.Equal(t, "no", fc.Proxy.EnabledFlag)
 		require.Equal(t, "no", fc.Auth.EnabledFlag)
 		require.Equal(t, "yes", fc.Apps.EnabledFlag)
+	})
+
+	t.Run("App role with MCP Demo server", func(t *testing.T) {
+		fc, err := MakeSampleFileConfig(SampleFlags{
+			Roles:         "app",
+			MCPDemoServer: true,
+		})
+		require.NoError(t, err)
+		require.Equal(t, "no", fc.SSH.EnabledFlag)
+		require.Equal(t, "no", fc.Proxy.EnabledFlag)
+		require.Equal(t, "no", fc.Auth.EnabledFlag)
+		require.Equal(t, "yes", fc.Apps.EnabledFlag)
+		require.True(t, fc.Apps.MCPDemoServer)
+	})
+
+	t.Run("App name and MCP Demo Server", func(t *testing.T) {
+		_, err := MakeSampleFileConfig(SampleFlags{
+			Roles:         "app",
+			AppURI:        "localhost:8080",
+			MCPDemoServer: true,
+		})
+		require.Error(t, err)
+
+		_, err = MakeSampleFileConfig(SampleFlags{
+			Roles:         "app",
+			AppName:       "nginx",
+			MCPDemoServer: true,
+		})
+		require.Error(t, err)
+
+		fc, err := MakeSampleFileConfig(SampleFlags{
+			Roles:         "app",
+			AppURI:        "localhost:8080",
+			AppName:       "nginx",
+			MCPDemoServer: true,
+		})
+		require.NoError(t, err)
+
+		require.Equal(t, "no", fc.SSH.EnabledFlag)
+		require.Equal(t, "no", fc.Proxy.EnabledFlag)
+		require.Equal(t, "no", fc.Auth.EnabledFlag)
+		require.Equal(t, "yes", fc.Apps.EnabledFlag)
+		require.True(t, fc.Apps.MCPDemoServer)
 	})
 
 	t.Run("Proxy role", func(t *testing.T) {
@@ -1390,6 +1913,14 @@ func TestMakeSampleFileConfig(t *testing.T) {
 		require.Error(t, err)
 	})
 
+	t.Run("Azure client ID", func(t *testing.T) {
+		fc, err := MakeSampleFileConfig(SampleFlags{
+			AzureClientID: "abcd1234",
+		})
+		require.NoError(t, err)
+		require.Equal(t, "abcd1234", fc.JoinParams.Azure.ClientID)
+	})
+
 	t.Run("CAPin", func(t *testing.T) {
 		fc, err := MakeSampleFileConfig(SampleFlags{
 			CAPin: "sha256:7e12c17c20d9cb",
@@ -1402,4 +1933,85 @@ func TestMakeSampleFileConfig(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, apiutils.Strings{"sha256:7e12c17c20d9cb", "sha256:7e12c17c20d9cb"}, fc.CAPin)
 	})
+}
+
+func TestAuditQueueConfig_Parse(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		desc      string
+		cfg       AuditQueueConfig
+		want      servicecfg.AuditQueueConfig
+		assertErr require.ErrorAssertionFunc
+	}{
+		{
+			desc: "empty",
+			cfg:  AuditQueueConfig{},
+			want: servicecfg.AuditQueueConfig{
+				Synchronous: auditqueue.SynchronousNormal,
+			},
+			assertErr: require.NoError,
+		},
+		{
+			desc: "valid fields",
+			cfg: AuditQueueConfig{
+				SoftLimit:               "100MiB",
+				HardLimit:               "1GiB",
+				MaxAttempts:             5,
+				DeadLetterTTL:           types.Duration(24 * time.Hour),
+				DeadLetterSweepInterval: types.Duration(5 * time.Minute),
+				OrphanScanInterval:      types.Duration(10 * time.Minute),
+				Backend:                 []string{"sqlite_disk", "sqlite_memory"},
+			},
+			want: servicecfg.AuditQueueConfig{
+				SoftLimit:               100 * 1024 * 1024,
+				MaxBytes:                1024 * 1024 * 1024,
+				MaxAttempts:             5,
+				DeadLetterTTL:           24 * time.Hour,
+				DeadLetterSweepInterval: 5 * time.Minute,
+				OrphanScanInterval:      10 * time.Minute,
+				Backends:                []string{"sqlite_disk", "sqlite_memory"},
+				Synchronous:             auditqueue.SynchronousNormal,
+			},
+			assertErr: require.NoError,
+		},
+		{
+			desc: "synchronous FULL",
+			cfg:  AuditQueueConfig{Synchronous: "FULL"},
+			want: servicecfg.AuditQueueConfig{
+				Synchronous: auditqueue.SynchronousFull,
+			},
+			assertErr: require.NoError,
+		},
+		{
+			desc: "invalid soft_limit",
+			cfg:  AuditQueueConfig{SoftLimit: "not-a-size"},
+			assertErr: func(t require.TestingT, err error, _ ...any) {
+				require.True(t, trace.IsBadParameter(err))
+			},
+		},
+		{
+			desc: "invalid hard_limit",
+			cfg:  AuditQueueConfig{HardLimit: "not-a-size"},
+			assertErr: func(t require.TestingT, err error, _ ...any) {
+				require.True(t, trace.IsBadParameter(err))
+			},
+		},
+		{
+			desc: "invalid synchronous",
+			cfg:  AuditQueueConfig{Synchronous: "OFF"},
+			assertErr: func(t require.TestingT, err error, _ ...any) {
+				require.True(t, trace.IsBadParameter(err))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			t.Parallel()
+			got, err := tt.cfg.Parse()
+			tt.assertErr(t, err)
+			if err == nil {
+				require.Equal(t, tt.want, got)
+			}
+		})
+	}
 }

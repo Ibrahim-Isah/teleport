@@ -1,30 +1,39 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
+	"slices"
 	"testing"
 
-	"github.com/gravitational/oxy/forward"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/httplib/reverseproxy"
 )
 
 func mustParseURL(urlString string) *url.URL {
@@ -48,15 +57,15 @@ func newTestDelegate(header, value string) *testDelegate {
 	}
 }
 
-func (t *testDelegate) Rewrite(req *http.Request) {
-	req.Header.Set(t.header, t.value)
+func (t *testDelegate) Rewrite(req *httputil.ProxyRequest) {
+	req.Out.Header.Set(t.header, t.value)
 }
 
 func TestHeaderRewriter(t *testing.T) {
 	tests := []struct {
 		name               string
 		req                *http.Request
-		extraDelegates     []forward.ReqRewriter
+		extraDelegates     []reverseproxy.Rewriter
 		expectedHeaders    http.Header
 		expectedSSLHeader  string
 		expectedPortHeader string
@@ -69,8 +78,8 @@ func TestHeaderRewriter(t *testing.T) {
 				Header: http.Header{},
 			},
 			expectedHeaders: http.Header{
-				XForwardedSSL:          []string{sslOff},
-				forward.XForwardedPort: []string{"80"},
+				XForwardedSSL:               []string{sslOff},
+				reverseproxy.XForwardedPort: []string{"80"},
 			},
 		},
 		{
@@ -81,8 +90,8 @@ func TestHeaderRewriter(t *testing.T) {
 				Header: http.Header{},
 			},
 			expectedHeaders: http.Header{
-				XForwardedSSL:          []string{sslOff},
-				forward.XForwardedPort: []string{"12345"},
+				XForwardedSSL:               []string{sslOff},
+				reverseproxy.XForwardedPort: []string{"12345"},
 			},
 		},
 		{
@@ -94,8 +103,8 @@ func TestHeaderRewriter(t *testing.T) {
 				TLS:    &tls.ConnectionState{},
 			},
 			expectedHeaders: http.Header{
-				XForwardedSSL:          []string{sslOn},
-				forward.XForwardedPort: []string{"443"},
+				XForwardedSSL:               []string{sslOn},
+				reverseproxy.XForwardedPort: []string{"443"},
 			},
 		},
 		{
@@ -106,30 +115,77 @@ func TestHeaderRewriter(t *testing.T) {
 				Header: http.Header{},
 				TLS:    &tls.ConnectionState{},
 			},
-			extraDelegates: []forward.ReqRewriter{
+			extraDelegates: []reverseproxy.Rewriter{
 				newTestDelegate("test-1", "value-1"),
 				newTestDelegate("test-2", "value-2"),
 			},
 			expectedHeaders: http.Header{
-				XForwardedSSL:          []string{sslOn},
-				forward.XForwardedPort: []string{"12345"},
-				"test-1":               []string{"value-1"},
-				"test-2":               []string{"value-2"},
+				XForwardedSSL:               []string{sslOn},
+				reverseproxy.XForwardedPort: []string{"12345"},
+				"test-1":                    []string{"value-1"},
+				"test-2":                    []string{"value-2"},
 			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			delegates := []forward.ReqRewriter{&forward.HeaderRewriter{}}
+			delegates := []reverseproxy.Rewriter{&reverseproxy.HeaderRewriter{}}
 			delegates = append(delegates, test.extraDelegates...)
 			hr := NewHeaderRewriter(delegates...)
 
-			hr.Rewrite(test.req)
+			// replicate net/http/httputil.ReverseProxy stripping
+			// forwarding headers from the outbound request
+			outReq := test.req.Clone(test.req.Context())
+			outReq.Header.Del("Forwarded")
+			outReq.Header.Del(reverseproxy.XForwardedFor)
+			outReq.Header.Del(reverseproxy.XForwardedHost)
+			outReq.Header.Del(reverseproxy.XForwardedProto)
+
+			hr.Rewrite(&httputil.ProxyRequest{
+				In:  test.req,
+				Out: outReq,
+			})
 
 			for header, value := range test.expectedHeaders {
-				assert.Equal(t, test.req.Header.Get(header), value[0])
+				assert.Equal(t, outReq.Header.Get(header), value[0])
 			}
+		})
+	}
+}
+
+func TestAppRewriteHeaders(t *testing.T) {
+	tests := []struct {
+		name        string
+		rewrite     *types.Rewrite
+		wantHeaders []*types.Header
+	}{
+		{
+			name:        "no rewrite",
+			rewrite:     nil,
+			wantHeaders: nil,
+		},
+		{
+			name: "reserved header is filtered",
+			rewrite: &types.Rewrite{
+				Headers: []*types.Header{
+					{Name: "test-key-1", Value: "test-value-1"},
+					{Name: "teleport-jwt-assertion", Value: "teleport-jwt-assertion-value"},
+					{Name: "test-key-2", Value: "test-value-2"},
+					{Name: "X-Real-Ip", Value: "1.2.3.4"},
+				},
+			},
+			wantHeaders: []*types.Header{
+				{Name: "test-key-1", Value: "test-value-1"},
+				{Name: "test-key-2", Value: "test-value-2"},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actualHeaders := AppRewriteHeaders(context.Background(), test.rewrite, slog.Default())
+			require.Equal(t, test.wantHeaders, slices.Collect(actualHeaders))
 		})
 	}
 }

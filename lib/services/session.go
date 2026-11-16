@@ -1,23 +1,27 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
+	"context"
 	"encoding/json"
+	"iter"
 
 	"github.com/gravitational/trace"
 
@@ -50,8 +54,8 @@ func UnmarshalWebSession(bytes []byte, opts ...MarshalOption) (types.WebSession,
 		if err := ws.CheckAndSetDefaults(); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		if cfg.ID != 0 {
-			ws.SetResourceID(cfg.ID)
+		if cfg.Revision != "" {
+			ws.SetRevision(cfg.Revision)
 		}
 		if !cfg.Expires.IsZero() {
 			ws.SetExpiry(cfg.Expires)
@@ -75,25 +79,32 @@ func MarshalWebSession(webSession types.WebSession, opts ...MarshalOption) ([]by
 		if version := webSession.GetVersion(); version != types.V2 {
 			return nil, trace.BadParameter("mismatched web session version %v and type %T", version, webSession)
 		}
-		if !cfg.PreserveResourceID {
-			// avoid modifying the original object
-			// to prevent unexpected data races
-			copy := *webSession
-			copy.SetResourceID(0)
-			webSession = &copy
-		}
-		return utils.FastMarshal(webSession)
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, webSession))
 	default:
 		return nil, trace.BadParameter("unrecognized web session version %T", webSession)
 	}
 }
 
+// WebToken defines an interface for managing web token resources.
+type WebToken interface {
+	// GetWebToken gets a web token.
+	GetWebToken(context.Context, types.GetWebTokenRequest) (types.WebToken, error)
+	// GetWebTokens gets all web tokens.
+	GetWebTokens(context.Context) ([]types.WebToken, error)
+	// ListWebTokens returns a page of web tokens
+	ListWebTokens(ctx context.Context, limit int, start string) ([]types.WebToken, string, error)
+	// RangeWebTokens returns web tokens within the range [start, end).
+	RangeWebTokens(ctx context.Context, start, end string) iter.Seq2[types.WebToken, error]
+	// UpsertWebToken updates the existing or inserts a new web token.
+	UpsertWebToken(context.Context, types.WebToken) error
+	// DeleteWebToken deletes a web token.
+	DeleteWebToken(context.Context, types.DeleteWebTokenRequest) error
+	// DeleteAllWebTokens deletes all web tokens.
+	DeleteAllWebTokens(context.Context) error
+}
+
 // MarshalWebToken serializes the web token as JSON-encoded payload
 func MarshalWebToken(webToken types.WebToken, opts ...MarshalOption) ([]byte, error) {
-	if err := webToken.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	cfg, err := CollectOptions(opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -101,14 +112,11 @@ func MarshalWebToken(webToken types.WebToken, opts ...MarshalOption) ([]byte, er
 
 	switch webToken := webToken.(type) {
 	case *types.WebTokenV3:
-		if !cfg.PreserveResourceID {
-			// avoid modifying the original object
-			// to prevent unexpected data races
-			copy := *webToken
-			copy.SetResourceID(0)
-			webToken = &copy
+		if err := webToken.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		return utils.FastMarshal(webToken)
+
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, webToken))
 	default:
 		return nil, trace.BadParameter("unrecognized web token version %T", webToken)
 	}
@@ -134,8 +142,8 @@ func UnmarshalWebToken(bytes []byte, opts ...MarshalOption) (types.WebToken, err
 		if err := token.CheckAndSetDefaults(); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		if config.ID != 0 {
-			token.SetResourceID(config.ID)
+		if config.Revision != "" {
+			token.SetRevision(config.Revision)
 		}
 		if !config.Expires.IsZero() {
 			token.Metadata.SetExpiry(config.Expires)

@@ -1,25 +1,27 @@
-/*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import Logger from 'shared/libs/logger';
 
 import cfg from 'teleport/config';
-import history from 'teleport/services/history';
 import api from 'teleport/services/api';
-import localStorage, { KeysEnum } from 'teleport/services/localStorage';
+import history from 'teleport/services/history';
+import { KeysEnum, storageService } from 'teleport/services/storageService';
 
 import makeBearerToken from './makeBearerToken';
 import { RenewSessionRequest } from './types';
@@ -33,18 +35,62 @@ const logger = Logger.create('services/session');
 let sesstionCheckerTimerId = null;
 
 const session = {
-  logout() {
-    api.delete(cfg.api.webSessionPath).finally(() => {
-      history.goToLogin();
-    });
+  _isRenewing: false,
+  _isDeviceTrustRequired: false,
+  _isDeviceTrusted: false,
 
+  async logout(rememberLocation = false) {
+    let samlSloUrl = '';
+    try {
+      const response = await this._plainLogout();
+      samlSloUrl = response?.samlSloUrl;
+    } finally {
+      if (samlSloUrl) {
+        window.open(samlSloUrl, '_self');
+      } else {
+        history.goToLogin({ rememberLocation });
+      }
+    }
+  },
+
+  async _plainLogout(): Promise<{ samlSloUrl: string } | undefined> {
+    try {
+      return await api.deleteWithOptions(cfg.api.webSessionPath, {});
+    } catch (err) {
+      // This request can fail if the session is already expired, which isn't an issue, but we should still catch the error.
+      logger.error(
+        'Failed to delete session. This can happen if the session has already expired.',
+        err
+      );
+    } finally {
+      this.clear();
+    }
+  },
+
+  async switchScope(scope: string) {
+    await this._plainLogout();
+    history.goToLogin({ scope });
+  },
+
+  logoutWithoutSlo({
+    rememberLocation = false,
+    withAccessChangedMessage = false,
+  } = {}) {
+    api.delete(cfg.api.webSessionPath).finally(() => {
+      this.clear();
+      history.goToLogin({ rememberLocation, withAccessChangedMessage });
+    });
+  },
+
+  clearBrowserSession(rememberLocation = false) {
     this.clear();
+    history.goToLogin({ rememberLocation });
   },
 
   clear() {
     this._stopTokenChecker();
-    localStorage.unsubscribe(receiveMessage);
-    localStorage.clear();
+    storageService.unsubscribe(receiveMessage);
+    storageService.clear();
   },
 
   // ensureSession verifies that token is valid and starts
@@ -71,10 +117,15 @@ const session = {
 
   // renewSession renews session and returns the
   // absolute time the new session expires.
-  renewSession(req: RenewSessionRequest): Promise<Date> {
-    return this._renewToken(req).then(token => token.sessionExpires);
+  renewSession(req: RenewSessionRequest, signal?: AbortSignal): Promise<Date> {
+    return this._renewToken(req, signal).then(token => token.sessionExpires);
   },
 
+  /**
+   * isValid first extracts bearer token from HTML if
+   * not already extracted and sets in the local storage.
+   * Then checks if token is not expired.
+   */
   isValid() {
     return this._timeLeft() > 0;
   },
@@ -90,9 +141,9 @@ const session = {
     try {
       token = this._extractBearerTokenFromHtml();
       if (token) {
-        localStorage.setBearerToken(token);
+        storageService.setBearerToken(token);
       } else {
-        token = localStorage.getBearerToken();
+        token = storageService.getBearerToken();
       }
     } catch (err) {
       logger.error('Cannot find bearer token', err);
@@ -109,7 +160,7 @@ const session = {
       return null;
     }
     // remove token from HTML as it will be renewed with a time
-    // and stored in the localStorage
+    // and stored in the storageService
     el.parentNode.removeChild(el);
     const decoded = window.atob(el.content);
     const json = JSON.parse(decoded);
@@ -121,20 +172,43 @@ const session = {
       return false;
     }
 
-    // Renew session if token expiry time is less than 3 minutes.
+    const token = this._getBearerToken();
+    if (!token) {
+      return false;
+    }
+    // Convert seconds to millis.
+    const expiresIn = (token.expiresIn ?? 0) * 1000;
+    const sessionExpiresIn = (token.sessionExpiresIn ?? 0) * 1000;
+
+    // Session TTL decreases on every renewal, up to a point where it doesn't
+    // make sense to renew anymore, as we won't gain any extra time from it.
+    // Once values are low enough both expiresIn (token expiration) and
+    // sessionExpiresIn are set in lockstep.
+    if (
+      expiresIn > 0 &&
+      sessionExpiresIn > 0 &&
+      expiresIn >= sessionExpiresIn &&
+      sessionExpiresIn <= RENEW_TOKEN_TIME
+    ) {
+      logger.warn(
+        `Session TTL is only ${sessionExpiresIn}ms, the session will expire soon.`
+      );
+      return false;
+    }
+
     // Browsers have js timer throttling behavior in inactive tabs that can go
     // up to 100s between timer calls from testing. 3 minutes seems to be a safe number
     // with extra padding.
     return this._timeLeft() < RENEW_TOKEN_TIME;
   },
 
-  _renewToken(req: RenewSessionRequest = {}) {
+  _renewToken(req: RenewSessionRequest = {}, signal?: AbortSignal) {
     this._setAndBroadcastIsRenewing(true);
     return api
-      .post(cfg.getRenewTokenUrl(), req)
+      .post(cfg.getRenewTokenUrl(), req, signal)
       .then(json => {
         const token = makeBearerToken(json);
-        localStorage.setBearerToken(token);
+        storageService.setBearerToken(token);
         return token;
       })
       .finally(() => {
@@ -142,17 +216,35 @@ const session = {
       });
   },
 
-  _setAndBroadcastIsRenewing(value) {
+  _setAndBroadcastIsRenewing(value: boolean) {
     this._setIsRenewing(value);
-    localStorage.broadcast(KeysEnum.TOKEN_RENEW, value);
+    storageService.broadcast(KeysEnum.TOKEN_RENEW, value);
   },
 
-  _setIsRenewing(value) {
+  _setIsRenewing(value: boolean) {
     this._isRenewing = value;
   },
 
   _getIsRenewing() {
-    return !!this._isRenewing;
+    return this._isRenewing;
+  },
+
+  setDeviceTrustRequired() {
+    this._isDeviceTrustRequired = true;
+  },
+
+  getDeviceTrustRequired() {
+    return this._isDeviceTrustRequired;
+  },
+
+  getIsDeviceTrusted() {
+    return this._isDeviceTrusted;
+  },
+
+  // a session will never be "downgraded" so we can just set to true
+  // if this method is called.
+  setIsDeviceTrusted() {
+    this._isDeviceTrusted = true;
   },
 
   _timeLeft() {
@@ -184,18 +276,26 @@ const session = {
     return this._timeLeft() > TOKEN_CHECKER_INTERVAL * 2;
   },
 
-  // subsribes to localStorage changes (triggered from other browser tabs)
+  // subsribes to storageService changes (triggered from other browser tabs)
   _ensureLocalStorageSubscription() {
-    localStorage.subscribe(receiveMessage);
+    storageService.subscribe(receiveMessage);
   },
 
   _fetchStatus() {
-    api.get(cfg.api.userStatusPath).catch(err => {
+    this.validateCookieAndSession().catch(err => {
       // this indicates that session is no longer valid (caused by server restarts or updates)
       if (err.response.status == 403) {
-        this.logout();
+        this.clearBrowserSession();
       }
     });
+  },
+
+  /**
+   * validateCookieAndSessionFromBackend makes an authenticated request
+   * which checks if the cookie and the user session are still valid.
+   */
+  validateCookieAndSession() {
+    return api.get(cfg.api.userStatusPath);
   },
 
   _startTokenChecker() {
@@ -218,12 +318,12 @@ const session = {
   },
 };
 
-function receiveMessage(event) {
+function receiveMessage(event: StorageEvent) {
   const { key, newValue } = event;
 
   // check if logout was triggered from other tabs
-  if (localStorage.getBearerToken() === null) {
-    session.logout();
+  if (storageService.getBearerToken() === null) {
+    session.clearBrowserSession();
   }
 
   // check if token is being renewed from another tab

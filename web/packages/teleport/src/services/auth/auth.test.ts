@@ -1,24 +1,24 @@
-/*
-Copyright 2015-2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import cfg from 'teleport/config';
-import auth from 'teleport/services/auth';
 import api from 'teleport/services/api';
-
-/* eslint-disable jest/no-conditional-expect */
+import auth from 'teleport/services/auth';
 
 describe('services/auth', () => {
   afterEach(() => {
@@ -30,26 +30,84 @@ describe('services/auth', () => {
   const email = 'user@example.com';
 
   test('login()', async () => {
-    jest.spyOn(api, 'post').mockResolvedValue({});
+    jest.spyOn(api, 'postWithOptions').mockResolvedValue({});
 
-    await auth.login(email, password, '');
-    expect(api.post).toHaveBeenCalledWith(cfg.api.webSessionPath, {
-      user: email,
-      pass: password,
-      second_factor_token: '',
-    });
+    await auth.login(email, password, '' /*otp*/, '' /*scope*/);
+    expect(api.postWithOptions).toHaveBeenCalledWith(
+      cfg.api.webSessionPath,
+      expect.objectContaining({
+        data: {
+          user: email,
+          pass: password,
+          second_factor_token: '',
+          scope: '',
+        },
+      })
+    );
   });
 
-  test('login() OTP', async () => {
-    jest.spyOn(api, 'post').mockResolvedValue({});
+  test('login() OTP and scope', async () => {
+    jest.spyOn(api, 'postWithOptions').mockResolvedValue({});
     const data = {
       user: email,
       pass: password,
       second_factor_token: 'xxx',
+      scope: '/prod/europe',
     };
 
-    await auth.login(email, password, 'xxx');
-    expect(api.post).toHaveBeenCalledWith(cfg.api.webSessionPath, data);
+    await auth.login(email, password, 'xxx', '/prod/europe');
+    expect(api.postWithOptions).toHaveBeenCalledWith(
+      cfg.api.webSessionPath,
+      expect.objectContaining({ data })
+    );
+  });
+
+  describe('getMfaChallengeResponseForAdminAction', () => {
+    const original = {
+      second_factor: cfg.auth.second_factor,
+      second_factors: cfg.auth.second_factors,
+    };
+    afterEach(() => {
+      cfg.auth.second_factor = original.second_factor;
+      cfg.auth.second_factors = original.second_factors;
+    });
+
+    test('skips the challenge when admin MFA is not enforced', async () => {
+      cfg.auth.second_factors = ['otp', 'webauthn'];
+      const getMfaChallenge = jest.spyOn(auth, 'getMfaChallenge');
+
+      const result = await auth.getMfaChallengeResponseForAdminAction(true);
+
+      expect(result).toBeUndefined();
+      expect(getMfaChallenge).not.toHaveBeenCalled();
+    });
+
+    test('falls back to server-side check when enforcement is unknown', async () => {
+      // Older proxy/auth: second_factors empty and legacy field collapses to off.
+      cfg.auth.second_factors = [];
+      cfg.auth.second_factor = 'off';
+      const getMfaChallenge = jest
+        .spyOn(auth, 'getMfaChallenge')
+        .mockResolvedValue(undefined);
+
+      await auth.getMfaChallengeResponseForAdminAction(true);
+
+      expect(getMfaChallenge).toHaveBeenCalled();
+    });
+
+    test('SSO-only cluster fetches the challenge with allowReuse', async () => {
+      cfg.auth.second_factors = ['sso'];
+      cfg.auth.second_factor = 'off';
+      const getMfaChallenge = jest
+        .spyOn(auth, 'getMfaChallenge')
+        .mockResolvedValue(undefined);
+
+      await auth.getMfaChallengeResponseForAdminAction(true);
+
+      expect(getMfaChallenge).toHaveBeenCalledWith(
+        expect.objectContaining({ allowReuse: true })
+      );
+    });
   });
 
   test('resetPassword()', async () => {
@@ -61,10 +119,15 @@ describe('services/auth', () => {
     };
 
     await auth.resetPassword({
-      tokenId: 'tokenId',
-      password,
-      otpCode: '2fa_token',
+      req: {
+        tokenId: 'tokenId',
+        password: password,
+        otpCode: '2fa_token',
+      },
     });
-    expect(api.put).toHaveBeenCalledWith(cfg.getPasswordTokenUrl(), submitData);
+    expect(api.put).toHaveBeenCalledWith(
+      cfg.getPasswordTokenUrl(),
+      expect.objectContaining(submitData)
+    );
   });
 });

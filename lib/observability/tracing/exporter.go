@@ -1,22 +1,25 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package tracing
 
 import (
 	"context"
-	"errors"
 	"io"
 
 	"github.com/gravitational/trace"
@@ -24,35 +27,50 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
-// NewExporter returns a new exporter that is configured per the provided Config.
-func NewExporter(ctx context.Context, cfg Config) (sdktrace.SpanExporter, error) {
+// newExporter returns a new exporter that is configured per the provided Config.
+// It also returns a *bufferedClient if one is required because the resource
+// attributes or the real client are not yet available, otherwise it will be
+// nil.
+func newExporter(ctx context.Context, cfg Config) (sdktrace.SpanExporter, *bufferedClient, error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
+		return nil, nil, trace.Wrap(err)
 	}
 
-	traceClient, err := NewClient(cfg)
-	if err != nil {
-		return nil, trace.Wrap(err)
+	var (
+		traceClient otlptrace.Client
+		bufClient   *bufferedClient
+		err         error
+	)
+	if cfg.WaitForDelayedResourceAttrs || cfg.WaitForDelayedClient {
+		// newBufferedClient will create the client if possible, or wait for a
+		// delayed client to be provided later.
+		bufClient, err = newBufferedClient(cfg)
+		if err != nil {
+			return nil, nil, trace.Wrap(err)
+		}
+		traceClient = bufClient
+	} else {
+		traceClient, err = NewClient(cfg)
+		if err != nil {
+			return nil, nil, trace.Wrap(err)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, cfg.DialTimeout)
 	defer cancel()
 	exporter, err := otlptrace.New(ctx, traceClient)
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		return nil, trace.ConnectionProblem(err, "failed to connect to tracing exporter %s: %v", cfg.ExporterURL, err)
-	case err != nil:
-		return nil, trace.NewAggregate(err, traceClient.Stop(context.Background()))
+	if err != nil {
+		return nil, nil, trace.NewAggregate(err, traceClient.Stop(context.Background()))
 	}
 
 	if cfg.Client == nil {
-		return exporter, nil
+		return exporter, bufClient, nil
 	}
 
 	return &wrappedExporter{
 		exporter: exporter,
 		closer:   cfg.Client,
-	}, nil
+	}, bufClient, nil
 }
 
 // wrappedExporter is a sdktrace.SpanExporter wrapper that is used to ensure that any

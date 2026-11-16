@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package ui
 
@@ -28,10 +30,10 @@ import (
 	"github.com/gravitational/teleport"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/memory"
-	"github.com/gravitational/teleport/lib/reversetunnel"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/local"
 )
@@ -66,9 +68,6 @@ func BenchmarkGetClusterDetails(b *testing.B) {
 
 		// run the sub benchmark
 		b.Run(name, func(sb *testing.B) {
-
-			sb.StopTimer() // stop timer while running setup
-
 			// configure the backend instance
 			var bk backend.Backend
 			var err error
@@ -90,29 +89,24 @@ func BenchmarkGetClusterDetails(b *testing.B) {
 			insertServers(ctx, b, svc, types.KindProxy, proxyCount)
 			insertServers(ctx, b, svc, types.KindAuthServer, authCount)
 
-			site := &mockRemoteSite{
+			site := &mockCluster{
 				accessPoint: &mockAccessPoint{
 					presence: svc,
 				},
 			}
-
-			sb.StartTimer() // restart timer for benchmark operations
-
 			benchmarkGetClusterDetails(ctx, sb, site, tt.nodes)
-
-			sb.StopTimer() // stop timer to exclude deferred cleanup
 		})
 	}
 }
 
 // insertServers inserts a collection of servers into a backend.
-func insertServers(ctx context.Context, b *testing.B, svc services.Presence, kind string, count int) {
+func insertServers(ctx context.Context, b *testing.B, svc services.PresenceInternal, kind string, count int) {
 	const labelCount = 10
 	labels := make(map[string]string, labelCount)
-	for i := 0; i < labelCount; i++ {
+	for i := range labelCount {
 		labels[fmt.Sprintf("label-key-%d", i)] = fmt.Sprintf("label-val-%d", i)
 	}
-	for i := 0; i < count; i++ {
+	for range count {
 		name := uuid.New().String()
 		addr := fmt.Sprintf("%s.%s", name, clusterName)
 		server := &types.ServerV2{
@@ -124,9 +118,8 @@ func insertServers(ctx context.Context, b *testing.B, svc services.Presence, kin
 				Labels:    labels,
 			},
 			Spec: types.ServerSpecV2{
-				Addr:       addr,
-				PublicAddr: addr,
-				Version:    teleport.Version,
+				Addr:    addr,
+				Version: teleport.Version,
 			},
 		}
 		var err error
@@ -134,9 +127,9 @@ func insertServers(ctx context.Context, b *testing.B, svc services.Presence, kin
 		case types.KindNode:
 			_, err = svc.UpsertNode(ctx, server)
 		case types.KindProxy:
-			err = svc.UpsertProxy(server)
+			_, err = svc.UpsertProxyServer(ctx, server)
 		case types.KindAuthServer:
-			err = svc.UpsertAuthServer(server)
+			err = svc.UpsertAuthServer(ctx, server)
 		default:
 			b.Errorf("Unexpected server kind: %s", kind)
 		}
@@ -144,40 +137,39 @@ func insertServers(ctx context.Context, b *testing.B, svc services.Presence, kin
 	}
 }
 
-func benchmarkGetClusterDetails(ctx context.Context, b *testing.B, site reversetunnel.RemoteSite, nodes int, opts ...services.MarshalOption) {
-	var cluster *Cluster
+func benchmarkGetClusterDetails(ctx context.Context, b *testing.B, cluster reversetunnelclient.Cluster, nodes int, opts ...services.MarshalOption) {
+	var got *Cluster
 	var err error
-	for i := 0; i < b.N; i++ {
-		cluster, err = GetClusterDetails(ctx, site, opts...)
+	for b.Loop() {
+		got, err = GetClusterDetails(ctx, cluster, opts...)
 		require.NoError(b, err)
 	}
-	require.NotNil(b, cluster)
-	require.Equal(b, nodes, cluster.NodeCount)
+	require.NotNil(b, got)
 }
 
-type mockRemoteSite struct {
-	reversetunnel.RemoteSite
-	accessPoint auth.ProxyAccessPoint
+type mockCluster struct {
+	reversetunnelclient.Cluster
+	accessPoint authclient.ProxyAccessPoint
 }
 
-func (m *mockRemoteSite) CachingAccessPoint() (auth.RemoteProxyAccessPoint, error) {
+func (m *mockCluster) CachingAccessPoint() (authclient.RemoteProxyAccessPoint, error) {
 	return m.accessPoint, nil
 }
 
-func (m *mockRemoteSite) GetName() string {
+func (m *mockCluster) GetName() string {
 	return clusterName
 }
 
-func (m *mockRemoteSite) GetLastConnected() time.Time {
+func (m *mockCluster) GetLastConnected() time.Time {
 	return time.Now()
 }
 
-func (m *mockRemoteSite) GetStatus() string {
+func (m *mockCluster) GetStatus() string {
 	return teleport.RemoteClusterStatusOnline
 }
 
 type mockAccessPoint struct {
-	auth.ProxyAccessPoint
+	authclient.ProxyAccessPoint
 	presence *local.PresenceService
 }
 
@@ -186,9 +178,19 @@ func (m *mockAccessPoint) GetNodes(ctx context.Context, namespace string) ([]typ
 }
 
 func (m *mockAccessPoint) GetProxies() ([]types.Server, error) {
+	//nolint:staticcheck // TODO(kiosion) DELETE IN 21.0.0
 	return m.presence.GetProxies()
 }
 
+func (m *mockAccessPoint) ListProxyServers(ctx context.Context, pageSize int, pageToken string) ([]types.Server, string, error) {
+	return m.presence.ListProxyServers(ctx, pageSize, pageToken)
+}
+
 func (m *mockAccessPoint) GetAuthServers() ([]types.Server, error) {
+	//nolint:staticcheck // TODO(kiosion) DELETE IN 21.0.0
 	return m.presence.GetAuthServers()
+}
+
+func (m *mockAccessPoint) ListAuthServers(ctx context.Context, pageSize int, pageToken string) ([]types.Server, string, error) {
+	return m.presence.ListAuthServers(ctx, pageSize, pageToken)
 }

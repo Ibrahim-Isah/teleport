@@ -1,39 +1,49 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import { ButtonIcon, ButtonPrimary, ButtonSecondary, H2 } from 'design';
 import DialogConfirmation, {
   DialogContent,
   DialogFooter,
   DialogHeader,
 } from 'design/DialogConfirmation';
-import { ButtonIcon, ButtonPrimary, ButtonSecondary, Text } from 'design';
-import { Close } from 'design/Icon';
+import { Cross } from 'design/Icon';
+import { P } from 'design/Text/Text';
+import { pluralize } from 'shared/utils/text';
 
-interface DocumentsReopenProps {
-  onCancel(): void;
+import { RootClusterUri, routing } from 'teleterm/ui/uri';
 
+export function DocumentsReopen(props: {
+  rootClusterUri: RootClusterUri;
+  numberOfDocuments: number;
+  onDiscard(): void;
   onConfirm(): void;
-}
+  hidden?: boolean;
+}) {
+  const { rootClusterUri } = props;
+  const clusterName = routing.parseClusterName(rootClusterUri);
 
-export function DocumentsReopen(props: DocumentsReopenProps) {
   return (
     <DialogConfirmation
-      open={true}
-      onClose={props.onCancel}
+      open={!props.hidden}
+      keepInDOMAfterClose
+      trapFocus
+      onClose={props.onDiscard}
       dialogCss={() => ({
         maxWidth: '400px',
         width: '100%',
@@ -45,33 +55,46 @@ export function DocumentsReopen(props: DocumentsReopenProps) {
           props.onConfirm();
         }}
       >
-        <DialogHeader
-          justifyContent="space-between"
-          mb={0}
-          alignItems="baseline"
-        >
-          <Text typography="h4" bold>
-            Reopen previous session
-          </Text>
+        <DialogHeader justifyContent="space-between" alignItems="baseline">
+          <H2>Reopen previous session</H2>
           <ButtonIcon
             type="button"
-            onClick={props.onCancel}
-            color="text.secondary"
+            onClick={props.onDiscard}
+            title="Close"
+            color="text.slightlyMuted"
           >
-            <Close fontSize={5} />
+            <Cross size="medium" />
           </ButtonIcon>
         </DialogHeader>
         <DialogContent mb={4}>
-          <Text typography="body1" color="text.secondary">
+          <P
+            // Split long continuous cluster names into separate lines.
+            css={`
+              word-wrap: break-word;
+            `}
+          >
             Do you want to reopen tabs from the previous session?
-          </Text>
+            <br />
+            {/*
+              We show this mostly because we needed to show the cluster name somewhere during UI
+              initialization. When you open the app and have some tabs to restore, the UI will show
+              nothing else but this modal. Showing the cluster name provides some information to the
+              user about which workspace they're in.
+            */}
+            You had{' '}
+            <strong>
+              {props.numberOfDocuments}{' '}
+              {pluralize(props.numberOfDocuments, 'tab')}
+            </strong>{' '}
+            open in <strong>{clusterName}</strong>.
+          </P>
         </DialogContent>
         <DialogFooter>
           <ButtonPrimary autoFocus mr={3} type="submit">
             Reopen
           </ButtonPrimary>
-          <ButtonSecondary type="button" onClick={props.onCancel}>
-            Start new session
+          <ButtonSecondary type="button" onClick={props.onDiscard}>
+            Start New Session
           </ButtonSecondary>
         </DialogFooter>
       </form>

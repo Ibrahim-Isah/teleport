@@ -1,10 +1,11 @@
+# orca-iac disable=b61415c4-ce88-4f3a-930b-821d0a4530bb
 // Bastion is an emergency access bastion
 // that could be spun up on demand in case
 // of the need to have emergency administrative access
 resource "aws_instance" "bastion" {
   count                       = "1"
   ami                         = data.aws_ami.base.id
-  instance_type               = "t2.medium"
+  instance_type               = var.bastion_instance_type
   key_name                    = var.key_name
   associate_public_ip_address = true
   source_dest_check           = false
@@ -18,6 +19,13 @@ resource "aws_instance" "bastion" {
 
   root_block_device {
     encrypted = true
+  }
+
+  // ignore any changes to name tag
+  lifecycle {
+    ignore_changes = [
+      tags["Name"],
+    ]
   }
 
   tags = {

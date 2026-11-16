@@ -17,17 +17,21 @@ limitations under the License.
 package types
 
 import (
+	"context"
+	"log/slog"
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/utils"
 )
 
-const githubURL = "https://github.com"
+const (
+	GithubURL    = "https://github.com"
+	GithubAPIURL = "https://api.github.com"
+)
 
 // GithubConnector defines an interface for a Github OAuth2 connector
 type GithubConnector interface {
@@ -65,6 +69,18 @@ type GithubConnector interface {
 	SetDisplay(string)
 	// GetEndpointURL returns the endpoint URL
 	GetEndpointURL() string
+	// GetAPIEndpointURL returns the API endpoint URL
+	GetAPIEndpointURL() string
+	// GetClientRedirectSettings returns the client redirect settings.
+	GetClientRedirectSettings() *SSOClientRedirectSettings
+	// GetUserMatchers returns the set of glob patterns to narrow down which username(s) this auth connector should
+	// match for identifier-first login.
+	GetUserMatchers() []string
+	// SetUserMatchers sets the set of glob patterns to narrow down which username(s) this auth connector should match
+	// for identifier-first login.
+	SetUserMatchers([]string)
+	// Validate ensures that required fields are present on the connector.
+	Validate() error
 }
 
 // NewGithubConnector creates a new Github connector from name and spec
@@ -101,14 +117,14 @@ func (c *GithubConnectorV3) SetSubKind(s string) {
 	c.SubKind = s
 }
 
-// GetResourceID returns resource ID
-func (c *GithubConnectorV3) GetResourceID() int64 {
-	return c.Metadata.ID
+// GetRevision returns the revision
+func (c *GithubConnectorV3) GetRevision() string {
+	return c.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (c *GithubConnectorV3) SetResourceID(id int64) {
-	c.Metadata.ID = id
+// SetRevision sets the revision
+func (c *GithubConnectorV3) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // GetName returns the name of the connector
@@ -176,7 +192,7 @@ func (c *GithubConnectorV3) CheckAndSetDefaults() error {
 
 	// DELETE IN 11.0.0
 	if len(c.Spec.TeamsToLogins) > 0 {
-		log.Warn("GitHub connector field teams_to_logins is deprecated and will be removed in the next version. Please use teams_to_roles instead.")
+		slog.WarnContext(context.Background(), "GitHub connector field teams_to_logins is deprecated and will be removed in the next version. Please use teams_to_roles instead.")
 	}
 
 	// make sure claim mappings have either roles or a role template
@@ -191,10 +207,14 @@ func (c *GithubConnectorV3) CheckAndSetDefaults() error {
 		}
 	}
 
+	return nil
+}
+
+// Validate ensures that required fields are present on the connector.
+func (c *GithubConnectorV3) Validate() error {
 	if len(c.Spec.TeamsToLogins)+len(c.Spec.TeamsToRoles) == 0 {
 		return trace.BadParameter("team_to_logins or team_to_roles mapping is invalid, no mappings defined.")
 	}
-
 	return nil
 }
 
@@ -264,7 +284,20 @@ func (c *GithubConnectorV3) SetDisplay(display string) {
 
 // GetEndpointURL returns the endpoint URL
 func (c *GithubConnectorV3) GetEndpointURL() string {
-	return githubURL
+	return GithubURL
+}
+
+// GetEndpointURL returns the API endpoint URL
+func (c *GithubConnectorV3) GetAPIEndpointURL() string {
+	return GithubAPIURL
+}
+
+// GetClientRedirectSettings returns the client redirect settings.
+func (c *GithubConnectorV3) GetClientRedirectSettings() *SSOClientRedirectSettings {
+	if c == nil {
+		return nil
+	}
+	return c.Spec.ClientRedirectSettings
 }
 
 // MapClaims returns a list of logins based on the provided claims,
@@ -302,6 +335,21 @@ func (c *GithubConnectorV3) MapClaims(claims GithubClaims) ([]string, []string, 
 	return utils.Deduplicate(roles), utils.Deduplicate(kubeGroups), utils.Deduplicate(kubeUsers)
 }
 
+// GetUserMatchers returns the set of glob patterns to narrow down which username(s) this auth connector should
+// match for identifier-first login.
+func (r *GithubConnectorV3) GetUserMatchers() []string {
+	if r.Spec.UserMatchers == nil {
+		return nil
+	}
+	return r.Spec.UserMatchers
+}
+
+// SetUserMatchers sets the set of glob patterns to narrow down which username(s) this auth connector should match
+// for identifier-first login.
+func (r *GithubConnectorV3) SetUserMatchers(userMatchers []string) {
+	r.Spec.UserMatchers = userMatchers
+}
+
 // SetExpiry sets expiry time for the object
 func (r *GithubAuthRequest) SetExpiry(expires time.Time) {
 	r.Expires = &expires
@@ -317,30 +365,31 @@ func (r *GithubAuthRequest) Expiry() time.Time {
 
 // Check makes sure the request is valid
 func (r *GithubAuthRequest) Check() error {
-	if r.ConnectorID == "" {
+	authenticatedUserFlow := r.AuthenticatedUser != ""
+	regularLoginFlow := !r.SSOTestFlow && !authenticatedUserFlow
+
+	switch {
+	case r.ConnectorID == "":
 		return trace.BadParameter("missing ConnectorID")
-	}
-	if r.StateToken == "" {
+	case r.StateToken == "":
 		return trace.BadParameter("missing StateToken")
-	}
-	if len(r.PublicKey) != 0 {
-		_, _, _, _, err := ssh.ParseAuthorizedKey(r.PublicKey)
-		if err != nil {
-			return trace.BadParameter("bad PublicKey: %v", err)
-		}
-		if (r.CertTTL > defaults.MaxCertDuration) || (r.CertTTL < defaults.MinCertDuration) {
-			return trace.BadParameter("wrong CertTTL")
-		}
-	}
-
 	// we could collapse these two checks into one, but the error message would become ambiguous.
-	if r.SSOTestFlow && r.ConnectorSpec == nil {
+	case r.SSOTestFlow && r.ConnectorSpec == nil:
 		return trace.BadParameter("ConnectorSpec cannot be nil when SSOTestFlow is true")
+	case authenticatedUserFlow && r.ConnectorSpec == nil:
+		return trace.BadParameter("ConnectorSpec cannot be nil for authenticated user")
+	case regularLoginFlow && r.ConnectorSpec != nil:
+		return trace.BadParameter("ConnectorSpec must be nil")
 	}
-
-	if !r.SSOTestFlow && r.ConnectorSpec != nil {
-		return trace.BadParameter("ConnectorSpec must be nil when SSOTestFlow is false")
+	if len(r.SshPublicKey) > 0 {
+		_, _, _, _, err := ssh.ParseAuthorizedKey(r.SshPublicKey)
+		if err != nil {
+			return trace.BadParameter("bad SSH public key: %v", err)
+		}
 	}
-
+	if (len(r.SshPublicKey) != 0 || len(r.TlsPublicKey) != 0) &&
+		(r.CertTTL > defaults.MaxCertDuration || r.CertTTL < defaults.MinCertDuration) {
+		return trace.BadParameter("wrong CertTTL")
+	}
 	return nil
 }

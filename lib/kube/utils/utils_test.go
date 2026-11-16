@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
@@ -20,133 +22,50 @@ import (
 	"context"
 	"testing"
 
+	"github.com/coreos/go-semver/semver"
+	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 
-	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/automaticupgrades/version"
 )
 
-func TestCheckOrSetKubeCluster(t *testing.T) {
+func TestGetAgentVersion(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
 
-	tests := []struct {
-		desc        string
-		services    []types.KubeServer
-		kubeCluster string
-		teleCluster string
-		want        string
-		assertErr   require.ErrorAssertionFunc
+	ctx := context.Background()
+
+	testCases := []struct {
+		desc            string
+		getter          version.Getter
+		expectedVersion *semver.Version
+		errorAssert     require.ErrorAssertionFunc
 	}{
 		{
-			desc: "valid cluster name",
-			services: []types.KubeServer{
-				kubeServer(t, "k8s-1", "server1", "uuuid"),
-				kubeServer(t, "k8s-2", "server1", "uuuid"),
-				kubeServer(t, "k8s-3", "server2", "uuuid2"),
-				kubeServer(t, "k8s-4", "server2", "uuuid2"),
-			},
-			kubeCluster: "k8s-4",
-			teleCluster: "zzz-tele-cluster",
-			want:        "k8s-4",
-			assertErr:   require.NoError,
+			desc:            "version getter error",
+			getter:          mustStaticGetter(t, "", trace.BadParameter("getter error")),
+			expectedVersion: nil,
+			errorAssert:     require.Error,
 		},
 		{
-			desc: "invalid cluster name",
-			services: []types.KubeServer{
-				kubeServer(t, "k8s-1", "server1", "uuuid"),
-				kubeServer(t, "k8s-2", "server1", "uuuid"),
-				kubeServer(t, "k8s-3", "server2", "uuuid2"),
-				kubeServer(t, "k8s-4", "server2", "uuuid2"),
-			},
-			kubeCluster: "k8s-5",
-			teleCluster: "zzz-tele-cluster",
-			assertErr:   require.Error,
-		},
-		{
-			desc:        "no registered clusters",
-			services:    []types.KubeServer{},
-			kubeCluster: "k8s-1",
-			teleCluster: "zzz-tele-cluster",
-			assertErr:   require.Error,
-		},
-		{
-			desc:        "no registered clusters and empty cluster provided",
-			services:    []types.KubeServer{},
-			kubeCluster: "",
-			teleCluster: "zzz-tele-cluster",
-			assertErr:   require.Error,
-		},
-		{
-			desc: "no cluster provided, default to first alphabetically",
-			services: []types.KubeServer{
-				kubeServer(t, "k8s-1", "server1", "uuuid"),
-				kubeServer(t, "k8s-2", "server1", "uuuid"),
-				kubeServer(t, "k8s-3", "server2", "uuuid2"),
-				kubeServer(t, "k8s-4", "server2", "uuuid2"),
-			},
-			kubeCluster: "",
-			teleCluster: "zzz-tele-cluster",
-			want:        "k8s-1",
-			assertErr:   require.NoError,
-		},
-		{
-			desc: "no cluster provided, default to teleport cluster name",
-			services: []types.KubeServer{
-				kubeServer(t, "k8s-1", "server1", "uuuid"),
-				kubeServer(t, "k8s-2", "server1", "uuuid"),
-				kubeServer(t, "k8s-3", "server2", "uuuid2"),
-
-				kubeServer(t, "zzz-tele-cluster", "server2", "uuuid2"),
-				kubeServer(t, "k8s-4", "server2", "uuuid2"),
-			},
-			kubeCluster: "",
-			teleCluster: "zzz-tele-cluster",
-			want:        "zzz-tele-cluster",
-			assertErr:   require.NoError,
+			desc:            "version from getter",
+			getter:          mustStaticGetter(t, "1.2.3", nil),
+			expectedVersion: semver.Must(version.EnsureSemver("1.2.3")),
+			errorAssert:     require.NoError,
 		},
 	}
-	for _, tt := range tests {
+
+	for _, tt := range testCases {
 		t.Run(tt.desc, func(t *testing.T) {
-			got, err := CheckOrSetKubeCluster(ctx, mockKubeServicesPresence(tt.services), tt.kubeCluster, tt.teleCluster)
-			tt.assertErr(t, err)
-			require.Equal(t, got, tt.want)
+			result, err := GetKubeAgentVersion(ctx, tt.getter)
+			tt.errorAssert(t, err)
+			require.Equal(t, tt.expectedVersion, result)
 		})
 	}
 }
 
-type mockKubeServicesPresence []types.KubeServer
-
-func (p mockKubeServicesPresence) GetKubernetesServers(context.Context) ([]types.KubeServer, error) {
-	return p, nil
-}
-
-func kubeServer(t *testing.T, kubeCluster, hostname, hostID string) types.KubeServer {
-	cluster, err := types.NewKubernetesClusterV3(types.Metadata{Name: kubeCluster}, types.KubernetesClusterSpecV3{})
-	require.NoError(t, err)
-	server, err := types.NewKubernetesServerV3FromCluster(cluster, hostname, hostID)
-	require.NoError(t, err)
-	return server
-}
-
-func TestExtractAndSortKubeClusterNames(t *testing.T) {
-	t.Parallel()
-
-	server1 := kubeServer(t, "watermelon", "server1", "uuuid")
-
-	server2 := kubeServer(t, "watermelon", "server1", "uuuid")
-
-	server3, err := types.NewServer("bar", types.KindNode, types.ServerSpecV2{
-		KubernetesClusters: []*types.KubernetesCluster{
-			{Name: "banana"},
-			{Name: "apple"},
-			{Name: "pear"},
-		},
-	})
-	require.NoError(t, err)
-
-	servers, err := types.NewKubeServersV3FromServer(server3)
-	require.NoError(t, err)
-
-	names := extractAndSortKubeClusterNames(append(servers, server1, server2))
-	require.Equal(t, []string{"apple", "banana", "pear", "watermelon"}, names)
+func mustStaticGetter(t *testing.T, v string, err error) version.Getter {
+	t.Helper()
+	g, gerr := version.NewStaticGetter(v, err)
+	require.NoError(t, gerr)
+	return g
 }

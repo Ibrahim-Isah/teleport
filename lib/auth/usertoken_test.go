@@ -1,26 +1,28 @@
 /*
-Copyright 2020 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-package auth
+package auth_test
 
 import (
 	"context"
 	"encoding/base32"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -34,18 +36,23 @@ import (
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/api/types/webauthn"
+	wanpb "github.com/gravitational/teleport/api/types/webauthn"
+	clientutils "github.com/gravitational/teleport/api/utils/clientutils"
+	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/auth/authtest"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/events/eventstest"
+	"github.com/gravitational/teleport/lib/itertools/stream"
 	"github.com/gravitational/teleport/lib/services"
 )
 
 func TestCreateResetPasswordToken(t *testing.T) {
 	t.Parallel()
 	srv := newTestTLSServer(t)
-	mockEmitter := &eventstest.MockEmitter{}
-	srv.Auth().emitter = mockEmitter
+	mockEmitter := &eventstest.MockRecorderEmitter{}
+	srv.Auth().SetEmitter(mockEmitter)
 
 	// Configure cluster and user for MFA, registering various devices.
 	mfa := configureForMFA(t, srv)
@@ -53,7 +60,7 @@ func TestCreateResetPasswordToken(t *testing.T) {
 	pass := mfa.Password
 
 	ctx := context.Background()
-	req := CreateUserTokenRequest{
+	req := authclient.CreateUserTokenRequest{
 		Name: username,
 		TTL:  time.Hour,
 	}
@@ -64,9 +71,9 @@ func TestCreateResetPasswordToken(t *testing.T) {
 	require.Equal(t, token.GetURL(), "https://<proxyhost>:3080/web/reset/"+token.GetName())
 
 	event := mockEmitter.LastEvent()
-	require.Equal(t, event.GetType(), events.ResetPasswordTokenCreateEvent)
-	require.Equal(t, event.(*apievents.UserTokenCreate).Name, username)
-	require.Equal(t, event.(*apievents.UserTokenCreate).User, teleport.UserSystem)
+	require.Equal(t, events.ResetPasswordTokenCreateEvent, event.GetType())
+	require.Equal(t, username, event.(*apievents.UserTokenCreate).Name)
+	require.Equal(t, teleport.UserSystem, event.(*apievents.UserTokenCreate).User)
 
 	// verify that user has no MFA devices
 	devs, err := srv.Auth().Services.GetMFADevices(ctx, username, false)
@@ -74,7 +81,7 @@ func TestCreateResetPasswordToken(t *testing.T) {
 	require.Empty(t, devs)
 
 	// verify that password was reset
-	err = srv.Auth().checkPasswordWOToken(username, []byte(pass))
+	err = srv.Auth().CheckPasswordWOToken(ctx, username, []byte(pass))
 	require.Error(t, err)
 
 	// create another reset token for the same user
@@ -82,67 +89,69 @@ func TestCreateResetPasswordToken(t *testing.T) {
 	require.NoError(t, err)
 
 	// previous token must be deleted
-	tokens, err := srv.Auth().GetUserTokens(ctx)
+	userTokens, err := stream.Collect(clientutils.Resources(ctx, srv.Auth().ListUserTokens))
 	require.NoError(t, err)
-	require.Len(t, tokens, 1)
-	require.Equal(t, tokens[0].GetName(), token.GetName())
+	require.Len(t, userTokens, 1)
+	require.Equal(t, userTokens[0].GetName(), token.GetName())
 }
 
 func TestCreateResetPasswordTokenErrors(t *testing.T) {
 	t.Parallel()
-	srv := newTestTLSServer(t)
+	as, err := authtest.NewAuthServer(authtest.AuthServerConfig{Dir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, as.Close()) })
 	ctx := context.Background()
 
 	username := "joe@example.com"
-	_, _, err := CreateUserAndRole(srv.Auth(), username, []string{username}, nil)
+	_, _, err = authtest.CreateUserAndRole(as.AuthServer, username, []string{username}, nil)
 	require.NoError(t, err)
 
 	type testCase struct {
 		desc string
-		req  CreateUserTokenRequest
+		req  authclient.CreateUserTokenRequest
 	}
 
 	testCases := []testCase{
 		{
 			desc: "Reset Password: TTL < 0",
-			req: CreateUserTokenRequest{
+			req: authclient.CreateUserTokenRequest{
 				Name: username,
 				TTL:  -1,
 			},
 		},
 		{
 			desc: "Reset Password: TTL > max",
-			req: CreateUserTokenRequest{
+			req: authclient.CreateUserTokenRequest{
 				Name: username,
 				TTL:  defaults.MaxChangePasswordTokenTTL + time.Hour,
 			},
 		},
 		{
 			desc: "Reset Password: empty user name",
-			req: CreateUserTokenRequest{
+			req: authclient.CreateUserTokenRequest{
 				TTL: time.Hour,
 			},
 		},
 		{
 			desc: "Reset Password: user does not exist",
-			req: CreateUserTokenRequest{
+			req: authclient.CreateUserTokenRequest{
 				Name: "doesnotexist@example.com",
 				TTL:  time.Hour,
 			},
 		},
 		{
 			desc: "Invite: TTL > max",
-			req: CreateUserTokenRequest{
+			req: authclient.CreateUserTokenRequest{
 				Name: username,
 				TTL:  defaults.MaxSignupTokenTTL + time.Hour,
-				Type: UserTokenTypeResetPasswordInvite,
+				Type: authclient.UserTokenTypeResetPasswordInvite,
 			},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
-			_, err := srv.Auth().CreateResetPasswordToken(ctx, tc.req)
+			_, err := as.AuthServer.CreateResetPasswordToken(ctx, tc.req)
 			require.Error(t, err)
 		})
 	}
@@ -173,8 +182,8 @@ func TestFormatAccountName(t *testing.T) {
 				proxies: []types.Server{
 					&types.ServerV2{
 						Spec: types.ServerSpecV2{
-							PublicAddr: "foo",
-							Version:    "bar",
+							PublicAddrs: []string{"foo"},
+							Version:     "bar",
 						},
 					},
 				},
@@ -214,7 +223,7 @@ func TestFormatAccountName(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.description, func(t *testing.T) {
-			accountName, err := formatAccountName(tt.inDebugAuth, "foo", "00000000-0000-0000-0000-000000000000")
+			accountName, err := auth.FormatAccountName(t.Context(), tt.inDebugAuth, "foo", "00000000-0000-0000-0000-000000000000")
 			tt.outError(t, err)
 			require.Equal(t, accountName, tt.outAccountName)
 		})
@@ -223,29 +232,31 @@ func TestFormatAccountName(t *testing.T) {
 
 func TestUserTokenSecretsCreationSettings(t *testing.T) {
 	t.Parallel()
-	srv := newTestTLSServer(t)
+	as, err := authtest.NewAuthServer(authtest.AuthServerConfig{Dir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, as.Close()) })
 
 	username := "joe@example.com"
-	_, _, err := CreateUserAndRole(srv.Auth(), username, []string{username}, nil)
+	_, _, err = authtest.CreateUserAndRole(as.AuthServer, username, []string{username}, nil)
 	require.NoError(t, err)
 
 	ctx := context.Background()
 
-	req := CreateUserTokenRequest{
+	req := authclient.CreateUserTokenRequest{
 		Name: username,
 		TTL:  time.Hour,
 	}
 
-	token, err := srv.Auth().CreateResetPasswordToken(ctx, req)
+	token, err := as.AuthServer.CreateResetPasswordToken(ctx, req)
 	require.NoError(t, err)
 
-	_, err = srv.Auth().CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+	_, err = as.AuthServer.CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
 		TokenID:    token.GetName(),
 		DeviceType: proto.DeviceType_DEVICE_TYPE_TOTP,
 	})
 	require.NoError(t, err)
 
-	secrets, err := srv.Auth().GetUserTokenSecrets(ctx, token.GetName())
+	secrets, err := as.AuthServer.GetUserTokenSecrets(ctx, token.GetName())
 	require.NoError(t, err)
 
 	require.NoError(t, err)
@@ -257,19 +268,22 @@ func TestUserTokenSecretsCreationSettings(t *testing.T) {
 
 func TestUserTokenCreationSettings(t *testing.T) {
 	t.Parallel()
-	srv := newTestTLSServer(t)
+	as, err := authtest.NewAuthServer(authtest.AuthServerConfig{Dir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, as.Close()) })
+	ctx := t.Context()
 
 	username := "joe@example.com"
-	_, _, err := CreateUserAndRole(srv.Auth(), username, []string{username}, nil)
+	_, _, err = authtest.CreateUserAndRole(as.AuthServer, username, []string{username}, nil)
 	require.NoError(t, err)
 
-	req := CreateUserTokenRequest{
+	req := authclient.CreateUserTokenRequest{
 		Name: username,
 		TTL:  time.Hour,
-		Type: UserTokenTypeResetPasswordInvite,
+		Type: authclient.UserTokenTypeResetPasswordInvite,
 	}
 
-	token, err := srv.Auth().newUserToken(req)
+	token, err := as.AuthServer.NewUserToken(ctx, req)
 	require.NoError(t, err)
 	require.Equal(t, req.Name, token.GetUser())
 	require.Equal(t, req.Type, token.GetSubKind())
@@ -281,16 +295,16 @@ func TestUserTokenCreationSettings(t *testing.T) {
 func TestCreatePrivilegeToken(t *testing.T) {
 	t.Parallel()
 	srv := newTestTLSServer(t)
-	fakeClock := srv.Clock().(clockwork.FakeClock)
-	mockEmitter := &eventstest.MockEmitter{}
-	srv.Auth().emitter = mockEmitter
+	fakeClock := srv.Clock().(*clockwork.FakeClock)
+	mockEmitter := &eventstest.MockRecorderEmitter{}
+	srv.Auth().SetEmitter(mockEmitter)
 	ctx := context.Background()
 
 	// Create a user and client with identity.
 	username := "joe@example.com"
-	_, _, err := CreateUserAndRoleWithoutRoles(srv.Auth(), username, []string{username})
+	_, _, err := authtest.CreateUserAndRoleWithoutRoles(srv.Auth(), username, []string{username})
 	require.NoError(t, err)
-	clt, err := srv.NewClient(TestUser(username))
+	clt, err := srv.NewClient(authtest.TestUser(username))
 	require.NoError(t, err)
 
 	// Test a failure when second factor isn't enabled.
@@ -303,7 +317,7 @@ func TestCreatePrivilegeToken(t *testing.T) {
 		SecondFactor: constants.SecondFactorOTP,
 	})
 	require.NoError(t, err)
-	err = srv.Auth().SetAuthPreference(ctx, ap)
+	_, err = srv.Auth().UpsertAuthPreference(ctx, ap)
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -313,14 +327,14 @@ func TestCreatePrivilegeToken(t *testing.T) {
 	}{
 		{
 			name:      "privilege exception token",
-			tokenType: UserTokenTypePrivilegeException,
+			tokenType: authclient.UserTokenTypePrivilegeException,
 			getReq: func() *proto.CreatePrivilegeTokenRequest {
 				return &proto.CreatePrivilegeTokenRequest{}
 			},
 		},
 		{
 			name:      "privilege token",
-			tokenType: UserTokenTypePrivilege,
+			tokenType: authclient.UserTokenTypePrivilege,
 			getReq: func() *proto.CreatePrivilegeTokenRequest {
 				// Upsert a TOTP device to authn with.
 				otpSecret := base32.StdEncoding.EncodeToString([]byte("def456"))
@@ -351,10 +365,10 @@ func TestCreatePrivilegeToken(t *testing.T) {
 
 			// Test events emitted.
 			event := mockEmitter.LastEvent()
-			require.Equal(t, event.GetType(), events.PrivilegeTokenCreateEvent)
-			require.Equal(t, event.GetCode(), events.PrivilegeTokenCreateCode)
-			require.Equal(t, event.(*apievents.UserTokenCreate).Name, username)
-			require.Equal(t, event.(*apievents.UserTokenCreate).User, username)
+			require.Equal(t, events.PrivilegeTokenCreateEvent, event.GetType())
+			require.Equal(t, events.PrivilegeTokenCreateCode, event.GetCode())
+			require.Equal(t, username, event.(*apievents.UserTokenCreate).Name)
+			require.Equal(t, username, event.(*apievents.UserTokenCreate).User)
 
 			// Test token expires after designated time.
 			fakeClock.Advance(defaults.PrivilegeTokenTTL)
@@ -378,7 +392,7 @@ func TestCreatePrivilegeToken_WithLock(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	err = srv.Auth().SetAuthPreference(ctx, ap)
+	_, err = srv.Auth().UpsertAuthPreference(ctx, ap)
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -400,7 +414,7 @@ func TestCreatePrivilegeToken_WithLock(t *testing.T) {
 			getReq: func() *proto.CreatePrivilegeTokenRequest {
 				return &proto.CreatePrivilegeTokenRequest{
 					ExistingMFAResponse: &proto.MFAAuthenticateResponse{Response: &proto.MFAAuthenticateResponse_Webauthn{
-						Webauthn: &webauthn.CredentialAssertionResponse{},
+						Webauthn: &wanpb.CredentialAssertionResponse{},
 					}},
 				}
 			},
@@ -408,15 +422,14 @@ func TestCreatePrivilegeToken_WithLock(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			// Create a user and client with identity.
 			username := fmt.Sprintf("llama%v@goteleport.com", rand.Int())
-			_, _, err := CreateUserAndRoleWithoutRoles(srv.Auth(), username, []string{username})
+			_, _, err := authtest.CreateUserAndRoleWithoutRoles(srv.Auth(), username, []string{username})
 			require.NoError(t, err)
-			clt, err := srv.NewClient(TestUser(username))
+			clt, err := srv.NewClient(authtest.TestUser(username))
 			require.NoError(t, err)
 
 			// Test lock from max failed auth attempts.
@@ -426,14 +439,14 @@ func TestCreatePrivilegeToken_WithLock(t *testing.T) {
 
 				// Test last attempt returns locked error.
 				if i == defaults.MaxLoginAttempts {
-					require.Equal(t, err.Error(), MaxFailedAttemptsErrMsg)
+					require.Equal(t, auth.MaxFailedAttemptsErrMsg, err.Error())
 				} else {
-					require.NotEqual(t, err.Error(), MaxFailedAttemptsErrMsg)
+					require.NotEqual(t, auth.MaxFailedAttemptsErrMsg, err.Error())
 				}
 			}
 
 			// Test user is locked.
-			user, err := srv.Auth().GetUser(username, false)
+			user, err := srv.Auth().GetUser(ctx, username, false)
 			require.NoError(t, err)
 			require.True(t, user.GetStatus().IsLocked)
 			require.False(t, user.GetStatus().LockExpires.IsZero())
@@ -452,6 +465,13 @@ func (s *debugAuth) GetProxies() ([]types.Server, error) {
 		return nil, trace.BadParameter("failed to fetch proxies")
 	}
 	return s.proxies, nil
+}
+
+func (s *debugAuth) ListProxyServers(ctx context.Context, pageSize int, pageToken string) ([]types.Server, string, error) {
+	if s.proxiesError {
+		return nil, "", trace.BadParameter("failed to fetch proxies")
+	}
+	return s.proxies, "", nil
 }
 
 func (s *debugAuth) GetDomainName() (string, error) {

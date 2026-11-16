@@ -1,27 +1,29 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
@@ -30,11 +32,11 @@ import (
 )
 
 const (
-	sessionPrefix   = "session_tracker"
-	retryDelay      = time.Second
-	terminatedTTL   = 3 * time.Minute
-	casRetryLimit   = 7
-	casErrorMessage = "CompareAndSwap reached retry limit"
+	sessionPrefix           = "session_tracker"
+	retryDelay              = time.Second
+	terminatedTTL           = 3 * time.Minute
+	updateRetryLimit        = 7
+	updateRetryLimitMessage = "Update retry limit reached"
 )
 
 type sessionTracker struct {
@@ -46,7 +48,7 @@ func NewSessionTrackerService(bk backend.Backend) (services.SessionTrackerServic
 }
 
 func (s *sessionTracker) loadSession(ctx context.Context, sessionID string) (types.SessionTracker, error) {
-	sessionJSON, err := s.bk.Get(ctx, backend.Key(sessionPrefix, sessionID))
+	sessionJSON, err := s.bk.Get(ctx, backend.NewKey(sessionPrefix, sessionID))
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -60,9 +62,9 @@ func (s *sessionTracker) loadSession(ctx context.Context, sessionID string) (typ
 }
 
 // UpdatePresence updates the presence status of a user in a session.
-func (s *sessionTracker) UpdatePresence(ctx context.Context, sessionID, user string) error {
-	for i := 0; i < casRetryLimit; i++ {
-		sessionItem, err := s.bk.Get(ctx, backend.Key(sessionPrefix, sessionID))
+func (s *sessionTracker) UpdatePresence(ctx context.Context, sessionID, user, userTeleportCluster string) error {
+	for range updateRetryLimit {
+		sessionItem, err := s.bk.Get(ctx, backend.NewKey(sessionPrefix, sessionID))
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -72,8 +74,7 @@ func (s *sessionTracker) UpdatePresence(ctx context.Context, sessionID, user str
 			return trace.Wrap(err)
 		}
 
-		err = session.UpdatePresence(user)
-		if err != nil {
+		if err := session.UpdatePresence(user, userTeleportCluster, s.bk.Clock().Now().UTC()); err != nil {
 			return trace.Wrap(err)
 		}
 
@@ -83,11 +84,12 @@ func (s *sessionTracker) UpdatePresence(ctx context.Context, sessionID, user str
 		}
 
 		item := backend.Item{
-			Key:     backend.Key(sessionPrefix, sessionID),
-			Value:   sessionJSON,
-			Expires: session.Expiry(),
+			Key:      backend.NewKey(sessionPrefix, sessionID),
+			Value:    sessionJSON,
+			Expires:  session.Expiry(),
+			Revision: sessionItem.Revision,
 		}
-		_, err = s.bk.CompareAndSwap(ctx, *sessionItem, item)
+		_, err = s.bk.ConditionalUpdate(ctx, item)
 		if trace.IsCompareFailed(err) {
 			select {
 			case <-ctx.Done():
@@ -100,7 +102,7 @@ func (s *sessionTracker) UpdatePresence(ctx context.Context, sessionID, user str
 		return trace.Wrap(err)
 	}
 
-	return trace.CompareFailed(casErrorMessage)
+	return trace.CompareFailed(updateRetryLimitMessage)
 }
 
 // GetSessionTracker returns the current state of a session tracker for an active session.
@@ -114,7 +116,7 @@ func (s *sessionTracker) GetSessionTracker(ctx context.Context, sessionID string
 }
 
 func (s *sessionTracker) getActiveSessionTrackers(ctx context.Context, filter *types.SessionTrackerFilter) ([]types.SessionTracker, error) {
-	prefix := backend.Key(sessionPrefix)
+	prefix := backend.ExactKey(sessionPrefix)
 	result, err := s.bk.GetRange(ctx, prefix, backend.RangeEnd(prefix), backend.NoLimit)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -158,7 +160,7 @@ func (s *sessionTracker) getActiveSessionTrackers(ctx context.Context, filter *t
 			for _, item := range noExpiry {
 				if err := s.bk.Delete(ctx, item.Key); err != nil {
 					if !trace.IsNotFound(err) {
-						logrus.WithError(err).Error("Failed to remove stale session tracker")
+						slog.ErrorContext(ctx, "Failed to remove stale session tracker", "error", err)
 					}
 				}
 			}
@@ -186,11 +188,11 @@ func (s *sessionTracker) CreateSessionTracker(ctx context.Context, tracker types
 	}
 
 	item := backend.Item{
-		Key:     backend.Key(sessionPrefix, tracker.GetSessionID()),
+		Key:     backend.NewKey(sessionPrefix, tracker.GetSessionID()),
 		Value:   json,
 		Expires: tracker.Expiry(),
 	}
-	_, err = s.bk.Put(ctx, item)
+	_, err = s.bk.Create(ctx, item)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -200,8 +202,8 @@ func (s *sessionTracker) CreateSessionTracker(ctx context.Context, tracker types
 
 // UpdateSessionTracker updates a tracker resource for an active session.
 func (s *sessionTracker) UpdateSessionTracker(ctx context.Context, req *proto.UpdateSessionTrackerRequest) error {
-	for i := 0; i < casRetryLimit; i++ {
-		sessionItem, err := s.bk.Get(ctx, backend.Key(sessionPrefix, req.SessionID))
+	for range updateRetryLimit {
+		sessionItem, err := s.bk.Get(ctx, backend.NewKey(sessionPrefix, req.SessionID))
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -215,6 +217,20 @@ func (s *sessionTracker) UpdateSessionTracker(ctx context.Context, req *proto.Up
 		case *types.SessionTrackerV1:
 			switch update := req.Update.(type) {
 			case *proto.UpdateSessionTrackerRequest_UpdateState:
+				// Since we are using a CAS loop, we can safely check the state of the session
+				// before updating it. If the session is already closed, we can return an error
+				// to the caller to indicate that the session is no longer active and the update
+				// should not be applied.
+				// Before, we were relying on the caller to send the updates in the correct order
+				// and to not send updates for closed sessions. This was error prone and led to
+				// sessions getting stuck as active. The expiry of the session was correctly stored
+				// in the backend, but since dynamodb deletion is eventually consistent, the session
+				// could still be returned by GetActiveSessionTrackers for days if a
+				// running event is received after the session termination event.
+				if session.GetState() == types.SessionState_SessionStateTerminated {
+					return trace.BadParameter("session %q is already closed", session.GetSessionID())
+				}
+
 				if err := session.SetState(update.UpdateState.State); err != nil {
 					return trace.Wrap(err)
 				}
@@ -247,11 +263,12 @@ func (s *sessionTracker) UpdateSessionTracker(ctx context.Context, req *proto.Up
 		}
 
 		item := backend.Item{
-			Key:     backend.Key(sessionPrefix, req.SessionID),
-			Value:   sessionJSON,
-			Expires: expiry,
+			Key:      backend.NewKey(sessionPrefix, req.SessionID),
+			Value:    sessionJSON,
+			Expires:  expiry,
+			Revision: sessionItem.Revision,
 		}
-		_, err = s.bk.CompareAndSwap(ctx, *sessionItem, item)
+		_, err = s.bk.ConditionalUpdate(ctx, item)
 		if trace.IsCompareFailed(err) {
 			select {
 			case <-ctx.Done():
@@ -264,10 +281,10 @@ func (s *sessionTracker) UpdateSessionTracker(ctx context.Context, req *proto.Up
 		return trace.Wrap(err)
 	}
 
-	return trace.CompareFailed(casErrorMessage)
+	return trace.CompareFailed(updateRetryLimitMessage)
 }
 
 // RemoveSessionTracker removes a tracker resource for an active session.
 func (s *sessionTracker) RemoveSessionTracker(ctx context.Context, sessionID string) error {
-	return trace.Wrap(s.bk.Delete(ctx, backend.Key(sessionPrefix, sessionID)))
+	return trace.Wrap(s.bk.Delete(ctx, backend.NewKey(sessionPrefix, sessionID)))
 }

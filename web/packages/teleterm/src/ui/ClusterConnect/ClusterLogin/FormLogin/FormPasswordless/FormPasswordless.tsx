@@ -1,22 +1,25 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-import React from 'react';
+
 import styled from 'styled-components';
-import { Text, Flex, ButtonText, Box } from 'design';
-import { Key, ArrowForward } from 'design/Icon';
+
+import { Box, ButtonText, Flex, Text } from 'design';
+import { ArrowForward, Key } from 'design/Icon';
 
 import type { Props } from '../FormLogin';
 
@@ -27,11 +30,11 @@ export const FormPasswordless = ({
 }: Props) => (
   <Box data-testid="passwordless">
     <StyledPaswordlessBtn
+      size="large"
       py={2}
       px={3}
       border={1}
       borderRadius={2}
-      borderColor="text.placeholder"
       width="100%"
       onClick={onLoginWithPasswordless}
       disabled={loginAttempt.status === 'processing'}
@@ -39,15 +42,15 @@ export const FormPasswordless = ({
     >
       <Flex alignItems="center" justifyContent="space-between">
         <Flex alignItems="center">
-          <Key mr={3} fontSize={16} />
+          <Key mr={3} size="medium" />
           <Box>
-            <Text typography="h6">Passwordless</Text>
-            <Text fontSize={1} color="text.secondary">
+            <Text mb={1}>Passwordless</Text>
+            <Text typography="subtitle3" color="text.slightlyMuted">
               Follow the prompts
             </Text>
           </Box>
         </Flex>
-        <ArrowForward fontSize={16} />
+        <ArrowForward size="medium" />
       </Flex>
     </StyledPaswordlessBtn>
   </Box>
@@ -56,17 +59,20 @@ export const FormPasswordless = ({
 const StyledPaswordlessBtn = styled(ButtonText)`
   display: block;
   text-align: left;
-  border: 1px solid ${({ theme }) => theme.colors.text.placeholder};
+  border: 1px solid ${({ theme }) => theme.colors.buttons.border.border};
 
   &:hover,
-  &:active,
   &:focus {
-    border-color: ${({ theme }) => theme.colors.action.active};
+    background: ${({ theme }) => theme.colors.buttons.border.hover};
     text-decoration: none;
+  }
+
+  &:active {
+    background: ${({ theme }) => theme.colors.buttons.border.active};
   }
 
   &[disabled] {
     pointer-events: none;
-    opacity: 0.7;
+    background: ${({ theme }) => theme.colors.buttons.bgDisabled};
   }
 `;

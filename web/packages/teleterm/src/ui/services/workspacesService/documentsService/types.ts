@@ -1,29 +1,41 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { AutoUserProvisioning } from 'gen-proto-ts/teleport/lib/teleterm/v1/database_pb';
+import { Report } from 'gen-proto-ts/teleport/lib/vnet/diag/v1/diag_pb';
+import {
+  ResourceHealthStatus,
+  SharedUnifiedResource,
+} from 'shared/components/UnifiedResources';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
+import type * as tsh from 'teleterm/services/tshd/types';
 import * as uri from 'teleterm/ui/uri';
 
-export type Kind =
-  | 'doc.access_requests'
-  | 'doc.cluster'
-  | 'doc.blank'
-  | 'doc.gateway'
-  | 'doc.terminal_shell'
-  | 'doc.terminal_tsh_node'
-  | 'doc.terminal_tsh_kube';
+export type Kind = Document['kind'];
+
+/**
+ * DocumentOrigin denotes which part of Connect UI was used to create a document for the resource.
+ */
+export type DocumentOrigin =
+  | 'resource_table'
+  | 'search_bar'
+  | 'connection_list'
+  | 'reopened_session';
 
 interface DocumentBase {
   uri: uri.DocumentUri;
@@ -35,19 +47,13 @@ export interface DocumentBlank extends DocumentBase {
   kind: 'doc.blank';
 }
 
-export type DocumentTshNode =
-  | DocumentTshNodeWithServerId
-  | DocumentTshNodeWithLoginHost;
-
-interface DocumentTshNodeBase extends DocumentBase {
+export interface DocumentTshNode extends DocumentBase {
   kind: 'doc.terminal_tsh_node';
   // status is used merely to show a progress bar when the document is being set up.
   status: '' | 'connecting' | 'connected' | 'error';
   rootClusterId: string;
   leafClusterId: string | undefined;
-}
-
-export interface DocumentTshNodeWithServerId extends DocumentTshNodeBase {
+  origin: DocumentOrigin;
   // serverId is the UUID of the SSH server. If it's is present, we can immediately start an SSH
   // session.
   //
@@ -56,49 +62,147 @@ export interface DocumentTshNodeWithServerId extends DocumentTshNodeBase {
   // serverUri is used for file transfer and for identifying a specific server among different
   // profiles and clusters.
   serverUri: uri.ServerUri;
-  // login is missing when the user executes `tsh ssh host` from the command bar without supplying
-  // the login. In that case, login will be undefined and serverId will be equal to "host". tsh will
-  // assume that login equals to the current OS user.
-  login?: string;
-  // loginHost exists on DocumentTshNodeWithServerId mostly because
-  // DocumentsService.prototype.update doesn't let us remove fields. To keep the types truthful to
-  // the implementation (which is something we should avoid doing, it should work the other way
-  // around), loginHost was kept on DocumentTshNodeWithServerId.
-  loginHost?: undefined;
+  login: string;
 }
 
-export interface DocumentTshNodeWithLoginHost extends DocumentTshNodeBase {
-  // serverId is missing, so we need to resolve loginHost to a server UUID.
-  loginHost: string;
-  // We don't provide types for other fields on purpose (such as serverId?: undefined) in order to
-  // force places which use DocumentTshNode to narrow down the type before using it.
-}
-
-export interface DocumentTshKube extends DocumentBase {
-  kind: 'doc.terminal_tsh_kube';
-  // status is used merely to show a progress bar when the document is being set up.
-  status: '' | 'connecting' | 'connected' | 'error';
-  kubeId: string;
-  kubeUri: uri.KubeUri;
-  kubeConfigRelativePath: string;
-  rootClusterId: string;
-  leafClusterId?: string;
-}
-
+/**
+ * DocumentGateway is used for database and app gateways. The two are distinguished by the kind of
+ * resource that targetUri points to.
+ */
 export interface DocumentGateway extends DocumentBase {
   kind: 'doc.gateway';
+  /** status is used merely to show a progress bar when the gateway is being set up. */
+  status: '' | 'connecting' | 'connected' | 'error';
+  /**
+   * gatewayUri is not present until the gateway described by the document is created.
+   */
   gatewayUri?: uri.GatewayUri;
-  targetUri: uri.DatabaseUri;
+  targetUri: uri.DatabaseUri | uri.AppUri;
+  /**
+   * targetUser is used only for db gateways and must contain the db user. Connect allows only a
+   * single doc.gateway to exist per targetUri + targetUser combo.
+   */
   targetUser: string;
+  /**
+   * targetName contains the name of the target resource as shown in the UI. This field could be
+   * removed in favor of targetUri, which always includes the target name anyway.
+   */
   targetName: string;
-  targetSubresourceName?: string;
+  /**
+   * targetSubresourceName contains database name for db gateways and target port for TCP app
+   * gateways. A DocumentGateway created for a multi-port TCP app is expected to always have this
+   * field present.
+   *
+   * For app gateways, Connect allows only a single doc.gateway to exist per targetUri +
+   * targetSubresourceName combo.
+   *
+   * For db gateways, targetSubresourceName is not taken into account when considering document
+   * "uniqueness".
+   */
+  targetSubresourceName: string | undefined;
+  /**
+   * port is the local port on which the gateway accepts connections.
+   *
+   * If empty, tshd is going to created a listener on a random port and then this field will be
+   * updated to match that random port.
+   */
   port?: string;
+  origin: DocumentOrigin;
+  /**
+   * targetProtocol is the protocol of the resource proxied by the gateway.
+   */
+  targetProtocol?: string;
+  /**
+   * llmFormat and llmProvider carry the LLM details of the proxied app when the document was
+   * created from a view that had the app resource at hand. When absent for an LLM gateway (e.g.
+   * the document was recreated from the connection list), the gateway view fetches the app
+   * instead.
+   */
+  llmFormat?: string;
+  llmProvider?: string;
+  /**
+   * autoUserProvisioning contains auto-user provisioning information for this database gateway.
+   * Its presence indicates that auto-user provisioning is enabled.
+   */
+  autoUserProvisioning: AutoUserProvisioning | undefined;
+}
+
+/**
+ * DocumentGatewayCliClient is the tab that opens a CLI tool which targets the given gateway.
+ *
+ * The gateway is found by matching targetUri and targetUser rather than gatewayUri. gatewayUri
+ * changes between app restarts while targetUri and targetUser won't.
+ */
+export interface DocumentGatewayCliClient extends DocumentBase {
+  kind: 'doc.gateway_cli_client';
+  // rootClusterId and leafClusterId are tech debt. They could be read from targetUri, but
+  // useDocumentTerminal expects these fields to be set on the doc.
+  rootClusterId: string;
+  leafClusterId: string | undefined;
+  // The four target properties are needed in order to call connectToDatabase from within
+  // DocumentGatewayCliClient. targetName is needed to set a proper tab title.
+  //
+  // targetUri and targetUser are also needed to find a gateway providing the connection to the
+  // target.
+  targetUri: uri.DatabaseUri;
+  targetUser: tsh.Gateway['targetUser'];
+  targetName: tsh.Gateway['targetName'];
+  targetProtocol: tsh.Gateway['protocol'];
+  // status is used merely to show a progress bar when the doc waits for the gateway to be created.
+  // It will be changed to 'connected' as soon as the CLI client prints something out. Some clients
+  // type something out immediately after starting while others only after they actually connect to
+  // a resource.
+  status: '' | 'connecting' | 'connected' | 'error';
+}
+
+/**
+ * DocumentGatewayKube transparently sets up a local proxy for the given kube cluster and spins up
+ * a local shell session with KUBECONFIG pointing at the config managed by the local proxy.
+ */
+export interface DocumentGatewayKube extends DocumentBase {
+  kind: 'doc.gateway_kube';
+  rootClusterId: string;
+  leafClusterId: string | undefined;
+  targetUri: uri.KubeUri;
+  origin: DocumentOrigin;
+  /** Identifier of the shell to be opened. */
+  shellId?: string;
+  // status is used merely to show a progress bar when the gateway is being set up.
+  status: '' | 'connecting' | 'connected' | 'error';
 }
 
 export interface DocumentCluster extends DocumentBase {
   kind: 'doc.cluster';
   clusterUri: uri.ClusterUri;
+  queryParams: DocumentClusterQueryParams;
 }
+
+// When extending this type, remember to update the
+// `WorkspacesService.reopenPreviousDocuments` method
+// that spreads all of its properties.
+export interface DocumentClusterQueryParams {
+  search: string;
+  advancedSearchEnabled: boolean;
+  /**
+   * This is a list of 'resource kind' filters that can be selected from
+   * both the search bar and the types selector in the unified resources view.
+   *
+   * If it is empty, all resource kinds are listed.
+   */
+  resourceKinds: DocumentClusterResourceKind[];
+  sort: {
+    fieldName: string;
+    dir: 'ASC' | 'DESC';
+  };
+  statuses: ResourceHealthStatus[];
+}
+
+// Any changes done to this type must be backwards compatible as
+// `DocumentClusterQueryParams` uses values of this type and documents are stored to disk.
+export type DocumentClusterResourceKind = Extract<
+  SharedUnifiedResource['resource']['kind'],
+  'node' | 'app' | 'kube_cluster' | 'db' | 'windows_desktop'
+>;
 
 export interface DocumentAccessRequests extends DocumentBase {
   kind: 'doc.access_requests';
@@ -110,69 +214,146 @@ export interface DocumentAccessRequests extends DocumentBase {
 export interface DocumentPtySession extends DocumentBase {
   kind: 'doc.terminal_shell';
   cwd?: string;
-  initCommand?: string;
+  /** Identifier of the shell to be opened. */
+  shellId?: string;
   rootClusterId?: string;
   leafClusterId?: string;
 }
 
+export interface DocumentConnectMyComputer extends DocumentBase {
+  kind: 'doc.connect_my_computer';
+  // `DocumentConnectMyComputer` always operates on the root cluster, so in theory `rootClusterUri` is not needed.
+  // However, there are a few components in the system, such as `getResourceUri`, which need to determine the relation
+  // between a document and a cluster just by looking at the document fields.
+  rootClusterUri: uri.RootClusterUri;
+  /**
+   * The status of 'connecting' is used to indicate that Connect My Computer permissions cannot be
+   * established yet and the document is waiting for the app to receive full cluster details.
+   */
+  status: '' | 'connecting' | 'connected' | 'error';
+}
+
+export interface DocumentVnetDiagReport extends DocumentBase {
+  kind: 'doc.vnet_diag_report';
+  // VNet itself is not bound to any workspace, but a document must belong to a workspace. Also, it
+  // must be possible to determine the relation between a document and a cluster just by looking at
+  // the document fields, hence why rootClusterUri is defined here.
+  rootClusterUri: uri.RootClusterUri;
+  report: Report;
+}
+
+export interface DocumentVnetInfo extends DocumentBase {
+  kind: 'doc.vnet_info';
+  // VNet itself is not bound to any workspace, but a document must belong to a workspace. Also, it
+  // must be possible to determine the relation between a document and a cluster just by looking at
+  // the document fields, hence why rootClusterUri is defined here.
+  rootClusterUri: uri.RootClusterUri;
+  /**
+   * Details of the resource if the doc was opened by selecting a specific resource.
+   *
+   * This field is needed to facilitate a scenario where a first-time user clicks "Connect" next to
+   * a TCP app or SSH server, which opens this doc. Once the user clicks "Start VNet" in the doc,
+   * Connect should continue the regular flow of connecting to a TCP app through VNet, which means
+   * it should copy the address of the resource to the clipboard, hence this field.
+   *
+   * launcherArgs is removed when restoring persisted state. Let's say the user opens the doc through
+   * the "Connect" button of a specific app. If they close the app and then reopen the doc, we don't
+   * want the "Start VNet" button to copy the address of the app from the prev session.
+   */
+  launcherArgs: VnetLauncherArgs | undefined;
+}
+
+/**
+ * Details about a user-selected resource that prompted the VNet launch, so
+ * that addrToCopy can be copied to the clipboard after VNet launches with a
+ * helpful message displayed in a notification.
+ */
+export type VnetLauncherArgs = {
+  // The address that's going to be copied to the clipboard.
+  addrToCopy: string;
+  // The URI of the resource the user clicked.
+  resourceUri: uri.ResourceUri;
+  // True if the user clicked a multi-port TCP app, used to render a slightly
+  // different message in the (copied to clipboard) notification.
+  isMultiPortApp?: boolean;
+};
+
+/**
+ * Document to authorize a web session with device trust.
+ * Unlike other documents, it is not persisted on disk.
+ */
+export interface DocumentAuthorizeWebSession extends DocumentBase {
+  kind: 'doc.authorize_web_session';
+  // `DocumentAuthorizeWebSession` always operates on the root cluster, so in theory `rootClusterUri` is not needed.
+  // However, there are a few components in the system, such as `getResourceUri`, which need to determine the relation
+  // between a document and a cluster just by looking at the document fields.
+  rootClusterUri: uri.RootClusterUri;
+  webSessionRequest: WebSessionRequest;
+}
+
+export interface DocumentDesktopSession extends DocumentBase {
+  kind: 'doc.desktop_session';
+  desktopUri: uri.DesktopUri;
+  login: string;
+  origin: DocumentOrigin;
+  // status is used merely to indicate that a connection is established in the connection tracker.
+  status: '' | 'connected' | 'error';
+}
+
+export interface WebSessionRequest {
+  id: string;
+  token: string;
+  username: string;
+  redirectUri: string;
+}
+
 export type DocumentTerminal =
   | DocumentPtySession
+  | DocumentGatewayCliClient
   | DocumentTshNode
-  | DocumentTshKube;
+  | DocumentGatewayKube;
 
 export type Document =
   | DocumentAccessRequests
   | DocumentBlank
   | DocumentGateway
   | DocumentCluster
-  | DocumentTerminal;
+  | DocumentTerminal
+  | DocumentConnectMyComputer
+  | DocumentVnetDiagReport
+  | DocumentVnetInfo
+  | DocumentAuthorizeWebSession
+  | DocumentDesktopSession;
 
-export function isDocumentTshNodeWithLoginHost(
+/**
+ * `DocumentPtySession` and `DocumentGatewayKube` spawn a shell.
+ * The shell is taken from the `doc.shellId` property.
+ */
+export function canDocChangeShell(
   doc: Document
-): doc is DocumentTshNodeWithLoginHost {
-  // Careful here as TypeScript lets you make type guards unsound. You can double invert the last
-  // check and TypeScript won't complain.
-  return doc.kind === 'doc.terminal_tsh_node' && !('serverId' in doc);
-}
-
-export function isDocumentTshNodeWithServerId(
-  doc: Document
-): doc is DocumentTshNodeWithServerId {
-  // Careful here as TypeScript lets you make type guards unsound. You can double invert the last
-  // check and TypeScript won't complain.
-  return doc.kind === 'doc.terminal_tsh_node' && 'serverId' in doc;
+): doc is DocumentPtySession | DocumentGatewayKube {
+  return doc.kind === 'doc.terminal_shell' || doc.kind === 'doc.gateway_kube';
 }
 
 export type CreateGatewayDocumentOpts = {
   gatewayUri?: uri.GatewayUri;
-  targetUri: uri.DatabaseUri;
+  targetUri: uri.DatabaseUri | uri.AppUri;
   targetName: string;
   targetUser: string;
   targetSubresourceName?: string;
   title?: string;
   port?: string;
-};
-
-export type CreateClusterDocumentOpts = {
-  clusterUri: uri.ClusterUri;
-};
-
-export type CreateTshKubeDocumentOptions = {
-  kubeUri: uri.KubeUri;
-  kubeConfigRelativePath?: string;
+  origin: DocumentOrigin;
+  targetProtocol?: string;
+  llmFormat?: string;
+  llmProvider?: string;
+  autoUserProvisioning: AutoUserProvisioning | undefined;
 };
 
 export type CreateAccessRequestDocumentOpts = {
   clusterUri: uri.ClusterUri;
   state: AccessRequestDocumentState;
-  title?: string;
   requestId?: string;
 };
 
-export type AccessRequestDocumentState = 'browsing' | 'creating' | 'reviewing';
-
-export type CreateNewTerminalOpts = {
-  initCommand?: string;
-  rootClusterId: string;
-  leafClusterId?: string;
-};
+type AccessRequestDocumentState = 'browsing' | 'creating' | 'reviewing';

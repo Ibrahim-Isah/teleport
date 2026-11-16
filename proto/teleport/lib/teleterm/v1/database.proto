@@ -1,26 +1,31 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 syntax = "proto3";
 
 package teleport.lib.teleterm.v1;
 
 import "teleport/lib/teleterm/v1/label.proto";
+import "teleport/lib/teleterm/v1/target_health.proto";
 
-option go_package = "github.com/gravitational/teleport/gen/proto/go/teleport/lib/teleterm/v1";
+option go_package = "github.com/gravitational/teleport/gen/proto/go/teleport/lib/teleterm/v1;teletermv1";
 
-// Database describes a database
+// Database describes a database (resource kind "db")
 message Database {
   // uri is the cluster resource URI
   string uri = 1;
@@ -38,4 +43,30 @@ message Database {
   string addr = 7;
   // labels is a list of labels for this database
   repeated Label labels = 8;
+  // target_health of the "db_server" that is serving this database.
+  TargetHealth target_health = 9;
+  // gcp_project_id is optional project ID set for GCP Project databases.
+  string gcp_project_id = 10;
+  // auto_user_provisioning contains database auto-user provisioning information.
+  AutoUserProvisioning auto_user_provisioning = 11;
+  // database_users is a list of allowed database users that Teleport RBAC permits the user to connect as.
+  repeated string database_users = 12;
+  // wildcard_user_allowed is true when the user's role grants access with db_users: ["*"],
+  bool wildcard_user_allowed = 13;
+}
+
+// AutoUserProvisioning contains database auto-user provisioning information.
+message AutoUserProvisioning {
+  // database_roles is a list of database roles that will be assigned to the auto-provisioned database user.
+  repeated string database_roles = 2;
+}
+
+// DatabaseServer (db_server) describes a database heartbeat signal
+// reported from an agent (db_service) that is proxying
+// the database.
+message DatabaseServer {
+  string uri = 1;
+  string hostname = 2;
+  string host_id = 3;
+  TargetHealth target_health = 4;
 }

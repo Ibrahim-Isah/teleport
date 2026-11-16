@@ -1,33 +1,32 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
-	"fmt"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/rds"
+	rdstypes "github.com/aws/aws-sdk-go-v2/service/rds/types"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/cloud"
 	"github.com/gravitational/teleport/lib/cloud/mocks"
-	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
 func TestRDSDBProxyFetcher(t *testing.T) {
@@ -38,68 +37,49 @@ func TestRDSDBProxyFetcher(t *testing.T) {
 	rdsProxyEndpointVpc1, rdsProxyEndpointDatabaseVpc1 := makeRDSProxyCustomEndpoint(t, rdsProxyVpc1, "endpoint-1", "us-east-1")
 	rdsProxyEndpointVpc2, rdsProxyEndpointDatabaseVpc2 := makeRDSProxyCustomEndpoint(t, rdsProxyVpc2, "endpoint-2", "us-east-1")
 
-	clients := &cloud.TestCloudClients{
-		RDS: &mocks.RDSMock{
-			DBProxies:         []*rds.DBProxy{rdsProxyVpc1, rdsProxyVpc2},
-			DBProxyEndpoints:  []*rds.DBProxyEndpoint{rdsProxyEndpointVpc1, rdsProxyEndpointVpc2},
-			DBProxyTargetPort: 9999,
-		},
-	}
-
-	tests := []struct {
-		name          string
-		inputLabels   map[string]string
-		wantDatabases types.Databases
-	}{
+	tests := []awsFetcherTest{
 		{
-			name:          "fetch all",
-			inputLabels:   wildcardLabels,
+			name: "fetch all",
+			fetcherCfg: AWSFetcherFactoryConfig{
+				AWSClients: fakeAWSClients{
+					rdsClient: &mocks.RDSClient{
+						DBProxies:        []rdstypes.DBProxy{*rdsProxyVpc1, *rdsProxyVpc2},
+						DBProxyEndpoints: []rdstypes.DBProxyEndpoint{*rdsProxyEndpointVpc1, *rdsProxyEndpointVpc2},
+					},
+				},
+			},
+			inputMatchers: makeAWSMatchersForType(types.AWSMatcherRDSProxy, "us-east-1", wildcardLabels),
 			wantDatabases: types.Databases{rdsProxyDatabaseVpc1, rdsProxyDatabaseVpc2, rdsProxyEndpointDatabaseVpc1, rdsProxyEndpointDatabaseVpc2},
 		},
 		{
-			name:          "fetch vpc1",
-			inputLabels:   map[string]string{"vpc-id": "vpc1"},
+			name: "fetch vpc1",
+			fetcherCfg: AWSFetcherFactoryConfig{
+				AWSClients: fakeAWSClients{
+					rdsClient: &mocks.RDSClient{
+						DBProxies:        []rdstypes.DBProxy{*rdsProxyVpc1, *rdsProxyVpc2},
+						DBProxyEndpoints: []rdstypes.DBProxyEndpoint{*rdsProxyEndpointVpc1, *rdsProxyEndpointVpc2},
+					},
+				},
+			},
+			inputMatchers: makeAWSMatchersForType(types.AWSMatcherRDSProxy, "us-east-1", map[string]string{"vpc-id": "vpc1"}),
 			wantDatabases: types.Databases{rdsProxyDatabaseVpc1, rdsProxyEndpointDatabaseVpc1},
 		},
 	}
-
-	for _, test := range tests {
-		test := test
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			fetchers := mustMakeAWSFetchersForMatcher(t, clients, services.AWSMatcherRDSProxy, "us-east-2", toTypeLabels(test.inputLabels))
-			require.ElementsMatch(t, test.wantDatabases, mustGetDatabases(t, fetchers))
-		})
-	}
+	testAWSFetchers(t, tests...)
 }
 
-func makeRDSProxy(t *testing.T, name, region, vpcID string) (*rds.DBProxy, types.Database) {
-	rdsProxy := &rds.DBProxy{
-		DBProxyArn:   aws.String(fmt.Sprintf("arn:aws:rds:%s:123456789012:db-proxy:prx-%s", region, name)),
-		DBProxyName:  aws.String(name),
-		EngineFamily: aws.String(rds.EngineFamilyMysql),
-		Endpoint:     aws.String("localhost"),
-		VpcId:        aws.String(vpcID),
-		RequireTLS:   aws.Bool(true),
-		Status:       aws.String("available"),
-	}
-
-	rdsProxyDatabase, err := services.NewDatabaseFromRDSProxy(rdsProxy, 9999, nil)
+func makeRDSProxy(t *testing.T, name, region, vpcID string) (*rdstypes.DBProxy, types.Database) {
+	rdsProxy := mocks.RDSProxy(name, region, vpcID)
+	rdsProxyDatabase, err := common.NewDatabaseFromRDSProxy(rdsProxy, nil)
 	require.NoError(t, err)
+	common.ApplyAWSDatabaseNameSuffix(rdsProxyDatabase, types.AWSMatcherRDSProxy)
 	return rdsProxy, rdsProxyDatabase
 }
 
-func makeRDSProxyCustomEndpoint(t *testing.T, rdsProxy *rds.DBProxy, name, region string) (*rds.DBProxyEndpoint, types.Database) {
-	rdsProxyEndpoint := &rds.DBProxyEndpoint{
-		Endpoint:            aws.String("localhost"),
-		DBProxyEndpointName: aws.String(name),
-		DBProxyName:         rdsProxy.DBProxyName,
-		DBProxyEndpointArn:  aws.String(fmt.Sprintf("arn:aws:rds:%v:123456789012:db-proxy-endpoint:prx-endpoint-%v", region, name)),
-		TargetRole:          aws.String(rds.DBProxyEndpointTargetRoleReadOnly),
-		Status:              aws.String("available"),
-	}
-	rdsProxyEndpointDatabase, err := services.NewDatabaseFromRDSProxyCustomEndpoint(rdsProxy, rdsProxyEndpoint, 9999, nil)
+func makeRDSProxyCustomEndpoint(t *testing.T, rdsProxy *rdstypes.DBProxy, name, region string) (*rdstypes.DBProxyEndpoint, types.Database) {
+	rdsProxyEndpoint := mocks.RDSProxyCustomEndpoint(rdsProxy, name, region)
+	rdsProxyEndpointDatabase, err := common.NewDatabaseFromRDSProxyCustomEndpoint(rdsProxy, rdsProxyEndpoint, nil)
 	require.NoError(t, err)
+	common.ApplyAWSDatabaseNameSuffix(rdsProxyEndpointDatabase, types.AWSMatcherRDSProxy)
 	return rdsProxyEndpoint, rdsProxyEndpointDatabase
 }

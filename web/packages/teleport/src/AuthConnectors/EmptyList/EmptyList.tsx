@@ -1,63 +1,46 @@
-/*
-Copyright 2020-2021 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-import { Text, Box, Flex, ButtonPrimary, Card } from 'design';
-import * as Icons from 'design/Icon';
-
+import getSsoIcon from 'teleport/AuthConnectors/ssoIcons/getSsoIcon';
 import { State as ResourceState } from 'teleport/components/useResources';
 
-export default function EmptyList({ onCreate }: Props) {
+import { AuthConnectorTile, LocalConnectorTile } from '../AuthConnectorTile';
+import { AuthConnectorsGrid } from '../ConnectorList/ConnectorList';
+
+export default function EmptyList({ onCreate, isLocalDefault }: Props) {
   return (
-    <Card maxWidth="700px" p={6} as={Flex} alignItems="center">
-      <Icons.Github
-        style={{ textAlign: 'center' }}
-        fontSize="150px"
-        color="primary.lighter"
-        mr={5}
+    <AuthConnectorsGrid>
+      <LocalConnectorTile isDefault={isLocalDefault} />
+      <AuthConnectorTile
+        key="github-placeholder"
+        kind="github"
+        id="github-placeholder"
+        name={'GitHub'}
+        Icon={getSsoIcon('github')}
+        isDefault={false}
+        isPlaceholder={true}
+        onSetup={() => onCreate('github')}
       />
-      <Box>
-        <Text typography="h6" mb={3} caps>
-          Create Your First Github Connector
-        </Text>
-        <Text typography="subtitle1" mb={3}>
-          Authentication connectors allow Teleport to authenticate users via an
-          external identity source such as Okta, Active Directory, GitHub, etc.
-          This authentication method is frequently called single sign-on (SSO).
-        </Text>
-        <Text typography="subtitle1">
-          Open Source Teleport supports only GitHub connectors. Please{' '}
-          <Text
-            as="a"
-            color="light"
-            href="https://goteleport.com/docs/setup/admin/github-sso/"
-            target="_blank"
-          >
-            view our documentation
-          </Text>{' '}
-          on how to configure a GitHub connector.
-        </Text>
-        <ButtonPrimary onClick={onCreate} mt={4} width="240px">
-          New Github Connector
-        </ButtonPrimary>
-      </Box>
-    </Card>
+    </AuthConnectorsGrid>
   );
 }
 
 type Props = {
   onCreate: ResourceState['create'];
+  isLocalDefault: boolean;
 };

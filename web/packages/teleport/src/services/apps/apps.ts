@@ -1,22 +1,28 @@
 /**
- * Copyright 2020-2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+import cfg, {
+  CreateAppSessionParams,
+  UrlAppParams,
+  UrlResourcesParams,
+} from 'teleport/config';
+import { ResourcesResponse } from 'teleport/services/agents';
 import api from 'teleport/services/api';
-import cfg, { UrlAppParams, UrlResourcesParams } from 'teleport/config';
-import { AgentResponse } from 'teleport/services/agents';
 
 import makeApp from './makeApps';
 import { App } from './types';
@@ -25,7 +31,7 @@ const service = {
   fetchApps(
     clusterId: string,
     params: UrlResourcesParams
-  ): Promise<AgentResponse<App>> {
+  ): Promise<ResourcesResponse<App>> {
     return api.get(cfg.getApplicationsUrl(clusterId, params)).then(json => {
       const items = json?.items || [];
 
@@ -37,29 +43,25 @@ const service = {
     });
   },
 
-  createAppSession(params: UrlAppParams) {
-    const { fqdn, clusterId = '', publicAddr = '', arn = '' } = params;
-    return api
-      .post(cfg.api.appSession, {
-        fqdn,
-        cluster_name: clusterId,
-        public_addr: publicAddr,
-        arn: arn,
-      })
-      .then(json => ({
-        fqdn: json.fqdn as string,
-        value: json.value as string,
-        subject: json.subject as string,
-        cookieValue: json.cookie_value as string,
-        subjectCookieValue: json.subject_cookie_value as string,
-      }));
-  },
-
-  getAppFqdn(params: UrlAppParams) {
-    return api.get(cfg.getAppFqdnUrl(params)).then(json => ({
+  async createAppSession(params: CreateAppSessionParams) {
+    return api.post(cfg.api.appSession, params).then(json => ({
       fqdn: json.fqdn as string,
+      cookieValue: json.cookie_value as string,
+      subjectCookieValue: json.subject_cookie_value as string,
     }));
   },
+
+  getAppDetails(params: UrlAppParams): Promise<AppDetails> {
+    return api.get(cfg.getAppDetailsUrl(params)).then(json => ({
+      fqdn: json.fqdn,
+      requiredAppFQDNs: json.requiredAppFQDNs,
+    }));
+  },
+};
+
+type AppDetails = {
+  fqdn: string;
+  requiredAppFQDNs?: string[];
 };
 
 export default service;

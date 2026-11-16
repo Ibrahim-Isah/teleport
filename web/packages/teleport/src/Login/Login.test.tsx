@@ -1,115 +1,249 @@
 /**
- * Copyright 2020-2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
-import { render, fireEvent, screen, waitFor } from 'design/utils/testing';
-import { privateKeyEnablingPolicies } from 'shared/services/consts';
+import { userEvent, UserEvent } from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router';
+import selectEvent from 'react-select-event';
 
+import { fireEvent, render, screen, waitFor } from 'design/utils/testing';
+
+import cfg from 'teleport/config';
 import auth from 'teleport/services/auth/auth';
 import history from 'teleport/services/history';
-import cfg from 'teleport/config';
+import session from 'teleport/services/websession';
 
-import Login from './Login';
+import { Login } from './Login';
+
+let user: UserEvent;
 
 beforeEach(() => {
   jest.restoreAllMocks();
   jest.spyOn(history, 'push').mockImplementation();
+  jest.spyOn(history, 'replace').mockImplementation();
   jest.spyOn(history, 'getRedirectParam').mockImplementation(() => '/');
+  jest.spyOn(history, 'hasAccessChangedParam').mockImplementation(() => false);
+  user = userEvent.setup();
 });
 
+function LoginTest({ initialURL }: { initialURL?: string }) {
+  const initialEntries = initialURL ? [initialURL] : undefined;
+  return (
+    <MemoryRouter initialEntries={initialEntries}>
+      <Login />
+    </MemoryRouter>
+  );
+}
+
 test('basic rendering', () => {
-  render(<Login />);
+  render(<LoginTest />);
 
   // test rendering of logo and title
   expect(screen.getByRole('img')).toBeInTheDocument();
   expect(screen.getByText(/sign in to teleport/i)).toBeInTheDocument();
 });
 
-test('login with redirect', async () => {
-  jest.spyOn(auth, 'login').mockResolvedValue(null);
+describe.each([
+  {
+    name: 'unscoped',
+    url: '/web/login',
+    scope: '',
+    ssoURL:
+      'http://localhost/v1/webapi/github/login/web?connector_id=github&redirect_url=http%3A%2F%2Flocalhost%2Fweb',
+  },
+  {
+    name: 'scoped',
+    url: '/web/login?scope=%2Fdev',
+    scope: '/dev',
+    ssoURL:
+      'http://localhost/v1/webapi/github/login/web?connector_id=github&scope=%2Fdev&redirect_url=http%3A%2F%2Flocalhost%2Fweb',
+  },
+])('$name', ({ url, scope, ssoURL }) => {
+  test('login with redirect', async () => {
+    jest.spyOn(auth, 'login').mockResolvedValue({});
 
-  render(<Login />);
+    render(<LoginTest initialURL={url} />);
 
-  // fill form
-  const username = screen.getByPlaceholderText(/username/i);
-  const password = screen.getByPlaceholderText(/password/i);
-  fireEvent.change(username, { target: { value: 'username' } });
-  fireEvent.change(password, { target: { value: '123' } });
+    // fill form
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText(/username/i), 'username');
+    await user.type(screen.getByPlaceholderText(/password/i), '123');
 
-  // test login and redirect
-  fireEvent.click(screen.getByText('Sign In'));
-  await waitFor(() => {
-    expect(auth.login).toHaveBeenCalledWith('username', '123', '');
-  });
-  expect(history.push).toHaveBeenCalledWith('http://localhost/web', true);
-});
-
-test('login with SSO', () => {
-  jest.spyOn(cfg, 'getAuth2faType').mockImplementation(() => 'otp');
-  jest.spyOn(cfg, 'getPrimaryAuthType').mockImplementation(() => 'sso');
-  jest.spyOn(cfg, 'getAuthProviders').mockImplementation(() => [
-    {
-      displayName: 'With Github',
-      type: 'github',
-      name: 'github',
-      url: '/github/login/web?redirect_url=:redirect?connector_id=:providerName',
-    },
-  ]);
-
-  render(<Login />);
-
-  // test login pathways
-  fireEvent.click(screen.getByText('With Github'));
-  expect(history.push).toHaveBeenCalledWith(
-    'http://localhost/github/login/web?redirect_url=http:%2F%2Flocalhost%2Fwebconnector_id=github',
-    true
-  );
-});
-
-test('login with private key policy enabled through cluster wide', () => {
-  jest
-    .spyOn(cfg, 'getPrivateKeyPolicy')
-    .mockImplementation(() => 'hardware_key');
-
-  render(<Login />);
-
-  expect(screen.queryByPlaceholderText(/username/i)).not.toBeInTheDocument();
-  expect(screen.getByText(/login disabled/i)).toBeInTheDocument();
-});
-
-test('login with private key policy enabled through role setting', async () => {
-  // Just needs any of these enabling keywords in error message
-  jest
-    .spyOn(auth, 'login')
-    .mockRejectedValue(new Error(privateKeyEnablingPolicies[0]));
-
-  render(<Login />);
-
-  // Fill form.
-  const username = screen.getByPlaceholderText(/username/i);
-  const password = screen.getByPlaceholderText(/password/i);
-  fireEvent.change(username, { target: { value: 'username' } });
-  fireEvent.change(password, { target: { value: '123' } });
-
-  // Test logging in with private key error return renders private policy error.
-  fireEvent.click(screen.getByText('Sign In'));
-  await waitFor(() => {
-    expect(auth.login).toHaveBeenCalledWith('username', '123', '');
+    // test login and redirect
+    await user.click(screen.getByText('Sign In'));
+    await waitFor(() => {
+      expect(auth.login).toHaveBeenCalledWith('username', '123', '', scope);
+    });
+    expect(history.push).toHaveBeenCalledWith('http://localhost/web', true);
   });
 
-  expect(screen.queryByPlaceholderText(/username/i)).not.toBeInTheDocument();
-  expect(screen.getByText(/login disabled/i)).toBeInTheDocument();
+  test('login with MFA, changing method to OTP', async () => {
+    jest.spyOn(cfg, 'getAuth2faType').mockImplementation(() => 'optional');
+    jest.spyOn(auth, 'login').mockResolvedValue({});
+
+    render(<LoginTest initialURL={url} />);
+
+    // fill form
+    const username = screen.getByLabelText(/username/i);
+    const password = screen.getByLabelText(/password/i);
+    const mfaType = screen.getByLabelText(/multi-factor type/i);
+    await user.type(username, 'username');
+    await user.type(password, '123');
+
+    expect(
+      screen.queryByLabelText(/authenticator code/i)
+    ).not.toBeInTheDocument();
+    await selectEvent.select(mfaType, 'Authenticator App');
+    const authCode = screen.getByLabelText(/authenticator code/i);
+    await user.type(authCode, '987654');
+
+    // test login and redirect
+    fireEvent.click(screen.getByText('Sign In'));
+    await waitFor(() => {
+      expect(auth.login).toHaveBeenCalledWith(
+        'username',
+        '123',
+        '987654',
+        scope
+      );
+    });
+    expect(history.push).toHaveBeenCalledWith('http://localhost/web', true);
+  });
+
+  test('login with SSO', () => {
+    jest.spyOn(cfg, 'getAuth2faType').mockImplementation(() => 'otp');
+    jest.spyOn(cfg, 'getPrimaryAuthType').mockImplementation(() => 'sso');
+    jest.spyOn(cfg, 'getAuthProviders').mockImplementation(() => [
+      {
+        displayName: 'With GitHub',
+        type: 'github',
+        name: 'github',
+        url: '/v1/webapi/github/login/web?connector_id=:providerName&scope=:scope?&redirect_url=:redirect',
+      },
+    ]);
+
+    render(<LoginTest initialURL={url} />);
+
+    // test login pathways
+    fireEvent.click(screen.getByText('With GitHub'));
+    expect(history.push).toHaveBeenCalledWith(ssoURL, true);
+  });
+
+  test('passwordless login', async () => {
+    jest.spyOn(cfg, 'getPrimaryAuthType').mockReturnValue('passwordless');
+    jest.spyOn(auth, 'loginWithWebauthn').mockResolvedValue({});
+
+    render(<LoginTest initialURL={url} />);
+
+    await user.click(
+      screen.getByRole('button', { name: 'Sign in with a Passkey' })
+    );
+    expect(auth.loginWithWebauthn).toHaveBeenCalledWith(undefined, scope); // No credentials
+    expect(history.push).toHaveBeenCalledWith('http://localhost/web', true);
+  });
+});
+
+describe('test MOTD', () => {
+  test('show motd only if motd is set', async () => {
+    // default login form
+    const { unmount } = render(<LoginTest />);
+    expect(screen.getByPlaceholderText(/username/i)).toBeInTheDocument();
+    expect(
+      screen.queryByText('Welcome to cluster, your activity will be recorded.')
+    ).not.toBeInTheDocument();
+    unmount();
+
+    // now set motd
+    jest
+      .spyOn(cfg, 'getMotd')
+      .mockImplementation(
+        () => 'Welcome to cluster, your activity will be recorded.'
+      );
+
+    render(<LoginTest />);
+
+    expect(
+      screen.getByText('Welcome to cluster, your activity will be recorded.')
+    ).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText(/username/i)).not.toBeInTheDocument();
+  });
+
+  test('show login form after modt acknowledge', async () => {
+    jest
+      .spyOn(cfg, 'getMotd')
+      .mockImplementation(
+        () => 'Welcome to cluster, your activity will be recorded.'
+      );
+    render(<LoginTest />);
+    expect(
+      screen.getByText('Welcome to cluster, your activity will be recorded.')
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Acknowledge'));
+    expect(screen.getByPlaceholderText(/username/i)).toBeInTheDocument();
+  });
+
+  test('skip motd if login initiated from headless auth', async () => {
+    jest
+      .spyOn(cfg, 'getMotd')
+      .mockImplementation(
+        () => 'Welcome to cluster, your activity will be recorded.'
+      );
+    jest
+      .spyOn(history, 'getRedirectParam')
+      .mockReturnValue(
+        'https://teleport.example.com/web/headless/5c5c1f73-ac5c-52ee-bc9e-0353094dcb4a'
+      );
+
+    render(<LoginTest />);
+
+    expect(
+      screen.queryByText('Welcome to cluster, your activity will be recorded.')
+    ).not.toBeInTheDocument();
+  });
+
+  test('access changed message renders when the URL param is set', () => {
+    jest.spyOn(history, 'hasAccessChangedParam').mockImplementation(() => true);
+
+    render(<LoginTest />);
+
+    expect(screen.getByText(/sign in to teleport/i)).toBeInTheDocument();
+    expect(screen.getByText(/Your access has changed/i)).toBeInTheDocument();
+  });
+});
+
+test('redirect to root if session is valid and path is not "/enterprise/saml-idp/sso"', () => {
+  jest.spyOn(session, 'isValid').mockImplementation(() => true);
+  jest
+    .spyOn(history, 'getRedirectParam')
+    .mockReturnValue(
+      'http://localhost/web/login?redirect_url=http://localhost/web/cluster/localhost/resources'
+    );
+  render(<LoginTest />);
+
+  expect(history.replace).toHaveBeenCalledWith('/web');
+});
+
+test('redirect if session is valid and path matches "/enterprise/saml-idp/sso"', () => {
+  const samlIdPPath = new URL('http://localhost' + cfg.routes.samlIdpSso);
+  jest.spyOn(session, 'isValid').mockImplementation(() => true);
+  jest
+    .spyOn(history, 'getRedirectParam')
+    .mockReturnValue(samlIdPPath.toString());
+  render(<LoginTest />);
+  expect(history.push).toHaveBeenCalledWith(samlIdPPath.toString(), true);
 });

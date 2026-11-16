@@ -1,16 +1,20 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
@@ -40,7 +44,7 @@ func NewSliceSyncPool(sliceSize int64) *SliceSyncPool {
 		sliceSize: sliceSize,
 		zeroSlice: make([]byte, sliceSize),
 	}
-	s.New = func() interface{} {
+	s.New = func() any {
 		slice := make([]byte, s.sliceSize)
 		return &slice
 	}
@@ -63,7 +67,7 @@ func (s *SliceSyncPool) Zero(b []byte) {
 		copy(b, s.zeroSlice[:len(b)])
 	} else {
 		// use working, but less optimal implementation
-		for i := 0; i < len(b); i++ {
+		for i := range b {
 			b[i] = 0
 		}
 	}
@@ -92,7 +96,7 @@ func NewBufferSyncPool(size int64) *BufferSyncPool {
 	return &BufferSyncPool{
 		size: size,
 		Pool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				return bytes.NewBuffer(make([]byte, size))
 			},
 		},
@@ -121,4 +125,20 @@ func (b *BufferSyncPool) Get() *bytes.Buffer {
 // Size returns default allocated buffer size
 func (b *BufferSyncPool) Size() int64 {
 	return b.size
+}
+
+// FromSlice converts the provided slice to a map using the key function
+// to determine the appropriate key per entry. If any duplicates
+// exist in the slice, then the entry with the lowest index is used.
+func FromSlice[T any](r []T, key func(T) string) map[string]T {
+	out := make(map[string]T, len(r))
+
+	// there may be duplicate resources in the input list.
+	// by iterating from end to start, the first resource of given name wins.
+	for i := len(r) - 1; i >= 0; i-- {
+		res := r[i]
+		out[key(res)] = res
+	}
+
+	return out
 }

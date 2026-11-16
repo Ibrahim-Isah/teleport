@@ -1,41 +1,32 @@
 /**
- * Copyright 2023 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import styled from 'styled-components';
-import {
-  ButtonIcon,
-  ButtonPrimary,
-  ButtonSecondary,
-  Input,
-  Text,
-} from 'design';
+
+import { ButtonIcon, ButtonPrimary, ButtonSecondary, H2, Input } from 'design';
 import DialogConfirmation, {
   DialogContent,
   DialogFooter,
   DialogHeader,
 } from 'design/DialogConfirmation';
-import { Close } from 'design/Icon';
+import { Cross } from 'design/Icon';
 import { RadioGroup } from 'design/RadioGroup';
-
-interface UserJobRoleProps {
-  onCancel(): void;
-
-  onSend(jobRole: string): void;
-}
 
 const JOB_OPTIONS = [
   'Software Engineer',
@@ -47,8 +38,12 @@ const JOB_OPTIONS = [
 
 const OTHER_JOB_ROLE = 'Other';
 
-export function UserJobRole(props: UserJobRoleProps) {
-  const inputRef = useRef<HTMLInputElement>();
+export function UserJobRole(props: {
+  onCancel(): void;
+  onSend(jobRole: string): void;
+  hidden?: boolean;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
   const [jobRole, setJobRole] = useState<string | null>(null);
   const [otherJobRole, setOtherJobRole] = useState('');
 
@@ -71,7 +66,8 @@ export function UserJobRole(props: UserJobRoleProps) {
 
   return (
     <DialogConfirmation
-      open={true}
+      open={!props.hidden}
+      keepInDOMAfterClose
       onClose={props.onCancel}
       dialogCss={() => ({
         maxWidth: '400px',
@@ -89,15 +85,13 @@ export function UserJobRole(props: UserJobRoleProps) {
           mb={1}
           alignItems="baseline"
         >
-          <Text typography="h4" bold>
-            What describes your current job role best?
-          </Text>
+          <H2 mb={4}>What describes your current job role best?</H2>
           <ButtonIcon
             type="button"
             onClick={props.onCancel}
-            color="text.secondary"
+            color="text.slightlyMuted"
           >
-            <Close fontSize={5} />
+            <Cross size="medium" />
           </ButtonIcon>
         </DialogHeader>
         <DialogContent mb={3}>
@@ -107,8 +101,9 @@ export function UserJobRole(props: UserJobRoleProps) {
             options={[...JOB_OPTIONS, OTHER_JOB_ROLE]}
             value={jobRole}
             onChange={handleRadioGroupChange}
+            mb={3}
           />
-          <DarkInput
+          <StyledInput
             ref={inputRef}
             value={otherJobRole}
             onClick={() => {
@@ -135,19 +130,8 @@ export function UserJobRole(props: UserJobRoleProps) {
   );
 }
 
-// TODO(gzdunek): remove after improving inputs styling in Connect
-const DarkInput = styled(Input)`
-  background: inherit;
-  border: 1px ${props => props.theme.colors.action.disabledBackground} solid;
-  box-shadow: none;
-  color: ${props => props.theme.colors.text.primary};
+const StyledInput = styled(Input)`
   margin-bottom: 10px;
   font-size: 14px;
   height: 34px;
-  transition: border 300ms ease-out;
-
-  ::placeholder {
-    opacity: 1;
-    color: ${props => props.theme.colors.text.secondary};
-  }
 `;

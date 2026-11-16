@@ -1,50 +1,59 @@
 /*
-Copyright 2017-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package tlsca
 
 import (
+	"context"
 	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/base32"
 	"encoding/pem"
 	"fmt"
 	"math/big"
 	"net"
+	"os"
+	"slices"
 	"strconv"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/gravitational/teleport"
+	scopesv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/scopes/v1"
+	workloadidentityv1pb "github.com/gravitational/teleport/api/gen/proto/go/teleport/workloadidentity/v1"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/api/types/wrappers"
 	"github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/scopes/pinning"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
-var log = logrus.WithFields(logrus.Fields{
-	trace.Component: teleport.ComponentAuthority,
-})
+var logger = logutils.NewPackageLogger(teleport.ComponentKey, teleport.ComponentAuthority)
 
 // FromCertAndSigner returns a CertAuthority with the given raw certificate and signer.
 func FromCertAndSigner(certPEM []byte, signer crypto.Signer) (*CertAuthority, error) {
@@ -69,7 +78,7 @@ func FromKeys(certPEM, keyPEM []byte) (*CertAuthority, error) {
 		return nil, trace.Wrap(err)
 	}
 	if len(keyPEM) != 0 {
-		ca.Signer, err = ParsePrivateKeyPEM(keyPEM)
+		ca.Signer, err = keys.ParsePrivateKey(keyPEM)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -107,9 +116,17 @@ type CertAuthority struct {
 }
 
 // Identity is an identity of the user or service, e.g. Proxy or Node
+// Must be kept in sync with teleport.decision.v1alpha1.TLSIdentity.
 type Identity struct {
-	// Username is a username or name of the node connection
+	// Username is the name of the user (for end-users/bots) or the Host ID (for
+	// Teleport processes).
 	Username string
+	// ScopePin is an optional pin that ties the certificate to a specific scope. For user identities it
+	// encodes scoped role assignments (PIN_KIND_USER); for agent identities it encodes system roles
+	// (PIN_KIND_AGENT). When set, the Groups field must not be set.
+	ScopePin *scopesv1.Pin
+	// AgentScope is the scope this identity belongs to.
+	AgentScope string
 	// Impersonator is a username of a user impersonating this user
 	Impersonator string
 	// Groups is a list of groups (Teleport roles) encoded in the identity
@@ -179,9 +196,31 @@ type Identity struct {
 	Renewable bool
 	// Generation counts the number of times this certificate has been renewed.
 	Generation uint64
+	// BotName indicates the name of the Machine ID bot this identity was issued
+	// to, if any.
+	BotName string
+	// BotInstanceID is a unique identifier for Machine ID bots that is
+	// persisted through renewals.
+	BotInstanceID string
+	// BotScope is the scope of the Machine ID bot this identity was issued to,
+	// if any. Empty for unscoped bots and non-bot identities.
+	BotScope string
+	// BotInternal is a flag that indicates an identity is specifically a bot
+	// internal identity, rather than output certificates intended for direct
+	// consumption by users or user-facing bot services.
+	BotInternal bool
+	// JoinToken contains the name of the join token used when a Machine ID bot
+	// or agent joins. Note that agents using the `token` join method will
+	// include a censored token name.
+	JoinToken string
 	// AllowedResourceIDs lists the resources the identity should be allowed to
 	// access.
+	//
+	// Deprecated: Use [Identity.AllowedResourceAccessIDs].
 	AllowedResourceIDs []types.ResourceID
+	// AllowedResourceAccessIDs lists the resources the user should be able to access,
+	// paired with ResourceConstraints or additional information.
+	AllowedResourceAccessIDs []types.ResourceAccessID
 	// PrivateKeyPolicy is the private key policy supported by this identity.
 	PrivateKeyPolicy keys.PrivateKeyPolicy
 
@@ -190,15 +229,38 @@ type Identity struct {
 
 	// DeviceExtensions holds device-aware extensions for the identity.
 	DeviceExtensions DeviceExtensions
+
+	// UserType indicates if the User was created by an SSO Provider or locally.
+	UserType types.UserType
+
+	// JoinAttributes holds the attributes that resulted from the
+	// Bot/Agent join process.
+	JoinAttributes *workloadidentityv1pb.JoinAttrs
+
+	// OriginClusterName is the name of the cluster where the identity is
+	// authenticated.
+	OriginClusterName string
+
+	// DelegationSessionID is the identifier of the Delegation Session this
+	// certificate was created for.
+	DelegationSessionID string
+
+	// BeamID is the identifier of the Beam this certificate was created for,
+	// derived from the delegation session's types.BeamIDLabel label.
+	BeamID string
+
+	// ImmutableLabelHash is the hash of the immutable labels that have been
+	// applied to the identity.
+	ImmutableLabelHash string
+
+	// WebSessionID is the session ID of the web session associated with this identity, if any.
+	WebSessionID string
 }
 
 // RouteToApp holds routing information for applications.
 type RouteToApp struct {
-	// SessionID is a UUIDv4 used to identify application sessions created by
-	// this certificate. The reason a UUID was used instead of a hash of the
-	// SubjectPublicKeyInfo like the CA pin is for UX consistency. For example,
-	// the SessionID is emitted in the audit log, using a UUID matches how SSH
-	// sessions are identified.
+	// SessionID is an ID used to identify application sessions created by
+	// this certificate.
 	SessionID string
 
 	// PublicAddr (and ClusterName) are used to route requests issued with this
@@ -220,6 +282,26 @@ type RouteToApp struct {
 
 	// GCPServiceAccount is the GCP service account to assume when accessing GCP API.
 	GCPServiceAccount string
+
+	// URI is the URI of the app. This is the internal endpoint where the application is running and isn't user-facing.
+	// Used merely for audit events and mirrors the URI from the app spec. Not used as a source of
+	// truth when routing connections.
+	URI string
+
+	// TargetPort is the port to which connections should be routed to. Used only for multi-port TCP
+	// apps. It is appended to the hostname from the URI in the app spec, since the URI from
+	// RouteToApp is not used as the source of truth for routing.
+	TargetPort int
+
+	// AWSCredentialProcessCredentials contains the credentials to access AWS APIs.
+	// This is a JSON string that conforms with
+	// https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html#feature-process-credentials-output
+	AWSCredentialProcessCredentials string
+
+	// Scope is the scope of the target application.
+	// TODO (williamo/scopes): consider creating a TargetScope parameter in the root
+	// Identity struct, and removing this.
+	Scope string
 }
 
 // RouteToDatabase contains routing information for databases.
@@ -238,12 +320,27 @@ type RouteToDatabase struct {
 	// Database is an optional database name to serve as a default
 	// database to connect to.
 	Database string
+	// Roles is an optional list of database roles to use for a database
+	// session.
+	// This list should be a subset of allowed database roles. If not
+	// specified, Database Service will use all allowed database roles for this
+	// database.
+	Roles []string
 }
 
 // String returns string representation of the database routing struct.
 func (r RouteToDatabase) String() string {
-	return fmt.Sprintf("Database(Service=%v, Protocol=%v, Username=%v, Database=%v)",
-		r.ServiceName, r.Protocol, r.Username, r.Database)
+	return fmt.Sprintf("Database(Service=%v, Protocol=%v, Username=%v, Database=%v, Roles=%v)",
+		r.ServiceName, r.Protocol, r.Username, r.Database, r.Roles)
+}
+
+// Empty returns true if RouteToDatabase is empty.
+func (r RouteToDatabase) Empty() bool {
+	return r.ServiceName == "" &&
+		r.Protocol == "" &&
+		r.Username == "" &&
+		r.Database == "" &&
+		len(r.Roles) == 0
 }
 
 // DeviceExtensions holds device-aware extensions for the identity.
@@ -281,20 +378,33 @@ func (id *Identity) GetEventIdentity() events.Identity {
 			AWSRoleARN:        id.RouteToApp.AWSRoleARN,
 			AzureIdentity:     id.RouteToApp.AzureIdentity,
 			GCPServiceAccount: id.RouteToApp.GCPServiceAccount,
+			URI:               id.RouteToApp.URI,
+			TargetPort:        uint32(id.RouteToApp.TargetPort),
 		}
 	}
 	var routeToDatabase *events.RouteToDatabase
-	if id.RouteToDatabase != (RouteToDatabase{}) {
+	if !id.RouteToDatabase.Empty() {
 		routeToDatabase = &events.RouteToDatabase{
 			ServiceName: id.RouteToDatabase.ServiceName,
 			Protocol:    id.RouteToDatabase.Protocol,
 			Username:    id.RouteToDatabase.Username,
 			Database:    id.RouteToDatabase.Database,
+			Roles:       id.RouteToDatabase.Roles,
+		}
+	}
+
+	var devExts *events.DeviceExtensions
+	if id.DeviceExtensions != (DeviceExtensions{}) {
+		devExts = &events.DeviceExtensions{
+			DeviceId:     id.DeviceExtensions.DeviceID,
+			AssetTag:     id.DeviceExtensions.AssetTag,
+			CredentialId: id.DeviceExtensions.CredentialID,
 		}
 	}
 
 	return events.Identity{
 		User:                    id.Username,
+		ScopePin:                pinning.ToEventsPin(id.ScopePin),
 		Impersonator:            id.Impersonator,
 		Roles:                   id.Groups,
 		Usage:                   id.Usage,
@@ -318,7 +428,16 @@ func (id *Identity) GetEventIdentity() events.Identity {
 		GCPServiceAccounts:      id.GCPServiceAccounts,
 		AccessRequests:          id.ActiveRequests,
 		DisallowReissue:         id.DisallowReissue,
-		AllowedResourceIDs:      events.ResourceIDs(id.AllowedResourceIDs),
+		//nolint:staticcheck // TODO(kiosion): deprecated, to be removed in v21
+		AllowedResourceIDs:       events.ResourceIDs(id.AllowedResourceIDs),
+		AllowedResourceAccessIDs: events.ToEventResourceAccessIDs(id.AllowedResourceAccessIDs),
+		PrivateKeyPolicy:         string(id.PrivateKeyPolicy),
+		DeviceExtensions:         devExts,
+		BotName:                  id.BotName,
+		BotInstanceID:            id.BotInstanceID,
+		BotScopeOfOrigin:         id.BotScope,
+		BotInternal:              id.BotInternal,
+		JoinToken:                id.JoinToken,
 	}
 }
 
@@ -327,8 +446,15 @@ func (id *Identity) CheckAndSetDefaults() error {
 	if id.Username == "" {
 		return trace.BadParameter("missing identity username")
 	}
-	if len(id.Groups) == 0 {
-		return trace.BadParameter("missing identity groups")
+	if len(id.Groups) == 0 && id.ScopePin == nil {
+		return trace.BadParameter("missing identity groups or scope pin")
+	}
+
+	// Set the origin cluster name to the teleport cluster name.
+	// OriginClusterName is never encoded in the certificate
+	// so we set it to cert's TeleportCluster.
+	if id.OriginClusterName == "" {
+		id.OriginClusterName = id.TeleportCluster
 	}
 
 	return nil
@@ -416,6 +542,19 @@ var (
 	// the list of allowed GCP service accounts into a certificate.
 	GCPServiceAccountsASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 19}
 
+	// UserTypeASN1ExtensionOID is an extension that encodes the user type.
+	// Its value is either local or sso.
+	UserTypeASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 20}
+
+	// AppTargetPortASN1ExtensionOID is an extension ID used to encode the application
+	// target port into a certificate.
+	AppTargetPortASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 21}
+
+	// AppAWSCredentialProcessCredentialsASN1ExtensionOID is an extension that encodes the credentials to access AWS APIs.
+	// This is a JSON string that conforms with
+	// https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html#feature-process-credentials-output
+	AppAWSCredentialProcessCredentialsASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 22}
+
 	// DatabaseServiceNameASN1ExtensionOID is an extension ID used when encoding/decoding
 	// database service name into certificates.
 	DatabaseServiceNameASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 1}
@@ -480,6 +619,91 @@ var (
 	// PinnedIPASN1ExtensionOID is an extension ID used when encoding/decoding
 	// the IP the certificate is pinned to.
 	PinnedIPASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 15}
+
+	// CreateWindowsUserOID is an extension OID used to indicate that the user should be created.
+	CreateWindowsUserOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 16}
+
+	// DesktopsLimitExceededOID is an extension OID used indicate if number of non-AD desktops exceeds the limit for OSS distribution.
+	DesktopsLimitExceededOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 17}
+
+	// BotASN1ExtensionOID is an extension OID used to indicate an identity is associated with a Machine ID bot.
+	BotASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 18}
+
+	// RequestedDatabaseRolesExtensionOID is an extension OID used when
+	// encoding/decoding requested database roles.
+	RequestedDatabaseRolesExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 19}
+
+	// BotInstanceASN1ExtensionOID is an extension that encodes a unique bot
+	// instance identifier into a certificate.
+	BotInstanceASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 20}
+
+	// JoinAttributesASN1ExtensionOID is an extension that encodes the
+	// attributes that resulted from the Bot/Agent join process.
+	JoinAttributesASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 21}
+
+	// ADStatusOID is an extension OID used to indicate that we're connecting to AD-joined desktop.
+	ADStatusOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 22}
+
+	// JoinTokenOID is an extension OID that contains the name of the join token
+	// used when a bot or agent joins. It is censored for agents joining with
+	// the `token` join method.
+	JoinTokenASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 23}
+
+	// ScopePinASN1ExtensionOID is an extension OID that contains the scope pin
+	// used to tie the certificate to a specific scope and set of scoped roles.
+	ScopePinASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 24}
+
+	// AgentScopeASN1ExtensionOID is an extension OID that contains the agent scope
+	// used to tie the certificate to a spec
+	AgentScopeASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 25}
+
+	// AllowedResourceAccessIDsASN1ExtensionOID is an extension OID used to list the
+	// ResourceAccessIDs which the certificate should be able to grant access to
+	AllowedResourceAccessIDsASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 26}
+	// ImmutableLabelHashASN1ExtensionOID is an extension OID that contains the
+	// immuable label hash used to verify immutable labels.
+	ImmutableLabelHashASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 27}
+
+	// WebSessionIDASN1ExtensionOID is an extension OID that contains the
+	// web session ID associated with this identity, if any.
+	WebSessionIDASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 28}
+
+	// BotInternalASN1ExtensionOID is a boolean OID that indicates certificates
+	// are for a bot internal identity, rather than an output certificate.
+	BotInternalASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 29}
+
+	// DelegationSessionIDASN1ExtensionOID is an extension OID that contains the
+	// identifier of the Delegation Session this certificate was created for.
+	DelegationSessionIDASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 30}
+
+	// AgentScopePinASN1ExtensionOID is an extension OID that contains the agent scope pin,
+	// encoding the agent's pinned scope and system roles.
+	AgentScopePinASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 31}
+
+	// BeamIDASN1ExtensionOID is an extension OID that contains the identifier of
+	// the Beam this certificate was created for.
+	BeamIDASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 32}
+
+	// BotScopeASN1ExtensionOID is an extension OID that encodes the scope of
+	// the Machine ID bot the certificate was issued to, if any.
+	BotScopeASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 33}
+
+	// TargetScopeASN1ExtensionOID is an extension OID used to encode the scope of the
+	// target resource. A single TargetScope OID hinges on the fact that
+	// certificates are only issued for one resource at a time.
+	// If this is changed, we will need additional per protocol target scopes.
+	TargetScopeASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 34}
+
+	// CAClusterNameExtensionOID records the cluster name in a Teleport CA
+	// certificate.
+	//
+	// Historically the cluster name is recorded in the certificate's "O=" field.
+	// This OID makes it possible to customize O= and still record the cluster
+	// name.
+	//
+	// Takes precedence, as the cluster name, over the O= field if both are
+	// present.
+	CAClusterNameExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 4, 1}
 )
 
 // Device Trust OIDs.
@@ -500,6 +724,21 @@ var (
 
 // Subject converts identity to X.509 subject name
 func (id *Identity) Subject() (pkix.Name, error) {
+	// Agent scope pins encode role and scope exclusively via the ScopePin field.
+	// Mixing in the legacy Groups, SystemRoles, or AgentScope fields would allow
+	// outdated infrastructure to misinterpret a scoped-agent cert as an unscoped one.
+	if id.ScopePin.GetKind() == scopesv1.PinKind_PIN_KIND_AGENT {
+		if len(id.Groups) > 0 {
+			return pkix.Name{}, trace.BadParameter("cannot encode tls certificate for agent scope pin with Groups set; encode roles via ScopePin.SystemRoles")
+		}
+		if len(id.SystemRoles) > 0 {
+			return pkix.Name{}, trace.BadParameter("cannot encode tls certificate for agent scope pin with SystemRoles set; encode roles via ScopePin.SystemRoles")
+		}
+		if id.AgentScope != "" {
+			return pkix.Name{}, trace.BadParameter("cannot encode tls certificate for agent scope pin with AgentScope set; encode scope via ScopePin.Scope")
+		}
+	}
+
 	rawTraits, err := wrappers.MarshalTraits(&id.Traits)
 	if err != nil {
 		return pkix.Name{}, trace.Wrap(err)
@@ -567,6 +806,15 @@ func (id *Identity) Subject() (pkix.Name, error) {
 				Value: id.RouteToApp.PublicAddr,
 			})
 	}
+	if id.RouteToApp.TargetPort != 0 {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type: AppTargetPortASN1ExtensionOID,
+				// asn1 doesn't seem to handle uint16, hence the string.
+				Value: strconv.Itoa(id.RouteToApp.TargetPort),
+			},
+		)
+	}
 	if id.RouteToApp.ClusterName != "" {
 		subject.ExtraNames = append(subject.ExtraNames,
 			pkix.AttributeTypeAndValue{
@@ -581,6 +829,13 @@ func (id *Identity) Subject() (pkix.Name, error) {
 				Value: id.RouteToApp.Name,
 			})
 	}
+	if id.RouteToApp.Scope != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  TargetScopeASN1ExtensionOID,
+				Value: id.RouteToApp.Scope,
+			})
+	}
 	if id.RouteToApp.AWSRoleARN != "" {
 		subject.ExtraNames = append(subject.ExtraNames,
 			pkix.AttributeTypeAndValue{
@@ -593,6 +848,13 @@ func (id *Identity) Subject() (pkix.Name, error) {
 			pkix.AttributeTypeAndValue{
 				Type:  AWSRoleARNsASN1ExtensionOID,
 				Value: id.AWSRoleARNs[i],
+			})
+	}
+	if id.RouteToApp.AWSCredentialProcessCredentials != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  AppAWSCredentialProcessCredentialsASN1ExtensionOID,
+				Value: id.RouteToApp.AWSCredentialProcessCredentials,
 			})
 	}
 	if id.RouteToApp.AzureIdentity != "" {
@@ -695,6 +957,13 @@ func (id *Identity) Subject() (pkix.Name, error) {
 				Value: id.RouteToDatabase.Database,
 			})
 	}
+	for i := range id.RouteToDatabase.Roles {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  RequestedDatabaseRolesExtensionOID,
+				Value: id.RouteToDatabase.Roles[i],
+			})
+	}
 
 	// Encode allowed database names/users used when passing them
 	// to remote clusters as user traits.
@@ -747,7 +1016,106 @@ func (id *Identity) Subject() (pkix.Name, error) {
 		)
 	}
 
+	if id.BotName != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  BotASN1ExtensionOID,
+				Value: id.BotName,
+			})
+	}
+
+	if id.BotInstanceID != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  BotInstanceASN1ExtensionOID,
+				Value: id.BotInstanceID,
+			})
+	}
+
+	if id.BotScope != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  BotScopeASN1ExtensionOID,
+				Value: id.BotScope,
+			})
+	}
+
+	if id.BotInternal {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  BotInternalASN1ExtensionOID,
+				Value: types.True,
+			},
+		)
+	}
+
+	if id.JoinToken != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  JoinTokenASN1ExtensionOID,
+				Value: id.JoinToken,
+			})
+	}
+
+	if id.ScopePin != nil {
+		// User pins go in the user OID; agent pins go in the agent OID. The OID separation
+		// ensures fail-closed behavior on older auth servers that only know about user pins.
+		var oid asn1.ObjectIdentifier
+		switch id.ScopePin.GetKind() {
+		case scopesv1.PinKind_PIN_KIND_USER:
+			oid = ScopePinASN1ExtensionOID
+		case scopesv1.PinKind_PIN_KIND_AGENT:
+			oid = AgentScopePinASN1ExtensionOID
+		default:
+			return pkix.Name{}, trace.BadParameter("cannot encode scope pin with unknown or unspecified kind %v", id.ScopePin.GetKind())
+		}
+		encoded, err := pinning.Encode(id.ScopePin)
+		if err != nil {
+			return pkix.Name{}, trace.Errorf("failed to encode scope pin: %w", err)
+		}
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  oid,
+				Value: encoded,
+			})
+	}
+
+	if id.AgentScope != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  AgentScopeASN1ExtensionOID,
+				Value: id.AgentScope,
+			})
+	}
+
+	if id.DelegationSessionID != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  DelegationSessionIDASN1ExtensionOID,
+				Value: id.DelegationSessionID,
+			})
+	}
+
+	if id.BeamID != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  BeamIDASN1ExtensionOID,
+				Value: id.BeamID,
+			})
+	}
+
+	if id.UserType != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  UserTypeASN1ExtensionOID,
+				Value: string(id.UserType),
+			},
+		)
+	}
+
+	//nolint:staticcheck // TODO(kiosion): deprecated, to be removed in v21
 	if len(id.AllowedResourceIDs) > 0 {
+		//nolint:staticcheck // TODO(kiosion): deprecated, to be removed in v21
 		allowedResourcesStr, err := types.ResourceIDsToString(id.AllowedResourceIDs)
 		if err != nil {
 			return pkix.Name{}, trace.Wrap(err)
@@ -756,6 +1124,36 @@ func (id *Identity) Subject() (pkix.Name, error) {
 			pkix.AttributeTypeAndValue{
 				Type:  AllowedResourcesASN1ExtensionOID,
 				Value: allowedResourcesStr,
+			},
+		)
+	} else if len(id.AllowedResourceAccessIDs) > 0 {
+		// If an identity is resource-constrained exclusively via AllowedResourceAccessIDs,
+		// we add a non-matching sentinel ResourceID into AllowedResourceIDs.
+		// This prevents authorization paths that only parse AllowedResourceIDs and ignore AllowedResourceAccessIDs
+		// (e.g., older Auths in mixed-version clusters) from interpreting an empty AllowedResourceIDs slice as
+		// "no resource-specific restrictions".
+		// TODO(kiosion): DELETE in 21.0.0
+		sentinelResourceIDStr, err := types.ResourceIDsToString([]types.ResourceID{types.CreateSentinelResourceID()})
+		if err != nil {
+			return pkix.Name{}, trace.Wrap(err)
+		}
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  AllowedResourcesASN1ExtensionOID,
+				Value: sentinelResourceIDStr,
+			},
+		)
+	}
+
+	if len(id.AllowedResourceAccessIDs) > 0 {
+		allowedResourceAccessIDsStr, err := types.ResourceAccessIDsToString(id.AllowedResourceAccessIDs)
+		if err != nil {
+			return pkix.Name{}, trace.Wrap(err)
+		}
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  AllowedResourceAccessIDsASN1ExtensionOID,
+				Value: allowedResourceAccessIDsStr,
 			},
 		)
 	}
@@ -774,6 +1172,24 @@ func (id *Identity) Subject() (pkix.Name, error) {
 			pkix.AttributeTypeAndValue{
 				Type:  ConnectionDiagnosticIDASN1ExtensionOID,
 				Value: id.ConnectionDiagnosticID,
+			},
+		)
+	}
+
+	if id.JoinAttributes != nil && shouldPersistJoinAttrs() {
+		encoded, err := protojson.MarshalOptions{
+			// Use the proto field names as this is what we use in the
+			// templating engine and this being consistent for any user who
+			// inspects the cert is kind.
+			UseProtoNames: true,
+		}.Marshal(id.JoinAttributes)
+		if err != nil {
+			return pkix.Name{}, trace.Wrap(err, "encoding join attributes as protojson")
+		}
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  JoinAttributesASN1ExtensionOID,
+				Value: string(encoded),
 			},
 		)
 	}
@@ -798,6 +1214,22 @@ func (id *Identity) Subject() (pkix.Name, error) {
 		})
 	}
 
+	if id.ImmutableLabelHash != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  ImmutableLabelHashASN1ExtensionOID,
+				Value: id.ImmutableLabelHash,
+			})
+	}
+
+	if id.WebSessionID != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  WebSessionIDASN1ExtensionOID,
+				Value: id.WebSessionID,
+			})
+	}
+
 	return subject, nil
 }
 
@@ -819,6 +1251,11 @@ func FromSubject(subject pkix.Name, expires time.Time) (*Identity, error) {
 			return nil, trace.Wrap(err)
 		}
 	}
+
+	var (
+		allowedResourceIDs       []types.ResourceID
+		allowedResourceAccessIDs []types.ResourceAccessID
+	)
 
 	for _, attr := range subject.Names {
 		switch {
@@ -852,6 +1289,16 @@ func FromSubject(subject pkix.Name, expires time.Time) (*Identity, error) {
 			if ok {
 				id.RouteToApp.PublicAddr = val
 			}
+		case attr.Type.Equal(AppTargetPortASN1ExtensionOID):
+			// Similar to GenerationASN1ExtensionOID, it has to be cast to a string first and then parsed.
+			val, ok := attr.Value.(string)
+			if ok {
+				targetPort, err := strconv.ParseUint(val, 10, 16)
+				if err != nil {
+					return nil, trace.Wrap(err, "parsing target port")
+				}
+				id.RouteToApp.TargetPort = int(targetPort)
+			}
 		case attr.Type.Equal(AppClusterNameASN1ExtensionOID):
 			val, ok := attr.Value.(string)
 			if ok {
@@ -862,6 +1309,11 @@ func FromSubject(subject pkix.Name, expires time.Time) (*Identity, error) {
 			if ok {
 				id.RouteToApp.Name = val
 			}
+		case attr.Type.Equal(TargetScopeASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.RouteToApp.Scope = val
+			}
 		case attr.Type.Equal(AppAWSRoleARNASN1ExtensionOID):
 			val, ok := attr.Value.(string)
 			if ok {
@@ -871,6 +1323,11 @@ func FromSubject(subject pkix.Name, expires time.Time) (*Identity, error) {
 			val, ok := attr.Value.(string)
 			if ok {
 				id.AWSRoleARNs = append(id.AWSRoleARNs, val)
+			}
+		case attr.Type.Equal(AppAWSCredentialProcessCredentialsASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.RouteToApp.AWSCredentialProcessCredentials = val
 			}
 		case attr.Type.Equal(AppAzureIdentityASN1ExtensionOID):
 			val, ok := attr.Value.(string)
@@ -941,6 +1398,11 @@ func FromSubject(subject pkix.Name, expires time.Time) (*Identity, error) {
 			if ok {
 				id.RouteToDatabase.Database = val
 			}
+		case attr.Type.Equal(RequestedDatabaseRolesExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.RouteToDatabase.Roles = append(id.RouteToDatabase.Roles, val)
+			}
 		case attr.Type.Equal(DatabaseNamesASN1ExtensionOID):
 			val, ok := attr.Value.(string)
 			if ok {
@@ -977,14 +1439,95 @@ func FromSubject(subject pkix.Name, expires time.Time) (*Identity, error) {
 				}
 				id.Generation = generation
 			}
+		case attr.Type.Equal(BotASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.BotName = val
+			}
+		case attr.Type.Equal(BotInstanceASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.BotInstanceID = val
+			}
+		case attr.Type.Equal(BotScopeASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.BotScope = val
+			}
+		case attr.Type.Equal(BotInternalASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.BotInternal = val == types.True
+			}
+		case attr.Type.Equal(JoinTokenASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.JoinToken = val
+			}
+		case attr.Type.Equal(ScopePinASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				pin, err := pinning.Decode(val)
+				if err != nil {
+					return nil, trace.Errorf("failed to decode scope pin: %w", err)
+				}
+				// Certs issued before PinKind was introduced will have UNSPECIFIED here.
+				// Pins decoded from the user OID are always user pins.
+				if pin.GetKind() == scopesv1.PinKind_PIN_KIND_UNSPECIFIED {
+					pin.SetKind(scopesv1.PinKind_PIN_KIND_USER)
+				}
+				id.ScopePin = pin
+			}
+		case attr.Type.Equal(AgentScopePinASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				pin, err := pinning.Decode(val)
+				if err != nil {
+					return nil, trace.Errorf("failed to decode agent scope pin: %w", err)
+				}
+				id.ScopePin = pin
+			}
+		case attr.Type.Equal(AgentScopeASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.AgentScope = val
+			}
+		case attr.Type.Equal(DelegationSessionIDASN1ExtensionOID):
+			if val, ok := attr.Value.(string); ok {
+				id.DelegationSessionID = val
+			}
+		case attr.Type.Equal(BeamIDASN1ExtensionOID):
+			if val, ok := attr.Value.(string); ok {
+				id.BeamID = val
+			}
 		case attr.Type.Equal(AllowedResourcesASN1ExtensionOID):
 			allowedResourcesStr, ok := attr.Value.(string)
 			if ok {
-				allowedResourceIDs, err := types.ResourceIDsFromString(allowedResourcesStr)
+				resourceIDs, err := types.ResourceIDsFromString(allowedResourcesStr)
 				if err != nil {
 					return nil, trace.Wrap(err)
 				}
-				id.AllowedResourceIDs = allowedResourceIDs
+				filteredAllowedResourceIDs := make([]types.ResourceID, 0, len(resourceIDs))
+				for _, rid := range resourceIDs {
+					// AllowedResourceIDs may contain a non-matching sentinel whose sole purpose is to prevent
+					// authorization paths (e.g., older versions operating in mixed-version clusters) that ignore
+					// AllowedResourceAccessIDs from treating an otherwise resource-scoped identity as unconstrained.
+					//
+					// It should be filtered out at decoding here, as it's not a real "requested resource".
+					if !types.IsSentinelResourceID(rid) {
+						filteredAllowedResourceIDs = append(filteredAllowedResourceIDs, rid)
+					}
+				}
+				allowedResourceIDs = filteredAllowedResourceIDs
+			}
+		case attr.Type.Equal(AllowedResourceAccessIDsASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				resourceAccessIDs, err := types.ResourceAccessIDsFromString(val)
+				if err != nil {
+					return nil, trace.Wrap(err)
+				}
+				allowedResourceAccessIDs = resourceAccessIDs
 			}
 		case attr.Type.Equal(PrivateKeyPolicyASN1ExtensionOID):
 			val, ok := attr.Value.(string)
@@ -1012,7 +1555,49 @@ func FromSubject(subject pkix.Name, expires time.Time) (*Identity, error) {
 			if val, ok := attr.Value.(string); ok {
 				id.PinnedIP = val
 			}
+		case attr.Type.Equal(UserTypeASN1ExtensionOID):
+			if val, ok := attr.Value.(string); ok {
+				id.UserType = types.UserType(val)
+			}
+		case attr.Type.Equal(JoinAttributesASN1ExtensionOID):
+			if val, ok := attr.Value.(string); ok {
+				id.JoinAttributes = &workloadidentityv1pb.JoinAttrs{}
+				unmarshaler := protojson.UnmarshalOptions{
+					// We specifically want to DiscardUnknown or unmarshaling
+					// will fail if the proto message was issued by a newer
+					// auth server w/ new fields.
+					DiscardUnknown: true,
+				}
+				if err := unmarshaler.Unmarshal([]byte(val), id.JoinAttributes); err != nil {
+					return nil, trace.Wrap(err)
+				}
+			}
+		case attr.Type.Equal(ImmutableLabelHashASN1ExtensionOID):
+			if val, ok := attr.Value.(string); ok {
+				id.ImmutableLabelHash = val
+			}
+		case attr.Type.Equal(WebSessionIDASN1ExtensionOID):
+			if val, ok := attr.Value.(string); ok {
+				id.WebSessionID = val
+			}
 		}
+	}
+
+	if len(allowedResourceAccessIDs) > 0 {
+		// Prefer new extension when present.
+		id.AllowedResourceAccessIDs = allowedResourceAccessIDs
+		// Populate AllowedResourceIDs with any present unconstrained resources,
+		// so any path re-encoding this identity (e.g., database proxy CSR signing)
+		// persists the resourceIDs to the legacy extension, instead of adding a
+		// sentinel.
+		//
+		// TODO(kiosion): DELETE in 20.0.0
+		id.AllowedResourceIDs, _ = types.UnwrapResourceAccessIDs(allowedResourceAccessIDs)
+	} else if len(allowedResourceIDs) > 0 {
+		// Fallback for certs from older Auths that don't write the new extension.
+		id.AllowedResourceAccessIDs = types.CombineAsResourceAccessIDs(allowedResourceIDs, nil)
+		//nolint:staticcheck // TODO(kiosion): deprecated, to be removed in v20
+		id.AllowedResourceIDs = allowedResourceIDs
 	}
 
 	if err := id.CheckAndSetDefaults(); err != nil {
@@ -1031,6 +1616,23 @@ func (id Identity) GetUserMetadata() events.UserMetadata {
 		}
 	}
 
+	_, systemRoleCheckErr := types.NewTeleportRoles(id.Groups)
+	var userKind events.UserKind
+	switch {
+	case id.BotName != "":
+		userKind = events.UserKind_USER_KIND_BOT
+	case id.ScopePin.GetKind() == scopesv1.PinKind_PIN_KIND_AGENT:
+		userKind = events.UserKind_USER_KIND_SYSTEM
+	case len(id.SystemRoles) > 0 || systemRoleCheckErr == nil && len(id.Groups) > 0:
+		userKind = events.UserKind_USER_KIND_SYSTEM
+	default:
+		userKind = events.UserKind_USER_KIND_HUMAN
+	}
+	userTeleportCluster := id.OriginClusterName
+	if userTeleportCluster == "" {
+		userTeleportCluster = id.TeleportCluster
+	}
+
 	return events.UserMetadata{
 		User:              id.Username,
 		Impersonator:      id.Impersonator,
@@ -1038,8 +1640,56 @@ func (id Identity) GetUserMetadata() events.UserMetadata {
 		AzureIdentity:     id.RouteToApp.AzureIdentity,
 		GCPServiceAccount: id.RouteToApp.GCPServiceAccount,
 		AccessRequests:    id.ActiveRequests,
+		UserKind:          userKind,
 		TrustedDevice:     device,
+		BotName:           id.BotName,
+		BotInstanceID:     id.BotInstanceID,
+		BotScopeOfOrigin:  id.BotScope,
+		UserRoles:         slices.Clone(id.Groups),
+		UserTraits:        id.Traits.Clone(),
+		UserClusterName:   userTeleportCluster,
+		ScopePin:          pinning.ToEventsPin(id.ScopePin),
+		BeamID:            id.BeamID,
 	}
+}
+
+func (id Identity) GetSessionMetadata(sid string) events.SessionMetadata {
+	return events.SessionMetadata{
+		SessionID:        sid,
+		WithMFA:          id.MFAVerified,
+		PrivateKeyPolicy: string(id.PrivateKeyPolicy),
+	}
+}
+
+// IsMFAVerified returns whether this identity is MFA verified. This MFA
+// verification may or may not have taken place recently, so it should not
+// be treated as blanket MFA verification uncritically. For example, MFA
+// should be re-verified for login procedures or admin actions.
+func (id *Identity) IsMFAVerified() bool {
+	return id.MFAVerified != "" || id.PrivateKeyPolicy.MFAVerified()
+}
+
+// IsBot returns whether this identity belongs to a bot.
+func (id *Identity) IsBot() bool {
+	return id.BotName != ""
+}
+
+// IsDelegationSession returns whether this identity was created for a Delegation Session.
+func (id *Identity) IsDelegationSession() bool {
+	return id.DelegationSessionID != ""
+}
+
+// GetAgentScope returns the effective agent scope for this identity. Returns empty string
+// for unscoped agents and non-agent certs.
+// TODO(fspmarshall/scopes): remove this helper once we've fully transitioned to pinned agents.
+func (id Identity) GetAgentScope() string {
+	if id.AgentScope != "" {
+		return id.AgentScope
+	}
+	if id.ScopePin.GetKind() == scopesv1.PinKind_PIN_KIND_AGENT {
+		return id.ScopePin.GetScope()
+	}
+	return ""
 }
 
 // CertificateRequest is a X.509 signing certificate request
@@ -1073,13 +1723,18 @@ func (c *CertificateRequest) CheckAndSetDefaults() error {
 		return trace.BadParameter("missing parameter PublicKey")
 	}
 	if c.Subject.CommonName == "" {
-		return trace.BadParameter("missing parameter Subject.Common name")
+		return trace.BadParameter("missing parameter Subject.CommonName")
 	}
 	if c.NotAfter.IsZero() {
 		return trace.BadParameter("missing parameter NotAfter")
 	}
 	if c.KeyUsage == 0 {
-		c.KeyUsage = x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature
+		c.KeyUsage = x509.KeyUsageDigitalSignature
+		if _, isRSA := c.PublicKey.(*rsa.PublicKey); isRSA {
+			// The KeyEncipherment bit is necessary for RSA key exchanges
+			// https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.3
+			c.KeyUsage |= x509.KeyUsageKeyEncipherment
+		}
 	}
 
 	c.DNSNames = utils.Deduplicate(c.DNSNames)
@@ -1098,11 +1753,13 @@ func (ca *CertAuthority) GenerateCertificate(req CertificateRequest) ([]byte, er
 		return nil, trace.Wrap(err)
 	}
 
-	log.WithFields(logrus.Fields{
-		"not_after": req.NotAfter,
-		"dns_names": req.DNSNames,
-		"key_usage": req.KeyUsage,
-	}).Infof("Generating TLS certificate %v", req.Subject.String())
+	logger.DebugContext(context.TODO(), "Generating TLS certificate",
+		"not_after", req.NotAfter,
+		"dns_names", req.DNSNames,
+		"key_usage", req.KeyUsage,
+		"common_name", req.Subject.CommonName,
+		"issuer_skid", base32.HexEncoding.EncodeToString(ca.Cert.SubjectKeyId),
+	)
 
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
@@ -1135,4 +1792,11 @@ func (ca *CertAuthority) GenerateCertificate(req CertificateRequest) ([]byte, er
 	}
 
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certBytes}), nil
+}
+
+// shouldPersistJoinAttrs returns true if the join attributes should be persisted
+// into the X509 identity. This provides an emergency "off" handle for this
+// new behavior until we are confident it is working as expected.
+func shouldPersistJoinAttrs() bool {
+	return os.Getenv("TELEPORT_UNSTABLE_DISABLE_JOIN_ATTRS") != "yes"
 }

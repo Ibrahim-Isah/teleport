@@ -1,91 +1,160 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import React from 'react';
+import { useLocation } from 'react-router';
 
-import { Prompt } from 'react-router-dom';
+import { Box, Flex } from 'design';
+import { InfoGuideButton } from 'shared/components/SlidingSidePanel/InfoGuide';
 
 import { FeatureBox } from 'teleport/components/Layout';
-
-import { Navigation } from 'teleport/Discover/Navigation/Navigation';
-import { SelectResource } from 'teleport/Discover/SelectResource';
+import { Prompt } from 'teleport/components/Router';
+import { findViewAtIndex } from 'teleport/components/Wizard/flow';
+import { Navigation } from 'teleport/components/Wizard/Navigation';
 import cfg from 'teleport/config';
+import type { View } from 'teleport/Discover/flow';
+import { SelectResource } from 'teleport/Discover/SelectResource/SelectResource';
+import { DiscoverBox } from 'teleport/Discover/Shared';
+import { DiscoverEvent } from 'teleport/services/userEvent';
 
-import { findViewAtIndex } from './flow';
-
-import { DiscoverProvider, useDiscover } from './useDiscover';
+import { getDiscoverInfoGuideConfig, getOverview } from './Overview/Overview';
+import { DiscoverIcon } from './SelectResource/icons';
+import { EViewConfigs } from './types';
+import {
+  DiscoverProvider,
+  DiscoverUpdateProps,
+  useDiscover,
+} from './useDiscover';
 
 function DiscoverContent() {
   const {
     currentStep,
-    selectedResource,
+    viewConfig,
     onSelectResource,
-    views,
+    indexedViews,
     ...agentProps
   } = useDiscover();
 
-  let content;
-  // we reserve step 0 for "Select Resource Type", that is present in all resource configs
-  if (currentStep > 0) {
-    const view = findViewAtIndex(views, currentStep);
+  let currentView: View | undefined;
+  let content: React.ReactNode;
 
-    const Component = view.component;
+  const hasSelectedResource = Boolean(viewConfig);
 
-    content = <Component {...agentProps} />;
+  if (hasSelectedResource) {
+    currentView = findViewAtIndex(indexedViews, currentStep);
 
-    if (selectedResource.wrapper) {
-      content = selectedResource.wrapper(content);
+    const Component = currentView.component;
+
+    const overview = getOverview({ resourceSpec: agentProps.resourceSpec });
+
+    if (!overview) {
+      content = (
+        <DiscoverBox>
+          <Component {...agentProps} />
+        </DiscoverBox>
+      );
+    } else {
+      content = (
+        <Flex alignItems="flex-start" gap={2}>
+          <DiscoverBox>
+            <Component {...agentProps} />
+          </DiscoverBox>
+          <Box mt={1}>
+            <InfoGuideButton config={getDiscoverInfoGuideConfig(overview)} />
+          </Box>
+        </Flex>
+      );
+    }
+
+    if (viewConfig.wrapper) {
+      content = viewConfig.wrapper(content);
     }
   } else {
+    currentView = undefined;
+
     content = (
-      <SelectResource
-        selectedResourceKind={selectedResource.kind}
-        onSelect={kind => onSelectResource(kind)}
-        onNext={() => agentProps.nextStep()}
-        resourceState={agentProps.resourceState}
-      />
+      <SelectResource onSelect={resource => onSelectResource(resource)} />
     );
   }
 
   return (
     <>
       <FeatureBox>
-        <Navigation
-          currentStep={currentStep}
-          selectedResource={selectedResource}
-          views={views}
-        />
-        {content}
+        {hasSelectedResource && (
+          <Box mt={3} mb={6}>
+            <Navigation
+              currentStep={currentStep}
+              views={indexedViews}
+              startWithIcon={{
+                title: agentProps.resourceSpec.name,
+                component: <DiscoverIcon name={agentProps.resourceSpec.icon} />,
+              }}
+            />
+          </Box>
+        )}
+        <Box>{content}</Box>
       </FeatureBox>
 
-      <Prompt
-        message={nextLocation => {
-          if (nextLocation.pathname === cfg.routes.discover) return true;
-          return 'Are you sure you want to exit the "Enroll New Resource” workflow? You’ll have to start from the beginning next time.';
-        }}
-        when={selectedResource.shouldPrompt(currentStep)}
-      />
+      {hasSelectedResource && (
+        <Prompt
+          message={nextLocation => {
+            if (nextLocation.pathname === cfg.routes.discover) {
+              return true;
+            }
+
+            return `Are you sure you want to exit the "Enroll New Resource" workflow? You'll have to start from the beginning next time.`;
+          }}
+          when={
+            viewConfig.shouldPrompt
+              ? viewConfig.shouldPrompt(
+                  currentStep,
+                  currentView,
+                  agentProps.resourceSpec
+                )
+              : currentView?.eventName !== DiscoverEvent.Completed
+          }
+        />
+      )}
     </>
   );
 }
 
-export function Discover() {
+export function DiscoverComponent({
+  eViewConfigs = [],
+  updateFlow,
+}: DiscoverComponentProps) {
+  const location = useLocation();
   return (
-    <DiscoverProvider>
+    <DiscoverProvider
+      eViewConfigs={eViewConfigs}
+      key={location.key}
+      updateFlow={updateFlow}
+    >
       <DiscoverContent />
     </DiscoverProvider>
   );
 }
+
+export function Discover() {
+  return <DiscoverComponent />;
+}
+
+export type DiscoverComponentProps = {
+  eViewConfigs?: EViewConfigs;
+  updateFlow?: DiscoverUpdateProps;
+};

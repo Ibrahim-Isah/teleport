@@ -1,30 +1,35 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package configure
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 
-	"github.com/gravitational/kingpin"
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/api/utils/clientutils"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
@@ -49,6 +54,15 @@ func addGithubCommand(cmd *SSOConfigureCommand) *AuthKindCommand {
 	sub.Flag("display", "Sets the connector display name.").StringVar(&spec.Display)
 	sub.Flag("id", "GitHub app client ID.").PlaceHolder("ID").Required().StringVar(&spec.ClientID)
 	sub.Flag("secret", "GitHub app client secret.").Required().PlaceHolder("SECRET").StringVar(&spec.ClientSecret)
+	sub.Flag("endpoint-url", "Endpoint URL for GitHub instance.").
+		PlaceHolder("URL").
+		Default(types.GithubURL).
+		StringVar(&spec.EndpointURL)
+
+	sub.Flag("api-endpoint-url", "API endpoint URL for GitHub instance.").
+		PlaceHolder("URL").
+		Default(types.GithubAPIURL).
+		StringVar(&spec.APIEndpointURL)
 
 	// auto
 	sub.Flag("redirect-url", "Authorization callback URL.").PlaceHolder("URL").StringVar(&spec.RedirectURL)
@@ -70,11 +84,11 @@ Examples:
   The values for --secret and --id are provided by GitHub.
 
   > tctl sso configure gh ... | tctl sso test
-  
+
   Generate the configuration and immediately test it using "tctl sso test" command.`)
 
 	preset := &AuthKindCommand{
-		Run: func(ctx context.Context, clt auth.ClientI) error { return ghRunFunc(ctx, cmd, &spec, gh, clt) },
+		Run: func(ctx context.Context, clt *authclient.Client) error { return ghRunFunc(ctx, cmd, &spec, gh, clt) },
 	}
 
 	sub.Action(func(ctx *kingpin.ParseContext) error {
@@ -85,13 +99,13 @@ Examples:
 	return preset
 }
 
-func ghRunFunc(ctx context.Context, cmd *SSOConfigureCommand, spec *types.GithubConnectorSpecV3, flags *ghExtraFlags, clt auth.ClientI) error {
+func ghRunFunc(ctx context.Context, cmd *SSOConfigureCommand, spec *types.GithubConnectorSpecV3, flags *ghExtraFlags, clt *authclient.Client) error {
 	if err := specCheckRoles(ctx, cmd.Logger, spec, flags.ignoreMissingRoles, clt); err != nil {
 		return trace.Wrap(err)
 	}
 
 	if spec.RedirectURL == "" {
-		spec.RedirectURL = ResolveCallbackURL(cmd.Logger, clt, "RedirectURL", "https://%v/v1/webapi/github/callback")
+		spec.RedirectURL = ResolveCallbackURL(ctx, cmd.Logger, clt, "RedirectURL", "https://%v/v1/webapi/github/callback")
 	}
 
 	connector, err := types.NewGithubConnector(flags.connectorName, *spec)
@@ -102,13 +116,16 @@ func ghRunFunc(ctx context.Context, cmd *SSOConfigureCommand, spec *types.Github
 }
 
 // ResolveCallbackURL deals with common pattern of resolving callback URL for IdP to use.
-func ResolveCallbackURL(logger *logrus.Entry, clt auth.ClientI, fieldName string, callbackPattern string) string {
+func ResolveCallbackURL(ctx context.Context, logger *slog.Logger, clt *authclient.Client, fieldName string, callbackPattern string) string {
 	var callbackURL string
 
-	logger.Infof("%v empty, resolving automatically.", fieldName)
-	proxies, err := clt.GetProxies()
+	logger.InfoContext(ctx, "resolving callback url automatically", "field_name", fieldName)
+	proxies, err := clientutils.CollectWithFallback(ctx, clt.ListProxyServers, func(context.Context) ([]types.Server, error) {
+		//nolint:staticcheck // TODO(kiosion) DELETE IN 21.0.0
+		return clt.GetProxies()
+	})
 	if err != nil {
-		logger.WithError(err).Error("unable to get proxy list.")
+		logger.ErrorContext(ctx, "unable to get proxy list", "error", err)
 	}
 
 	// find first proxy with public addr
@@ -122,17 +139,17 @@ func ResolveCallbackURL(logger *logrus.Entry, clt auth.ClientI, fieldName string
 
 	// check if successfully set.
 	if callbackURL == "" {
-		logger.Warnf("Unable to fill %v automatically, cluster's public address unknown.", fieldName)
+		logger.WarnContext(ctx, "Unable to resolve callback url automatically, cluster's public address unknown", "field_name", fieldName)
 	} else {
-		logger.Infof("%v set to %q", fieldName, callbackURL)
+		logger.InfoContext(ctx, "resolved callback url", "field_name", fieldName, "callback_url", callbackURL)
 	}
 	return callbackURL
 }
 
-func specCheckRoles(ctx context.Context, logger *logrus.Entry, spec *types.GithubConnectorSpecV3, ignoreMissingRoles bool, clt auth.ClientI) error {
+func specCheckRoles(ctx context.Context, logger *slog.Logger, spec *types.GithubConnectorSpecV3, ignoreMissingRoles bool, clt *authclient.Client) error {
 	allRoles, err := clt.GetRoles(ctx)
 	if err != nil {
-		logger.WithError(err).Warn("Unable to get roles list. Skipping teams-to-roles sanity checks.")
+		logger.WarnContext(ctx, "Unable to get roles list, skipping teams-to-roles sanity checks", "error", err)
 		return nil
 	}
 
@@ -148,7 +165,10 @@ func specCheckRoles(ctx context.Context, logger *logrus.Entry, spec *types.Githu
 			_, found := roleMap[role]
 			if !found {
 				if ignoreMissingRoles {
-					logger.Warnf("teams-to-roles references non-existing role: %q. Available roles: %v.", role, roleNames)
+					logger.WarnContext(ctx, "teams-to-roles references non-existing role",
+						"non_existent_role", role,
+						"available_roles", roleNames,
+					)
 				} else {
 					return trace.BadParameter("teams-to-roles references non-existing role: %v. Correct the mapping, or add --ignore-missing-roles to ignore this error. Available roles: %v.", role, roleNames)
 				}

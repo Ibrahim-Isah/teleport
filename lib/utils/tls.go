@@ -1,26 +1,28 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"net"
-	"os"
 	"time"
 
 	"github.com/gravitational/trace"
@@ -35,35 +37,18 @@ func TLSConfig(cipherSuites []uint16) *tls.Config {
 
 // SetupTLSConfig sets up cipher suites in existing TLS config
 func SetupTLSConfig(config *tls.Config, cipherSuites []uint16) {
-	// If ciphers suites were passed in, use them. Otherwise use the the
+	// If ciphers suites were passed in, use them. Otherwise use the
 	// Go defaults.
 	if len(cipherSuites) > 0 {
 		config.CipherSuites = cipherSuites
 	}
 
+	// pre-v17 Teleport uses a client ticket cache, which doesn't play well with
+	// verification (both client- and server-side) when using dynamic
+	// credentials and CAs (in v17+ Teleport)
+	config.SessionTicketsDisabled = true
+
 	config.MinVersion = tls.VersionTLS12
-	config.SessionTicketsDisabled = false
-	config.ClientSessionCache = tls.NewLRUClientSessionCache(DefaultLRUCapacity)
-}
-
-// CreateTLSConfiguration sets up default TLS configuration
-func CreateTLSConfiguration(certFile, keyFile string, cipherSuites []uint16) (*tls.Config, error) {
-	config := TLSConfig(cipherSuites)
-
-	if _, err := os.Stat(certFile); err != nil {
-		return nil, trace.BadParameter("certificate is not accessible by '%v'", certFile)
-	}
-	if _, err := os.Stat(keyFile); err != nil {
-		return nil, trace.BadParameter("certificate is not accessible by '%v'", certFile)
-	}
-
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	config.Certificates = []tls.Certificate{cert}
-
-	return config, nil
 }
 
 // CipherSuiteMapping transforms Teleport formatted cipher suites strings
@@ -82,6 +67,95 @@ func CipherSuiteMapping(cipherSuites []string) ([]uint16, error) {
 
 	return out, nil
 }
+
+// VerifyConnectionWithRoots returns a [tls.Config.VerifyConnection] function
+// that uses the provided function to generate a [*x509.CertPool] that's used as
+// the source of root CAs for verification. Use of this function requires a
+// modicum of care: the [*tls.Config] using the returned callback should be
+// generated as close to its point of use as possible. An example use for this
+// would be something like:
+//
+//	c := utils.TLSConfig(cfg.cipherSuites)
+//	c.GetClientCertificate = func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+//		return cfg.getCert()
+//	}
+//	c.ServerName = apiutils.EncodeClusterName(cfg.clusterName)
+//	c.InsecureSkipVerify = true
+//	c.VerifyConnection = VerifyConnectionWithRoots(cfg.getRoots)
+//	httpTransport.TLSClientConfig = c
+//	clientConn := grpc.NewClient(target, grpc.WithTransportCredentials(credentials.NewTLS(c)))
+//
+// The necessity of using InsecureSkipVerify is the reason why this construction
+// is deliberately not packaged into a utility function, as the stakes must be
+// clear to whoever is interacting with the constructed [*tls.Config]. The
+// recommended approach is to push the getter functions as close to the point of
+// use as possible.
+// TODO(tross): Remove when all references are replaced with [VerifyConnection].
+func VerifyConnectionWithRoots(getRoots func() (*x509.CertPool, error)) func(cs tls.ConnectionState) error {
+	return VerifyConnection(time.Now, getRoots)
+}
+
+// VerifyConnection returns a [tls.Config.VerifyConnection] function
+// that uses the provided function to generate a [*x509.CertPool] that's used as
+// the source of root CAs for verification. Use of this function requires a
+// modicum of care: the [*tls.Config] using the returned callback should be
+// generated as close to its point of use as possible. An example use for this
+// would be something like:
+//
+//	c := utils.TLSConfig(cfg.cipherSuites)
+//	c.GetClientCertificate = func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+//		return cfg.getCert()
+//	}
+//	c.ServerName = apiutils.EncodeClusterName(cfg.clusterName)
+//	c.InsecureSkipVerify = true
+//	c.VerifyConnection = VerifyConnectionWithRoots(cfg.getRoots)
+//	httpTransport.TLSClientConfig = c
+//	clientConn := grpc.NewClient(target, grpc.WithTransportCredentials(credentials.NewTLS(c)))
+//
+// The necessity of using InsecureSkipVerify is the reason why this construction
+// is deliberately not packaged into a utility function, as the stakes must be
+// clear to whoever is interacting with the constructed [*tls.Config]. The
+// recommended approach is to push the getter functions as close to the point of
+// use as possible.
+func VerifyConnection(now func() time.Time, getRoots func() (*x509.CertPool, error)) func(cs tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		if cs.ServerName == "" {
+			return trace.BadParameter("TLS verification requires a server name")
+		}
+		roots, err := getRoots()
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
+		opts := x509.VerifyOptions{
+			Roots:         roots,
+			Intermediates: nil,
+
+			DNSName: cs.ServerName,
+		}
+		if len(cs.PeerCertificates) > 1 {
+			opts.Intermediates = x509.NewCertPool()
+			for _, cert := range cs.PeerCertificates[1:] {
+				opts.Intermediates.AddCert(cert)
+			}
+		}
+
+		if now != nil {
+			opts.CurrentTime = now()
+		}
+
+		if _, err := cs.PeerCertificates[0].Verify(opts); err != nil {
+			return trace.Wrap(err)
+		}
+
+		return nil
+	}
+}
+
+type (
+	GetCertificateFunc = func() (*tls.Certificate, error)
+	GetRootsFunc       = func() (*x509.CertPool, error)
+)
 
 // TLSConn is a `net.Conn` that implements some of the functions defined by the
 // `tls.Conn` struct. This interface can be used where it could receive a
@@ -106,17 +180,10 @@ type TLSConn interface {
 // cipherSuiteMapping is the mapping between Teleport formatted cipher
 // suites strings and uint16 IDs.
 var cipherSuiteMapping = map[string]uint16{
-	"tls-rsa-with-aes-128-cbc-sha":            tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-	"tls-rsa-with-aes-256-cbc-sha":            tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-	"tls-rsa-with-aes-128-cbc-sha256":         tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
-	"tls-rsa-with-aes-128-gcm-sha256":         tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-	"tls-rsa-with-aes-256-gcm-sha384":         tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
 	"tls-ecdhe-ecdsa-with-aes-128-cbc-sha":    tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
 	"tls-ecdhe-ecdsa-with-aes-256-cbc-sha":    tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
 	"tls-ecdhe-rsa-with-aes-128-cbc-sha":      tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
 	"tls-ecdhe-rsa-with-aes-256-cbc-sha":      tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-	"tls-ecdhe-ecdsa-with-aes-128-cbc-sha256": tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-	"tls-ecdhe-rsa-with-aes-128-cbc-sha256":   tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
 	"tls-ecdhe-rsa-with-aes-128-gcm-sha256":   tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 	"tls-ecdhe-ecdsa-with-aes-128-gcm-sha256": tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 	"tls-ecdhe-rsa-with-aes-256-gcm-sha384":   tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
@@ -138,7 +205,7 @@ const (
 // secrecy (ECDHE).
 //
 // Note that TLS_RSA_WITH_AES_128_GCM_SHA{256,384} have been dropped due to
-// being banned by HTTP2 which breaks GRPC clients. For more information see:
+// being banned by HTTP2 which breaks gRPC clients. For more information see:
 // https://tools.ietf.org/html/rfc7540#appendix-A. These two can still be
 // manually added if needed.
 func DefaultCipherSuites() []uint16 {
@@ -152,4 +219,11 @@ func DefaultCipherSuites() []uint16 {
 		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 	}
+}
+
+// RefreshTLSConfigTickets should be called right before cloning a [tls.Config]
+// for a one-off use to not break TLS session resumption, as a workaround for
+// https://github.com/golang/go/issues/60506 .
+func RefreshTLSConfigTickets(c *tls.Config) {
+	_, _ = c.DecryptTicket(nil, tls.ConnectionState{})
 }

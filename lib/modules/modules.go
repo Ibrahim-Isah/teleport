@@ -1,18 +1,20 @@
 /*
-Copyright 2017-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // package modules allows external packages override certain behavioral
 // aspects of teleport
@@ -21,10 +23,12 @@ package modules
 import (
 	"context"
 	"crypto"
-	"crypto/sha256"
+	"errors"
 	"fmt"
-	"reflect"
+	"iter"
+	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -32,52 +36,239 @@ import (
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/client/proto"
-	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/accesslist"
 	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/api/utils/keys/hardwarekey"
+	"github.com/gravitational/teleport/entitlements"
+	"github.com/gravitational/teleport/lib/automaticupgrades"
+	"github.com/gravitational/teleport/lib/tlsca"
 )
 
 // Features provides supported and unsupported features
 type Features struct {
-	// Kubernetes enables Kubernetes Access product
-	Kubernetes bool
-	// App enables Application Access product
-	App bool
-	// DB enables database access product
-	DB bool
-	// OIDC enables OIDC connectors
-	OIDC bool
-	// SAML enables SAML connectors
-	SAML bool
-	// AccessControls enables FIPS access controls
-	AccessControls bool
-	// AdvancedAccessWorkflows enables advanced access workflows
-	AdvancedAccessWorkflows bool
+	// --------------- Cloud Settings
 	// Cloud enables some cloud-related features
 	Cloud bool
-	// HSM enables PKCS#11 HSM support
-	HSM bool
-	// Desktop enables desktop access product
-	Desktop bool
+	// CustomTheme holds the name of WebUI custom theme.
+	CustomTheme string
+	// IsStripeManaged indicates if the cluster billing is managed via Stripe
+	IsStripeManaged bool
+	// IsUsageBasedBilling enables some usage-based billing features
+	IsUsageBasedBilling bool
+	// Questionnaire indicates whether cluster users should get an onboarding questionnaire
+	Questionnaire bool
+	// SupportType indicates the type of customer's support
+	SupportType proto.SupportType
+	// Entitlements reflect Cloud Entitlements including access and limits
+	Entitlements map[entitlements.EntitlementKind]EntitlementInfo
+	// CloudAnonymizationKey is the key used to anonymize usage events in a cluster.
+	// Only applicable for Cloud customers (self-hosted clusters get their anonymization key from the
+	// license file).
+	CloudAnonymizationKey []byte
+	// BeamsUI indicates whether the Beams lite-mode UI is enabled
+	BeamsUI bool
+
+	// todo (michellescripts) have the following fields evaluated for deprecation, consolidation, or fetch from Cloud
+	// AdvancedAccessWorkflows is currently set to the value of the Cloud Access Requests entitlement
+	AdvancedAccessWorkflows bool
 	// RecoveryCodes enables account recovery codes
 	RecoveryCodes bool
+	// Plugins enables hosted plugins
+	Plugins bool
+	// AutomaticUpgrades enables automatic upgrades of agents/services.
+	AutomaticUpgrades bool
+	// AccessGraph enables the usage of access graph.
+	// NOTE: this is a legacy flag that is currently used to signal
+	// that Access Graph integration is *enabled* on a cluster.
+	// *Access* to the feature is gated on the `AccessGraph` entitlement.
+	// TODO(justinas): remove this field once "TAG enabled" status is moved to a resource in the backend.
+	AccessGraph bool
+	// AccessMonitoringConfigured contributes to the enablement of access monitoring.
+	// NOTE: this flag is used to signal that Access Monitoring is *enabled* on a cluster.
+	// *Access* to the feature is gated on the `AccessMonitoring` entitlement.
+	AccessMonitoringConfigured bool
+	// --------------- Deprecated Fields
+	// AccessControls enables FIPS access controls
+	// Deprecated
+	AccessControls bool
+	// Assist enables Assistant feature
+	// Deprecated
+	Assist bool
+	// ProductType describes the product being used.
+	// Deprecated
+	ProductType ProductType
+}
+
+// EntitlementInfo is the state and limits of a particular entitlement
+type EntitlementInfo struct {
+	// Enabled indicates the feature is 'on' if true; feature is disabled if false
+	Enabled bool
+	// Limit indicates the allotted amount of use when limited; if 0 use is unlimited
+	Limit int32
+}
+
+// UnderLimit tests that a given entitlement is under its prescribed limit
+// based on the supplied use count. A return value of `true` indicates that
+// there is still at least *some* capacity left in the entitlement. The actual
+// definition of a "use" depends on the entitlement in question.
+// A disabled entitlement is always out of its limit.
+func (e EntitlementInfo) UnderLimit(count int) bool {
+	return e.Enabled && (e.Limit == 0 || count < int(e.Limit))
 }
 
 // ToProto converts Features into proto.Features
 func (f Features) ToProto() *proto.Features {
 	return &proto.Features{
-		Kubernetes:              f.Kubernetes,
-		App:                     f.App,
-		DB:                      f.DB,
-		OIDC:                    f.OIDC,
-		SAML:                    f.SAML,
-		AccessControls:          f.AccessControls,
-		AdvancedAccessWorkflows: f.AdvancedAccessWorkflows,
-		Cloud:                   f.Cloud,
-		HSM:                     f.HSM,
-		Desktop:                 f.Desktop,
-		RecoveryCodes:           f.RecoveryCodes,
+		Cloud:                      f.Cloud,
+		CustomTheme:                f.CustomTheme,
+		IsStripeManaged:            f.IsStripeManaged,
+		IsUsageBased:               f.IsUsageBasedBilling,
+		Questionnaire:              f.Questionnaire,
+		SupportType:                f.SupportType,
+		AccessControls:             f.AccessControls,
+		AccessGraph:                f.AccessGraph,
+		AdvancedAccessWorkflows:    f.AdvancedAccessWorkflows,
+		AutomaticUpgrades:          f.AutomaticUpgrades,
+		Plugins:                    f.Plugins,
+		ProductType:                proto.ProductType(f.ProductType),
+		RecoveryCodes:              f.RecoveryCodes,
+		AccessMonitoringConfigured: f.AccessMonitoringConfigured,
+		Entitlements:               f.EntitlementsToProto(),
+
+		// TODO(michellescripts) DELETE IN v21.0.0
+		// Deprecated, use entitlements
+		Policy: &proto.PolicyFeature{
+			Enabled: f.GetEntitlement(entitlements.Policy).Enabled,
+		},
+		AccessGraphDemoMode:  f.GetEntitlement(entitlements.AccessGraphDemoMode).Enabled,
+		ClientIPRestrictions: f.GetEntitlement(entitlements.ClientIPRestrictions).Enabled,
+		BeamsUI:              f.BeamsUI && f.GetEntitlement(entitlements.Beams).Enabled,
 	}
+}
+
+// EntitlementsToProto takes the features.Entitlements object and returns a
+// proto version. Missing split identity security entitlements fall back to the
+// legacy Policy entitlement.
+func (f Features) EntitlementsToProto() map[string]*proto.EntitlementInfo {
+	all := entitlements.AllEntitlements
+	result := make(map[string]*proto.EntitlementInfo, len(all))
+
+	for _, e := range all {
+		al := f.GetEntitlement(e)
+		result[string(e)] = &proto.EntitlementInfo{
+			Enabled: al.Enabled,
+			Limit:   al.Limit,
+		}
+	}
+
+	return result
+}
+
+// GetEntitlement returns the requested entitlement. For compatibility with
+// licenses that predate the identity security entitlement split, a missing
+// AccessGraph, ActivityCenter, or SessionSummaries entitlement falls back to an
+// enabled legacy Policy entitlement.
+func (f Features) GetEntitlement(e entitlements.EntitlementKind) EntitlementInfo {
+	al, ok := f.Entitlements[e]
+	if ok {
+		return EntitlementInfo{
+			Enabled: al.Enabled,
+			Limit:   al.Limit,
+		}
+	}
+
+	if isLegacyPolicyFallbackEntitlement(e) && f.Entitlements[entitlements.Policy].Enabled {
+		return EntitlementInfo{Enabled: true}
+	}
+
+	return EntitlementInfo{}
+}
+
+// GetProtoEntitlement returns the requested proto entitlement. For
+// compatibility with clusters that predate the identity security entitlement
+// split, a missing AccessGraph, ActivityCenter, or SessionSummaries entitlement
+// falls back to an enabled legacy Policy entitlement or Policy proto field.
+func GetProtoEntitlement(f *proto.Features, e entitlements.EntitlementKind) *proto.EntitlementInfo {
+	fE := f.GetEntitlements()
+	al, ok := fE[string(e)]
+	if ok {
+		return &proto.EntitlementInfo{
+			Enabled: al.Enabled,
+			Limit:   al.Limit,
+		}
+	}
+
+	if isLegacyPolicyFallbackEntitlement(e) {
+		policy, hasPolicyEntitlement := fE[string(entitlements.Policy)]
+		if policy.GetEnabled() || !hasPolicyEntitlement && f.GetPolicy().GetEnabled() {
+			return &proto.EntitlementInfo{Enabled: true}
+		}
+	}
+
+	return &proto.EntitlementInfo{}
+}
+
+func isLegacyPolicyFallbackEntitlement(e entitlements.EntitlementKind) bool {
+	switch e {
+	case entitlements.AccessGraph, entitlements.ActivityCenter, entitlements.SessionSummaries:
+		return true
+	default:
+		return false
+	}
+}
+
+// ProductType is the type of product.
+type ProductType int32
+
+const (
+	ProductTypeUnknown ProductType = 0
+	// ProductTypeTeam is Teleport ProductTypeTeam product.
+	ProductTypeTeam ProductType = 1
+	// ProductTypeEUB is Teleport Enterprise Usage Based product.
+	ProductTypeEUB ProductType = 2
+)
+
+// AccessResourcesGetter is a minimal interface that is used to get access lists
+// and related resources from the backend.
+type AccessResourcesGetter interface {
+	ListAccessLists(context.Context, int, string) ([]*accesslist.AccessList, string, error)
+	ListResources(ctx context.Context, req proto.ListResourcesRequest) (*types.ListResourcesResponse, error)
+
+	GetAccessList(context.Context, string) (*accesslist.AccessList, error)
+	GetAccessLists(ctx context.Context) ([]*accesslist.AccessList, error)
+
+	ListAccessListMembers(ctx context.Context, accessList string, pageSize int, pageToken string) (members []*accesslist.AccessListMember, nextToken string, err error)
+	GetAccessListMember(ctx context.Context, accessList string, memberName string) (*accesslist.AccessListMember, error)
+	GetAccessListOwners(ctx context.Context, accessList string) ([]*accesslist.Owner, error)
+
+	GetUser(ctx context.Context, userName string, withSecrets bool) (types.User, error)
+	GetRole(ctx context.Context, name string) (types.Role, error)
+
+	GetLock(ctx context.Context, name string) (types.Lock, error)
+	GetLocks(ctx context.Context, inForceOnly bool, targets ...types.LockTarget) ([]types.Lock, error)
+	ListLocks(ctx context.Context, limit int, startKey string, filter *types.LockFilter) ([]types.Lock, string, error)
+	RangeLocks(ctx context.Context, start, end string, filter *types.LockFilter) iter.Seq2[types.Lock, error]
+}
+
+type AccessListSuggestionClient interface {
+	GetUser(ctx context.Context, userName string, withSecrets bool) (types.User, error)
+	RoleGetter
+
+	GetAccessRequestAllowedPromotions(ctx context.Context, req types.AccessRequest) (*types.AccessRequestAllowedPromotions, error)
+	GetAccessRequests(ctx context.Context, filter types.AccessRequestFilter) ([]types.AccessRequest, error)
+	ListResources(ctx context.Context, req proto.ListResourcesRequest) (*types.ListResourcesResponse, error)
+}
+
+type RoleGetter interface {
+	GetRole(ctx context.Context, name string) (types.Role, error)
+}
+
+type AccessListAndMembersGetter interface {
+	GetAccessList(ctx context.Context, name string) (*accesslist.AccessList, error)
+	GetAccessLists(ctx context.Context) ([]*accesslist.AccessList, error)
+	GetAccessListMember(ctx context.Context, accessList string, memberName string) (*accesslist.AccessListMember, error)
+	ListAccessListMembers(ctx context.Context, accessListName string, pageSize int, pageToken string) (members []*accesslist.AccessListMember, nextToken string, err error)
 }
 
 // Modules defines interface that external libraries can implement customizing
@@ -85,16 +276,38 @@ func (f Features) ToProto() *proto.Features {
 type Modules interface {
 	// PrintVersion prints teleport version
 	PrintVersion()
-	// IsBoringBinary checks if the binary was compiled with BoringCrypto.
-	IsBoringBinary() bool
 	// Features returns supported features
 	Features() Features
-	// BuildType returns build type (OSS or Enterprise)
+	// SetFeatures set features queried from Cloud
+	SetFeatures(Features)
+	// BuildType returns build type (OSS, Community or Enterprise)
 	BuildType() string
+	// IsEnterpriseBuild returns if the binary was built with enterprise modules
+	IsEnterpriseBuild() bool
+	// IsOSSBuild returns if the binary was built without enterprise modules
+	IsOSSBuild() bool
+	// IsFIPSBuild checks if the binary was compiled in FIPS140 mode.
+	IsFIPSBuild() bool
 	// AttestHardwareKey attests a hardware key and returns its associated private key policy.
-	AttestHardwareKey(context.Context, interface{}, keys.PrivateKeyPolicy, *keys.AttestationStatement, crypto.PublicKey, time.Duration) (keys.PrivateKeyPolicy, error)
+	AttestHardwareKey(context.Context, any, *hardwarekey.AttestationStatement, crypto.PublicKey, time.Duration) (*keys.AttestationData, error)
+	// GenerateAccessRequestPromotions generates a list of valid promotions for given access request.
+	GenerateAccessRequestPromotions(context.Context, AccessResourcesGetter, types.AccessRequest) (*types.AccessRequestAllowedPromotions, error)
+	// GenerateAccessRequestSuggestedReviewers generates a list of suggested reviewers for a given access request.
+	GenerateAccessRequestSuggestedReviewers(context.Context, AccessResourcesGetter, types.AccessRequest) ([]string, error)
+	// GenerateLongTermResourceGrouping analyzes how resources can be grouped into access lists and returns information about optimal groupings for long-term access.
+	GenerateLongTermResourceGrouping(context.Context, AccessResourcesGetter, types.AccessRequest) (*types.LongTermResourceGrouping, error)
+	// GetSuggestedAccessLists generates a list of valid promotions for given access request.
+	GetSuggestedAccessLists(ctx context.Context, identity *tlsca.Identity, clt AccessListSuggestionClient, accessListGetter AccessListAndMembersGetter, requestID string) ([]*accesslist.AccessList, error)
 	// EnableRecoveryCodes enables the usage of recovery codes for resetting forgotten passwords
 	EnableRecoveryCodes()
+	// EnablePlugins enables the hosted plugins runtime
+	EnablePlugins()
+	// EnableAccessGraph enables the usage of access graph.
+	EnableAccessGraph()
+	// EnableAccessMonitoring enables the usage of access monitoring.
+	EnableAccessMonitoring()
+	// LicenseExpiry returns the expiry date of the enterprise license, if applicable.
+	LicenseExpiry() time.Time
 }
 
 const (
@@ -102,6 +315,10 @@ const (
 	BuildOSS = "oss"
 	// BuildEnterprise specifies enterprise build type
 	BuildEnterprise = "ent"
+	// BuildCommunity identifies builds of Teleport Community Edition,
+	// which are distributed on goteleport.com/download under our
+	// Teleport Community license agreement.
+	BuildCommunity = "community"
 )
 
 // SetModules sets the modules interface
@@ -111,26 +328,38 @@ func SetModules(m Modules) {
 	modules = m
 }
 
-// GetModules returns the modules interface
+// GetModules returns the modules interface. It only works in the auth service
+// process, so any code that may be executed in a different context needs to
+// obtain modules or derived options from an auth-specific caller or an RPC
+// call to the auth server.
 func GetModules() Modules {
 	mutex.Lock()
 	defer mutex.Unlock()
 	return modules
 }
 
+var ErrCannotDisableSecondFactor = errors.New("cannot disable multi-factor authentication")
+
 // ValidateResource performs additional resource checks.
 func ValidateResource(res types.Resource) error {
+	// todo(tross): DELETE WHEN ABLE TO [remove env var, leave insecure test mode]
+	allowNoSecondFactor, _ := strconv.ParseBool(os.Getenv(teleport.EnvVarAllowNoSecondFactor))
+	if GetModules().Features().Cloud ||
+		(!allowNoSecondFactor && !IsInsecureTestMode()) {
+		switch r := res.(type) {
+		case types.AuthPreference:
+			if !r.IsSecondFactorEnforced() {
+				return trace.Wrap(ErrCannotDisableSecondFactor)
+			}
+		}
+	}
+
 	// All checks below are Cloud-specific.
 	if !GetModules().Features().Cloud {
 		return nil
 	}
 
 	switch r := res.(type) {
-	case types.AuthPreference:
-		switch r.GetSecondFactor() {
-		case constants.SecondFactorOff, constants.SecondFactorOptional:
-			return trace.BadParameter("cannot disable two-factor authentication on Cloud")
-		}
 	case types.SessionRecordingConfig:
 		switch r.GetMode() {
 		case types.RecordAtProxy, types.RecordAtProxySync:
@@ -143,11 +372,26 @@ func ValidateResource(res types.Resource) error {
 	return nil
 }
 
-type defaultModules struct{}
+type defaultModules struct {
+	automaticUpgrades bool
+	loadDynamicValues sync.Once
+}
 
-// BuildType returns build type (OSS or Enterprise)
+var teleportBuildType = BuildOSS
+
+// BuildType returns build type (OSS, Community or Enterprise)
 func (p *defaultModules) BuildType() string {
-	return BuildOSS
+	return teleportBuildType
+}
+
+// IsEnterpriseBuild returns false for [defaultModules].
+func (p *defaultModules) IsEnterpriseBuild() bool {
+	return false
+}
+
+// IsOSSBuild returns true for [defaultModules].
+func (p *defaultModules) IsOSSBuild() bool {
+	return true
 }
 
 // PrintVersion prints the Teleport version.
@@ -155,28 +399,68 @@ func (p *defaultModules) PrintVersion() {
 	fmt.Printf("Teleport v%s git:%s %s\n", teleport.Version, teleport.Gitref, runtime.Version())
 }
 
-// Features returns supported features
+// LicenseExpiry returns the expiry date of the enterprise license, if applicable.
+// Returns the zero value for time.Time for OSS.
+func (p *defaultModules) LicenseExpiry() time.Time {
+	return time.Time{}
+}
+
+// Features returns supported features for default modules which is applied for OSS users
+// todo (michellescripts) remove deprecated features
 func (p *defaultModules) Features() Features {
+	p.loadDynamicValues.Do(func() {
+		p.automaticUpgrades = automaticupgrades.IsEnabled()
+	})
+
 	return Features{
-		Kubernetes: true,
-		DB:         true,
-		App:        true,
-		Desktop:    true,
+		AutomaticUpgrades: p.automaticUpgrades,
+		SupportType:       proto.SupportType_SUPPORT_TYPE_FREE,
+		Entitlements: map[entitlements.EntitlementKind]EntitlementInfo{
+			entitlements.App:                {Enabled: true, Limit: 0},
+			entitlements.DB:                 {Enabled: true, Limit: 0},
+			entitlements.Desktop:            {Enabled: true, Limit: 0},
+			entitlements.JoinActiveSessions: {Enabled: true, Limit: 0},
+			entitlements.K8s:                {Enabled: true, Limit: 0},
+		},
 	}
 }
 
-func (p *defaultModules) IsBoringBinary() bool {
-	// Check the package name for one of the boring primitives, if the package
-	// path is from BoringCrypto, we know this binary was compiled against the
-	// dev.boringcrypto branch of Go.
-	hash := sha256.New()
-	return reflect.TypeOf(hash).Elem().PkgPath() == "crypto/internal/boring"
+// SetFeatures sets features queried from Cloud.
+// This is a noop since OSS teleport does not support enterprise features
+func (p *defaultModules) SetFeatures(f Features) {
+}
+
+// IsFIPSBuild checks if the binary was compiled in FIPS140 mode.
+func (p *defaultModules) IsFIPSBuild() bool {
+	return IsFIPSBuild()
 }
 
 // AttestHardwareKey attests a hardware key.
-func (p *defaultModules) AttestHardwareKey(_ context.Context, _ interface{}, _ keys.PrivateKeyPolicy, _ *keys.AttestationStatement, _ crypto.PublicKey, _ time.Duration) (keys.PrivateKeyPolicy, error) {
+func (p *defaultModules) AttestHardwareKey(_ context.Context, _ any, _ *hardwarekey.AttestationStatement, _ crypto.PublicKey, _ time.Duration) (*keys.AttestationData, error) {
 	// Default modules do not support attesting hardware keys.
-	return keys.PrivateKeyPolicyNone, nil
+	return nil, trace.NotFound("no attestation data for the given key")
+}
+
+// GenerateLongTermResourceGrouping is a noop since OSS teleport does not support long-term Access Requests.
+func (p *defaultModules) GenerateLongTermResourceGrouping(_ context.Context, _ AccessResourcesGetter, _ types.AccessRequest) (*types.LongTermResourceGrouping, error) {
+	return &types.LongTermResourceGrouping{}, nil
+}
+
+// GenerateAccessRequestPromotions is a noop since OSS teleport does not support generating access list promotions.
+func (p *defaultModules) GenerateAccessRequestPromotions(_ context.Context, _ AccessResourcesGetter, _ types.AccessRequest) (*types.AccessRequestAllowedPromotions, error) {
+	// The default module does not support generating access list promotions.
+	return types.NewAccessRequestAllowedPromotions(nil), nil
+}
+
+// GenerateAccessRequestSuggestedReviewers is a noop for OSS teleport.
+func (p *defaultModules) GenerateAccessRequestSuggestedReviewers(context.Context, AccessResourcesGetter, types.AccessRequest) ([]string, error) {
+	return []string{}, nil
+}
+
+func (p *defaultModules) GetSuggestedAccessLists(ctx context.Context, identity *tlsca.Identity, clt AccessListSuggestionClient,
+	accessListGetter AccessListAndMembersGetter, requestID string,
+) ([]*accesslist.AccessList, error) {
+	return nil, trace.NotImplemented("GetSuggestedAccessLists not implemented")
 }
 
 // EnableRecoveryCodes enables recovery codes. This is a noop since OSS teleport does not
@@ -184,7 +468,44 @@ func (p *defaultModules) AttestHardwareKey(_ context.Context, _ interface{}, _ k
 func (p *defaultModules) EnableRecoveryCodes() {
 }
 
+// EnablePlugins enables hosted plugins runtime.
+// This is a noop since OSS teleport does not support hosted plugins
+func (p *defaultModules) EnablePlugins() {
+}
+
+// EnableAccessGraph enables the usage of access graph.
+// This is a noop since OSS teleport does not support access graph.
+func (p *defaultModules) EnableAccessGraph() {}
+
+// EnableAccessMonitoring enables the usage of access monitoring.
+// This is a noop since OSS teleport does not support access monitoring.
+func (p *defaultModules) EnableAccessMonitoring() {}
+
 var (
 	mutex   sync.Mutex
 	modules Modules = &defaultModules{}
 )
+
+var (
+	// flagLock protects access to accessing insecure test mode below
+	flagLock sync.Mutex
+
+	// insecureTestAllow is used to allow disabling second factor auth
+	// in test environments. Not user configurable.
+	insecureTestAllowNoSecondFactor bool
+)
+
+// SetInsecureTestMode is used to set insecure test mode on, to allow
+// second factor to be disabled
+func SetInsecureTestMode(m bool) {
+	flagLock.Lock()
+	defer flagLock.Unlock()
+	insecureTestAllowNoSecondFactor = m
+}
+
+// IsInsecureTestMode retrieves the current insecure test mode value
+func IsInsecureTestMode() bool {
+	flagLock.Lock()
+	defer flagLock.Unlock()
+	return insecureTestAllowNoSecondFactor
+}

@@ -1,79 +1,188 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import {
+  dialog,
   ipcMain,
   ipcRenderer,
   Menu,
   MenuItemConstructorOptions,
 } from 'electron';
 
+import { makeCustomShellFromPath, Shell } from 'teleterm/mainProcess/shell';
+import { ConfigService } from 'teleterm/services/config';
+
 import {
   TabContextMenuEventChannel,
   TabContextMenuEventType,
+  TabContextMenuCapabilities,
   TabContextMenuOptions,
 } from '../types';
 
-type MainTabContextMenuOptions = Pick<TabContextMenuOptions, 'documentKind'>;
+type MainTabContextMenuOptions = {
+  capabilities: TabContextMenuCapabilities;
+};
 
-export function subscribeToTabContextMenuEvent(): void {
+type TabContextMenuEvent =
+  | {
+      event: TabContextMenuEventType.ReopenPtyInShell;
+      item: Shell;
+    }
+  | {
+      event:
+        | TabContextMenuEventType.Close
+        | TabContextMenuEventType.CloseOthers
+        | TabContextMenuEventType.CloseToRight
+        | TabContextMenuEventType.DuplicatePty;
+    };
+
+export function subscribeToTabContextMenuEvent(
+  shells: Shell[],
+  configService: ConfigService
+): void {
   ipcMain.handle(
     TabContextMenuEventChannel,
     (event, options: MainTabContextMenuOptions) => {
-      return new Promise(resolve => {
+      return new Promise<TabContextMenuEvent>(resolve => {
+        let preventAutoPromiseResolveOnMenuClose = false;
+
         function getCommonTemplate(): MenuItemConstructorOptions[] {
           return [
             {
               label: 'Close',
-              click: () => resolve(TabContextMenuEventType.Close),
+              click: () => resolve({ event: TabContextMenuEventType.Close }),
             },
             {
               label: 'Close Others',
-              click: () => resolve(TabContextMenuEventType.CloseOthers),
+              click: () =>
+                resolve({ event: TabContextMenuEventType.CloseOthers }),
             },
             {
               label: 'Close to the Right',
-              click: () => resolve(TabContextMenuEventType.CloseToRight),
+              click: () =>
+                resolve({ event: TabContextMenuEventType.CloseToRight }),
             },
           ];
         }
 
         function getPtyTemplate(): MenuItemConstructorOptions[] {
-          if (
-            options.documentKind === 'doc.terminal_shell' ||
-            options.documentKind === 'doc.terminal_tsh_node'
-          ) {
+          if (options.capabilities.canDuplicatePty) {
             return [
               {
-                type: 'separator',
-              },
-              {
                 label: 'Duplicate Tab',
-                click: () => resolve(TabContextMenuEventType.DuplicatePty),
+                click: () =>
+                  resolve({ event: TabContextMenuEventType.DuplicatePty }),
               },
             ];
           }
         }
 
+        function getShellTemplate(): MenuItemConstructorOptions[] {
+          const shellSelector = options.capabilities.shellSelector;
+          if (!shellSelector) {
+            return;
+          }
+          const activeShellId = shellSelector.activeShellId;
+          const defaultShellId = configService.get('terminal.shell').value;
+          const customShellPath = configService.get(
+            'terminal.customShell'
+          ).value;
+          const customShell =
+            customShellPath && makeCustomShellFromPath(customShellPath);
+          const shellsWithCustom = [...shells, customShell].filter(Boolean);
+          const isMoreThanOneShell = shellsWithCustom.length > 1;
+          return [
+            {
+              type: 'separator',
+            },
+            ...shellsWithCustom.map(shell => ({
+              label: shell.friendlyName,
+              id: shell.id,
+              type: 'radio' as const,
+              visible: isMoreThanOneShell,
+              checked: shell.id === activeShellId,
+              click: () => {
+                // Do nothing when the shell doesn't change.
+                if (shell.id === activeShellId) {
+                  return;
+                }
+                resolve({
+                  event: TabContextMenuEventType.ReopenPtyInShell,
+                  item: shell,
+                });
+              },
+            })),
+            {
+              label: customShell
+                ? `Change Custom Shell (${customShell.friendlyName})…`
+                : 'Select Custom Shell…',
+              click: async () => {
+                // By default, when the popup menu is closed, the promise is
+                // resolved (popup.callback).
+                // Here we need to prevent this behavior to wait for the file
+                // to be selected.
+                // A more universal way of handling this problem:
+                // https://github.com/gravitational/teleport/pull/45152#discussion_r1723314524
+                preventAutoPromiseResolveOnMenuClose = true;
+                const { filePaths, canceled } = await dialog.showOpenDialog({
+                  properties: ['openFile'],
+                  defaultPath: customShell.binPath,
+                });
+                if (canceled) {
+                  resolve(undefined);
+                  return;
+                }
+                const file = filePaths[0];
+                configService.set('terminal.customShell', file);
+                resolve({
+                  event: TabContextMenuEventType.ReopenPtyInShell,
+                  item: makeCustomShellFromPath(file),
+                });
+              },
+            },
+            {
+              label: 'Default Shell',
+              visible: isMoreThanOneShell,
+              type: 'submenu',
+              sublabel:
+                shellsWithCustom.find(s => defaultShellId === s.id)
+                  ?.friendlyName || defaultShellId,
+              submenu: shellsWithCustom.map(shell => ({
+                label: shell.friendlyName,
+                id: shell.id,
+                checked: shell.id === defaultShellId,
+                type: 'radio' as const,
+                click: () => {
+                  configService.set('terminal.shell', shell.id);
+                  resolve(undefined);
+                },
+              })),
+            },
+          ];
+        }
+
         Menu.buildFromTemplate(
-          [getCommonTemplate(), getPtyTemplate()]
+          [getCommonTemplate(), getPtyTemplate(), getShellTemplate()]
             .filter(Boolean)
             .flatMap(template => template)
         ).popup({
-          callback: () => resolve(undefined),
+          callback: () =>
+            !preventAutoPromiseResolveOnMenuClose && resolve(undefined),
         });
       });
     }
@@ -84,13 +193,19 @@ export async function openTabContextMenu(
   options: TabContextMenuOptions
 ): Promise<void> {
   const mainOptions: MainTabContextMenuOptions = {
-    documentKind: options.documentKind,
+    capabilities: options.capabilities,
   };
-  const eventType = await ipcRenderer.invoke(
+  const response = (await ipcRenderer.invoke(
     TabContextMenuEventChannel,
     mainOptions
-  );
-  switch (eventType) {
+  )) as TabContextMenuEvent | undefined;
+  // Undefined when the menu gets closed without clicking on any action.
+  if (!response) {
+    return;
+  }
+  const { event } = response;
+
+  switch (event) {
     case TabContextMenuEventType.Close:
       return options.onClose();
     case TabContextMenuEventType.CloseOthers:
@@ -99,5 +214,9 @@ export async function openTabContextMenu(
       return options.onCloseToRight();
     case TabContextMenuEventType.DuplicatePty:
       return options.onDuplicatePty();
+    case TabContextMenuEventType.ReopenPtyInShell:
+      return options.onReopenPtyInShell(response.item);
+    default:
+      event satisfies never;
   }
 }

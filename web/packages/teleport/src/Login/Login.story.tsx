@@ -1,28 +1,48 @@
-/*
-Copyright 2019-2022 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { useEffect } from 'react';
+import { MemoryRouter } from 'react-router';
 
-    http://www.apache.org/licenses/LICENSE-2.0
+import { Route } from 'teleport/components/Router';
+import cfg from 'teleport/config';
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-
-import LoginSuccess from './LoginSuccess';
-import { LoginFailed } from './LoginFailed';
-import { Login } from './Login';
+import { LoginComponent as Login } from './Login';
+import { LoginFailedComponent as LoginFailed } from './LoginFailed';
+import { LoginSuccess } from './LoginSuccess';
+import { LoginTerminalRedirect } from './LoginTerminalRedirect';
 import { State } from './useLogin';
+
+const defaultEdition = cfg.edition;
 
 export default {
   title: 'Teleport/Login',
+  decorators: [
+    Story => {
+      useEffect(() => {
+        // Clean up
+        return () => {
+          cfg.edition = defaultEdition;
+        };
+      }, []);
+      return <Story />;
+    },
+  ],
 };
 
 export const MfaOff = () => <Login {...sample} />;
@@ -30,7 +50,39 @@ export const Otp = () => <Login {...sample} auth2faType="otp" />;
 export const Webauthn = () => <Login {...sample} auth2faType="webauthn" />;
 export const Optional = () => <Login {...sample} auth2faType="optional" />;
 export const On = () => <Login {...sample} auth2faType="on" />;
+export const Scoped = () => <Login {...sample} scope="/prod/west" />;
+export const CommunityAcknowledgement = () => {
+  cfg.edition = 'community';
+  return <Login {...sample} licenseAcknowledged={false} />;
+};
+export const MessageOfTheDay = () => {
+  return (
+    <Login
+      {...sample}
+      motd="One often meets his destiny on the road he takes to avoid it."
+      showMotd={true}
+    />
+  );
+};
+export const LongMessageOfTheDay = () => {
+  return (
+    <Login
+      {...sample}
+      motd={'One often meets his destiny on the road he takes to avoid it.\n'.repeat(
+        20
+      )}
+      showMotd={true}
+    />
+  );
+};
 export const Success = () => <LoginSuccess />;
+export const TerminalRedirect = () => (
+  <MemoryRouter initialEntries={[cfg.routes.loginTerminalRedirect]}>
+    <Route path={cfg.routes.loginTerminalRedirect + '?auth=MyAuth'}>
+      <LoginTerminalRedirect />
+    </Route>
+  </MemoryRouter>
+);
 export const FailedDefault = () => <LoginFailed />;
 export const FailedCustom = () => <LoginFailed message="custom message" />;
 
@@ -41,6 +93,7 @@ const sample: State = {
     isSuccess: true,
     message: '',
   },
+  checkingValidSession: false,
   onLogin: () => null,
   onLoginWithWebauthn: () => null,
   onLoginWithSso: () => null,
@@ -51,5 +104,10 @@ const sample: State = {
   clearAttempt: () => null,
   isPasswordlessEnabled: false,
   primaryAuthType: 'local',
-  privateKeyPolicyEnabled: false,
+  motd: '',
+  showMotd: false,
+  acknowledgeMotd: () => null,
+  licenseAcknowledged: true,
+  setLicenseAcknowledged: () => {},
+  scope: '',
 };

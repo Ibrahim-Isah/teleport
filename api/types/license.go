@@ -103,6 +103,11 @@ type License interface {
 	// generate licenses that support older versions of Teleport
 	SetSupportsResourceAccessRequests(Bool)
 
+	// GetSupportsFeatureHiding returns feature hiding support flag.
+	GetSupportsFeatureHiding() Bool
+	// SetSupportsFeatureHiding sets feature hiding support flag.
+	SetSupportsFeatureHiding(Bool)
+
 	// GetTrial returns the trial flag.
 	//  Note: This is not applicable to Cloud licenses
 	GetTrial() Bool
@@ -116,7 +121,69 @@ type License interface {
 	// GetAccountID returns Account ID.
 	//  Note: This is not applicable to all Cloud licenses
 	GetAccountID() string
+
+	// GetFeatureSource returns where the features should be loaded from.
+	//
+	// Deprecated.
+	// FeatureSource was used to differentiate between
+	// cloud+team vs cloud+enterprise. cloud+enterprise read from license
+	// and cloud+team read from salescenter. With the new EUB product,
+	// all cloud+ will read from salescenter.
+	GetFeatureSource() FeatureSource
+
+	// GetCustomTheme returns the name of the WebUI custom theme
+	GetCustomTheme() string
+
+	// SetCustomTheme sets the name of the WebUI custom theme
+	SetCustomTheme(themeName string)
+
+	// GetSupportsIdentityGovernanceSecurity returns IGS features support flag.
+	// IGS includes: access list, access request, access monitoring and device trust.
+	GetSupportsIdentityGovernanceSecurity() Bool
+	// SetSupportsIdentityGovernanceSecurity sets IGS feature support flag.
+	// IGS includes: access list, access request, access monitoring and device trust.
+	SetSupportsIdentityGovernanceSecurity(Bool)
+	// GetUsageBasedBilling returns if usage based billing is turned on or off
+	GetUsageBasedBilling() Bool
+	// SetUsageBasedBilling sets flag for usage based billing
+	SetUsageBasedBilling(Bool)
+
+	// GetAnonymizationKey returns a key that should be used to
+	// anonymize usage data if it's set.
+	GetAnonymizationKey() string
+	// SetAnonymizationKey sets the anonymization key.
+	SetAnonymizationKey(string)
+
+	// GetSupportsPolicy returns Teleport Policy support flag.
+	GetSupportsPolicy() Bool
+	// SetSupportsPolicy sets Teleport Policy support flag.
+	SetSupportsPolicy(Bool)
+
+	// GetEntitlements returns the Entitlements object
+	GetEntitlements() map[string]EntitlementInfo
+	// SetEntitlements sets the Entitlements object
+	SetEntitlements(map[string]EntitlementInfo)
 }
+
+// EntitlementInfo is the state and limits of a particular entitlement; Example for feature X:
+// { Enabled: true,  Limit: 0 }   => unlimited access to feature X
+// { Enabled: true,  Limit: >0 }  => limited access to feature X
+// { Enabled: false, Limit: >=0 } => no access to feature X
+type EntitlementInfo struct {
+	// Enabled indicates the feature is 'on' if true; feature is disabled if false
+	Enabled Bool
+	// Limit indicates the allotted amount of use when limited; if 0 use is unlimited
+	Limit int32
+}
+
+// FeatureSource defines where the list of features enabled
+// by the license is.
+type FeatureSource string
+
+const (
+	FeatureSourceLicense FeatureSource = "license"
+	FeatureSourceCloud   FeatureSource = "cloud"
+)
 
 // NewLicense is a convenience method to create LicenseV3.
 func NewLicense(name string, spec LicenseSpecV3) (License, error) {
@@ -172,14 +239,14 @@ func (c *LicenseV3) GetKind() string {
 	return c.Kind
 }
 
-// GetResourceID returns resource ID
-func (c *LicenseV3) GetResourceID() int64 {
-	return c.Metadata.ID
+// GetRevision returns the revision
+func (c *LicenseV3) GetRevision() string {
+	return c.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (c *LicenseV3) SetResourceID(id int64) {
-	c.Metadata.ID = id
+// SetRevision sets the revision
+func (c *LicenseV3) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // GetName returns the name of the resource
@@ -258,6 +325,9 @@ func (c *LicenseV3) setStaticFields() {
 // CheckAndSetDefaults verifies the constraints for License.
 func (c *LicenseV3) CheckAndSetDefaults() error {
 	c.setStaticFields()
+	if c.Spec.FeatureSource == "" {
+		c.Spec.FeatureSource = FeatureSourceLicense
+	}
 	if err := c.Metadata.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}
@@ -367,6 +437,48 @@ func (c *LicenseV3) SetSupportsResourceAccessRequests(value Bool) {
 	c.Spec.SupportsResourceAccessRequests = value
 }
 
+// GetSupportsFeatureHiding returns feature hiding requests support flag
+func (c *LicenseV3) GetSupportsFeatureHiding() Bool {
+	return c.Spec.SupportsFeatureHiding
+}
+
+// SetSupportsFeatureHiding sets feature hiding requests support flag
+func (c *LicenseV3) SetSupportsFeatureHiding(value Bool) {
+	c.Spec.SupportsFeatureHiding = value
+}
+
+// GetCustomTheme returns the name of the WebUI custom theme
+func (c *LicenseV3) GetCustomTheme() string {
+	return c.Spec.CustomTheme
+}
+
+// SetCustomTheme sets the name of the WebUI custom theme
+func (c *LicenseV3) SetCustomTheme(themeName string) {
+	c.Spec.CustomTheme = themeName
+}
+
+// GetSupportsIdentityGovernanceSecurity returns IGS feature support flag.
+// IGS includes: access list, access request, access monitoring and device trust.
+func (c *LicenseV3) GetSupportsIdentityGovernanceSecurity() Bool {
+	return c.Spec.SupportsIdentityGovernanceSecurity
+}
+
+// SetSupportsIdentityGovernanceSecurity sets IGS feature support flag.
+// IGS includes: access list, access request, access monitoring and device trust.
+func (c *LicenseV3) SetSupportsIdentityGovernanceSecurity(b Bool) {
+	c.Spec.SupportsIdentityGovernanceSecurity = b
+}
+
+// GetUsageBasedBilling returns if usage based billing is turned on or off
+func (c *LicenseV3) GetUsageBasedBilling() Bool {
+	return c.Spec.UsageBasedBilling
+}
+
+// SetUsageBasedBilling sets flag for usage based billing.
+func (c *LicenseV3) SetUsageBasedBilling(b Bool) {
+	c.Spec.UsageBasedBilling = b
+}
+
 // GetTrial returns the trial flag
 func (c *LicenseV3) GetTrial() Bool {
 	return c.Spec.Trial
@@ -375,6 +487,37 @@ func (c *LicenseV3) GetTrial() Bool {
 // SetTrial sets the trial flag
 func (c *LicenseV3) SetTrial(value Bool) {
 	c.Spec.Trial = value
+}
+
+// GetAnonymizationKey returns a key that should be used to
+// anonymize usage data if it's set.
+func (c *LicenseV3) GetAnonymizationKey() string {
+	return c.Spec.AnonymizationKey
+}
+
+// SetAnonymizationKey sets the anonymization key.
+func (c *LicenseV3) SetAnonymizationKey(anonKey string) {
+	c.Spec.AnonymizationKey = anonKey
+}
+
+// GetSupportsPolicy returns Teleport Policy support flag
+func (c *LicenseV3) GetSupportsPolicy() Bool {
+	return c.Spec.SupportsPolicy
+}
+
+// SetSupportsPolicy sets Teleport Policy support flag
+func (c *LicenseV3) SetSupportsPolicy(value Bool) {
+	c.Spec.SupportsPolicy = value
+}
+
+// GetEntitlements returns Entitlements
+func (c *LicenseV3) GetEntitlements() map[string]EntitlementInfo {
+	return c.Spec.Entitlements
+}
+
+// SetEntitlements sets Entitlements
+func (c *LicenseV3) SetEntitlements(value map[string]EntitlementInfo) {
+	c.Spec.Entitlements = value
 }
 
 // String represents a human readable version of license enabled features
@@ -386,7 +529,7 @@ func (c *LicenseV3) String() string {
 	if c.GetTrial() {
 		features = append(features, "is trial")
 	}
-	if c.GetReportsUsage() {
+	if c.GetSalesCenterReporting() {
 		features = append(features, "reports usage")
 	}
 	if c.GetSupportsKubernetes() {
@@ -401,6 +544,9 @@ func (c *LicenseV3) String() string {
 	if c.GetSupportsDesktopAccess() {
 		features = append(features, "supports desktop access")
 	}
+	if c.GetSupportsFeatureHiding() {
+		features = append(features, "supports feature hiding")
+	}
 	if c.GetCloud() {
 		features = append(features, "is hosted by Gravitational")
 	}
@@ -414,6 +560,16 @@ func (c *LicenseV3) String() string {
 		return ""
 	}
 	return strings.Join(features, ",")
+}
+
+// GetFeatureSource returns the source Teleport should use to read the features
+func (c *LicenseV3) GetFeatureSource() FeatureSource {
+	// defaults to License for backward compatibility
+	if c.Spec.FeatureSource == "" {
+		return FeatureSourceLicense
+	}
+
+	return c.Spec.FeatureSource
 }
 
 // LicenseSpecV3 is the actual data we care about for LicenseV3. When changing
@@ -448,6 +604,30 @@ type LicenseSpecV3 struct {
 	SupportsMachineID Bool `json:"machine_id,omitempty"`
 	// SupportsResourceAccessRequests turns resource access request support on or off
 	SupportsResourceAccessRequests Bool `json:"resource_access_requests,omitempty"`
+	// SupportsFeatureHiding turns feature hiding support on or off
+	SupportsFeatureHiding Bool `json:"feature_hiding,omitempty"`
 	// Trial is true for trial licenses
 	Trial Bool `json:"trial,omitempty"`
+	// FeatureSource is the source of the set of enabled feature
+	//
+	// Deprecated.
+	// FeatureSource was used to differentiate between
+	// cloud+team vs cloud+enterprise. cloud+enterprise read from license
+	// and cloud+team read from salescenter. With the new EUB product,
+	// all cloud+ will read from salescenter.
+	FeatureSource FeatureSource `json:"feature_source"`
+	// CustomTheme is the name of the WebUI custom theme
+	CustomTheme string `json:"custom_theme,omitempty"`
+	// SupportsIdentityGovernanceSecurity turns IGS features on or off.
+	SupportsIdentityGovernanceSecurity Bool `json:"identity_governance_security,omitempty"`
+	// UsageBasedBilling determines if the user subscription is usage-based (pay-as-you-go).
+	UsageBasedBilling Bool `json:"usage_based_billing,omitempty"`
+	// AnonymizationKey is a key that is used to anonymize usage data when it is set.
+	// It should only be set when UsageBasedBilling is true.
+	AnonymizationKey string `json:"anonymization_key,omitempty"`
+	// SupportsPolicy turns Teleport Policy features on or off.
+	SupportsPolicy Bool `json:"policy,omitempty"`
+
+	// entitlements define a customer’s access to a specific features
+	Entitlements map[string]EntitlementInfo `json:"entitlements,omitempty"`
 }

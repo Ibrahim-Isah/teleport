@@ -1,27 +1,32 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package keystore
 
 import (
 	"context"
 	"crypto"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
-	"math/rand"
+	mathrandv1 "math/rand" //nolint:depguard // only used for deterministic output
 	"net"
 	"strings"
 	"sync"
@@ -31,51 +36,24 @@ import (
 	kms "cloud.google.com/go/kms/apiv1"
 	"cloud.google.com/go/kms/apiv1/kmspb"
 	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/gravitational/teleport/api/types"
+	apiutils "github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/api/utils/grpc/interceptors"
+	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/lib/auth/keystore/internal/faketime"
-	"github.com/gravitational/teleport/lib/auth/testauthority"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/jwt"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
-	"github.com/gravitational/teleport/lib/utils"
-)
-
-const (
-	testPrivateKeyPem = `-----BEGIN RSA PRIVATE KEY-----
-MIIEpAIBAAKCAQEA0El4Wi5gPO64E/brJ8jYxj+s4UELoMxUyVmw9wj0utmzL1OF
-zTHhyr2NCfpEixYOKR81JCrfcyi5q24pgp8oefLt1wT1lyTjSwh8DFEsRK1vhHfq
-O8dwG1Snx3zx9u92u7ZmbTpzVWFcSwK6C7LKjvFYuBrSt6qZ2rwg3jURqiql5i9Q
-wV7Q+uC/WW5epJ3rX8SeChtq0laaLiw3bMQ23cFiFpZFGUEsYmMDPiSt/LSjwFAb
-iDulz0BozR+WV+i13G6LZat+QmvHjSi4QyWUpEDF+VVz2MZ1WnvY10JX/kngE81a
-qszchd4ThpjqJY17Dqs6R+wNLzKZ1iaMO5AGXQIDAQABAoIBAQCfptEjfsyxp+Fd
-HDTfh+nw+7nN5we8tyJ+O8uTbz/3QQtByWmUARorRuOmtDh5y+wKxSr8kAg6wwqe
-RpB22PwzjWuVFu4QbmvyhYxf/JBMDAygozHdpF9f86GvHSxytNZzx7n3G4hv93LA
-5FQqx17P9lqks5q0wYWwzeb7q/3gSfINtq/aqK76W+vg9hxI1V99PP03a64q6BYg
-XbOpK6p+hiONsV2nB6rYeTZ+RhGuXE97MVT1XGRVgEtzlxBAWI/SS4EaBV9MhI9/
-JF+yPyR7P8LpAqgSj0Q2XvOmn0wuW4PgWkhliBTAonxED2rHJQLWNDTqoCHZYpOZ
-erhaFXPBAoGBAN0C26C/ajk3wa7bm6CmBLro1tbBK7/xeUUSgHXw7OUu2z3yRJEv
-ZxroeeGvP0yW/NFjfWWqTVszDqreehegsQfqz6YBoaqXooVr6MWUOeIrCYJBUMWI
-o48rc+f5BpB6c3DdvAAsn6aLGEZJHJhqNlNSGormicObpgaYpWcF/nyZAoGBAPFC
-7UmmUuymBybuMYD6hfHRz6XPsbiF2zJue/bGXETmrZ/d95svWK16lUOP9AGzG7UC
-5GyCaEOmOwMWagiuglZTknbrOgT8/N8+5l0T2cu3w8jy2bcAOMxow7QNhV0ZVGPB
-d5F4mVbq3cownUbiY2LV5d3aYa8DOVb+R66Y7I5lAoGAKPvTsH5ue0fModlVhbfj
-nql41YAi1cg4ncdtjPFtbJ6Ax376mhW5P/MmTuSJj3FcVpPleAnZqHTSXns9Fs6U
-pYw0j2s0CIdv+t/k3Wa8SSWD8OSdztOkyPLc3oJ+ZiJe7+oeZ8XeoSqgCMCcDeN8
-SX0rMODJYT2mzwhVe8JPy9kCgYEAmCuWbvWxKAIwUKW8I5XgFf438mVluvTypIR7
-O9MxL2Qv7r2aBw995y2CJ/ML/GZz+1+vo6E9Ei4u2muwxXkMTFa58re7CJppBIYv
-1lVG8e8eVgiWuY4yRPtvNImyrF3llGXafK6MSP4qlfTDvoncFeLD8YJkSnbGG9CW
-ddGOouECgYBh3WFOnERRyviW/LTVspYOSwbOK3f17yyd13kuFJWjcULCSob2mwIk
-0eHP1qt9ZxIIXJngrKz5nssgAvHKWu1q245MBZ7rChuBXJLwvY8Puh0C54JJbhlb
-K5UACTho05E0hm3kAJ+pV5APw4UdBFPt90K5nx1OI8nmhxYPqR4V3w==
------END RSA PRIVATE KEY-----`
 )
 
 // fakeGCPKMSServer is a GRPC service implementation which fakes the real GCP
@@ -111,7 +89,7 @@ func withInitialKeyState(state kmspb.CryptoKeyVersion_CryptoKeyVersionState) fak
 }
 
 type keyState struct {
-	pem              string
+	pem              []byte
 	cryptoKey        *kmspb.CryptoKey
 	cryptoKeyVersion *kmspb.CryptoKeyVersion
 }
@@ -120,7 +98,7 @@ func (f *fakeGCPKMSServer) CreateCryptoKey(ctx context.Context, req *kmspb.Creat
 	keyName := req.Parent + "/cryptoKeys/" + req.CryptoKeyId
 	keyVersionName := keyName + "/cryptoKeyVersions/1"
 
-	cryptoKey := proto.Clone(req.CryptoKey).(*kmspb.CryptoKey)
+	cryptoKey := apiutils.CloneProtoMsg(req.CryptoKey)
 	cryptoKey.Name = keyName
 
 	cryptoKeyVersion := &kmspb.CryptoKeyVersion{
@@ -130,9 +108,28 @@ func (f *fakeGCPKMSServer) CreateCryptoKey(ctx context.Context, req *kmspb.Creat
 		Algorithm:       cryptoKey.VersionTemplate.Algorithm,
 	}
 
+	var pem []byte
+	switch cryptoKey.VersionTemplate.Algorithm {
+	case kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_2048_SHA256, kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_4096_SHA512:
+		pem = testRSA2048PrivateKeyPEM
+	case kmspb.CryptoKeyVersion_RSA_DECRYPT_OAEP_4096_SHA256:
+		pem = testRSA4096PrivateKeyPEM
+	case kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256:
+		signer, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		pem, err = keys.MarshalPrivateKey(signer)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+	default:
+		return nil, trace.BadParameter("unsupported algorithm %v", cryptoKey.VersionTemplate.Algorithm)
+	}
+
 	f.mu.Lock()
 	f.keyVersions[keyVersionName] = &keyState{
-		pem:              testPrivateKeyPem,
+		pem:              pem,
 		cryptoKey:        cryptoKey,
 		cryptoKeyVersion: cryptoKeyVersion,
 	}
@@ -152,24 +149,23 @@ func (f *fakeGCPKMSServer) GetPublicKey(ctx context.Context, req *kmspb.GetPubli
 		return nil, trace.BadParameter("cannot fetch public key, state has value %s", keyState.cryptoKeyVersion.State)
 	}
 
-	signer, err := utils.ParsePrivateKeyPEM([]byte(keyState.pem))
+	signer, err := keys.ParsePrivateKey(keyState.pem)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	pubKeyBytes, err := x509.MarshalPKIXPublicKey(signer.Public())
+	// Not using [keys.MarshalPublicKey] here because GCP always encodes RSA keys in PKIX format, not PKCS#1.
+	pubKeyDER, err := x509.MarshalPKIXPublicKey(signer.Public())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
-	block := &pem.Block{
-		Type:  "PUBLIC KEY",
-		Bytes: pubKeyBytes,
-	}
-	pubKeyPem := pem.EncodeToMemory(block)
+	pubKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  keys.PKIXPublicKeyType,
+		Bytes: pubKeyDER,
+	})
 
 	return &kmspb.PublicKey{
-		Pem: string(pubKeyPem),
+		Pem: string(pubKeyPEM),
 	}, nil
 }
 
@@ -184,7 +180,7 @@ func (f *fakeGCPKMSServer) AsymmetricSign(ctx context.Context, req *kmspb.Asymme
 		return nil, trace.BadParameter("cannot fetch key, state has value %s", keyState.cryptoKeyVersion.State)
 	}
 
-	signer, err := utils.ParsePrivateKeyPEM([]byte(keyState.pem))
+	signer, err := keys.ParsePrivateKey(keyState.pem)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -193,9 +189,10 @@ func (f *fakeGCPKMSServer) AsymmetricSign(ctx context.Context, req *kmspb.Asymme
 	var alg crypto.Hash
 	switch typedDigest := req.Digest.Digest.(type) {
 	case *kmspb.Digest_Sha256:
-		if keyState.cryptoKeyVersion.Algorithm != kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_2048_SHA256 {
-			return nil, trace.BadParameter(
-				"requested key uses algorithm %s which cannot handle a 256 bit digest",
+		switch keyState.cryptoKeyVersion.Algorithm {
+		case kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_2048_SHA256, kmspb.CryptoKeyVersion_EC_SIGN_P256_SHA256:
+		default:
+			return nil, trace.BadParameter("requested key uses algorithm %s which cannot handle a 256 bit digest",
 				keyState.cryptoKeyVersion.Algorithm)
 		}
 		digest = typedDigest.Sha256
@@ -212,7 +209,7 @@ func (f *fakeGCPKMSServer) AsymmetricSign(ctx context.Context, req *kmspb.Asymme
 		return nil, trace.BadParameter("unsupported digest type %T", typedDigest)
 	}
 
-	testRand := rand.New(rand.NewSource(0))
+	testRand := mathrandv1.New(mathrandv1.NewSource(0))
 	sig, err := signer.Sign(testRand, digest, alg)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -225,15 +222,49 @@ func (f *fakeGCPKMSServer) AsymmetricSign(ctx context.Context, req *kmspb.Asymme
 	return resp, nil
 }
 
-func (f *fakeGCPKMSServer) ListCryptoKeys(context.Context, *kmspb.ListCryptoKeysRequest) (*kmspb.ListCryptoKeysResponse, error) {
+func (f *fakeGCPKMSServer) AsymmetricDecrypt(ctx context.Context, req *kmspb.AsymmetricDecryptRequest) (*kmspb.AsymmetricDecryptResponse, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	keyState, ok := f.keyVersions[req.Name]
+	if !ok {
+		return nil, trace.NotFound("no such key")
+	}
+	if keyState.cryptoKeyVersion.State != kmspb.CryptoKeyVersion_ENABLED {
+		return nil, trace.BadParameter("cannot fetch key, state has value %s", keyState.cryptoKeyVersion.State)
+	}
+
+	signer, err := keys.ParsePrivateKey(keyState.pem)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	decrypter, ok := signer.Signer.(crypto.Decrypter)
+	if !ok {
+		return nil, trace.Errorf("private key is not a valid decrypter")
+	}
+
+	testRand := mathrandv1.New(mathrandv1.NewSource(0))
+	plaintext, err := decrypter.Decrypt(testRand, req.Ciphertext, &rsa.OAEPOptions{Hash: crypto.SHA256})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	resp := &kmspb.AsymmetricDecryptResponse{
+		Plaintext: plaintext,
+	}
+
+	return resp, nil
+}
+
+func (f *fakeGCPKMSServer) ListCryptoKeys(ctx context.Context, req *kmspb.ListCryptoKeysRequest) (*kmspb.ListCryptoKeysResponse, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	var cryptoKeys []*kmspb.CryptoKey
-	for keyVersionName := range f.keyVersions {
-		cryptoKey := &kmspb.CryptoKey{
-			Name: strings.TrimSuffix(keyVersionName, "/cryptoKeyVersions/1"),
+	for keyVersionName, keyState := range f.keyVersions {
+		if !strings.HasPrefix(keyVersionName, req.Parent) {
+			continue
 		}
-		cryptoKeys = append(cryptoKeys, cryptoKey)
+		cryptoKeys = append(cryptoKeys, keyState.cryptoKey)
 	}
 	resp := &kmspb.ListCryptoKeysResponse{
 		CryptoKeys: cryptoKeys,
@@ -251,12 +282,7 @@ func (f *fakeGCPKMSServer) DestroyCryptoKeyVersion(ctx context.Context, req *kms
 	}
 
 	keyState.cryptoKeyVersion.State = kmspb.CryptoKeyVersion_DESTROY_SCHEDULED
-
-	resp := &kmspb.CryptoKeyVersion{
-		Name:  req.Name,
-		State: keyState.cryptoKeyVersion.State,
-	}
-	return resp, nil
+	return keyState.cryptoKeyVersion, nil
 }
 
 // deleteKey is a test helper to delete a key by the raw ID which would be
@@ -287,8 +313,8 @@ func (f *fakeGCPKMSServer) activateAllKeys() {
 func newTestGRPCServer() *grpc.Server {
 	// Set up some helpful interceptors so that we return compliant error types.
 	return grpc.NewServer(
-		grpc.UnaryInterceptor(utils.GRPCServerUnaryErrorInterceptor),
-		grpc.StreamInterceptor(utils.GRPCServerStreamErrorInterceptor),
+		grpc.UnaryInterceptor(interceptors.GRPCServerUnaryErrorInterceptor),
+		grpc.StreamInterceptor(interceptors.GRPCServerStreamErrorInterceptor),
 	)
 }
 
@@ -342,6 +368,10 @@ func newTestGCPKMSClient(t *testing.T, dialer contextDialer) *kms.KeyManagementC
 // TestGCPKMSKeystore tests GCP KMS keystore operation in the presence of
 // delays, timeouts, and errors specific to GCP KMS.
 func TestGCPKMSKeystore(t *testing.T) {
+	clusterName, err := services.NewClusterNameWithRandomID(types.ClusterNameSpecV2{
+		ClusterName: "test-cluster",
+	})
+	require.NoError(t, err)
 	for _, tc := range []struct {
 		desc                  string
 		initialKeyState       kmspb.CryptoKeyVersion_CryptoKeyVersionState
@@ -378,7 +408,6 @@ func TestGCPKMSKeystore(t *testing.T) {
 			expectSignError: true,
 		},
 	} {
-		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -403,14 +432,17 @@ func TestGCPKMSKeystore(t *testing.T) {
 				withInitialKeyState(tc.initialKeyState),
 			)
 			kmsClient := newTestGCPKMSClient(t, dialer)
-			manager, err := NewManager(testCtx, Config{
-				GCPKMS: GCPKMSConfig{
-					HostUUID:          "test-host-id",
-					ProtectionLevel:   "HSM",
-					KeyRing:           "test-keyring",
-					kmsClientOverride: kmsClient,
-					clockOverride:     clock,
+			manager, err := NewManager(testCtx, &servicecfg.KeystoreConfig{
+				GCPKMS: servicecfg.GCPKMSConfig{
+					ProtectionLevel: "HSM",
+					KeyRing:         "test-keyring",
 				},
+			}, &Options{
+				ClusterName:          clusterName,
+				HostUUID:             "test-host-id",
+				AuthPreferenceGetter: &fakeAuthPreferenceGetter{types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_HSM_V1},
+				kmsClient:            kmsClient,
+				faketimeOverride:     clock,
 			})
 			require.NoError(t, err, "error while creating test keystore manager")
 
@@ -474,24 +506,24 @@ func TestGCPKMSKeystore(t *testing.T) {
 			}()
 
 			// Test key creation.
-			sshKeyPair, err := manager.NewSSHKeyPair(clientContext)
+			sshKeyPair, err := manager.NewSSHKeyPair(clientContext, cryptosuites.UserCASSH)
 			if tc.expectNewKeyPairError {
 				require.Error(t, err, "expected to get error generating SSH keypair, got nil")
 				return
 			}
 			require.NoError(t, err, "unexpected error while generating SSH keypair")
 
-			jwtKeyPair, err := manager.NewJWTKeyPair(clientContext)
-			require.NoError(t, err, "unexpected error creating JWT keypair")
-
-			tlsKeyPair, err := manager.NewTLSKeyPair(clientContext, "test-cluster")
+			tlsKeyPair, err := manager.NewTLSKeyPair(clientContext, "test-cluster", cryptosuites.UserCATLS)
 			require.NoError(t, err, "unexpected error creating TLS keypair")
+
+			jwtKeyPair, err := manager.NewJWTKeyPair(clientContext, cryptosuites.JWTCAJWT)
+			require.NoError(t, err, "unexpected error creating JWT keypair")
 
 			// Put all the keys into a "CA" so that the keystore manager can
 			// select them and we can test the public API.
 			ca, err := types.NewCertAuthority(types.CertAuthoritySpecV2{
 				Type:        types.HostCA,
-				ClusterName: "test-cluster",
+				ClusterName: clusterName.GetClusterName(),
 				ActiveKeys: types.CAKeySet{
 					SSH: []*types.SSHKeyPair{sshKeyPair},
 					TLS: []*types.TLSKeyPair{tlsKeyPair},
@@ -500,11 +532,9 @@ func TestGCPKMSKeystore(t *testing.T) {
 			})
 			require.NoError(t, err, "unexpected error creating CA")
 
-			// Generate a test private key that will be the basis of test certs
-			// to be signed.
-			keygen := testauthority.New()
-			clientPrivKey, err := keygen.GeneratePrivateKey()
-			require.NoError(t, err, "unexpected error generating test private key")
+			// Client private key that will be the basis of test certs to be signed.
+			clientPrivKey, err := keys.ParsePrivateKey(testRSA2048PrivateKeyPEM)
+			require.NoError(t, err)
 
 			// Test signing an SSH certificate.
 			t.Run("ssh", func(t *testing.T) {
@@ -523,12 +553,12 @@ func TestGCPKMSKeystore(t *testing.T) {
 					Key:             clientPrivKey.SSHPublicKey(),
 					CertType:        ssh.HostCert,
 				}
-				err = cert.SignCert(rand.New(rand.NewSource(0)), sshSigner)
+				err = cert.SignCert(mathrandv1.New(mathrandv1.NewSource(0)), sshSigner)
 				if tc.expectSignError {
 					require.Error(t, err, "expected to get error signing SSH cert")
 					return
 				}
-				require.NoError(t, err, "unexpected error signing SSH certificate")
+				require.NoError(t, err, trace.DebugReport(err))
 			})
 
 			// Test signing a TLS certificate.
@@ -551,7 +581,7 @@ func TestGCPKMSKeystore(t *testing.T) {
 					},
 				}
 				_, err = x509.CreateCertificate(
-					rand.New(rand.NewSource(0)),
+					mathrandv1.New(mathrandv1.NewSource(0)),
 					template,
 					tlsCA.Cert,
 					clientPrivKey.Public(),
@@ -587,8 +617,169 @@ func TestGCPKMSKeystore(t *testing.T) {
 					require.Error(t, err, "expected to get error signing JWT")
 					return
 				}
-				require.NoError(t, err, "unexpected error signing JWT")
+				require.NoError(t, err, "unexpected error signing JWT: %s", trace.DebugReport(err))
 			})
 		})
+	}
+}
+
+func TestGCPKMSDeleteUnusedKeys(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	clusterName, err := services.NewClusterNameWithRandomID(types.ClusterNameSpecV2{
+		ClusterName: "test-cluster",
+	})
+	require.NoError(t, err)
+
+	const (
+		localHostID  = "local-host-id"
+		otherHostID  = "other-host-id"
+		localKeyring = "local-keyring"
+		otherKeyring = "other-keyring"
+	)
+
+	for _, tc := range []struct {
+		desc            string
+		existingKeys    []keySpec
+		activeKeys      []keySpec
+		expectDestroyed []keySpec
+	}{
+		{
+			// Only inactive keys should be destroyed.
+			desc: "active and inactive",
+			existingKeys: []keySpec{
+				{keyring: localKeyring, id: "id_active", host: localHostID},
+				{keyring: localKeyring, id: "id_inactive", host: localHostID},
+			},
+			activeKeys: []keySpec{
+				{keyring: localKeyring, id: "id_active", host: localHostID},
+			},
+			expectDestroyed: []keySpec{
+				{keyring: localKeyring, id: "id_inactive", host: localHostID},
+			},
+		},
+		{
+			// Inactive key from other host should not be destroyed, it may
+			// be recently created and just not added to Teleport CA yet, or the
+			// other Auth might be in a completely different Teleport cluster
+			// using the same keyring (I wouldn't advise this but someone might
+			// do it).
+			desc: "inactive key from other host",
+			existingKeys: []keySpec{
+				{keyring: localKeyring, id: "id_inactive_local", host: localHostID},
+				{keyring: localKeyring, id: "id_inactive_remote", host: otherHostID},
+			},
+			expectDestroyed: []keySpec{
+				{keyring: localKeyring, id: "id_inactive_local", host: localHostID},
+			},
+		},
+		{
+			// The presence of active keys created by a remote host in the local
+			// keyring should not break the DeleteUnusedKeys operation.
+			desc: "active key from other host",
+			existingKeys: []keySpec{
+				{keyring: localKeyring, id: "id_active_local", host: localHostID},
+				{keyring: localKeyring, id: "id_inactive_local", host: localHostID},
+				{keyring: localKeyring, id: "id_active_remote", host: otherHostID},
+				{keyring: localKeyring, id: "id_inactive_remote", host: otherHostID},
+			},
+			activeKeys: []keySpec{
+				{keyring: localKeyring, id: "id_active_local", host: localHostID},
+				{keyring: localKeyring, id: "id_active_remote", host: otherHostID},
+			},
+			expectDestroyed: []keySpec{
+				{keyring: localKeyring, id: "id_inactive_local", host: localHostID},
+			},
+		},
+		{
+			// Keys in other keyring should never be destroyed.
+			desc: "keys in other keyring",
+			existingKeys: []keySpec{
+				{keyring: localKeyring, id: "id_inactive_local", host: localHostID},
+				{keyring: otherKeyring, id: "id_inactive_other1", host: localHostID},
+				{keyring: otherKeyring, id: "id_inactive_other2", host: otherHostID},
+			},
+			expectDestroyed: []keySpec{
+				{keyring: localKeyring, id: "id_inactive_local", host: localHostID},
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			fakeKMSServer, dialer := newTestGCPKMSService(t)
+			kmsClient := newTestGCPKMSClient(t, dialer)
+			manager, err := NewManager(ctx, &servicecfg.KeystoreConfig{
+				GCPKMS: servicecfg.GCPKMSConfig{
+					ProtectionLevel: "HSM",
+					KeyRing:         localKeyring,
+				},
+			}, &Options{
+				ClusterName:          clusterName,
+				HostUUID:             localHostID,
+				AuthPreferenceGetter: &fakeAuthPreferenceGetter{types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_HSM_V1},
+				kmsClient:            kmsClient,
+			})
+			require.NoError(t, err, "error while creating test keystore manager")
+
+			// Pre-req: create existing keys in fake KMS backend
+			for _, ks := range tc.existingKeys {
+				_, err := fakeKMSServer.CreateCryptoKey(ctx, createKeyRequest(ks))
+				require.NoError(t, err)
+			}
+
+			// Test: DeleteUnusedKeys with activeKeys from the testcase
+			activeKeyIDs := make([][]byte, len(tc.activeKeys))
+			for i, ks := range tc.activeKeys {
+				activeKeyIDs[i] = ks.keyID()
+			}
+			err = manager.DeleteUnusedKeys(ctx, activeKeyIDs)
+			assert.NoError(t, err)
+
+			expectDestroyedSet := make(map[string]bool, len(tc.expectDestroyed))
+			for _, ks := range tc.expectDestroyed {
+				expectDestroyedSet[ks.keyVersionName()] = true
+			}
+			require.Len(t, fakeKMSServer.keyVersions, len(tc.existingKeys))
+			for keyVersionName, state := range fakeKMSServer.keyVersions {
+				if expectDestroyedSet[keyVersionName] {
+					// Fake KMS server only sets state to DESTROY_SCHEDULED,
+					// that's good enough for the test.
+					require.Equal(t, kmspb.CryptoKeyVersion_DESTROY_SCHEDULED.String(), state.cryptoKeyVersion.State.String())
+				} else {
+					require.Equal(t, kmspb.CryptoKeyVersion_ENABLED.String(), state.cryptoKeyVersion.State.String())
+				}
+			}
+		})
+	}
+}
+
+type keySpec struct {
+	keyring, id, host string
+}
+
+func (ks *keySpec) keyVersionName() string {
+	return ks.keyring + "/cryptoKeys/" + ks.id + keyVersionSuffix
+}
+
+func (ks *keySpec) keyID() []byte {
+	return gcpKMSKeyID{
+		keyVersionName: ks.keyVersionName(),
+	}.marshal()
+}
+
+func createKeyRequest(ks keySpec) *kmspb.CreateCryptoKeyRequest {
+	return &kmspb.CreateCryptoKeyRequest{
+		Parent:      ks.keyring,
+		CryptoKeyId: ks.id,
+		CryptoKey: &kmspb.CryptoKey{
+			Purpose: kmspb.CryptoKey_ASYMMETRIC_SIGN,
+			Labels: map[string]string{
+				hostLabel: ks.host,
+			},
+			VersionTemplate: &kmspb.CryptoKeyVersionTemplate{
+				ProtectionLevel: kmspb.ProtectionLevel_SOFTWARE,
+				Algorithm:       kmspb.CryptoKeyVersion_RSA_SIGN_PKCS1_2048_SHA256,
+			},
+		},
 	}
 }

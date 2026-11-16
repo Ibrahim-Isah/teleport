@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package webauthnwin
 
@@ -25,6 +29,10 @@ const (
 	webauthnUserVerificationRequired    = uint32(1)
 	webauthnUserVerificationPreferred   = uint32(2)
 	webauthnUserVerificationDiscouraged = uint32(3)
+
+	webauthnCredentialHintSecurityKey  = "security-key"
+	webauthnCredentialHintClientDevice = "client-device"
+	webauthnCredentialHintHybrid       = "hybrid"
 )
 
 type webauthnRPEntityInformation struct {
@@ -35,8 +43,10 @@ type webauthnRPEntityInformation struct {
 	// "Acme Corporation", "Widgets Inc" or "Awesome Site".
 	// This field is required.
 	pwszName *uint16
-	// Optional URL pointing to RP's logo.
-	pwszIcon *uint16
+
+	// RP icon (previously pwszIcon).
+	// This field is kept just to keep size of struct valid.
+	_ *uint16
 }
 
 type webauthnUserEntityInformation struct {
@@ -48,9 +58,9 @@ type webauthnUserEntityInformation struct {
 	// "john.p.smith@example.com".
 	// It holds the Teleport user name.
 	pwszName *uint16
-	// Optional URL that can be used to retrieve an image containing the user's current avatar,
-	// or a data URI that contains the image data.
-	pwszIcon *uint16
+	// User icon (previously pwszIcon).
+	// This field is kept just to keep size of struct valid.
+	_ *uint16
 	// For User: Contains the friendly name associated with the user account by the Relying Party, such as "John P. Smith".
 	pwszDisplayName *uint16
 }
@@ -234,6 +244,7 @@ type webauthnClientData struct {
 	pwszHashAlgID *uint16
 }
 
+//nolint:unused // This type maps a C struct. We need to keep the layout consistent.
 type webauthnAuthenticatorGetAssertionOptions struct {
 	dwVersion uint32
 	// Time that the operation is expected to complete within.
@@ -283,13 +294,60 @@ type webauthnAuthenticatorGetAssertionOptions struct {
 	//
 	// The following fields have been added in WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_5
 	//
-	// This field is kept just to keep size of struct valid.
-	_ uint32
-	// Size of pbCredLargeBlob
-	// This field is kept just to keep size of struct valid.
-	_ uint32
-	// This field is kept just to keep size of struct valid.
-	_ *byte
+
+	_               uint32 // dwCredLargeBlobOperation
+	cbCredLargeBlob uint32
+	pbCredLargeBlob *byte
+
+	//
+	// The following fields have been added in WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6
+	//
+
+	// PRF values which will be converted into HMAC-SECRET values according to WebAuthn Spec.
+	_ uint32 // pHmacSecretSaltValues
+
+	// Optional. BrowserInPrivate Mode. Defaulting to FALSE.
+	bBrowserInPrivateMode bool
+
+	//
+	// The following fields have been added in WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_7
+	//
+
+	// Deprecated
+	// Optional. Linked Device Connection Info.
+	_ uint32 // pLinkedDevice
+
+	// Optional. Allowlist MUST contain 1 credential applicable for Hybrid transport.
+	bAutoFill bool
+
+	// Size of pbJsonExt
+	cbJsonExt uint32
+	pbJsonExt *byte
+
+	//
+	// The following fields have been added in WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_8
+	//
+
+	// PublicKeyCredentialHints (https://w3c.github.io/webauthn/#enum-hints)
+	cCredentialHints     uint32
+	ppwszCredentialHints *uint16
+
+	//
+	// The following fields have been added in WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_9
+	//
+	// https://github.com/microsoft/webauthn/blob/c3ed95fd7603441a0253c55c14e79239cb556a9f/webauthn.h#L958.
+	//
+
+	// Web Origin. For Remote Web App scenario.
+	pwszRemoteWebOrigin *uint16
+
+	// UTF-8 encoded JSON serialization of the PublicKeyCredentialRequestOptions.
+	cbPublicKeyCredentialRequestOptionsJSON uint32
+	pbPublicKeyCredentialRequestOptionsJSON *byte
+
+	// Authenticator ID got from WebAuthNGetAuthenticatorList API.
+	cbAuthenticatorID uint32
+	pbAuthenticatorID *byte
 }
 
 //nolint:unused // TODO: remove when linter runs on windows build tag

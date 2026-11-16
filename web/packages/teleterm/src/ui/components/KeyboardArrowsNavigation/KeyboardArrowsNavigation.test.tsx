@@ -1,25 +1,29 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, {
+import {
+  createRef,
   forwardRef,
   ReactNode,
   useCallback,
   useImperativeHandle,
 } from 'react';
+
 import { act, fireEvent, render, screen } from 'design/utils/testing';
 
 import { KeyboardArrowsNavigation } from './KeyboardArrowsNavigation';
@@ -45,7 +49,11 @@ function TestItem(props: { index: number }) {
     onRun: useCallback(() => {}, []),
   });
 
-  return <>{createTextItem(props.index, isActive)}</>;
+  return (
+    <span data-testid={`item-${props.index}`}>
+      {createTextItem(props.index, isActive)}
+    </span>
+  );
 }
 
 test('context should render provided children', () => {
@@ -78,16 +86,18 @@ describe('go through navigation items', () => {
       </KeyboardArrowsNavigation>
     );
 
-    fireEvent.keyDown(container.firstChild, { key: 'ArrowDown' });
+    const target = screen.getByTestId('item-0');
+
+    fireEvent.keyDown(target, { key: 'ArrowDown' });
     expect(container).toHaveTextContent(getAllItemsText(0, 3));
 
-    fireEvent.keyDown(container.firstChild, { key: 'ArrowDown' });
+    fireEvent.keyDown(target, { key: 'ArrowDown' });
     expect(container).toHaveTextContent(getAllItemsText(1, 3));
 
-    fireEvent.keyDown(container.firstChild, { key: 'ArrowDown' });
+    fireEvent.keyDown(target, { key: 'ArrowDown' });
     expect(container).toHaveTextContent(getAllItemsText(2, 3));
 
-    fireEvent.keyDown(container.firstChild, { key: 'ArrowDown' });
+    fireEvent.keyDown(target, { key: 'ArrowDown' });
     expect(container).toHaveTextContent(getAllItemsText(0, 3));
   });
 
@@ -100,16 +110,18 @@ describe('go through navigation items', () => {
       </KeyboardArrowsNavigation>
     );
 
-    fireEvent.keyDown(container.firstChild, { key: 'ArrowDown' });
+    const target = screen.getByTestId('item-0');
+
+    fireEvent.keyDown(target, { key: 'ArrowDown' });
     expect(container).toHaveTextContent(getAllItemsText(0, 3));
 
-    fireEvent.keyDown(container.firstChild, { key: 'ArrowUp' });
+    fireEvent.keyDown(target, { key: 'ArrowUp' });
     expect(container).toHaveTextContent(getAllItemsText(2, 3));
 
-    fireEvent.keyDown(container.firstChild, { key: 'ArrowUp' });
+    fireEvent.keyDown(target, { key: 'ArrowUp' });
     expect(container).toHaveTextContent(getAllItemsText(1, 3));
 
-    fireEvent.keyDown(container.firstChild, { key: 'ArrowUp' });
+    fireEvent.keyDown(target, { key: 'ArrowUp' });
     expect(container).toHaveTextContent(getAllItemsText(0, 3));
   });
 });
@@ -123,17 +135,18 @@ test('fire action on active item when Enter is pressed', () => {
       onRun: props.onRunActiveItem,
     });
 
-    return <>Test item</>;
+    return <span data-testid="test-item">Test item</span>;
   }
 
-  const { container } = render(
+  render(
     <KeyboardArrowsNavigation>
       <TestItem index={0} onRunActiveItem={firstItemCallback} />
     </KeyboardArrowsNavigation>
   );
 
-  fireEvent.keyDown(container.firstChild, { key: 'ArrowDown' });
-  fireEvent.keyDown(container.firstChild, { key: 'Enter' });
+  const target = screen.getByTestId('test-item');
+  fireEvent.keyDown(target, { key: 'ArrowDown' });
+  fireEvent.keyDown(target, { key: 'Enter' });
   expect(firstItemCallback).toHaveBeenCalledWith();
 });
 
@@ -150,7 +163,7 @@ test('activeIndex can be changed manually', () => {
     }
   );
 
-  const ref = React.createRef<any>();
+  const ref = createRef<any>();
 
   const { container } = render(
     <KeyboardArrowsNavigation>

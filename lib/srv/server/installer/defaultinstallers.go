@@ -1,0 +1,186 @@
+/*
+ * Teleport
+ * Copyright (C) 2024  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+package installer
+
+import (
+	"strings"
+
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/installers"
+	"github.com/gravitational/teleport/lib/web/scripts/oneoff"
+)
+
+const windowsAuthPackageScriptSetup = `$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$AuthPackageVersion = '{{.AuthPackageVersion}}'
+$CA = '{{getWindowsCA}}'`
+
+var windowsAuthPackageInstallerScript = `$InstallerName = "teleport-windows-auth-setup-v$AuthPackageVersion-amd64.exe"
+# Stage installer files under %WINDIR%\SystemTemp, which is only writable by
+# SYSTEM and Administrators.
+$SystemTemp    = Join-Path $env:WINDIR 'SystemTemp'
+
+# SystemTemp isn't guaranteed to exist on older builds.
+New-Item -ItemType Directory -Path $SystemTemp -Force | Out-Null
+
+# Refuse to stage under a redirected SystemTemp
+if ((Get-Item -LiteralPath $SystemTemp -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+	Write-Host "$SystemTemp is a reparse point, refusing to stage installer files there."
+	exit {{ .WindowsInstallerStagingDirUnsafe }}
+}
+
+$WorkDir       = Join-Path $SystemTemp ([System.Guid]::NewGuid().ToString())
+New-Item -ItemType Directory -Path $WorkDir | Out-Null
+$InstallerPath = Join-Path $WorkDir $InstallerName
+$CertPath      = Join-Path $WorkDir 'teleport.pem'
+
+Write-Host "Base64-decoding the embedded CA bundle and writing it to $CertPath..."
+[IO.File]::WriteAllBytes($CertPath, [Convert]::FromBase64String($CA))
+
+# Returns whether $TargetHost should be excluded from proxying by NO_PROXY list
+function Test-NoProxyMatch($TargetHost, $NoProxy) {
+	if (-not $NoProxy) { return $false }
+	foreach ($entry in $NoProxy -split ',') {
+		$entry = $entry.Trim()
+		if (-not $entry) { continue }
+		if ($entry -eq '*') { return $true }
+		$entry = $entry.TrimStart('.').ToLowerInvariant()
+		if ($TargetHost -eq $entry -or $TargetHost.EndsWith(".$entry")) { return $true }
+	}
+	return $false
+}
+
+$UseProxy = $env:HTTPS_PROXY -and -not (Test-NoProxyMatch 'cdn.teleport.dev' $env:NO_PROXY)
+
+Write-Host "Downloading authentication package installer ($InstallerName)..."
+try {
+	$dl = @{ Uri = "https://cdn.teleport.dev/$InstallerName"; OutFile = $InstallerPath; UseBasicParsing = $true }
+	if ($UseProxy) { $dl.Proxy = $env:HTTPS_PROXY }
+	Invoke-WebRequest @dl
+} catch {
+	Write-Host "Authentication package download failed: $_"
+	exit {{ .WindowsInstallerDownloadFailure }}
+}
+
+Write-Host "Downloading authentication package installer checksum..."
+$ChecksumPath = "$InstallerPath.sha256"
+try {
+	$cs = @{ Uri = "https://cdn.teleport.dev/$InstallerName.sha256"; OutFile = $ChecksumPath; UseBasicParsing = $true }
+	if ($UseProxy) { $cs.Proxy = $env:HTTPS_PROXY }
+	Invoke-WebRequest @cs
+} catch {
+	Write-Host "Authentication package checksum download failed: $_"
+	exit {{ .WindowsInstallerDownloadFailure }}
+}
+
+Write-Host "Verifying authentication package installer checksum..."
+$ExpectedHash = ((Get-Content -LiteralPath $ChecksumPath -Raw) -split '\s+' | Where-Object { $_ })[0].ToLowerInvariant()
+$ActualHash = (Get-FileHash -LiteralPath $InstallerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($ExpectedHash -ne $ActualHash) {
+	Write-Host "Authentication package checksum mismatch: expected $ExpectedHash, got $ActualHash"
+	exit {{ .WindowsInstallerChecksumMismatch }}
+}
+
+Write-Host "Running authentication package installer..."
+& $InstallerPath install --cert=$CertPath
+if ($LASTEXITCODE -ne 0) {
+	Write-Host "Authentication package installer failed (exit $LASTEXITCODE)"
+	exit {{ .WindowsInstallerExecutionFailure }}
+}
+
+{{if .RestartAfterEnrollment}}
+Write-Host "Scheduling a system restart in 60 seconds to complete the enrollment process"
+& shutdown.exe /r /t 60 /c "Restarting to complete Teleport enrollment process"
+{{else}}
+Write-Host "A reboot is required to complete installation."
+{{end}}`
+
+var DefaultWindowsAuthPackageInstaller = types.MustNewInstallerV1(
+	installers.InstallerScriptNameWindowsAuthPackage,
+	strings.Join([]string{windowsAuthPackageScriptSetup, windowsAuthPackageInstallerScript}, "\n\n"),
+)
+
+const (
+	scriptShebangAndSetOptions = `#!/usr/bin/env sh
+set -eu`
+	execGenericInstallScript = `
+INSTALL_SCRIPT_URL="https://{{.PublicProxyAddr}}/scripts/install.sh"
+
+echo "Offloading the installation part to the generic Teleport install script hosted at: $INSTALL_SCRIPT_URL"
+
+TEMP_INSTALLER_SCRIPT="$(mktemp)"
+curl -sSf "$INSTALL_SCRIPT_URL" -o "$TEMP_INSTALLER_SCRIPT"
+
+chmod +x "$TEMP_INSTALLER_SCRIPT"
+
+envs=$(awk 'BEGIN { for (name in ENVIRON) if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) { list = list sep name; sep = "," } print list }')
+sudo --preserve-env="$envs" "$TEMP_INSTALLER_SCRIPT" || (echo "The install script ($TEMP_INSTALLER_SCRIPT) returned a non-zero exit code" && exit 1)
+rm "$TEMP_INSTALLER_SCRIPT"`
+)
+
+// LegacyDefaultInstaller represents the default installer script provided by teleport.
+var (
+	// LegacyDefaultInstaller uses oneoff.sh to download the Teleport tarball and run `teleport install`.
+	// The Teleport install command handles both Teleport installation and agent configuration.
+	LegacyDefaultInstaller = oneoffScriptToDefaultInstaller()
+
+	// NewDefaultInstaller installs Teleport by calling the standard "/scripts/install.sh" route on the proxy.
+	// After successfully installing Teleport, it will invoke the same `teleport install`
+	// command as the LegacyDefaultInstaller which will only take care of configuring Teleport.
+	NewDefaultInstaller = types.MustNewInstallerV1(
+		installers.InstallerScriptName,
+		strings.Join(
+			[]string{scriptShebangAndSetOptions, execGenericInstallScript, configureTeleport},
+			"\n\n",
+		),
+	)
+	// Note: if we add namespacing support, we will need to edit this script to use the namespaced full path
+	configureTeleport = `
+echo "Configuring the Teleport agent"
+
+set +x
+TELEPORT_BINARY=/usr/local/bin/teleport
+[ -z "${TELEPORT_INSTALL_SUFFIX:-}" ] || TELEPORT_BINARY=/opt/teleport/${TELEPORT_INSTALL_SUFFIX}/bin/teleport
+
+envs=$(awk 'BEGIN { for (name in ENVIRON) if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) { list = list sep name; sep = "," } print list }')
+sudo --preserve-env="$envs" "$TELEPORT_BINARY" ` + strings.Join(argsList, " ") + " $@"
+
+	argsList = []string{
+		"install", "autodiscover-node",
+		"--public-proxy-addr={{.PublicProxyAddr}}",
+		"--teleport-package={{.TeleportPackage}}",
+		"--repo-channel={{.RepoChannel}}",
+		"--auto-upgrade={{.AutomaticUpgrades}}",
+		"--azure-client-id={{.AzureClientID}}",
+	}
+)
+
+func oneoffScriptToDefaultInstaller() *types.InstallerV1 {
+	script, err := oneoff.BuildScript(oneoff.OneOffScriptParams{
+		EntrypointArgs:        strings.Join(argsList, " "),
+		SuccessMessage:        "Teleport is installed and running.",
+		TeleportCommandPrefix: oneoff.PrefixSUDO,
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	return types.MustNewInstallerV1(installers.InstallerScriptName, script)
+}

@@ -1,30 +1,33 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package webauthn
 
 import (
+	"context"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/x509"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/go-webauthn/webauthn/protocol/webauthncose"
 	wan "github.com/go-webauthn/webauthn/webauthn"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 )
@@ -33,7 +36,15 @@ import (
 // https://datatracker.ietf.org/doc/html/rfc8152#section-13.1
 const curveP256CBOR = 1
 
-func deviceToCredential(dev *types.MFADevice, idOnly bool) (wan.Credential, bool) {
+type credentialFlags struct {
+	BE, BS bool
+}
+
+func deviceToCredential(
+	dev *types.MFADevice,
+	idOnly bool,
+	currentFlags *credentialFlags,
+) (wan.Credential, bool) {
 	switch dev := dev.Device.(type) {
 	case *types.MFADevice_U2F:
 		var pubKeyCBOR []byte
@@ -41,7 +52,7 @@ func deviceToCredential(dev *types.MFADevice, idOnly bool) (wan.Credential, bool
 			var err error
 			pubKeyCBOR, err = u2fDERKeyToCBOR(dev.U2F.PubKey)
 			if err != nil {
-				log.Warnf("WebAuthn: failed to convert U2F device key to CBOR: %v", err)
+				log.WarnContext(context.Background(), "failed to convert U2F device key to CBOR", "error", err)
 				return wan.Credential{}, false
 			}
 		}
@@ -57,10 +68,29 @@ func deviceToCredential(dev *types.MFADevice, idOnly bool) (wan.Credential, bool
 		if !idOnly {
 			pubKeyCBOR = dev.Webauthn.PublicKeyCbor
 		}
+
+		// Use BE/BS from the device, falling back to currentFlags for devices that
+		// haven't been backfilled yet.
+		var be, bs bool
+		if dev.Webauthn.CredentialBackupEligible != nil {
+			be = dev.Webauthn.CredentialBackupEligible.Value
+		} else {
+			be = currentFlags != nil && currentFlags.BE
+		}
+		if dev.Webauthn.CredentialBackedUp != nil {
+			bs = dev.Webauthn.CredentialBackedUp.Value
+		} else {
+			bs = currentFlags != nil && currentFlags.BS
+		}
+
 		return wan.Credential{
 			ID:              dev.Webauthn.CredentialId,
 			PublicKey:       pubKeyCBOR,
 			AttestationType: dev.Webauthn.AttestationType,
+			Flags: wan.CredentialFlags{
+				BackupEligible: be,
+				BackupState:    bs,
+			},
 			Authenticator: wan.Authenticator{
 				AAGUID:    dev.Webauthn.Aaguid,
 				SignCount: dev.Webauthn.SignatureCounter,
@@ -87,11 +117,17 @@ func u2fDERKeyToCBOR(der []byte) ([]byte, error) {
 
 // U2FKeyToCBOR transforms a DER-encoded U2F into its CBOR counterpart.
 func U2FKeyToCBOR(pubKey *ecdsa.PublicKey) ([]byte, error) {
-	// X and Y coordinates must be exactly 32 bytes.
-	xBytes := make([]byte, 32)
-	yBytes := make([]byte, 32)
-	pubKey.X.FillBytes(xBytes)
-	pubKey.Y.FillBytes(yBytes)
+	if pubKey.Curve != elliptic.P256() {
+		return nil, trace.BadParameter("unsupported curve %T", pubKey.Curve)
+	}
+
+	pubKeyBytes, err := pubKey.Bytes()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// First byte is the 0x04 prefix, which can be skipped. The rest are the x and y coordinates.
+	x, y := pubKeyBytes[1:33], pubKeyBytes[33:]
 
 	pubKeyCBOR, err := cbor.Marshal(&webauthncose.EC2PublicKeyData{
 		PublicKeyData: webauthncose.PublicKeyData{
@@ -99,8 +135,8 @@ func U2FKeyToCBOR(pubKey *ecdsa.PublicKey) ([]byte, error) {
 			Algorithm: int64(webauthncose.AlgES256),
 		},
 		Curve:  curveP256CBOR,
-		XCoord: xBytes,
-		YCoord: yBytes,
+		XCoord: x,
+		YCoord: y,
 	})
 	return pubKeyCBOR, trace.Wrap(err)
 }

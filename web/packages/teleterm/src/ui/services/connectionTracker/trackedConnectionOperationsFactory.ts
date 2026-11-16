@@ -1,30 +1,39 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { LeafClusterUri, RootClusterUri, routing } from 'teleterm/ui/uri';
 import { ClustersService } from 'teleterm/ui/services/clusters';
-import { WorkspacesService } from 'teleterm/ui/services/workspacesService';
+import {
+  createDesktopSessionDocument,
+  DocumentGateway,
+  DocumentOrigin,
+  WorkspacesService,
+} from 'teleterm/ui/services/workspacesService';
+import { LeafClusterUri, RootClusterUri, routing } from 'teleterm/ui/uri';
 
 import {
+  getDesktopDocumentByConnection,
   getGatewayDocumentByConnection,
-  getKubeDocumentByConnection,
+  getGatewayKubeDocumentByConnection,
   getServerDocumentByConnection,
 } from './trackedConnectionUtils';
 import {
   TrackedConnection,
+  TrackedDesktopConnection,
   TrackedGatewayConnection,
   TrackedKubeConnection,
   TrackedServerConnection,
@@ -43,7 +52,9 @@ export class TrackedConnectionOperationsFactory {
       case 'connection.gateway':
         return this.getConnectionGatewayOperations(connection);
       case 'connection.kube':
-        return this.getConnectionKubeOperations(connection);
+        return this.getConnectionGatewayKubeOperations(connection);
+      case 'connection.desktop':
+        return this.getConnectionDesktopOperations(connection);
     }
   }
 
@@ -64,13 +75,16 @@ export class TrackedConnectionOperationsFactory {
     return {
       rootClusterUri,
       leafClusterUri,
-      activate: () => {
+      activate: params => {
         let srvDoc = documentsService
           .getDocuments()
           .find(getServerDocumentByConnection(connection));
 
         if (!srvDoc) {
-          srvDoc = documentsService.createTshNodeDocument(connection.serverUri);
+          srvDoc = documentsService.createTshNodeDocument(
+            connection.serverUri,
+            params
+          );
           srvDoc.status = 'connecting';
           srvDoc.login = connection.login;
           srvDoc.title = connection.title;
@@ -94,7 +108,7 @@ export class TrackedConnectionOperationsFactory {
   private getConnectionGatewayOperations(
     connection: TrackedGatewayConnection
   ): TrackedConnectionOperations {
-    const { rootClusterId, leafClusterId } = routing.parseDbUri(
+    const { rootClusterId, leafClusterId } = routing.parseClusterUri(
       connection.targetUri
     ).params;
     const { rootClusterUri, leafClusterUri } = this.getClusterUris({
@@ -108,43 +122,60 @@ export class TrackedConnectionOperationsFactory {
     return {
       rootClusterUri,
       leafClusterUri,
-      activate: () => {
+      activate: params => {
         let gwDoc = documentsService
           .getDocuments()
-          .find(getGatewayDocumentByConnection(connection));
+          .find(getGatewayDocumentByConnection(connection)) as DocumentGateway;
 
         if (!gwDoc) {
+          const gw = this._clustersService.findGatewayByConnectionParams({
+            targetUri: connection.targetUri,
+            targetUser: connection.targetUser,
+            targetSubresourceName: connection.targetSubresourceName,
+          });
+
           gwDoc = documentsService.createGatewayDocument({
             targetUri: connection.targetUri,
             targetName: connection.targetName,
             targetUser: connection.targetUser,
             targetSubresourceName: connection.targetSubresourceName,
             title: connection.title,
-            gatewayUri: connection.gatewayUri,
+            // If the doc was closed but the gateway is still running, it's important for the
+            // doc to reopen with the existing gateway URI. Otherwise the doc would attempt to
+            // create a new gateway with the same connection params.
+            gatewayUri: gw?.uri,
             port: connection.port,
+            origin: params.origin,
+            autoUserProvisioning: connection.autoUserProvisioning,
           });
 
           documentsService.add(gwDoc);
         }
         documentsService.open(gwDoc.uri);
       },
-      disconnect: () => {
-        return this._clustersService
-          .removeGateway(connection.gatewayUri)
-          .then(() => {
-            documentsService
-              .getDocuments()
-              .filter(getGatewayDocumentByConnection(connection))
-              .forEach(document => {
-                documentsService.close(document.uri);
-              });
-          });
+      disconnect: async () => {
+        // When disconnecting, assume that the gateway exists. If a gateway doesn't exist, the UI is
+        // supposed to expose the remove operation, not the disconnect operation.
+        const gw = this._clustersService.findGatewayByConnectionParams({
+          targetUri: connection.targetUri,
+          targetUser: connection.targetUser,
+          targetSubresourceName: connection.targetSubresourceName,
+        });
+
+        return this._clustersService.removeGateway(gw.uri).then(() => {
+          documentsService
+            .getDocuments()
+            .filter(getGatewayDocumentByConnection(connection))
+            .forEach(document => {
+              documentsService.close(document.uri);
+            });
+        });
       },
       remove: async () => {},
     };
   }
 
-  private getConnectionKubeOperations(
+  private getConnectionGatewayKubeOperations(
     connection: TrackedKubeConnection
   ): TrackedConnectionOperations {
     const { rootClusterId, leafClusterId } = routing.parseKubeUri(
@@ -161,34 +192,83 @@ export class TrackedConnectionOperationsFactory {
     return {
       rootClusterUri,
       leafClusterUri,
-      activate: () => {
-        let kubeConn = documentsService
+      activate: params => {
+        let gwDoc = documentsService
           .getDocuments()
-          .find(getKubeDocumentByConnection(connection));
+          .find(getGatewayKubeDocumentByConnection(connection));
 
-        if (!kubeConn) {
-          kubeConn = documentsService.createTshKubeDocument({
-            kubeUri: connection.kubeUri,
-            kubeConfigRelativePath: connection.kubeConfigRelativePath,
+        if (!gwDoc) {
+          gwDoc = documentsService.createGatewayKubeDocument({
+            targetUri: connection.kubeUri,
+            origin: params.origin,
           });
-
-          documentsService.add(kubeConn);
+          documentsService.add(gwDoc);
         }
-        documentsService.open(kubeConn.uri);
+        documentsService.open(gwDoc.uri);
+      },
+      disconnect: async () => {
+        return (
+          this._clustersService
+            // We have to use `removeKubeGateway` instead of `removeGateway`,
+            // because we need to support both the old kube connections
+            // (which don't have gatewayUri and an underlying gateway)
+            // and new ones (which do have a gateway).
+            .removeKubeGateway(connection.kubeUri)
+            .then(() => {
+              documentsService
+                .getDocuments()
+                .filter(getGatewayKubeDocumentByConnection(connection))
+                .forEach(document => {
+                  documentsService.close(document.uri);
+                });
+            })
+        );
+      },
+      remove: async () => {},
+    };
+  }
+
+  private getConnectionDesktopOperations(
+    connection: TrackedDesktopConnection
+  ): TrackedConnectionOperations {
+    const { rootClusterId, leafClusterId } = routing.parseClusterUri(
+      connection.desktopUri
+    ).params;
+    const { rootClusterUri, leafClusterUri } = this.getClusterUris({
+      rootClusterId,
+      leafClusterId,
+    });
+
+    const documentsService =
+      this._workspacesService.getWorkspaceDocumentService(rootClusterUri);
+
+    return {
+      rootClusterUri,
+      leafClusterUri,
+      activate: params => {
+        let doc = documentsService
+          .getDocuments()
+          .find(getDesktopDocumentByConnection(connection));
+
+        if (!doc) {
+          doc = createDesktopSessionDocument({
+            desktopUri: connection.desktopUri,
+            login: connection.login,
+            origin: params.origin,
+          });
+          documentsService.add(doc);
+        }
+        documentsService.open(doc.uri);
       },
       disconnect: async () => {
         documentsService
           .getDocuments()
-          .filter(getKubeDocumentByConnection(connection))
+          .filter(getDesktopDocumentByConnection(connection))
           .forEach(document => {
             documentsService.close(document.uri);
           });
       },
-      remove: () => {
-        return this._clustersService.removeKubeConfig(
-          connection.kubeConfigRelativePath
-        );
-      },
+      remove: async () => {},
     };
   }
 
@@ -215,7 +295,7 @@ interface TrackedConnectionOperations {
   rootClusterUri: RootClusterUri;
   leafClusterUri: LeafClusterUri;
 
-  activate(): void;
+  activate(params: { origin: DocumentOrigin }): void;
 
   disconnect(): Promise<void>;
 

@@ -1,0 +1,22 @@
+suite: Test deployment
+templates:
+  - configmap.yaml
+# Override chart version so snapshots are stable across releases.
+chart:
+  version: "99.0.0"
+  appVersion: "99.0.0"
+tests:
+  - it: should match the snapshot
+    set:
+      teleport:
+        address: teleport.example.com:1234
+      mattermost:
+        url: https://my.mattermost.com
+        token: test-mattermost-token
+        recipients:
+          - security@example.com
+      log:
+        output: /var/log/teleport-mattermost.log
+        severity: DEBUG
+    asserts:
+      - matchSnapshot: {}

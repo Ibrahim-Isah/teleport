@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package ui
 
@@ -25,7 +27,6 @@ import (
 	"github.com/gravitational/teleport/api/client/proto"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/services"
 )
 
 func TestNewUserContext(t *testing.T) {
@@ -35,94 +36,57 @@ func TestNewUserContext(t *testing.T) {
 		Metadata: types.Metadata{
 			Name: "root",
 		},
+		Status: types.UserStatusV2{
+			PasswordState: types.PasswordState_PASSWORD_STATE_SET,
+		},
 	}
 
 	// set some rules
 	role1 := &types.RoleV6{}
 	role1.SetNamespaces(types.Allow, []string{apidefaults.Namespace})
-	role1.SetRules(types.Allow, []types.Rule{
-		{
-			Resources: []string{types.KindAuthConnector},
-			Verbs:     services.RW(),
-		},
-		{
-			Resources: []string{types.KindWindowsDesktop},
-			Verbs:     services.RW(),
-		},
-	})
-
-	// not setting the rule, or explicitly denying, both denies access
-	role1.SetRules(types.Deny, []types.Rule{
-		{
-			Resources: []string{types.KindEvent},
-			Verbs:     services.RW(),
-		},
-	})
 
 	role2 := &types.RoleV6{}
 	role2.SetNamespaces(types.Allow, []string{apidefaults.Namespace})
-	role2.SetRules(types.Allow, []types.Rule{
-		{
-			Resources: []string{types.KindTrustedCluster},
-			Verbs:     services.RW(),
-		},
-		{
-			Resources: []string{types.KindBilling},
-			Verbs:     services.RO(),
-		},
-	})
 
 	roleSet := []types.Role{role1, role2}
-	userContext, err := NewUserContext(user, roleSet, proto.Features{}, true)
+	userContext, err := NewUserContext(user, roleSet, proto.Features{}, true, false)
 	require.NoError(t, err)
 
-	allowed := access{true, true, true, true, true}
-	denied := access{false, false, false, false, false}
-
-	// test user name and acl
-	require.Equal(t, userContext.Name, "root")
-	require.Empty(t, cmp.Diff(userContext.ACL.AuthConnectors, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.TrustedClusters, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.AppServers, denied))
-	require.Empty(t, cmp.Diff(userContext.ACL.DBServers, denied))
-	require.Empty(t, cmp.Diff(userContext.ACL.KubeServers, denied))
-	require.Empty(t, cmp.Diff(userContext.ACL.Events, denied))
-	require.Empty(t, cmp.Diff(userContext.ACL.RecordedSessions, denied))
-	require.Empty(t, cmp.Diff(userContext.ACL.Roles, denied))
-	require.Empty(t, cmp.Diff(userContext.ACL.Users, denied))
-	require.Empty(t, cmp.Diff(userContext.ACL.Tokens, denied))
-	require.Empty(t, cmp.Diff(userContext.ACL.Nodes, denied))
-	require.Empty(t, cmp.Diff(userContext.ACL.AccessRequests, denied))
-	require.Empty(t, cmp.Diff(userContext.ACL.ConnectionDiagnostic, denied))
-	require.Empty(t, cmp.Diff(userContext.ACL.Desktops, allowed))
+	// test user name
+	require.Equal(t, "root", userContext.Name)
 	require.Empty(t, cmp.Diff(userContext.AccessStrategy, accessStrategy{
 		Type:   types.RequestStrategyOptional,
 		Prompt: "",
 	}))
-
-	require.Empty(t, cmp.Diff(userContext.ACL.Billing, denied))
-	require.Equal(t, userContext.ACL.Clipboard, true)
-	require.Equal(t, userContext.ACL.DesktopSessionRecording, true)
-	require.Empty(t, cmp.Diff(userContext.ACL.License, denied))
-	require.Empty(t, cmp.Diff(userContext.ACL.Download, denied))
+	require.Equal(t, types.PasswordState_PASSWORD_STATE_SET, userContext.PasswordSate)
 
 	// test local auth type
-	require.Equal(t, userContext.AuthType, authLocal)
+	require.Equal(t, authLocal, userContext.AuthType)
 
 	// test sso auth type
 	user.Spec.GithubIdentities = []types.ExternalIdentity{{ConnectorID: "foo", Username: "bar"}}
-	userContext, err = NewUserContext(user, roleSet, proto.Features{}, true)
+	userContext, err = NewUserContext(user, roleSet, proto.Features{}, true, false)
 	require.NoError(t, err)
-	require.Equal(t, userContext.AuthType, authSSO)
+	require.Equal(t, authSSO, userContext.AuthType)
 
-	userContext, err = NewUserContext(user, roleSet, proto.Features{Cloud: true}, true)
+	// test sso auth type for users with the CreatedBy.Connector field set.
+	// Eg users import from okta do not have any <IdP>Identities, so the CreatedBy.Connector must be checked.
+	userCreatedExternally := &types.UserV2{
+		Metadata: types.Metadata{
+			Name: "root",
+		},
+		Status: types.UserStatusV2{
+			PasswordState: types.PasswordState_PASSWORD_STATE_SET,
+		},
+		Spec: types.UserSpecV2{
+			CreatedBy: types.CreatedBy{
+				Connector: &types.ConnectorRef{},
+			},
+		},
+	}
+	userContext, err = NewUserContext(userCreatedExternally, roleSet, proto.Features{}, true, false)
 	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(userContext.ACL.Billing, access{true, true, false, false, false}))
-
-	// test that desktopRecordingEnabled being false overrides the roleSet.RecordDesktopSession() returning true
-	userContext, err = NewUserContext(user, roleSet, proto.Features{}, false)
-	require.NoError(t, err)
-	require.Equal(t, userContext.ACL.DesktopSessionRecording, false)
+	require.Equal(t, authSSO, userContext.AuthType)
 }
 
 func TestNewUserContextCloud(t *testing.T) {
@@ -136,45 +100,40 @@ func TestNewUserContextCloud(t *testing.T) {
 
 	role := &types.RoleV6{}
 	role.SetNamespaces(types.Allow, []string{"*"})
-	role.SetRules(types.Allow, []types.Rule{
-		{
-			Resources: []string{"*"},
-			Verbs:     services.RW(),
-		},
-	})
-
-	role.SetWindowsLogins(types.Allow, []string{"a", "b"})
-	role.SetWindowsLogins(types.Deny, []string{"c"})
 
 	roleSet := []types.Role{role}
 
-	allowed := access{true, true, true, true, true}
-
-	userContext, err := NewUserContext(user, roleSet, proto.Features{Cloud: true}, true)
+	userContext, err := NewUserContext(user, roleSet, proto.Features{Cloud: true}, true, false)
 	require.NoError(t, err)
 
-	require.Equal(t, userContext.Name, "root")
-	require.Empty(t, cmp.Diff(userContext.ACL.AuthConnectors, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.TrustedClusters, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.AppServers, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.DBServers, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.KubeServers, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.Events, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.RecordedSessions, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.Roles, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.Users, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.Tokens, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.Nodes, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.AccessRequests, allowed))
+	require.Equal(t, "root", userContext.Name)
 	require.Empty(t, cmp.Diff(userContext.AccessStrategy, accessStrategy{
 		Type:   types.RequestStrategyOptional,
 		Prompt: "",
 	}))
+}
 
-	require.Equal(t, userContext.ACL.Clipboard, true)
-	require.Equal(t, userContext.ACL.DesktopSessionRecording, true)
+func TestNewUserContextDisplayValues(t *testing.T) {
+	t.Parallel()
 
-	// cloud-specific asserts
-	require.Empty(t, cmp.Diff(userContext.ACL.Billing, allowed))
-	require.Empty(t, cmp.Diff(userContext.ACL.Desktops, allowed))
+	t.Run("populated from traits", func(t *testing.T) {
+		t.Parallel()
+
+		user := &types.UserV2{
+			Metadata: types.Metadata{
+				Name: "alice",
+			},
+			Spec: types.UserSpecV2{
+				Traits: map[string][]string{
+					"displayName": {"Alice Anderson"},
+					"email":       {"alice@example.com"},
+				},
+			},
+		}
+
+		userContext, err := NewUserContext(user, nil, proto.Features{}, true, false)
+		require.NoError(t, err)
+		require.Equal(t, "Alice Anderson", userContext.DisplayPrimary)
+		require.Equal(t, "alice@example.com", userContext.DisplaySecondary)
+	})
 }

@@ -1,31 +1,29 @@
 /*
-Copyright 2018-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package teleport
 
 import (
-	"fmt"
 	"strings"
 	"time"
 
-	"github.com/coreos/go-semver/semver"
+	"github.com/gravitational/trace"
 )
-
-// WebAPIVersion is a current webapi version
-const WebAPIVersion = "v1"
 
 const (
 	// SSHAuthSock is the environment variable pointing to the
@@ -38,8 +36,8 @@ const (
 	// SSHTeleportUser is the current Teleport user that is logged in.
 	SSHTeleportUser = "SSH_TELEPORT_USER"
 
-	// SSHSessionWebproxyAddr is the address the web proxy.
-	SSHSessionWebproxyAddr = "SSH_SESSION_WEBPROXY_ADDR"
+	// SSHSessionWebProxyAddr is the address the web proxy.
+	SSHSessionWebProxyAddr = "SSH_SESSION_WEBPROXY_ADDR"
 
 	// SSHTeleportClusterName is the name of the cluster this node belongs to.
 	SSHTeleportClusterName = "SSH_TELEPORT_CLUSTER_NAME"
@@ -67,6 +65,12 @@ const (
 )
 
 const (
+	// ComponentKey is a field that represents a component - e.g. service or
+	// function
+	ComponentKey = "trace.component"
+	// ComponentFields is a fields component
+	ComponentFields = "trace.fields"
+
 	// ComponentMemory is a memory backend
 	ComponentMemory = "memory"
 
@@ -101,7 +105,7 @@ const (
 	// ComponentAuth is the cluster CA node (auth server API)
 	ComponentAuth = "auth"
 
-	// ComponentGRPC is grpc server
+	// ComponentGRPC is gRPC server
 	ComponentGRPC = "grpc"
 
 	// ComponentMigrate is responsible for data migrations
@@ -116,6 +120,9 @@ const (
 	// ComponentProxy is SSH proxy (SSH server forwarding connections)
 	ComponentProxy = "proxy"
 
+	// ComponentRelay is the component name for the relay service.
+	ComponentRelay = "relay"
+
 	// ComponentProxyPeer is the proxy peering component of the proxy service
 	ComponentProxyPeer = "proxy:peer"
 
@@ -124,6 +131,10 @@ const (
 
 	// ComponentDatabase is the database proxy service.
 	ComponentDatabase = "db:service"
+
+	// ComponentDatabaseHealth is the endpoint health checking component of the
+	// database proxy service.
+	ComponentDatabaseHealth = "db:health"
 
 	// ComponentDiscovery is the Discovery service.
 	ComponentDiscovery = "discovery:service"
@@ -136,6 +147,14 @@ const (
 
 	// ComponentDiagnostic is a diagnostic service
 	ComponentDiagnostic = "diag"
+
+	// ComponentDiagnosticHealth is the health monitor used by the diagnostic
+	// and debug services.
+	ComponentDiagnosticHealth = "diag:health"
+
+	// ComponentDebug is the debug service, which exposes debugging
+	// configuration over a Unix socket.
+	ComponentDebug = "debug"
 
 	// ComponentClient is a client
 	ComponentClient = "client"
@@ -151,9 +170,6 @@ const (
 
 	// ComponentSubsystemProxy is the proxy subsystem.
 	ComponentSubsystemProxy = "subsystem:proxy"
-
-	// ComponentSubsystemSFTP is the SFTP subsystem.
-	ComponentSubsystemSFTP = "subsystem:sftp"
 
 	// ComponentLocalTerm is a terminal on a regular SSH node.
 	ComponentLocalTerm = "term:local"
@@ -190,17 +206,21 @@ const (
 	// ComponentSession is an active session.
 	ComponentSession = "session"
 
+	// ComponentHostUsers represents host user management.
+	ComponentHostUsers = "hostusers"
+
 	// ComponentDynamoDB represents dynamodb clients
 	ComponentDynamoDB = "dynamodb"
-
-	// Component pluggable authentication module (PAM)
-	ComponentPAM = "pam"
 
 	// ComponentUpload is a session recording upload server
 	ComponentUpload = "upload"
 
 	// ComponentWeb is a web server
 	ComponentWeb = "web"
+
+	// ComponentUnifiedResource is a cache of resources meant to be listed and displayed
+	// together in the web UI
+	ComponentUnifiedResource = "unified_resource"
 
 	// ComponentWebsocket is websocket server that the web client connects to.
 	ComponentWebsocket = "websocket"
@@ -218,6 +238,9 @@ const (
 	// ComponentTSH is the "tsh" binary.
 	ComponentTSH = "tsh"
 
+	// ComponentTCTL is the "tctl" binary.
+	ComponentTCTL = "tctl"
+
 	// ComponentTBot is the "tbot" binary
 	ComponentTBot = "tbot"
 
@@ -230,9 +253,6 @@ const (
 
 	// ComponentBPF is the eBPF packagae.
 	ComponentBPF = "bpf"
-
-	// ComponentRestrictedSession is restriction of user access to kernel objects
-	ComponentRestrictedSession = "restrictedsess"
 
 	// ComponentCgroup is the cgroup package.
 	ComponentCgroup = "cgroups"
@@ -249,6 +269,9 @@ const (
 	// ComponentWindowsDesktop is a Windows desktop access server.
 	ComponentWindowsDesktop = "windows_desktop"
 
+	// ComponentLinuxDesktop is a Linux desktop access server.
+	ComponentLinuxDesktop = "linux_desktop"
+
 	// ComponentTracing is a tracing exporter
 	ComponentTracing = "tracing"
 
@@ -261,7 +284,34 @@ const (
 	// ComponentUsageReporting is the component responsible for reporting usage metrics.
 	ComponentUsageReporting = "usage-reporting"
 
-	// VerboseLogEnvVar forces all logs to be verbose (down to DEBUG level)
+	// ComponentAthena represents athena clients.
+	ComponentAthena = "athena"
+
+	// ComponentProxySecureGRPC represents a secure gRPC server running on Proxy (used for Kube).
+	ComponentProxySecureGRPC = "proxy:secure-grpc"
+
+	// ComponentUpdater represents the teleport-update binary.
+	ComponentUpdater = "updater"
+
+	// ComponentRolloutController represents the autoupdate_agent_rollout controller.
+	ComponentRolloutController = "rollout-controller"
+
+	// ComponentGit represents git proxy related services.
+	ComponentGit = "git"
+
+	// ComponentForwardingGit represents the SSH proxy that forwards Git commands.
+	ComponentForwardingGit = "git:forward"
+
+	// ComponentMCP represents the MCP server handler.
+	ComponentMCP = "mcp"
+
+	// ComponentLLM represents the LLM server handler.
+	ComponentLLM = "llm"
+
+	// ComponentRecordingEncryption represents recording encryption
+	ComponentRecordingEncryption = "recording-encryption"
+
+	// VerboseLogsEnvVar forces all logs to be verbose (down to DEBUG level)
 	VerboseLogsEnvVar = "TELEPORT_DEBUG"
 
 	// IterationsEnvVar sets tests iterations to run
@@ -284,7 +334,7 @@ const (
 	DataDirParameterName = "data_dir"
 
 	// KeepAliveReqType is a SSH request type to keep the connection alive. A client and
-	// a server keep pining each other with it.
+	// a server keep pinging each other with it.
 	KeepAliveReqType = "keepalive@openssh.com"
 
 	// ClusterDetailsReqType is the name of a global request which returns cluster details like
@@ -300,7 +350,7 @@ const (
 	// Text means text serialization format
 	Text = "text"
 
-	// PTY is a raw pty session capture format
+	// PTY is a raw PTY session capture format
 	PTY = "pty"
 
 	// Names is for formatting node names in plain text
@@ -311,11 +361,11 @@ const (
 
 	// DirMaskSharedGroup is the mask for a directory accessible
 	// by the owner and group
-	DirMaskSharedGroup = 0770
+	DirMaskSharedGroup = 0o770
 
 	// FileMaskOwnerOnly is the file mask that allows read write access
 	// to owers only
-	FileMaskOwnerOnly = 0600
+	FileMaskOwnerOnly = 0o600
 
 	// On means mode is on
 	On = "on"
@@ -326,8 +376,15 @@ const (
 	// GCSTestURI turns on GCS tests
 	GCSTestURI = "TEST_GCS_URI"
 
+	// AZBlobTestURI specifies the storage account URL to use for Azure Blob
+	// Storage tests.
+	AZBlobTestURI = "TEST_AZBLOB_URI"
+
 	// AWSRunTests turns on tests executed against AWS directly
 	AWSRunTests = "TEST_AWS"
+
+	// AWSRunDBTests turns on tests executed against AWS databases directly.
+	AWSRunDBTests = "TEST_AWS_DB"
 
 	// Region is AWS region parameter
 	Region = "region"
@@ -347,6 +404,13 @@ const (
 	// SSEKMSKey is an optional switch to use an KMS CMK key for S3 SSE.
 	SSEKMSKey = "sse_kms_key"
 
+	// S3UseVirtualStyleAddressing is an optional switch to use use a virtual-hosted–style URI.
+	S3UseVirtualStyleAddressing = "use_s3_virtual_style_addressing"
+
+	// S3CompleteInitiators is an optional allow list which configures the upload completer
+	// to only complete uploads from the specified set of initiators.
+	S3CompleteInitiators = "complete_initiators"
+
 	// SchemeFile configures local disk-based file storage for audit events
 	SchemeFile = "file"
 
@@ -359,23 +423,23 @@ const (
 	// SchemeGCS is used for Google Cloud Storage
 	SchemeGCS = "gs"
 
+	// SchemeAZBlob is the Azure Blob Storage scheme, used as the scheme in the
+	// session storage URI to identify a storage account accessed over https.
+	SchemeAZBlob = "azblob"
+
+	// SchemeAZBlobHTTP is the Azure Blob Storage scheme, used as the scheme in the
+	// session storage URI to identify a storage account accessed over http.
+	SchemeAZBlobHTTP = "azblob-http"
+
 	// LogsDir is a log subdirectory for events and logs
 	LogsDir = "log"
-
-	// Syslog is a mode for syslog logging
-	Syslog = "syslog"
-
-	// HumanDateFormat is a human readable date formatting
-	HumanDateFormat = "Jan _2 15:04 UTC"
-
-	// HumanDateFormatMilli is a human readable date formatting with milliseconds
-	HumanDateFormatMilli = "Jan _2 15:04:05.000 UTC"
 
 	// DebugLevel is a debug logging level name
 	DebugLevel = "debug"
 
-	// MinimumEtcdVersion is the minimum version of etcd supported by Teleport
-	MinimumEtcdVersion = "3.3.0"
+	// EnvVarAllowNoSecondFactor is used to allow disabling second factor auth
+	// todo(tross): DELETE WHEN ABLE TO
+	EnvVarAllowNoSecondFactor = "TELEPORT_ALLOW_NO_SECOND_FACTOR"
 )
 
 const (
@@ -404,6 +468,17 @@ const (
 )
 
 const (
+	// CertExtensionScopePin is used to pin a user certificate to a specific scope and
+	// set of scoped roles. This constrains a user's access to resources based on both
+	// the scoping rules and scoped roles defined.
+	CertExtensionScopePin = "scope-pin@goteleport.com"
+	// CertExtensionAgentScope is used to pin an agent/host certificate to a specific scope.
+	// This constrains other identities' access to the agent itself as well as the agent's
+	// access to other resources based on scoping rules.
+	CertExtensionAgentScope = "agent-scope@goteleport.com"
+	// CertExtensionAgentScopePin encodes an agent's scope pin, including the pinned scope and system roles.
+	// Supersedes CertExtensionAgentScope for scoped agents.
+	CertExtensionAgentScopePin = "agent-scope-pin@goteleport.com"
 	// CertExtensionPermitX11Forwarding allows X11 forwarding for certificate
 	CertExtensionPermitX11Forwarding = "permit-X11-forwarding"
 	// CertExtensionPermitAgentForwarding allows agent forwarding for certificate
@@ -449,6 +524,9 @@ const (
 	// CertExtensionAllowedResources lists the resources which this certificate
 	// should be allowed to access
 	CertExtensionAllowedResources = "teleport-allowed-resources"
+	// CertExtensionAllowedResourceAccessIDs lists the resources which this
+	// certificate should be allowed to access, paired with additional access information.
+	CertExtensionAllowedResourceAccessIDs = "teleport-allowed-resource-access-ids"
 	// CertExtensionConnectionDiagnosticID contains the ID of the ConnectionDiagnostic.
 	// The Node/Agent will append connection traces to this diagnostic instance.
 	CertExtensionConnectionDiagnosticID = "teleport-connection-diagnostic-id"
@@ -462,6 +540,43 @@ const (
 	// CertExtensionDeviceCredentialID is the identifier for the credential used
 	// by the device to authenticate itself.
 	CertExtensionDeviceCredentialID = "teleport-device-credential-id"
+	// CertExtensionBotName indicates the name of the Machine ID bot this
+	// certificate was issued to, if any.
+	CertExtensionBotName = "bot-name@goteleport.com"
+	// CertExtensionBotInstanceID indicates the unique identifier of this
+	// Machine ID bot instance, if any. This identifier is persisted through
+	// certificate renewals.
+	CertExtensionBotInstanceID = "bot-instance-id@goteleport.com"
+	// CertExtensionBotScope indicates the scope of the Machine ID bot this
+	// certificate was issued to, if any.
+	CertExtensionBotScope = "bot-scope@goteleport.com"
+	// CertExtensionJoinToken is the name of the join token used to join this
+	// bot, if any.
+	CertExtensionJoinToken = "join-token@goteleport.com"
+	// CertExtensionDelegationSessionID contains the identifier of the
+	// Delegation Session this certificate was created for.
+	CertExtensionDelegationSessionID = "delegation-session-id@goteleport.com"
+	// CertExtensionBeamID contains the identifier of the Beam this certificate
+	// was created for, derived from the delegation session's
+	// types.BeamIDLabel label.
+	CertExtensionBeamID = "beam-id@goteleport.com"
+
+	// CertCriticalOptionSourceAddress is a critical option that defines IP addresses (in CIDR notation)
+	// from which this certificate is accepted for authentication.
+	// See: https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.certkeys?annotate=HEAD.
+	CertCriticalOptionSourceAddress = "source-address"
+	// CertExtensionGitHubUserID indicates the GitHub user ID identified by the
+	// GitHub connector.
+	CertExtensionGitHubUserID = "github-id@goteleport.com"
+	// CertExtensionGitHubUsername indicates the GitHub username identified by
+	// the GitHub connector.
+	CertExtensionGitHubUsername = "github-login@goteleport.com"
+	// CertExtensionImmutableLabelHash is the hash used to verify immutable
+	// labels against a certificate.
+	CertExtensionImmutableLabelHash = "immutable-label-hash@goteleport.com"
+	// CertExtensionHeadlessAuthenticationID is the ID of the headless
+	// authentication resource this certificate was created for.
+	CertExtensionHeadlessAuthenticationID = "headless-authentication-id@goteleport.com"
 )
 
 // Note: when adding new providers to this list, consider updating the help message for --provider flag
@@ -481,20 +596,6 @@ const (
 	JumpCloud = "jumpcloud"
 )
 
-const (
-	// RemoteCommandSuccess is returned when a command has successfully executed.
-	RemoteCommandSuccess = 0
-	// RemoteCommandFailure is returned when a command has failed to execute and
-	// we don't have another status code for it.
-	RemoteCommandFailure = 255
-	// HomeDirNotFound is returned when a the "teleport checkhomedir" command cannot
-	// find the user's home directory.
-	HomeDirNotFound = 254
-)
-
-// MaxEnvironmentFileLines is the maximum number of lines in a environment file.
-const MaxEnvironmentFileLines = 1000
-
 // MaxResourceSize is the maximum size (in bytes) of a serialized resource.  This limit is
 // typically only enforced against resources that are likely to arbitrarily grow (e.g. PluginData).
 const MaxResourceSize = 1000000
@@ -508,6 +609,10 @@ const MaxHTTPRequestSize = 10 * 1024 * 1024
 // a received HTTP response.  This limit is meant to be used with utils.ReadAtMost
 // to prevent resource exhaustion attacks.
 const MaxHTTPResponseSize = 10 * 1024 * 1024
+
+// MaxUsernameLength is the maximum allowed length (characters) for usernames.
+// This limit prevents sending extremely long usernames that could clog up logs or exhaust resources.
+const MaxUsernameLength = 1000
 
 const (
 	// CertificateFormatOldSSH is used to make Teleport interoperate with older
@@ -531,9 +636,6 @@ const (
 	// membership information
 	TraitTeams = "github_teams"
 
-	// TraitJWT is the name of the trait containing JWT header for app access.
-	TraitJWT = "jwt"
-
 	// TraitInternalLoginsVariable is the variable used to store allowed
 	// logins for local accounts.
 	TraitInternalLoginsVariable = "{{internal.logins}}"
@@ -541,6 +643,10 @@ const (
 	// TraitInternalWindowsLoginsVariable is the variable used to store
 	// allowed Windows Desktop logins for local accounts.
 	TraitInternalWindowsLoginsVariable = "{{internal.windows_logins}}"
+
+	// TraitInternalLinuxDesktopLoginsVariable is the variable used to store
+	// allowed Linux Desktop logins for local accounts.
+	TraitInternalLinuxDesktopLoginsVariable = "{{internal.linux_desktop_logins}}"
 
 	// TraitInternalKubeGroupsVariable is the variable used to store allowed
 	// kubernetes groups for local accounts.
@@ -558,6 +664,10 @@ const (
 	// database users for local accounts.
 	TraitInternalDBUsersVariable = "{{internal.db_users}}"
 
+	// TraitInternalDBRolesVariable is the variable used to store allowed
+	// database roles for automatic database user provisioning.
+	TraitInternalDBRolesVariable = "{{internal.db_roles}}"
+
 	// TraitInternalAWSRoleARNs is the variable used to store allowed AWS
 	// role ARNs for local accounts.
 	TraitInternalAWSRoleARNs = "{{internal.aws_role_arns}}"
@@ -573,14 +683,18 @@ const (
 	// TraitInternalJWTVariable is the variable used to store JWT token for
 	// app sessions.
 	TraitInternalJWTVariable = "{{internal.jwt}}"
+
+	// TraitInternalGitHubOrgs is the variable used to store allowed GitHub
+	// organizations for GitHub integrations.
+	TraitInternalGitHubOrgs = "{{internal.github_orgs}}"
+
+	// TraitInternalMCPTools is the variable used to store allowed MCP tools for
+	// MCP servers.
+	TraitInternalMCPTools = "{{internal.mcp_tools}}"
 )
 
 // SCP is Secure Copy.
 const SCP = "scp"
-
-// AdminRoleName is the name of the default admin role for all local users if
-// another role is not explicitly assigned
-const AdminRoleName = "admin"
 
 const (
 	// PresetEditorRoleName is a name of a preset role that allows
@@ -594,19 +708,118 @@ const (
 	// PresetAuditorRoleName is a name of a preset role that allows
 	// reading cluster events and playing back session records.
 	PresetAuditorRoleName = "auditor"
+
+	// PresetReviewerRoleName is a name of a preset role that allows
+	// for reviewing access requests.
+	PresetReviewerRoleName = "reviewer"
+
+	// PresetRequesterRoleName is a name of a preset role that allows
+	// for requesting access to resources.
+	PresetRequesterRoleName = "requester"
+
+	// PresetGroupAccessRoleName is a name of a preset role that allows
+	// access to all user groups.
+	PresetGroupAccessRoleName = "group-access"
+
+	// PresetDeviceAdminRoleName is the name of the "device-admin" role.
+	// The role is used to administer trusted devices.
+	PresetDeviceAdminRoleName = "device-admin"
+
+	// PresetDeviceEnrollRoleName is the name of the "device-enroll" role.
+	// The role is used to grant device enrollment powers to users.
+	PresetDeviceEnrollRoleName = "device-enroll"
+
+	// PresetRequireTrustedDeviceRoleName is the name of the
+	// "require-trusted-device" role.
+	// The role is used as a basis for requiring trusted device access to
+	// resources.
+	PresetRequireTrustedDeviceRoleName = "require-trusted-device"
+
+	// PresetTerraformProviderRoleName is a name of a default role that allows the Terraform provider
+	// to configure all its supported Teleport resources.
+	PresetTerraformProviderRoleName = "terraform-provider"
+
+	// SystemAutomaticAccessApprovalRoleName names a preset role that may
+	// automatically approve any Role Access Request
+	SystemAutomaticAccessApprovalRoleName = "@teleport-access-approver"
+
+	// ConnectMyComputerRoleNamePrefix is the prefix used for roles prepared for individual users
+	// during the setup of Connect My Computer. The prefix is followed by the name of the cluster
+	// user. See teleterm.connectmycomputer.RoleSetup.
+	ConnectMyComputerRoleNamePrefix = "connect-my-computer-"
+
+	// SystemOktaRequesterRoleName is a name of a system role that allows
+	// for requesting access to Okta resources. This differs from the requester role
+	// in that it allows for requesting longer lived access.
+	SystemOktaRequesterRoleName = "okta-requester"
+
+	// SystemOktaAccessRoleName is the name of the system role that allows
+	// access to Okta resources. This will be used by the Okta requester role to
+	// search for Okta resources.
+	SystemOktaAccessRoleName = "okta-access"
+
+	// SystemIdentityCenterAccessRoleName specifies the name of a system role
+	// that grants a user access to AWS Identity Center resources via
+	// Access Requests.
+	SystemIdentityCenterAccessRoleName = "aws-ic-access"
+
+	// SystemBeamRoleName specifies the name of a system role that grants the
+	// beam bot permission to issue itself credentials.
+	SystemBeamRoleName = "beam"
+
+	// PresetWildcardWorkloadIdentityIssuerRoleName is a name of a preset role
+	// that includes the permissions necessary to issue workload identity
+	// credentials using any workload_identity resource. This exists to simplify
+	// Day 0 UX experience with workload identity.
+	PresetWildcardWorkloadIdentityIssuerRoleName = "wildcard-workload-identity-issuer"
+
+	// PresetAccessPluginRoleName is a name of a preset role that includes
+	// permissions required by self-hosted access request plugin.
+	PresetAccessPluginRoleName = "access-plugin"
+
+	// PresetAccessPluginWithReviewRoleName names the preset role that includes
+	// permissions required by self-hosted access request plugins that permit native reviews.
+	PresetAccessPluginWithReviewRoleName = "access-plugin-with-review"
+
+	// PresetListAccessRequestResourcesRoleName is a name of a preset role that
+	// includes permissions to read access request resources.
+	PresetListAccessRequestResourcesRoleName = "list-access-request-resources"
+
+	// PresetMCPUserRoleName is a name of a preset role that allows
+	// accessing MCP servers.
+	PresetMCPUserRoleName = "mcp-user"
+
+	// PresetBeamUserRoleName is a name of a preset role that allows users to use
+	// the Beams feature.
+	PresetBeamUserRoleName = "beam-user"
+
+	// PresetBeamAdminRoleName is a name of a preset role that allows users to
+	// administer beams belonging to other users.
+	PresetBeamAdminRoleName = "beam-admin"
 )
 
 var PresetRoles = []string{PresetEditorRoleName, PresetAccessRoleName, PresetAuditorRoleName}
 
-// MinClientVersion is the minimum client version required by the server.
-var MinClientVersion string
+const (
+	// VirtualDefaultHealthCheckConfigDBName is the name of a virtual
+	// health_check_config that enables health checks for all database
+	// resources. For historical reasons, it's value is "default" even
+	// though it applies to databases only.
+	VirtualDefaultHealthCheckConfigDBName = "default"
+	// VirtualDefaultHealthCheckConfigKubeName is the name of a virtual
+	// health_check_config that enables health checks for all Kubernetes
+	// resources.
+	VirtualDefaultHealthCheckConfigKubeName = "default-kube"
+	// VirtualDefaultHealthCheckConfigCount is the number of virtual
+	// health_check_config resources.
+	VirtualDefaultHealthCheckConfigCount = 2
+)
 
-func init() {
-	// Per https://github.com/gravitational/teleport/blob/master/rfd/0012-teleport-versioning.md,
-	// only one major version backwards is supported for clients.
-	ver := semver.New(Version)
-	MinClientVersion = fmt.Sprintf("%d.0.0", ver.Major-1)
-}
+const (
+	// SystemAccessApproverUserName names a Teleport user that acts as
+	// an Access Request approver for access plugins
+	SystemAccessApproverUserName = "@teleport-access-approval-bot"
+)
 
 const (
 	// RemoteClusterStatusOffline indicates that cluster is considered as
@@ -619,10 +832,10 @@ const (
 
 const (
 	// SharedDirMode is a mode for a directory shared with group
-	SharedDirMode = 0750
+	SharedDirMode = 0o750
 
 	// PrivateDirMode is a mode for private directories
-	PrivateDirMode = 0700
+	PrivateDirMode = 0o700
 )
 
 const (
@@ -634,11 +847,40 @@ const (
 	// version they are running.
 	VersionRequest = "x-teleport-version"
 
+	// CurrentSessionIDRequest is sent by servers to inform clients of
+	// the session ID that is being used.
+	CurrentSessionIDRequest = "current-session-id@goteleport.com"
+
+	// SessionIDQueryRequest is sent by clients to ask servers if they
+	// will generate and share their own session ID when a new session
+	// is started (session and exec/shell channels accepted).
+	//
+	// TODO(Joerger): DELETE IN v20.0.0
+	// All v17+ servers set the session ID. v19+ clients stop checking.
+	SessionIDQueryRequest = "session-id-query@goteleport.com"
+
+	// SessionIDQueryRequestV2 is sent by clients to ask servers if they
+	// will generate and share their own session ID when a new session
+	// channel is accepted, rather than when the shell/exec channel is.
+	//
+	// TODO(Joerger): DELETE IN v21.0.0
+	// all v19+ servers set the session ID directly after accepting the session channel.
+	// clients should stop checking in v21, and servers should stop responding to the query in v22.
+	SessionIDQueryRequestV2 = "session-id-query-v2@goteleport.com"
+
 	// ForceTerminateRequest is an SSH request to forcefully terminate a session.
 	ForceTerminateRequest = "x-teleport-force-terminate"
 
 	// TerminalSizeRequest is a request for the terminal size of the session.
 	TerminalSizeRequest = "x-teleport-terminal-size"
+
+	// TCPIPForwardRequest is an SSH request for the server to open a listener
+	// for port forwarding.
+	TCPIPForwardRequest = "tcpip-forward"
+
+	// CancelTCPIPForwardRequest is an SSHRequest to cancel a previous
+	// TCPIPForwardRequest.
+	CancelTCPIPForwardRequest = "cancel-tcpip-forward"
 
 	// MFAPresenceRequest is an SSH request to notify clients that MFA presence is required for a session.
 	MFAPresenceRequest = "x-teleport-mfa-presence"
@@ -649,8 +891,8 @@ const (
 	// EnvSSHSessionReason is a reason attached to started sessions meant to describe their intent.
 	EnvSSHSessionReason = "TELEPORT_SESSION_REASON"
 
-	// EnvSSHSessionInvited is an environment variable listning people invited to a session.
-	EnvSSHSessionInvited = "TELEPORT_SESSION_JOIN_MODE"
+	// EnvSSHSessionInvited is an environment variable listing people invited to a session.
+	EnvSSHSessionInvited = "TELEPORT_SESSION_INVITED_USERS"
 
 	// EnvSSHSessionDisplayParticipantRequirements is set to true or false to indicate if participant
 	// requirement information should be printed.
@@ -694,11 +936,25 @@ const (
 	// UsageWindowsDesktopOnly specifies certificate usage metadata that limits
 	// certificate to be only used for Windows desktop access
 	UsageWindowsDesktopOnly = "usage:windows_desktop"
+
+	// UsageLinuxDesktopOnly specifies certificate usage metadata that limits
+	// certificate to be only used for Linux desktop access
+	UsageLinuxDesktopOnly = "usage:linux_desktop"
+
+	// UsageAccessGraphAPIOnly specifies certificate usage metadata that limits
+	// certificate to be only used for Access Graph API access.
+	UsageAccessGraphAPIOnly = "usage:access_graph_api"
 )
+
+// ErrNodeIsAmbiguous serves as an identifying error string indicating that
+// the proxy subsystem found multiple nodes matching the specified hostname.
+var ErrNodeIsAmbiguous = &trace.NotFoundError{Message: "ambiguous host could match multiple nodes"}
 
 const (
 	// NodeIsAmbiguous serves as an identifying error string indicating that
 	// the proxy subsystem found multiple nodes matching the specified hostname.
+	// TODO(tross) DELETE IN v20.0.0
+	// Deprecated: Prefer using ErrNodeIsAmbiguous
 	NodeIsAmbiguous = "err-node-is-ambiguous"
 
 	// MaxLeases serves as an identifying error string indicating that the
@@ -723,45 +979,30 @@ const (
 )
 
 const (
-	// ExecSubCommand is the sub-command Teleport uses to re-exec itself for
-	// command execution (exec and shells).
-	ExecSubCommand = "exec"
-
-	// ForwardSubCommand is the sub-command Teleport uses to re-exec itself
-	// for port forwarding.
-	ForwardSubCommand = "forward"
-
-	// CheckHomeDirSubCommand is the sub-command Teleport uses to re-exec itself
-	// to check if the user's home directory exists.
-	CheckHomeDirSubCommand = "checkhomedir"
-
-	// ParkSubCommand is the sub-command Teleport uses to re-exec itself as a
-	// specific UID to prevent the matching user from being deleted before
-	// spawning the intended child process.
-	ParkSubCommand = "park"
-
-	// SFTPSubCommand is the sub-command Teleport uses to re-exec itself to
-	// handle SFTP connections.
-	SFTPSubCommand = "sftp"
-
 	// WaitSubCommand is the sub-command Teleport uses to wait
 	// until a domain name stops resolving. Its main use is to ensure no
 	// auth instances are still running the previous major version.
 	WaitSubCommand = "wait"
+
+	// VnetAdminSetupSubCommand is the sub-command tsh vnet uses to perform
+	// a setup as a privileged user.
+	VnetAdminSetupSubCommand = "vnet-admin-setup"
 )
 
 const (
-	// ChanDirectTCPIP is a SSH channel of type "direct-tcpip".
+	// ChanDirectTCPIP is an SSH channel of type "direct-tcpip".
 	ChanDirectTCPIP = "direct-tcpip"
 
-	// ChanSession is a SSH channel of type "session".
+	// ChanForwardedTCPIP is an SSH channel of type "forwarded-tcpip".
+	ChanForwardedTCPIP = "forwarded-tcpip"
+
+	// ChanSession is an SSH channel of type "session".
 	ChanSession = "session"
 )
 
 const (
-	// GetHomeDirSubsystem is an SSH subsystem request that Teleport
-	// uses to get the home directory of a remote user.
-	GetHomeDirSubsystem = "gethomedir"
+	// SFTPSubsystem is the SFTP SSH subsystem.
+	SFTPSubsystem = "sftp"
 )
 
 // A principal name for use in SSH certificates.
@@ -786,11 +1027,15 @@ const (
 	// internal application being proxied.
 	AppJWTHeader = "teleport-jwt-assertion"
 
-	// AppCFHeader is a compatibility header.
-	AppCFHeader = "cf-access-token"
-
 	// HostHeader is the name of the Host header.
 	HostHeader = "Host"
+
+	// XTeleportUsernameHeader is the name of the X-Teleport-Username header
+	// used to pass the username to the Access Graph service.
+	// This header is used to identify the user that is making the request
+	// so that the Access Graph service can store information about the
+	// user's preferences.
+	XTeleportUsernameHeader = "X-Teleport-Username"
 )
 
 // UserSingleUseCertTTL is a TTL for per-connection user certificates.
@@ -801,13 +1046,47 @@ const UserSingleUseCertTTL = time.Minute
 const StandardHTTPSPort = 443
 
 const (
-	// WebAPIConnUpgrade is the HTTP web API to make the connection upgrade
-	// call.
-	WebAPIConnUpgrade = "/webapi/connectionupgrade"
-	// WebAPIConnUpgradeHeader is the header used to indicate the requested
-	// connection upgrade types in the connection upgrade API.
-	WebAPIConnUpgradeHeader = "Upgrade"
-	// WebAPIConnUpgradeTypeALPN is a connection upgrade type that specifies
-	// the upgraded connection should be handled by the ALPN handler.
-	WebAPIConnUpgradeTypeALPN = "alpn"
+	// KubeSessionDisplayParticipantRequirementsQueryParam is the query parameter used to
+	// indicate that the client wants to display the participant requirements
+	// for the given session.
+	KubeSessionDisplayParticipantRequirementsQueryParam = "displayParticipantRequirements"
+	// KubeSessionReasonQueryParam is the query parameter used to indicate the reason
+	// for the session request.
+	KubeSessionReasonQueryParam = "reason"
+	// KubeSessionInvitedQueryParam is the query parameter used to indicate the users
+	// to invite to the session.
+	KubeSessionInvitedQueryParam = "invite"
+)
+
+const (
+	// KubeLegacyProxySuffix is the suffix used for legacy proxy services when
+	// generating their names Server names.
+	KubeLegacyProxySuffix = "-proxy_service"
+)
+
+const (
+	// DebugServiceSocketName represents the Unix domain socket name of the
+	// debug service.
+	DebugServiceSocketName = "debug.sock"
+)
+
+const (
+	// OktaAccessRoleContext is the context used to name Okta Access role created by Okta access list sync
+	OktaAccessRoleContext = "access-okta-acl-role"
+	// OktaReviewerRoleContext  is the context used to name Okta Reviewer role created by Okta Access List sync
+	OktaReviewerRoleContext = "reviewer-okta-acl-role"
+)
+
+const (
+	// EnvVarUnstableDisableSAMLRedirectDowngradeCheck allows disabling saml_connector
+	// entity_descriptor_url check preventing following redirects via HTTP originating from
+	// HTTPS route.
+	EnvVarUnstableDisableSAMLRedirectDowngradeCheck = "TELEPORT_UNSTABLE_DISABLE_SAML_REDIRECT_DOWNGRADE_CHECK"
+
+	// EnvVarUnstableForceInBandMFA is the environment variable that, when set to "yes", disables the legacy out-of-band
+	// MFA flow and forces all connections to use in-band MFA. When unset or empty, both flows are supported during the
+	// transition period.
+	//
+	// TODO(cthach): Remove in v20.0 when the legacy out-of-band MFA flow is removed and in-band MFA is the default.
+	EnvVarUnstableForceInBandMFA = "TELEPORT_UNSTABLE_FORCE_IN_BAND_MFA"
 )

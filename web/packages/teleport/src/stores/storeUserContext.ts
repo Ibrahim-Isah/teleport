@@ -1,18 +1,24 @@
-/*
-Copyright 2019 Gravitational, Inc.
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-    http://www.apache.org/licenses/LICENSE-2.0
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 import { Store } from 'shared/libs/stores';
 
+import cfg from 'teleport/config';
 import { UserContext } from 'teleport/services/user';
 
 export default class StoreUserContext extends Store<UserContext> {
@@ -26,8 +32,20 @@ export default class StoreUserContext extends Store<UserContext> {
     return this.state?.username;
   }
 
+  getPasswordState() {
+    return this.state.passwordState;
+  }
+
   getClusterId() {
     return this.state.cluster.clusterId;
+  }
+
+  getClusterAuthVersion() {
+    return this.state.cluster.authVersion;
+  }
+
+  getClusterPublicUrl() {
+    return this.state.cluster.publicURL;
   }
 
   getEventAccess() {
@@ -86,6 +104,10 @@ export default class StoreUserContext extends Store<UserContext> {
     return this.state.acl.billing;
   }
 
+  getLockAccess() {
+    return this.state.acl.lock;
+  }
+
   getDatabaseServerAccess() {
     return this.state.acl.dbServers;
   }
@@ -110,6 +132,10 @@ export default class StoreUserContext extends Store<UserContext> {
     return this.state.acl.clipboardSharingEnabled;
   }
 
+  getReviewRequests() {
+    return this.state.acl.reviewRequests;
+  }
+
   getNodeAccess() {
     return this.state.acl.nodes;
   }
@@ -130,6 +156,26 @@ export default class StoreUserContext extends Store<UserContext> {
     return this.state.acl.accessRequests;
   }
 
+  getAccessMonitoringRuleAccess() {
+    return this.state.acl.accessMonitoringRule;
+  }
+
+  getAccessGraphAccess() {
+    return this.state.acl.accessGraph;
+  }
+
+  getSamlIdPServiceProviderAccess() {
+    return this.state.acl.samlIdpServiceProvider;
+  }
+
+  hasFileTransferAccess() {
+    return this.state.acl.fileTransferAccess;
+  }
+
+  isWebTerminalCopyBlocked() {
+    return this.state.acl.webTerminalClipboardMode === 'no-copy';
+  }
+
   // hasPrereqAccessToAddAgents checks if user meets the prerequisite
   // access to add an agent:
   //  - user should be able to create provisioning tokens
@@ -142,8 +188,20 @@ export default class StoreUserContext extends Store<UserContext> {
   // has access to download either teleport binaries or the license.
   // Since the page is used to download both of them, having access to one
   // is enough to show access this page.
+  // This page is only available for `dashboards` and cloud customers.
   hasDownloadCenterListAccess() {
-    return this.state.acl.license.read || this.state.acl.download.list;
+    return (
+      cfg.isCloud ||
+      (cfg.isDashboard &&
+        (this.state.acl.license.read || this.state.acl.download.list))
+    );
+  }
+
+  // hasSupportPageLinkAccess checks if the user
+  // has access to a Support external link in the side menu.
+  // This should only be displayed on `dashboards`.
+  hasSupportPageLinkAccess() {
+    return cfg.isDashboard;
   }
 
   // hasAccessToAgentQuery checks for at least one valid query permission.
@@ -163,6 +221,117 @@ export default class StoreUserContext extends Store<UserContext> {
   }
 
   hasDiscoverAccess() {
-    return this.hasPrereqAccessToAddAgents() || this.hasAccessToQueryAgent();
+    return (
+      this.hasPrereqAccessToAddAgents() ||
+      (this.hasAccessToQueryAgent() && !cfg.hideInaccessibleFeatures)
+    );
+  }
+
+  getDiscoveryConfigAccess() {
+    return this.state.acl.discoverConfigs;
+  }
+
+  getPluginsAccess() {
+    return this.state.acl.plugins;
+  }
+
+  getDeviceTrustAccess() {
+    return this.state.acl.deviceTrust;
+  }
+
+  getIntegrationsAccess() {
+    return this.state.acl.integrations;
+  }
+
+  getAllowedSearchAsRoles() {
+    return this.state.allowedSearchAsRoles;
+  }
+
+  getAccessListAccess() {
+    return this.state.acl.accessList;
+  }
+
+  getAuditQueryAccess() {
+    return this.state.acl.auditQuery;
+  }
+
+  getSecurityReportAccess() {
+    return this.state.acl.securityReport;
+  }
+
+  getExternalAuditStorageAccess() {
+    return this.state.acl.externalAuditStorage;
+  }
+
+  getBotsAccess() {
+    return this.state.acl.bots;
+  }
+
+  getBotInstancesAccess() {
+    return this.state.acl.botInstances;
+  }
+
+  getInstancesAccess() {
+    return this.state.acl.instances;
+  }
+
+  getContactsAccess() {
+    return this.state.acl.contacts;
+  }
+
+  getGitServersAccess() {
+    return this.state.acl.gitServers;
+  }
+
+  getWorkloadIdentityAccess() {
+    return this.state.acl.workloadIdentity;
+  }
+
+  geClientIpRestrictionAccess() {
+    return this.state.acl.clientIpRestriction;
+  }
+
+  getAutoUpdateConfigAccess() {
+    return this.state.acl.autoUpdateConfig;
+  }
+
+  getAutoUpdateVersionAccess() {
+    return this.state.acl.autoUpdateVersion;
+  }
+
+  getAutoUpdateAgentRolloutAccess() {
+    return this.state.acl.autoUpdateAgentRollout;
+  }
+
+  getAutoUpdateAgentReportAccess() {
+    return this.state.acl.autoUpdateAgentReport;
+  }
+
+  getInferencePolicyAccess() {
+    return this.state.acl.inferencePolicy;
+  }
+
+  getInferenceModelAccess() {
+    return this.state.acl.inferenceModel;
+  }
+
+  getInferenceSecretAccess() {
+    return this.state.acl.inferenceSecret;
+  }
+
+  getBeamAccess() {
+    return this.state.acl.beam;
+  }
+
+  getMobileDeviceAccess() {
+    return this.state.acl.mobileDevice;
+  }
+
+  getAvailableScopes() {
+    return this.state.availableScopes;
+  }
+
+  getScope() {
+    return this.state?.scope ?? '';
   }
 }

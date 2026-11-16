@@ -1,214 +1,265 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import { Meta } from '@storybook/react-vite';
+import { ComponentProps } from 'react';
 
 import {
   makeEmptyAttempt,
-  makeProcessingAttempt,
   makeErrorAttempt,
+  makeProcessingAttempt,
 } from 'shared/hooks/useAsync';
 
-import { Gateway } from 'teleterm/services/tshd/types';
+import { makeDatabaseGateway } from 'teleterm/services/tshd/testHelpers';
 
-import { DocumentGateway } from './DocumentGateway';
+import { OfflineGateway } from '../components/OfflineGateway';
+import {
+  formSchema,
+  makeRenderFormControlsFromDefaultPort,
+} from './DocumentGateway';
+import { OnlineDocumentGateway } from './OnlineDocumentGateway';
 
-export default {
+type StoryProps = {
+  online: boolean;
+  // Online props.
+  longValues: boolean;
+  dbNameAttempt: 'not-started' | 'processing' | 'error';
+  portAttempt: 'not-started' | 'processing' | 'error';
+  disconnectAttempt: 'not-started' | 'error';
+  autoUsersEnabled: boolean;
+  databaseRoles: string[];
+  // Offline props.
+  connectAttempt: 'not-started' | 'processing' | 'error';
+};
+
+const meta: Meta<StoryProps> = {
   title: 'Teleterm/DocumentGateway',
+  component: Story,
+  argTypes: {
+    // Online props.
+    longValues: { if: { arg: 'online' } },
+    dbNameAttempt: {
+      if: { arg: 'online' },
+      control: { type: 'radio' },
+      options: ['not-started', 'processing', 'error'],
+    },
+    portAttempt: {
+      if: { arg: 'online' },
+      control: { type: 'radio' },
+      options: ['not-started', 'processing', 'error'],
+    },
+    disconnectAttempt: {
+      if: { arg: 'online' },
+      control: { type: 'radio' },
+      options: ['not-started', 'error'],
+    },
+    autoUsersEnabled: {
+      if: { arg: 'online' },
+      control: { type: 'boolean' },
+    },
+    databaseRoles: {
+      if: { arg: 'online' },
+      control: { type: 'object' },
+    },
+    // Offline props.
+    connectAttempt: {
+      if: { arg: 'online', truthy: false },
+      control: { type: 'radio' },
+      options: ['not-started', 'processing', 'error'],
+    },
+  },
+  args: {
+    online: true,
+    // Online props.
+    longValues: false,
+    dbNameAttempt: 'not-started',
+    portAttempt: 'not-started',
+    disconnectAttempt: 'not-started',
+    autoUsersEnabled: false,
+    databaseRoles: [],
+    // Offline props.
+    connectAttempt: 'not-started',
+  },
 };
+export default meta;
 
-const gateway: Gateway = {
-  uri: '/gateways/bar',
-  targetName: 'sales-production',
-  targetUri: '/clusters/bar/dbs/foo',
-  targetUser: 'alice',
-  localAddress: 'localhost',
-  localPort: '1337',
-  protocol: 'postgres',
-  cliCommand: 'connect-me-to-db-please',
-  targetSubresourceName: 'bar',
-};
-
-export function Online() {
-  return (
-    <DocumentGateway
-      gateway={gateway}
-      defaultPort={gateway.localPort}
-      disconnect={() => Promise.resolve([undefined, null])}
-      connected={true}
-      reconnect={() => {}}
-      connectAttempt={{ status: 'success', data: undefined, statusText: null }}
-      runCliCommand={() => {}}
-      changeDbName={() => Promise.resolve([undefined, null])}
-      changeDbNameAttempt={makeEmptyAttempt()}
-      changePort={() => Promise.resolve([undefined, null])}
-      changePortAttempt={makeEmptyAttempt()}
-    />
-  );
-}
-
-export function OnlineWithLongValues() {
-  const gateway: Gateway = {
+export function Story(props: StoryProps) {
+  let gateway = makeDatabaseGateway({
     uri: '/gateways/bar',
     targetName: 'sales-production',
     targetUri: '/clusters/bar/dbs/foo',
-    targetUser:
-      'quux-quuz-foo-bar-quux-quuz-foo-bar-quux-quuz-foo-bar-quux-quuz-foo-bar',
+    targetUser: 'alice',
     localAddress: 'localhost',
-    localPort: '13337',
+    localPort: '1337',
     protocol: 'postgres',
-    cliCommand:
-      'connect-me-to-db-please-baz-quux-quuz-foo-baz-quux-quuz-foo-baz-quux-quuz-foo',
-    targetSubresourceName:
-      'foo-bar-baz-quux-quuz-foo-bar-baz-quux-quuz-foo-bar-baz-quux-quuz',
+    targetSubresourceName: 'bar',
+  });
+  gateway.gatewayCliCommand.preview = 'connect-me-to-db-please';
+
+  if (!props.online) {
+    const offlineGatewayProps: ComponentProps<typeof OfflineGateway> = {
+      connectAttempt: makeEmptyAttempt(),
+      reconnect: () => {},
+      targetName: gateway.targetName,
+      gatewayKind: 'database',
+      formSchema,
+      renderFormControls: makeRenderFormControlsFromDefaultPort('1337'),
+    };
+
+    if (props.connectAttempt === 'error') {
+      offlineGatewayProps.connectAttempt = makeErrorAttempt(
+        new Error('listen tcp 127.0.0.1:62414: bind: address already in use')
+      );
+    }
+
+    if (props.connectAttempt === 'processing') {
+      offlineGatewayProps.connectAttempt = makeProcessingAttempt();
+    }
+
+    return (
+      <OfflineGateway
+        // Completely re-mount all components on props change.
+        key={JSON.stringify(props)}
+        {...offlineGatewayProps}
+      />
+    );
+  }
+
+  if (props.longValues) {
+    gateway = makeDatabaseGateway({
+      uri: '/gateways/bar',
+      targetName: 'sales-production',
+      targetUri: '/clusters/bar/dbs/foo',
+      targetUser:
+        'quux-quuz-foo-bar-quux-quuz-foo-bar-quux-quuz-foo-bar-quux-quuz-foo-bar',
+      localAddress: 'localhost',
+      localPort: '13337',
+      protocol: 'postgres',
+      targetSubresourceName:
+        'foo-bar-baz-quux-quuz-foo-bar-baz-quux-quuz-foo-bar-baz-quux-quuz',
+    });
+    gateway.gatewayCliCommand.preview =
+      'connect-me-to-db-please-baz-quux-quuz-foo-baz-quux-quuz-foo-baz-quux-quuz-foo';
+  }
+
+  const onlineDocumentGatewayProps: ComponentProps<
+    typeof OnlineDocumentGateway
+  > = {
+    gateway: gateway,
+    disconnect: async () => [undefined, null],
+    runCliCommand: () => {},
+    changeDbName: async () => [undefined, null],
+    changeDbNameAttempt: makeEmptyAttempt(),
+    changePort: async () => [undefined, null],
+    changePortAttempt: makeEmptyAttempt(),
+    disconnectAttempt: makeEmptyAttempt(),
+    autoUserProvisioning: props.autoUsersEnabled
+      ? { databaseRoles: props.databaseRoles }
+      : undefined,
   };
 
+  if (props.dbNameAttempt === 'error') {
+    onlineDocumentGatewayProps.changeDbNameAttempt = makeErrorAttempt(
+      new Error('Something went wrong with setting database name.')
+    );
+  }
+  if (props.dbNameAttempt === 'processing') {
+    onlineDocumentGatewayProps.changeDbNameAttempt = makeProcessingAttempt();
+  }
+
+  if (props.portAttempt === 'error') {
+    onlineDocumentGatewayProps.changePortAttempt = makeErrorAttempt(
+      new Error('Something went wrong with setting port.')
+    );
+  }
+  if (props.portAttempt === 'processing') {
+    onlineDocumentGatewayProps.changePortAttempt = makeProcessingAttempt();
+  }
+
+  if (props.disconnectAttempt === 'error') {
+    onlineDocumentGatewayProps.disconnectAttempt = makeErrorAttempt(
+      new Error('Something went wrong with closing connection.')
+    );
+  }
+
   return (
-    <DocumentGateway
-      gateway={gateway}
-      defaultPort={gateway.localPort}
-      disconnect={() => Promise.resolve([undefined, null])}
-      connected={true}
-      reconnect={() => {}}
-      connectAttempt={{ status: 'success', data: undefined, statusText: null }}
-      runCliCommand={() => {}}
-      changeDbName={() => Promise.resolve([undefined, null])}
-      changeDbNameAttempt={makeEmptyAttempt()}
-      changePort={() => Promise.resolve([undefined, null])}
-      changePortAttempt={makeEmptyAttempt()}
+    <OnlineDocumentGateway
+      // Completely re-mount all components on props change. This impacts the default values of
+      // inputs.
+      key={JSON.stringify(props)}
+      {...onlineDocumentGatewayProps}
     />
   );
 }
 
-export function OnlineWithFailedDbNameAttempt() {
-  return (
-    <DocumentGateway
-      gateway={gateway}
-      defaultPort={gateway.localPort}
-      disconnect={() => Promise.resolve([undefined, null])}
-      connected={true}
-      reconnect={() => {}}
-      connectAttempt={{ status: 'success', data: undefined, statusText: null }}
-      runCliCommand={() => {}}
-      changeDbName={() => Promise.resolve([undefined, null])}
-      changeDbNameAttempt={makeErrorAttempt<void>(
-        'Something went wrong with setting database name.'
-      )}
-      changePort={() => Promise.resolve([undefined, null])}
-      changePortAttempt={makeEmptyAttempt()}
-    />
-  );
-}
+export const WithAutoUsersEnabled = {
+  args: {
+    online: true,
+    autoUsersEnabled: true,
+    databaseRoles: ['reader', 'writer'],
+  },
+};
 
-export function OnlineWithFailedPortAttempt() {
-  return (
-    <DocumentGateway
-      gateway={gateway}
-      defaultPort={gateway.localPort}
-      disconnect={() => Promise.resolve([undefined, null])}
-      connected={true}
-      reconnect={() => {}}
-      connectAttempt={{ status: 'success', data: undefined, statusText: null }}
-      runCliCommand={() => {}}
-      changeDbName={() => Promise.resolve([undefined, null])}
-      changeDbNameAttempt={makeEmptyAttempt()}
-      changePort={() => Promise.resolve([undefined, null])}
-      changePortAttempt={makeErrorAttempt<void>(
-        'Something went wrong with setting port.'
-      )}
-    />
-  );
-}
+export const WithManyDatabaseRoles = {
+  args: {
+    online: true,
+    autoUsersEnabled: true,
+    databaseRoles: [
+      'reader',
+      'writer',
+      'admin',
+      'db_owner',
+      'db_backup_operator',
+      'db_datawriter',
+      'db_datareader',
+      'db_ddladmin',
+      'db_securityadmin',
+      'db_accessadmin',
+      'db_backupoperator',
+      'db_denydatawriter',
+      'db_denydatareader',
+      'analyst',
+      'developer',
+      'manager',
+      'auditor',
+      'operations',
+      'support',
+      'qa_engineer',
+    ],
+  },
+};
 
-export function OnlineWithFailedDbNameAndPortAttempts() {
-  return (
-    <DocumentGateway
-      gateway={gateway}
-      defaultPort={gateway.localPort}
-      disconnect={() => Promise.resolve([undefined, null])}
-      connected={true}
-      reconnect={() => {}}
-      connectAttempt={{ status: 'success', data: undefined, statusText: null }}
-      runCliCommand={() => {}}
-      changeDbName={() => Promise.resolve([undefined, null])}
-      changeDbNameAttempt={makeErrorAttempt<void>(
-        'Something went wrong with setting database name.'
-      )}
-      changePort={() => Promise.resolve([undefined, null])}
-      changePortAttempt={makeErrorAttempt<void>(
-        'Something went wrong with setting port.'
-      )}
-    />
-  );
-}
+export const WithLongRoleNames = {
+  args: {
+    online: true,
+    autoUsersEnabled: true,
+    databaseRoles: [
+      'super-long-role-name-that-might-cause-layout-issues-in-the-ui',
+      'another-very-long-database-role-name-with-many-hyphens',
+      'db_administrator_with_full_permissions_read_write_execute',
+    ],
+  },
+};
 
-export function Offline() {
-  return (
-    <DocumentGateway
-      gateway={undefined}
-      defaultPort="1337"
-      disconnect={() => Promise.resolve([undefined, null])}
-      connected={false}
-      reconnect={() => {}}
-      connectAttempt={makeEmptyAttempt()}
-      runCliCommand={() => {}}
-      changeDbName={() => Promise.resolve([undefined, null])}
-      changeDbNameAttempt={makeEmptyAttempt()}
-      changePort={() => Promise.resolve([undefined, null])}
-      changePortAttempt={makeEmptyAttempt()}
-    />
-  );
-}
-
-export function OfflineWithFailedConnectAttempt() {
-  const connectAttempt = makeErrorAttempt<void>(
-    'listen tcp 127.0.0.1:62414: bind: address already in use'
-  );
-
-  return (
-    <DocumentGateway
-      gateway={undefined}
-      defaultPort="62414"
-      disconnect={() => Promise.resolve([undefined, null])}
-      connected={false}
-      reconnect={() => {}}
-      connectAttempt={connectAttempt}
-      runCliCommand={() => {}}
-      changeDbName={() => Promise.resolve([undefined, null])}
-      changeDbNameAttempt={makeEmptyAttempt()}
-      changePort={() => Promise.resolve([undefined, null])}
-      changePortAttempt={makeEmptyAttempt()}
-    />
-  );
-}
-
-export function Processing() {
-  return (
-    <DocumentGateway
-      gateway={undefined}
-      defaultPort="1337"
-      disconnect={() => Promise.resolve([undefined, null])}
-      connected={false}
-      reconnect={() => {}}
-      connectAttempt={makeProcessingAttempt()}
-      runCliCommand={() => {}}
-      changeDbName={() => Promise.resolve([undefined, null])}
-      changeDbNameAttempt={makeEmptyAttempt()}
-      changePort={() => Promise.resolve([undefined, null])}
-      changePortAttempt={makeEmptyAttempt()}
-    />
-  );
-}
+export const WithoutAutoUsers = {
+  args: {
+    online: true,
+    autoUsersEnabled: false,
+    databaseRoles: [],
+  },
+};

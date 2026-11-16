@@ -1,34 +1,41 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
 import (
+	"cmp"
 	"context"
+	"slices"
+	"strconv"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
+	gocmp "github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/backend/memory"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/itertools/stream"
 )
 
 // TestDatabasesCRUD tests backend operations with database resources.
@@ -62,7 +69,16 @@ func TestDatabasesCRUD(t *testing.T) {
 	// Initially we expect no databases.
 	out, err := service.GetDatabases(ctx)
 	require.NoError(t, err)
-	require.Equal(t, 0, len(out))
+	require.Empty(t, out)
+
+	out, next, err := service.ListDatabases(ctx, 0, "")
+	require.NoError(t, err)
+	require.Empty(t, out)
+	require.Empty(t, next)
+
+	out, err = stream.Collect(service.RangeDatabases(ctx, "", ""))
+	require.NoError(t, err)
+	require.Empty(t, out)
 
 	// Create both databases.
 	err = service.CreateDatabase(ctx, db1)
@@ -78,30 +94,42 @@ func TestDatabasesCRUD(t *testing.T) {
 		URI:      "localhost",
 	})
 	require.NoError(t, err)
-	err = service.CreateDatabase(ctx, dbBadURI)
-	require.True(t, trace.IsBadParameter(err))
+	require.NoError(t, service.CreateDatabase(ctx, dbBadURI))
 
 	// Fetch all databases.
 	out, err = service.GetDatabases(ctx)
 	require.NoError(t, err)
-	require.Empty(t, cmp.Diff([]types.Database{db1, db2}, out,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+	require.Empty(t, gocmp.Diff([]types.Database{dbBadURI, db1, db2}, out,
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+	))
+
+	out, next, err = service.ListDatabases(ctx, 0, "")
+	require.NoError(t, err)
+	require.Empty(t, gocmp.Diff([]types.Database{dbBadURI, db1, db2}, out,
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+	))
+	require.Empty(t, next)
+
+	out, err = stream.Collect(service.RangeDatabases(ctx, "", ""))
+	require.NoError(t, err)
+	require.Empty(t, gocmp.Diff([]types.Database{dbBadURI, db1, db2}, out,
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 	))
 
 	// Fetch a specific database.
 	db, err := service.GetDatabase(ctx, db2.GetName())
 	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(db2, db,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+	require.Empty(t, gocmp.Diff(db2, db,
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 	))
 
 	// Try to fetch a database that doesn't exist.
 	_, err = service.GetDatabase(ctx, "doesnotexist")
-	require.IsType(t, trace.NotFound(""), err)
+	require.ErrorAs(t, err, new(*trace.NotFoundError))
 
 	// Try to create the same database.
 	err = service.CreateDatabase(ctx, db1)
-	require.IsType(t, trace.AlreadyExists(""), err)
+	require.ErrorAs(t, err, new(*trace.AlreadyExistsError))
 
 	// Update a database.
 	db1.Metadata.Description = "description"
@@ -109,8 +137,8 @@ func TestDatabasesCRUD(t *testing.T) {
 	require.NoError(t, err)
 	db, err = service.GetDatabase(ctx, db1.GetName())
 	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(db1, db,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+	require.Empty(t, gocmp.Diff(db1, db,
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 	))
 
 	// Delete a database.
@@ -118,18 +146,100 @@ func TestDatabasesCRUD(t *testing.T) {
 	require.NoError(t, err)
 	out, err = service.GetDatabases(ctx)
 	require.NoError(t, err)
-	require.Empty(t, cmp.Diff([]types.Database{db2}, out,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+	require.Empty(t, gocmp.Diff([]types.Database{dbBadURI, db2}, out,
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+	))
+
+	out, next, err = service.ListDatabases(ctx, 0, "")
+	require.NoError(t, err)
+	require.Empty(t, gocmp.Diff([]types.Database{dbBadURI, db2}, out,
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+	))
+	require.Empty(t, next)
+
+	out, err = stream.Collect(service.RangeDatabases(ctx, "", ""))
+	require.NoError(t, err)
+	require.Empty(t, gocmp.Diff([]types.Database{dbBadURI, db2}, out,
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 	))
 
 	// Try to delete a database that doesn't exist.
 	err = service.DeleteDatabase(ctx, "doesnotexist")
-	require.IsType(t, trace.NotFound(""), err)
+	require.ErrorAs(t, err, new(*trace.NotFoundError))
 
 	// Delete all databases.
 	err = service.DeleteAllDatabases(ctx)
 	require.NoError(t, err)
 	out, err = service.GetDatabases(ctx)
 	require.NoError(t, err)
-	require.Len(t, out, 0)
+	require.Empty(t, out)
+
+	out, next, err = service.ListDatabases(ctx, 0, "")
+	require.NoError(t, err)
+	require.Empty(t, out)
+	require.Empty(t, next)
+
+	out, err = stream.Collect(service.RangeDatabases(ctx, "", ""))
+	require.NoError(t, err)
+	require.Empty(t, out)
+
+	// Test pagination
+	expected := make([]types.Database, 0, 50)
+	for i := range 50 {
+		db, err := types.NewDatabaseV3(types.Metadata{
+			Name: "db" + strconv.Itoa(i+1),
+		}, types.DatabaseSpecV3{
+			Protocol: defaults.ProtocolPostgres,
+			URI:      "localhost",
+		})
+		require.NoError(t, err)
+		require.NoError(t, service.CreateDatabase(t.Context(), db))
+		expected = append(expected, db)
+	}
+	slices.SortFunc(expected, func(a, b types.Database) int {
+		return cmp.Compare(a.GetMetadata().Name, b.GetMetadata().Name)
+	})
+
+	out, err = service.GetDatabases(ctx)
+	require.NoError(t, err)
+	assert.Len(t, out, len(expected))
+	assert.Empty(t, gocmp.Diff(expected, out,
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+	))
+
+	page1, page2Start, err := service.ListDatabases(t.Context(), 10, "")
+	require.NoError(t, err)
+	assert.Len(t, page1, 10)
+	assert.NotEmpty(t, page2Start)
+
+	page2, next, err := service.ListDatabases(t.Context(), 1000, page2Start)
+	require.NoError(t, err)
+	assert.Len(t, page2, len(expected)-10)
+	assert.Empty(t, next)
+
+	listed := append(page1, page2...)
+	assert.Empty(t, gocmp.Diff(expected, listed,
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+	))
+
+	out, err = stream.Collect(service.RangeDatabases(t.Context(), "", page2Start))
+	require.NoError(t, err)
+	assert.Len(t, out, len(page1))
+	assert.Empty(t, gocmp.Diff(page1, out,
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+	))
+
+	out, err = stream.Collect(service.RangeDatabases(t.Context(), "", ""))
+	require.NoError(t, err)
+	assert.Len(t, out, len(expected))
+	assert.Empty(t, gocmp.Diff(expected, out,
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+	))
+
+	out, err = stream.Collect(service.RangeDatabases(t.Context(), page2Start, ""))
+	require.NoError(t, err)
+	assert.Len(t, out, len(expected)-10)
+	assert.Empty(t, gocmp.Diff(expected, append(page1, out...),
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
+	))
 }

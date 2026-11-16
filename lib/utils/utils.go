@@ -1,48 +1,47 @@
 /*
-Copyright 2015-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
-	"math/rand"
+	"log/slog"
+	"math/rand/v2"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
-	"github.com/google/uuid"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
 	apiutils "github.com/gravitational/teleport/api/utils"
-	"github.com/gravitational/teleport/lib/modules"
 )
 
 // WriteContextCloser provides close method with context
@@ -86,6 +85,16 @@ func (*nilCloser) Close() error {
 	return nil
 }
 
+// assert that CloseFunc implement io.Closer.
+var _ io.Closer = (CloseFunc)(nil)
+
+// CloseFunc is a helper used to implement io.Closer on a closure.
+type CloseFunc func() error
+
+func (cf CloseFunc) Close() error {
+	return cf()
+}
+
 // NopWriteCloser returns a WriteCloser with a no-op Close method wrapping
 // the provided Writer w
 func NopWriteCloser(r io.Writer) io.WriteCloser {
@@ -113,13 +122,17 @@ func NewTracer(description string) *Tracer {
 
 // Start logs start of the trace
 func (t *Tracer) Start() *Tracer {
-	log.Debugf("Tracer started %v.", t.Description)
+	slog.DebugContext(context.Background(), "Tracer started",
+		"trace", t.Description)
 	return t
 }
 
 // Stop logs stop of the trace
 func (t *Tracer) Stop() *Tracer {
-	log.Debugf("Tracer completed %v in %v.", t.Description, time.Since(t.Started))
+	slog.DebugContext(context.Background(), "Tracer completed",
+		"trace", t.Description,
+		"duration", time.Since(t.Started),
+	)
 	return t
 }
 
@@ -128,49 +141,6 @@ func ThisFunction() string {
 	var pc [32]uintptr
 	runtime.Callers(2, pc[:])
 	return runtime.FuncForPC(pc[0]).Name()
-}
-
-// SyncString is a string value
-// that can be concurrently accessed
-type SyncString struct {
-	sync.Mutex
-	string
-}
-
-// Value returns value of the string
-func (s *SyncString) Value() string {
-	s.Lock()
-	defer s.Unlock()
-	return s.string
-}
-
-// Set sets the value of the string
-func (s *SyncString) Set(v string) {
-	s.Lock()
-	defer s.Unlock()
-	s.string = v
-}
-
-// ClickableURL fixes address in url to make sure
-// it's clickable, e.g. it replaces "undefined" address like
-// 0.0.0.0 used in network listeners format with loopback 127.0.0.1
-func ClickableURL(in string) string {
-	out, err := url.Parse(in)
-	if err != nil {
-		return in
-	}
-	host, port, err := net.SplitHostPort(out.Host)
-	if err != nil {
-		return in
-	}
-	ip := net.ParseIP(host)
-	// if address is not an IP, unspecified, e.g. all interfaces 0.0.0.0 or multicast,
-	// replace with localhost that is clickable
-	if len(ip) == 0 || ip.IsUnspecified() || ip.IsMulticast() {
-		out.Host = fmt.Sprintf("127.0.0.1:%v", port)
-		return out.String()
-	}
-	return out.String()
 }
 
 // AsBool converts string to bool, in case of the value is empty
@@ -213,62 +183,8 @@ func ParseAdvertiseAddr(advertiseIP string) (string, string, error) {
 	return host, port, nil
 }
 
-// StringsSliceFromSet returns a sorted strings slice from set
-func StringsSliceFromSet(in map[string]struct{}) []string {
-	if in == nil {
-		return nil
-	}
-	out := make([]string, 0, len(in))
-	for key := range in {
-		out = append(out, key)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// StringsSet creates set of string (map[string]struct{})
-// from a list of strings
-func StringsSet(in []string) map[string]struct{} {
-	if in == nil {
-		return map[string]struct{}{}
-	}
-	out := make(map[string]struct{})
-	for _, v := range in {
-		out[v] = struct{}{}
-	}
-	return out
-}
-
-// ParseOnOff parses whether value is "on" or "off", parameterName is passed for error
-// reporting purposes, defaultValue is returned when no value is set
-func ParseOnOff(parameterName, val string, defaultValue bool) (bool, error) {
-	switch val {
-	case teleport.On:
-		return true, nil
-	case teleport.Off:
-		return false, nil
-	case "":
-		return defaultValue, nil
-	default:
-		return false, trace.BadParameter("bad %q parameter value: %q, supported values are on or off", parameterName, val)
-	}
-}
-
-// IsGroupMember returns whether currently logged user is a member of a group
-func IsGroupMember(gid int) (bool, error) {
-	groups, err := os.Getgroups()
-	if err != nil {
-		return false, trace.ConvertSystemError(err)
-	}
-	for _, group := range groups {
-		if group == gid {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// DNSName extracts DNS name from host:port string.
+// DNSName extracts DNS name from host:port string,
+// returning an error if the hostname is an IP address.
 func DNSName(hostport string) (string, error) {
 	host, err := Host(hostport)
 	if err != nil {
@@ -301,6 +217,16 @@ func Host(hostname string) (string, error) {
 	return host, nil
 }
 
+// TryHost is a utility function that extracts host from the host:port pair,
+// in case of any error returns the original value.
+func TryHost(in string) string {
+	out, err := Host(in)
+	if err != nil {
+		return in
+	}
+	return out
+}
+
 // SplitHostPort splits host and port and checks that host is not empty
 func SplitHostPort(hostname string) (string, string, error) {
 	host, port, err := net.SplitHostPort(hostname)
@@ -313,10 +239,40 @@ func SplitHostPort(hostname string) (string, string, error) {
 	return host, port, nil
 }
 
+// HostFQDN consists of host UUID and cluster name joined via '.'
+func HostFQDN(hostUUID, clusterName string) string {
+	return hostUUID + "." + clusterName
+}
+
 // IsValidHostname checks if a string represents a valid hostname.
 func IsValidHostname(hostname string) bool {
-	for _, label := range strings.Split(hostname, ".") {
+	for label := range strings.SplitSeq(hostname, ".") {
 		if len(validation.IsDNS1035Label(label)) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// IsValidUnixUser checks if a string represents a valid
+// UNIX username.
+func IsValidUnixUser(u string) bool {
+	// See http://www.unix.com/man-page/linux/8/useradd:
+	//
+	// On Debian, the only constraints are that usernames must neither start with a dash ('-')
+	// nor contain a colon (':') or a whitespace (space: ' ', end of line: '\n', tabulation:
+	// '\t', etc.). Note that using a slash ('/') may break the default algorithm for the
+	// definition of the user's home directory.
+
+	const maxUsernameLen = 32
+	if len(u) > maxUsernameLen || len(u) == 0 || u[0] == '-' {
+		return false
+	}
+	if strings.ContainsAny(u, ":/") {
+		return false
+	}
+	for _, r := range u {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
 			return false
 		}
 	}
@@ -389,10 +345,11 @@ func IsCertExpiredError(err error) bool {
 	return strings.Contains(trace.Unwrap(err).Error(), "ssh: cert has expired")
 }
 
-// OpaqueAccessDenied returns a generic NotFound instead of AccessDenied
-// so as to avoid leaking the existence of secret resources.
+// OpaqueAccessDenied returns a generic [trace.NotFoundError] if [err] is a [trace.NotFoundError] or
+// a [trace.AccessDeniedError] so as to avoid leaking the existence of secret resources,
+// for other error types it returns the original error.
 func OpaqueAccessDenied(err error) error {
-	if trace.IsAccessDenied(err) {
+	if trace.IsNotFound(err) || trace.IsAccessDenied(err) {
 		return trace.NotFound("not found")
 	}
 	return trace.Wrap(err)
@@ -426,16 +383,6 @@ func (p *PortList) PopInt() int {
 	return i
 }
 
-// PopIntSlice returns a slice of values from the list, it panics if not enough
-// ports were allocated
-func (p *PortList) PopIntSlice(num int) []int {
-	ports := make([]int, num)
-	for i := range ports {
-		ports[i] = p.PopInt()
-	}
-	return ports
-}
-
 // PortStartingNumber is a starting port number for tests
 const PortStartingNumber = 20000
 
@@ -452,127 +399,14 @@ func GetFreeTCPPorts(n int, offset ...int) (PortList, error) {
 	return PortList{ports: list}, nil
 }
 
-// HostUUIDExistsLocally checks if dataDir/host_uuid file exists in local storage.
-func HostUUIDExistsLocally(dataDir string) bool {
-	_, err := ReadHostUUID(dataDir)
-	return err == nil
-}
-
-// ReadHostUUID reads host UUID from the file in the data dir
-func ReadHostUUID(dataDir string) (string, error) {
-	out, err := ReadPath(filepath.Join(dataDir, HostUUIDFile))
-	if err != nil {
-		if errors.Is(err, fs.ErrPermission) {
-			//do not convert to system error as this loses the ability to compare that it is a permission error
-			return "", err
-		}
-		return "", trace.ConvertSystemError(err)
-	}
-	id := strings.TrimSpace(string(out))
-	if id == "" {
-		return "", trace.NotFound("host uuid is empty")
-	}
-	return id, nil
-}
-
-// WriteHostUUID writes host UUID into a file
-func WriteHostUUID(dataDir string, id string) error {
-	err := os.WriteFile(filepath.Join(dataDir, HostUUIDFile), []byte(id), os.ModeExclusive|0400)
-	if err != nil {
-		if errors.Is(err, fs.ErrPermission) {
-			//do not convert to system error as this loses the ability to compare that it is a permission error
-			return err
-		}
-		return trace.ConvertSystemError(err)
-	}
-	return nil
-}
-
-// ReadOrMakeHostUUID looks for a hostid file in the data dir. If present,
-// returns the UUID from it, otherwise generates one
-func ReadOrMakeHostUUID(dataDir string) (string, error) {
-	id, err := ReadHostUUID(dataDir)
-	if err == nil {
-		return id, nil
-	}
-	if !trace.IsNotFound(err) {
-		return "", trace.Wrap(err)
-	}
-	// Checking error instead of the usual uuid.New() in case uuid generation
-	// fails due to not enough randomness. It's been known to happen happen when
-	// Teleport starts very early in the node initialization cycle and /dev/urandom
-	// isn't ready yet.
-	rawID, err := uuid.NewRandom()
-	if err != nil {
-		return "", trace.BadParameter("" +
-			"Teleport failed to generate host UUID. " +
-			"This may happen if randomness source is not fully initialized when the node is starting up. " +
-			"Please try restarting Teleport again.")
-	}
-	id = rawID.String()
-	if err = WriteHostUUID(dataDir, id); err != nil {
-		return "", trace.Wrap(err)
-	}
-	return id, nil
-}
-
-// PrintVersion prints human readable version
-func PrintVersion() {
-	modules.GetModules().PrintVersion()
-}
-
-// StringSliceSubset returns true if b is a subset of a.
-func StringSliceSubset(a []string, b []string) error {
-	aset := make(map[string]bool)
-	for _, v := range a {
-		aset[v] = true
-	}
-
-	for _, v := range b {
-		_, ok := aset[v]
-		if !ok {
-			return trace.BadParameter("%v not in set", v)
-		}
-
-	}
-	return nil
-}
-
-// UintSliceSubset returns true if b is a subset of a.
-func UintSliceSubset(a []uint16, b []uint16) error {
-	aset := make(map[uint16]bool)
-	for _, v := range a {
-		aset[v] = true
-	}
-
-	for _, v := range b {
-		_, ok := aset[v]
-		if !ok {
-			return trace.BadParameter("%v not in set", v)
-		}
-
-	}
-	return nil
-}
-
 // RemoveFromSlice makes a copy of the slice and removes the passed in values from the copy.
 func RemoveFromSlice(slice []string, values ...string) []string {
-	output := make([]string, 0, len(slice))
-
-	remove := make(map[string]bool)
-	for _, value := range values {
-		remove[value] = true
-	}
-
-	for _, s := range slice {
-		_, ok := remove[s]
-		if ok {
-			continue
-		}
-		output = append(output, s)
-	}
-
-	return output
+	return slices.DeleteFunc(
+		slices.Clone(slice),
+		func(s string) bool {
+			return slices.Contains(values, s)
+		},
+	)
 }
 
 // ChooseRandomString returns a random string from the given slice.
@@ -583,7 +417,7 @@ func ChooseRandomString(slice []string) string {
 	case 1:
 		return slice[0]
 	default:
-		return slice[rand.Intn(len(slice))]
+		return slice[rand.N(len(slice))]
 	}
 }
 
@@ -613,10 +447,7 @@ func AddrsFromStrings(s apiutils.Strings, defaultPort int) ([]NetAddr, error) {
 // FileExists checks whether a file exists at a given path
 func FileExists(fp string) bool {
 	_, err := os.Stat(fp)
-	if err != nil && os.IsNotExist(err) {
-		return false
-	}
-	return true
+	return !errors.Is(err, fs.ErrNotExist)
 }
 
 // StoreErrorOf stores the error returned by f within *err.
@@ -624,47 +455,40 @@ func StoreErrorOf(f func() error, err *error) {
 	*err = trace.NewAggregate(*err, f())
 }
 
+// LimitReader returns a reader that limits bytes from r, and reports an error
+// when limit bytes are read.
+func LimitReader(r io.Reader, limit int64) io.Reader {
+	return &limitedReader{
+		LimitedReader: &io.LimitedReader{R: r, N: limit},
+	}
+}
+
+// limitedReader wraps an [io.LimitedReader] that limits bytes read, and
+// reports an error when the read limit is reached.
+type limitedReader struct {
+	*io.LimitedReader
+}
+
+func (l *limitedReader) Read(p []byte) (int, error) {
+	n, err := l.LimitedReader.Read(p)
+	if l.LimitedReader.N <= 0 {
+		return n, ErrLimitReached
+	}
+	return n, err
+}
+
 // ReadAtMost reads up to limit bytes from r, and reports an error
 // when limit bytes are read.
 func ReadAtMost(r io.Reader, limit int64) ([]byte, error) {
-	limitedReader := &io.LimitedReader{R: r, N: limit}
+	limitedReader := LimitReader(r, limit)
 	data, err := io.ReadAll(limitedReader)
-	if err != nil {
-		return data, err
-	}
-	if limitedReader.N <= 0 {
-		return data, ErrLimitReached
-	}
-	return data, nil
-}
-
-// HasPrefixAny determines if any of the string values have the given prefix.
-func HasPrefixAny(prefix string, values []string) bool {
-	for _, val := range values {
-		if strings.HasPrefix(val, prefix) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// ByteCount converts a size in bytes to a human-readable string.
-func ByteCount(b int64) string {
-	const unit = 1000
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB",
-		float64(b)/float64(div), "kMGTPE"[exp])
+	return data, err
 }
 
 // ErrLimitReached means that the read limit is reached.
+//
+// TODO(gavin): this should be converted to a 413 StatusRequestEntityTooLarge
+// in trace.ErrorToCode instead of 429 StatusTooManyRequests.
 var ErrLimitReached = &trace.LimitExceededError{Message: "the read limit is reached"}
 
 const (
@@ -677,16 +501,34 @@ const (
 	// CertExtensionAuthority specifies teleport authority's name
 	// that signed this domain
 	CertExtensionAuthority = "x-teleport-authority"
-	// HostUUIDFile is the file name where the host UUID file is stored
-	HostUUIDFile = "host_uuid"
 	// CertTeleportClusterName is a name of the teleport cluster
 	CertTeleportClusterName = "x-teleport-cluster-name"
 	// CertTeleportUserCertificate is the certificate of the authenticated in user.
 	CertTeleportUserCertificate = "x-teleport-certificate"
+	// extIntSuffix is the suffix common to all internal extensions.
+	extIntSuffix = "@teleport.internal"
 	// ExtIntCertType is an internal extension used to propagate cert type.
-	ExtIntCertType = "certtype@teleport"
+	ExtIntCertType = "certtype" + extIntSuffix
 	// ExtIntCertTypeHost indicates a host-type certificate.
-	ExtIntCertTypeHost = "host"
+	ExtIntCertTypeHost = "host" + extIntSuffix
 	// ExtIntCertTypeUser indicates a user-type certificate.
-	ExtIntCertTypeUser = "user"
+	ExtIntCertTypeUser = "user" + extIntSuffix
+	// ExtIntSSHAccessPermit is an internal extension used to propagate
+	// the access permit for the user.
+	ExtIntSSHAccessPermit = "ssh-access-permit" + extIntSuffix
+	// ExtIntSSHJoinPermi is an internal extension used to propagate
+	// the join permit for the user.
+	ExtIntSSHJoinPermit = "ssh-join-permit" + extIntSuffix
+	// ExtIntProxyingPermit is an internal extension used to propagate
+	// the proxying permit for the user.
+	ExtIntProxyingPermit = "proxying-permit" + extIntSuffix
+	// ExtIntGitForwardingPermit is an internal extension used to propagate
+	// the git forwarding permit for the user.
+	ExtIntGitForwardingPermit = "git-forwarding-permit" + extIntSuffix
 )
+
+// IsInternalSSHExtension returns true if the extension has the internal
+// extension suffix.
+func IsInternalSSHExtension(extension string) bool {
+	return strings.HasSuffix(extension, extIntSuffix)
+}

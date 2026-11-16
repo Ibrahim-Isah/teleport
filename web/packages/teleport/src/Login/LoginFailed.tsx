@@ -1,42 +1,52 @@
-/*
-Copyright 2019-2021 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
 import { LoginFailed as CardFailed } from 'design/CardError';
 
+import { LogoHero } from 'teleport/components/LogoHero';
 import { Route, Switch } from 'teleport/components/Router';
-import LogoHero from 'teleport/components/LogoHero';
 import cfg from 'teleport/config';
 
-export default function Container() {
+export function LoginFailed() {
   return (
     <Switch>
       <Route path={cfg.routes.loginErrorCallback}>
-        <LoginFailed message="unable to process callback" />
+        <LoginFailedComponent message="Unable to process SSO callback." />
+      </Route>
+      <Route path={cfg.routes.loginErrorCallbackMissingRole}>
+        <LoginFailedComponent message="Unable to process SSO callback. The connector has a mapping to a role that does not exist. Please contact your SSO administrator." />
       </Route>
       <Route path={cfg.routes.loginErrorUnauthorized}>
-        <LoginFailed message="You are not authorized, please contact your SSO administrator." />
+        <LoginFailedComponent message="You are not authorized. Please contact your Teleport administrator." />
       </Route>
-      <Route component={LoginFailed} />
+      <Route path={cfg.routes.loginErrorEntraIDGroupsOverage}>
+        <LoginFailedComponent message="Your account is a member of more than 150 Entra ID groups. Please contact your SSO administrator to configure Graph API access on the Teleport SAML connector." />
+      </Route>
+      <Route>
+        <LoginFailedComponent />
+      </Route>
     </Switch>
   );
 }
 
-export function LoginFailed({ message }: { message?: string }) {
-  const defaultMsg = "unable to login, please check Teleport's log for details";
+export function LoginFailedComponent({ message }: { message?: string }) {
+  const defaultMsg =
+    "Unable to log in, please check Teleport's log for details.";
   return (
     <>
       <LogoHero />

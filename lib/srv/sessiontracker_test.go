@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
@@ -60,8 +62,7 @@ func waitForUpdate(t *testing.T, svc *failingTrackerService, done chan error) {
 func TestSessionTracker_UpdateRetry(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	clock := clockwork.NewFakeClock()
 
 	svc := &failingTrackerService{
@@ -87,16 +88,8 @@ func TestSessionTracker_UpdateRetry(t *testing.T) {
 	// Walk through a few attempts to update the session tracker. Even iterations
 	// will fail and force the retry mechanism to kick in. Odd iterations update
 	// session trackers successfully on first attempt.
-	for i := 0; i < 4; i++ {
-		// Wait for the ticker to be ready. On odd iterations we have to block on 2 instead of 1
-		// because clockwork.fakeTicker.Stop() doesn't result in removal of the ticker from the clockwork.FakeClock
-		// sleepers list. When the ticker is recreated after the retry finishes, the clock ends up with a sleeper
-		// for both the original ticker and the new ticker.
-		if i%2 == 1 {
-			clock.BlockUntil(2)
-		} else {
-			clock.BlockUntil(1)
-		}
+	for i := range 4 {
+		clock.BlockUntil(1)
 
 		// advance the clock to fire the ticker
 		clock.Advance(sessionTrackerExpirationUpdateInterval)
@@ -152,7 +145,8 @@ func TestSessionTracker_UpdateRetry(t *testing.T) {
 func TestSessionTracker(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
+	ctx := t.Context()
+
 	clock := clockwork.NewFakeClock()
 
 	mockService := &mockSessiontrackerService{
@@ -269,7 +263,7 @@ func (m *mockSessiontrackerService) RemoveSessionTracker(ctx context.Context, se
 	return trace.NotImplemented("")
 }
 
-func (m *mockSessiontrackerService) UpdatePresence(ctx context.Context, sessionID, user string) error {
+func (m *mockSessiontrackerService) UpdatePresence(_ context.Context, _, _, _ string) error {
 	return trace.NotImplemented("")
 }
 

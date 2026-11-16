@@ -1,43 +1,58 @@
-/**
- * Copyright 2021 Gravitational, Inc.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package local_test
 
 import (
 	"context"
-	"crypto/x509"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/bcrypt"
 
+	"github.com/gravitational/teleport/api/constants"
+	headerv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/header/v1"
+	notificationsv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/notifications/v1"
+	userspb "github.com/gravitational/teleport/api/gen/proto/go/teleport/users/v1"
 	"github.com/gravitational/teleport/api/types"
-	wantypes "github.com/gravitational/teleport/api/types/webauthn"
 	"github.com/gravitational/teleport/api/utils/keys"
-	"github.com/gravitational/teleport/lib/auth/native"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/memory"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/local"
 )
 
@@ -45,10 +60,60 @@ func newIdentityService(t *testing.T, clock clockwork.Clock) *local.IdentityServ
 	t.Helper()
 	backend, err := memory.New(memory.Config{
 		Context: context.Background(),
-		Clock:   clockwork.NewFakeClock(),
+		Clock:   clock,
 	})
 	require.NoError(t, err)
-	return local.NewIdentityService(backend)
+	service, err := local.NewTestIdentityService(backend)
+	require.NoError(t, err)
+	return service
+}
+
+func TestIdentityService_CreateUser(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	identity := newIdentityService(t, clockwork.NewFakeClock())
+
+	tests := []struct {
+		desc, username, password, role string
+		passwordState                  types.PasswordState
+	}{{
+		desc:          "user without a password",
+		username:      "capybara",
+		role:          "access",
+		passwordState: types.PasswordState_PASSWORD_STATE_UNSET,
+	}, {
+		desc:          "user with a password",
+		username:      "llama",
+		password:      "verysecret",
+		role:          "editor",
+		passwordState: types.PasswordState_PASSWORD_STATE_SET,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			user, err := types.NewUser(tt.username)
+			require.NoError(t, err)
+			user.AddRole(tt.role)
+			if tt.password != "" {
+				hash, err := bcrypt.GenerateFromPassword(([]byte(tt.password)), bcrypt.MinCost)
+				require.NoError(t, err, "Unable to generate password hash")
+				user.SetLocalAuth(&types.LocalAuthSecrets{PasswordHash: hash})
+			}
+			_, err = identity.CreateUser(ctx, user)
+			require.NoError(t, err, "failed to create the user")
+
+			user, err = identity.GetUser(ctx, tt.username, true /* withSecrets */)
+			require.NoError(t, err, "failed to get the user")
+			assert.Equal(t, []string{tt.role}, user.GetRoles(), "roles are not set")
+			assert.Equal(t, tt.passwordState, user.GetPasswordState(), "password state is not set")
+			if tt.password != "" {
+				assert.NoError(t,
+					bcrypt.CompareHashAndPassword(user.GetLocalAuth().PasswordHash, []byte(tt.password)),
+					"password hash does not match")
+			}
+		})
+	}
+
 }
 
 func TestRecoveryCodesCRUD(t *testing.T) {
@@ -109,7 +174,7 @@ func TestRecoveryCodesCRUD(t *testing.T) {
 		// Create a user.
 		userResource := &types.UserV2{}
 		userResource.SetName(username)
-		err := identity.CreateUser(userResource)
+		_, err := identity.CreateUser(ctx, userResource)
 		require.NoError(t, err)
 
 		// Test codes exist for user.
@@ -135,14 +200,14 @@ func TestRecoveryCodesCRUD(t *testing.T) {
 		// Create a user.
 		userResource1 := &types.UserV2{}
 		userResource1.SetName(username1)
-		err := identity.CreateUser(userResource1)
+		_, err := identity.CreateUser(ctx, userResource1)
 		require.NoError(t, err)
 
 		// Create another user whose username which is prefixed with
 		// the previous username.
 		userResource2 := &types.UserV2{}
 		userResource2.SetName(username2)
-		err = identity.CreateUser(userResource2)
+		_, err = identity.CreateUser(ctx, userResource2)
 		require.NoError(t, err)
 
 		// Test codes exist for the first user.
@@ -184,7 +249,7 @@ func TestRecoveryCodesCRUD(t *testing.T) {
 		// Create a user.
 		userResource := &types.UserV2{}
 		userResource.SetName(username)
-		err := identity.CreateUser(userResource)
+		_, err := identity.CreateUser(ctx, userResource)
 		require.NoError(t, err)
 
 		// Test codes exist for user.
@@ -204,65 +269,69 @@ func TestRecoveryCodesCRUD(t *testing.T) {
 	})
 }
 
-func TestRecoveryAttemptsCRUD(t *testing.T) {
+// TestNotificationCleanupOnUserDelete tests that notification objects associated with a user are deleted
+// when the user is deleted.
+func TestNotificationCleanupOnUserDelete(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	clock := clockwork.NewFakeClock()
-	identity := newIdentityService(t, clock)
 
-	// Predefine times for equality check.
-	time1 := clock.Now()
-	time2 := time1.Add(2 * time.Minute)
-	time3 := time1.Add(4 * time.Minute)
-
-	t.Run("create, get, and delete recovery attempts", func(t *testing.T) {
-		username := "someuser"
-
-		// Test creation of recovery attempt.
-		err := identity.CreateUserRecoveryAttempt(ctx, username, &types.RecoveryAttempt{Time: time3, Expires: time3})
-		require.NoError(t, err)
-		err = identity.CreateUserRecoveryAttempt(ctx, username, &types.RecoveryAttempt{Time: time1, Expires: time3})
-		require.NoError(t, err)
-		err = identity.CreateUserRecoveryAttempt(ctx, username, &types.RecoveryAttempt{Time: time2, Expires: time3})
-		require.NoError(t, err)
-
-		// Test retrieving attempts sorted by oldest to latest.
-		attempts, err := identity.GetUserRecoveryAttempts(ctx, username)
-		require.NoError(t, err)
-		require.Len(t, attempts, 3)
-		require.Equal(t, time1, attempts[0].Time)
-		require.Equal(t, time2, attempts[1].Time)
-		require.Equal(t, time3, attempts[2].Time)
-
-		// Test delete all recovery attempts.
-		err = identity.DeleteUserRecoveryAttempts(ctx, username)
-		require.NoError(t, err)
-		attempts, err = identity.GetUserRecoveryAttempts(ctx, username)
-		require.NoError(t, err)
-		require.Len(t, attempts, 0)
+	backend, err := memory.New(memory.Config{
+		Context: context.Background(),
+		Clock:   clock,
 	})
+	require.NoError(t, err)
 
-	t.Run("deleting user deletes recovery attempts", func(t *testing.T) {
-		username := "someuser2"
+	identitySvc, err := local.NewIdentityService(backend)
+	require.NoError(t, err)
+	notificationsSvc, err := local.NewNotificationsService(backend, backend.Clock())
+	require.NoError(t, err)
 
-		// Create a user, to test deletion of recovery attempts with user.
-		userResource := &types.UserV2{}
-		userResource.SetName(username)
-		err := identity.CreateUser(userResource)
-		require.NoError(t, err)
+	// Create the user.
+	username := "someuser"
+	userResource := &types.UserV2{}
+	userResource.SetName(username)
+	_, err = identitySvc.CreateUser(ctx, userResource)
+	require.NoError(t, err)
 
-		err = identity.CreateUserRecoveryAttempt(ctx, username, &types.RecoveryAttempt{Time: time3, Expires: time3})
-		require.NoError(t, err)
-		attempts, err := identity.GetUserRecoveryAttempts(ctx, username)
-		require.NoError(t, err)
-		require.Len(t, attempts, 1)
+	// Create a notification for this user.
+	testNotification := notificationsv1.Notification_builder{
+		SubKind: "test-subkind",
+		Spec: notificationsv1.NotificationSpec_builder{
+			Username: username,
+		}.Build(),
+		Metadata: headerv1.Metadata_builder{
+			Labels: map[string]string{types.NotificationTitleLabel: "test"},
+		}.Build(),
+	}.Build()
+	notif, err := notificationsSvc.CreateUserNotification(ctx, testNotification)
+	require.NoError(t, err)
 
-		err = identity.DeleteUser(ctx, username)
-		require.NoError(t, err)
-		attempts, err = identity.GetUserRecoveryAttempts(ctx, username)
-		require.NoError(t, err)
-		require.Len(t, attempts, 0)
-	})
+	// Create a notification state for this user.
+	userNotificationState := notificationsv1.UserNotificationState_builder{
+		Spec: notificationsv1.UserNotificationStateSpec_builder{
+			NotificationId: notif.GetMetadata().GetName(),
+		}.Build(),
+		Status: notificationsv1.UserNotificationStateStatus_builder{
+			NotificationState: notificationsv1.NotificationState_NOTIFICATION_STATE_CLICKED,
+		}.Build(),
+	}.Build()
+	_, err = notificationsSvc.UpsertUserNotificationState(ctx, username, userNotificationState)
+	require.NoError(t, err)
+
+	// Delete the user.
+	err = identitySvc.DeleteUser(ctx, username)
+	require.NoError(t, err)
+
+	// Verify that the notification was deleted.
+	notifsOut, _, err := notificationsSvc.ListUserNotifications(ctx, 0, "")
+	require.NoError(t, err)
+	require.Empty(t, notifsOut)
+
+	// Verify that the notification state was deleted.
+	unsOut, _, err := notificationsSvc.ListUserNotificationStates(ctx, username, 1, "")
+	require.NoError(t, err)
+	require.Empty(t, unsOut)
 }
 
 func TestIdentityService_UpsertMFADevice(t *testing.T) {
@@ -461,10 +530,273 @@ func TestIdentityService_UpsertMFADevice_errors(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			err := identity.UpsertMFADevice(ctx, user, test.createDev())
-			require.NotNil(t, err)
+			require.Error(t, err)
 			require.Contains(t, err.Error(), test.wantErr)
 		})
 	}
+}
+
+func TestIdentityService_GetMFADevices_SSO(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	clock := clockwork.NewFakeClock()
+	identity := newIdentityService(t, clock)
+
+	samlConnectorNoMFA, err := types.NewSAMLConnector("saml-no-mfa", types.SAMLConnectorSpecV2{
+		AssertionConsumerService: "http://localhost:65535/acs", // not called
+		Issuer:                   "test",
+		SSO:                      "https://localhost:65535/sso", // not called
+		AttributesToRoles: []types.AttributeMapping{
+			// not used. can be any name, value but role must exist
+			{Name: "groups", Value: "admin", Roles: []string{"access"}},
+		},
+		MFASettings: &types.SAMLConnectorMFASettings{
+			Enabled: false,
+		},
+	})
+	require.NoError(t, err)
+	_, err = identity.UpsertSAMLConnector(ctx, samlConnectorNoMFA)
+	require.NoError(t, err)
+
+	samlConnector, err := types.NewSAMLConnector("saml", types.SAMLConnectorSpecV2{
+		AssertionConsumerService: "http://localhost:65535/acs", // not called
+		Issuer:                   "test",
+		SSO:                      "https://localhost:65535/sso", // not called
+		AttributesToRoles: []types.AttributeMapping{
+			// not used. can be any name, value but role must exist
+			{Name: "groups", Value: "admin", Roles: []string{"access"}},
+		},
+		MFASettings: &types.SAMLConnectorMFASettings{
+			Enabled: true,
+			Issuer:  "test",
+			Sso:     "https://localhost:65535/sso", // not called
+		},
+	})
+	require.NoError(t, err)
+	_, err = identity.UpsertSAMLConnector(ctx, samlConnector)
+	require.NoError(t, err)
+
+	var metadataRequests atomic.Int64
+	idpMetadataServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		metadataRequests.Add(1)
+		_, err := w.Write([]byte(entityDescriptor))
+		require.NoError(t, err)
+	}))
+	t.Cleanup(idpMetadataServer.Close)
+
+	samlConnectorWithMatchingSSOAndSSOMFAIdP := newSAMlConenctorWithEDURL(t, identity, "samlConnectorWithMatchingSSOAndSSOMFAIdP", idpMetadataServer.URL, idpMetadataServer.URL)
+	samlConnectorWithDifferentSSOAndSSOMFAIdP := newSAMlConenctorWithEDURL(t, identity, "samlConnectorWithDifferentSSOAndSSOMFAIdP", idpMetadataServer.URL, idpMetadataServer.URL+"/mfa")
+
+	// Reset so we can check the GetMFADevices does not call the endpoint.
+	metadataRequests.Store(0)
+
+	oidcConnector, err := types.NewOIDCConnector("oidc", types.OIDCConnectorSpecV3{
+		ClientID:     "12345",
+		ClientSecret: "678910",
+		RedirectURLs: []string{"https://proxy.example.com/v1/webapi/oidc/callback"},
+		ClaimsToRoles: []types.ClaimMapping{
+			{
+				Claim: "test",
+				Value: "test",
+				Roles: []string{"access"},
+			},
+		},
+		MFASettings: &types.OIDCConnectorMFASettings{
+			Enabled: true,
+		},
+	})
+	require.NoError(t, err)
+	_, err = identity.UpsertOIDCConnector(ctx, oidcConnector)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name            string
+		connectorRef    *types.ConnectorRef
+		expectSSODevice *types.SSOMFADevice
+	}{
+		{
+			name:            "non-sso user",
+			connectorRef:    nil,
+			expectSSODevice: nil,
+		}, {
+			name: "sso user mfa disabled",
+			connectorRef: &types.ConnectorRef{
+				Type: "saml",
+				ID:   samlConnectorNoMFA.GetName(),
+			},
+		}, {
+			name: "saml user",
+			connectorRef: &types.ConnectorRef{
+				Type: "saml",
+				ID:   samlConnector.GetName(),
+			},
+			expectSSODevice: &types.SSOMFADevice{
+				ConnectorType: "saml",
+				ConnectorId:   samlConnector.GetName(),
+				DisplayName:   samlConnector.GetDisplay(),
+			},
+		}, {
+			name: "saml user, with entity descriptor URL, matching SSO and SSO MFA IdP URL",
+			connectorRef: &types.ConnectorRef{
+				Type: "saml",
+				ID:   samlConnectorWithMatchingSSOAndSSOMFAIdP.GetName(),
+			},
+			expectSSODevice: &types.SSOMFADevice{
+				ConnectorType: "saml",
+				ConnectorId:   samlConnectorWithMatchingSSOAndSSOMFAIdP.GetName(),
+				DisplayName:   samlConnectorWithMatchingSSOAndSSOMFAIdP.GetDisplay(),
+			},
+		}, {
+			name: "saml user, with entity descriptor URL, different SSO and SSO MFA IdP URL",
+			connectorRef: &types.ConnectorRef{
+				Type: "saml",
+				ID:   samlConnectorWithDifferentSSOAndSSOMFAIdP.GetName(),
+			},
+			expectSSODevice: &types.SSOMFADevice{
+				ConnectorType: "saml",
+				ConnectorId:   samlConnectorWithDifferentSSOAndSSOMFAIdP.GetName(),
+				DisplayName:   samlConnectorWithDifferentSSOAndSSOMFAIdP.GetDisplay(),
+			},
+		}, {
+			name: "oidc user",
+			connectorRef: &types.ConnectorRef{
+				Type: "oidc",
+				ID:   oidcConnector.GetName(),
+			},
+			expectSSODevice: &types.SSOMFADevice{
+				ConnectorType: "oidc",
+				ConnectorId:   oidcConnector.GetName(),
+				DisplayName:   oidcConnector.GetDisplay(),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			user, err := types.NewUser("alice")
+			require.NoError(t, err)
+			user.SetCreatedBy(types.CreatedBy{
+				Time:      clock.Now().UTC(),
+				Connector: test.connectorRef,
+			})
+			_, err = identity.UpsertUser(ctx, user)
+			require.NoError(t, err)
+
+			devs, err := identity.GetMFADevices(ctx, "alice", true /* withSecrets */)
+			require.NoError(t, err)
+			// Expected zero attempts to fetch the entity descriptor.
+			require.Zero(t, metadataRequests.Load())
+
+			if test.expectSSODevice == nil {
+				assert.Empty(t, devs)
+				return
+			}
+
+			expectSSODevice, err := types.NewMFADevice(test.expectSSODevice.ConnectorId, test.expectSSODevice.DisplayName, clock.Now().UTC(), &types.MFADevice_Sso{
+				Sso: test.expectSSODevice,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, []*types.MFADevice{expectSSODevice}, devs)
+		})
+	}
+}
+
+func TestIdentityService_UpsertMFADevice_SSO(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	clock := clockwork.NewFakeClock()
+	identity := newIdentityService(t, clock)
+
+	connectorName := "saml"
+	connectorType := "saml"
+	samlConnector, err := types.NewSAMLConnector(connectorName, types.SAMLConnectorSpecV2{
+		AssertionConsumerService: "http://localhost:65535/acs", // not called
+		Issuer:                   "test",
+		SSO:                      "https://localhost:65535/sso", // not called
+		AttributesToRoles: []types.AttributeMapping{
+			// not used. can be any name, value but role must exist
+			{Name: "groups", Value: "admin", Roles: []string{"access"}},
+		},
+		MFASettings: &types.SAMLConnectorMFASettings{
+			Enabled: true,
+			Issuer:  "test",
+			Sso:     "https://localhost:65535/sso", // not called
+		},
+	})
+	require.NoError(t, err)
+	_, err = identity.UpsertSAMLConnector(ctx, samlConnector)
+	require.NoError(t, err)
+
+	username := "alice"
+	user, err := types.NewUser(username)
+	require.NoError(t, err)
+	user.SetCreatedBy(types.CreatedBy{
+		Time: clock.Now().UTC(),
+		Connector: &types.ConnectorRef{
+			Type: connectorType,
+			ID:   connectorName,
+		},
+	})
+	_, err = identity.UpsertUser(ctx, user)
+	require.NoError(t, err)
+
+	ssoDevice, err := types.NewMFADevice(connectorName, connectorName, clock.Now().UTC(), &types.MFADevice_Sso{
+		Sso: &types.SSOMFADevice{
+			ConnectorId:   connectorName,
+			ConnectorType: connectorType,
+		},
+	})
+	require.NoError(t, err)
+
+	upsertErr := identity.UpsertMFADevice(ctx, username, ssoDevice)
+	assert.ErrorAs(t, upsertErr, new(*trace.BadParameterError), "expected BadParameterError upserting SSO MFA device")
+	assert.ErrorContains(t, upsertErr, "cannot create SSO MFA device", "unexpected error upserting SSO MFA device")
+}
+
+func TestIdentityService_DeleteMFADevice_SSO(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	clock := clockwork.NewFakeClock()
+	identity := newIdentityService(t, clock)
+
+	connectorName := "saml"
+	connectorType := "saml"
+	samlConnector, err := types.NewSAMLConnector(connectorName, types.SAMLConnectorSpecV2{
+		AssertionConsumerService: "http://localhost:65535/acs", // not called
+		Issuer:                   "test",
+		SSO:                      "https://localhost:65535/sso", // not called
+		AttributesToRoles: []types.AttributeMapping{
+			// not used. can be any name, value but role must exist
+			{Name: "groups", Value: "admin", Roles: []string{"access"}},
+		},
+		MFASettings: &types.SAMLConnectorMFASettings{
+			Enabled: true,
+			Issuer:  "test",
+			Sso:     "https://localhost:65535/sso", // not called
+		},
+	})
+	require.NoError(t, err)
+	_, err = identity.UpsertSAMLConnector(ctx, samlConnector)
+	require.NoError(t, err)
+
+	username := "alice"
+	user, err := types.NewUser(username)
+	require.NoError(t, err)
+	user.SetCreatedBy(types.CreatedBy{
+		Time: clock.Now().UTC(),
+		Connector: &types.ConnectorRef{
+			Type: connectorType,
+			ID:   connectorName,
+		},
+	})
+	_, err = identity.UpsertUser(ctx, user)
+	require.NoError(t, err)
+
+	deleteErr := identity.DeleteMFADevice(ctx, username, connectorName)
+	assert.ErrorAs(t, deleteErr, new(*trace.BadParameterError), "expected BadParameterError deleting SSO MFA device")
+	assert.ErrorContains(t, deleteErr, "cannot delete ephemeral SSO MFA device", "unexpected error deleting SSO MFA device")
 }
 
 func TestIdentityService_UpsertWebauthnLocalAuth(t *testing.T) {
@@ -483,11 +815,11 @@ func TestIdentityService_UpsertWebauthnLocalAuth(t *testing.T) {
 		las.Webauthn = wal
 		u.SetLocalAuth(las)
 
-		err = identity.UpsertUser(u)
+		_, err = identity.UpsertUser(ctx, u)
 		return err
 	}
 	getViaUser := func(ctx context.Context, user string) (*types.WebauthnLocalAuth, error) {
-		u, err := identity.GetUser(user, true /* withSecrets */)
+		u, err := identity.GetUser(ctx, user, true /* withSecrets */)
 		if err != nil {
 			return nil, err
 		}
@@ -495,15 +827,15 @@ func TestIdentityService_UpsertWebauthnLocalAuth(t *testing.T) {
 	}
 
 	// Create a user to begin with.
+	ctx := context.Background()
 	const name = "llama"
 	user, err := types.NewUser(name)
 	require.NoError(t, err)
-	err = identity.UpsertUser(user)
+	_, err = identity.UpsertUser(ctx, user)
 	require.NoError(t, err)
 
 	// Try a few empty reads.
-	ctx := context.Background()
-	_, err = identity.GetUser(name, true /* withSecrets */)
+	_, err = identity.GetUser(ctx, name, true /* withSecrets */)
 	require.NoError(t, err) // User read should be fine.
 	_, err = identity.GetWebauthnLocalAuth(ctx, name)
 	require.True(t, trace.IsNotFound(err)) // Direct WAL read should fail.
@@ -513,7 +845,7 @@ func TestIdentityService_UpsertWebauthnLocalAuth(t *testing.T) {
 	err = identity.UpsertWebauthnLocalAuth(ctx, name, badWAL)
 	require.True(t, trace.IsBadParameter(err))
 	user.SetLocalAuth(&types.LocalAuthSecrets{Webauthn: badWAL})
-	err = identity.UpdateUser(ctx, user)
+	_, err = identity.UpdateUser(ctx, user)
 	require.True(t, trace.IsBadParameter(err))
 
 	// Update/Read tests.
@@ -765,6 +1097,7 @@ func TestIdentityService_UpsertGlobalWebauthnSessionData_maxLimit(t *testing.T) 
 		local.GlobalSessionDataMaxEntries = sdMax
 		local.SessionDataLimiter.Clock = sdClock
 		local.SessionDataLimiter.ResetPeriod = sdReset
+		local.SessionDataLimiter.Reset()
 	}()
 	fakeClock := clockwork.NewFakeClock()
 	period := 1 * time.Minute // arbitrary, applied to fakeClock
@@ -772,8 +1105,10 @@ func TestIdentityService_UpsertGlobalWebauthnSessionData_maxLimit(t *testing.T) 
 	local.SessionDataLimiter.Clock = fakeClock
 	local.SessionDataLimiter.ResetPeriod = period
 
-	const scopeLogin = "login"
-	const scopeOther = "other"
+	// Add some randomness to the scopes to avoid high -count runs tripping on
+	// each other.
+	scopeLogin := "login" + uuid.NewString()
+	scopeOther := "other" + uuid.NewString()
 	const id1 = "challenge1"
 	const id2 = "challenge2"
 	const id3 = "challenge3"
@@ -892,49 +1227,702 @@ Tirv9LjajEBxUnuV+wIDAQAB
 			err := identity.UpsertKeyAttestationData(ctx, attestationData, time.Hour)
 			require.NoError(t, err, "UpsertKeyAttestationData failed")
 
-			pub, err := x509.ParsePKIXPublicKey(pubDer)
-			require.NoError(t, err, "ParsePKIXPublicKey failed")
-
-			retrievedAttestationData, err := identity.GetKeyAttestationData(ctx, pub)
+			retrievedAttestationData, err := identity.GetKeyAttestationData(ctx, pubDer)
 			require.NoError(t, err, "GetKeyAttestationData failed")
 			require.Equal(t, attestationData, retrievedAttestationData, "GetKeyAttestationData mismatch")
 		})
 	}
 }
 
-// DELETE IN 13.0, old fingerprints not in use by then (Joerger).
-func TestIdentityService_GetKeyAttestationDataV11Fingerprint(t *testing.T) {
+func TestIdentityService_UpdateAndSwapUser(t *testing.T) {
 	t.Parallel()
 	identity := newIdentityService(t, clockwork.NewFakeClock())
 	ctx := context.Background()
 
-	key, err := native.GenerateRSAPrivateKey()
-	require.NoError(t, err)
-
-	pubDER, err := x509.MarshalPKIXPublicKey(key.Public())
-	require.NoError(t, err)
-
-	attestationData := &keys.AttestationData{
-		PrivateKeyPolicy: keys.PrivateKeyPolicyNone,
-		PublicKeyDER:     pubDER,
+	type updateParams struct {
+		user        string
+		withSecrets bool
+		fn          func(u types.User) (changed bool, err error)
 	}
 
-	// manually insert attestation data with old style fingerprint.
-	value, err := json.Marshal(attestationData)
-	require.NoError(t, err)
-
-	backendKey, err := local.KeyAttestationDataFingerprintV11(key.Public())
-	require.NoError(t, err)
-
-	item := backend.Item{
-		Key:   backend.Key("key_attestations", backendKey),
-		Value: value,
+	tests := []struct {
+		name     string
+		makeUser func() (types.User, error) // if not nil, the user is created
+		updateParams
+		wantErr  string
+		wantNoop bool
+	}{
+		{
+			name: "update without secrets",
+			makeUser: func() (types.User, error) {
+				return types.NewUser("updateNoSecrets1")
+			},
+			updateParams: updateParams{
+				fn: func(u types.User) (bool, error) {
+					u.SetLogins([]string{"llama", "alpaca"})
+					return true, nil
+				},
+			},
+		},
+		{
+			name: "update without secrets can't write secrets",
+			makeUser: func() (types.User, error) {
+				return types.NewUser("updateNoSecrets2")
+			},
+			updateParams: updateParams{
+				fn: func(u types.User) (bool, error) {
+					u.SetLogins([]string{"llama", "alpaca"})
+					u.SetLocalAuth(&types.LocalAuthSecrets{
+						Webauthn: &types.WebauthnLocalAuth{
+							UserID: []byte("superwebllama"),
+						},
+					})
+					return true, nil
+				},
+			},
+		},
+		{
+			name: "update with secrets",
+			makeUser: func() (types.User, error) {
+				return types.NewUser("updateWithSecrets")
+			},
+			updateParams: updateParams{
+				withSecrets: true,
+				fn: func(u types.User) (bool, error) {
+					u.SetLogins([]string{"llama", "alpaca"})
+					u.SetLocalAuth(&types.LocalAuthSecrets{
+						Webauthn: &types.WebauthnLocalAuth{
+							UserID: []byte("superwebllama"),
+						},
+					})
+					return true, nil
+				},
+			},
+		},
+		{
+			name: "noop fn",
+			makeUser: func() (types.User, error) {
+				return types.NewUser("noop1")
+			},
+			updateParams: updateParams{
+				fn: func(u types.User) (changed bool, err error) {
+					u.SetLogins([]string{"llama"}) // not written to storage!
+					return false, nil
+				},
+			},
+			wantNoop: true,
+		},
+		{
+			name: "user not found",
+			updateParams: updateParams{
+				user: "unknown",
+				fn:   func(u types.User) (changed bool, err error) { return false, nil },
+			},
+			wantErr: "not found",
+		},
+		{
+			name: "fn error surfaced",
+			makeUser: func() (types.User, error) {
+				return types.NewUser("fnErr")
+			},
+			updateParams: updateParams{
+				fn: func(u types.User) (changed bool, err error) {
+					return false, errors.New("something really terrible happened")
+				},
+			},
+			wantErr: "something really terrible",
+		},
 	}
-	_, err = identity.Put(ctx, item)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var before types.User
+
+			// Create user?
+			if test.makeUser != nil {
+				var err error
+				before, err = test.makeUser()
+				require.NoError(t, err, "makeUser failed")
+				_, err = identity.CreateUser(ctx, before)
+				require.NoError(t, err, "CreateUser failed")
+
+				if test.user == "" {
+					test.user = before.GetName()
+				} else if test.user != before.GetName() {
+					t.Fatal("Test has both makeUser and updateParams.user, but they don't match")
+				}
+			}
+
+			updated, err := identity.UpdateAndSwapUser(ctx, test.user, test.withSecrets, test.fn)
+			if test.wantErr != "" {
+				assert.ErrorContains(t, err, test.wantErr, "UpdateAndSwapUser didn't error")
+				return
+			}
+
+			// Determine wanted user based on `before` and params.
+			want := before
+			if !test.wantNoop {
+				test.fn(want)
+			}
+			if !test.withSecrets {
+				want = want.WithoutSecrets().(types.User)
+			}
+
+			// Assert update response.
+			if diff := cmp.Diff(want, updated, cmpopts.IgnoreFields(types.Metadata{}, "Revision")); diff != "" {
+				t.Errorf("UpdateAndSwapUser return mismatch (-want +got)\n%s", diff)
+			}
+
+			// Assert stored.
+			stored, err := identity.GetUser(ctx, test.user, test.withSecrets)
+			require.NoError(t, err, "GetUser failed")
+			if diff := cmp.Diff(want, stored, cmpopts.IgnoreFields(types.Metadata{}, "Revision")); diff != "" {
+				t.Errorf("UpdateAndSwapUser storage mismatch (-want +got)\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestIdentityService_ListUsers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+	identity := newIdentityService(t, clock)
+
+	password, err := bcrypt.GenerateFromPassword([]byte("insecure"), bcrypt.MinCost)
+	require.NoError(t, err, "creating password failed")
+
+	dev1, err := services.NewTOTPDevice("otp1", base32.StdEncoding.EncodeToString([]byte("abc123")), time.Now())
+	require.NoError(t, err, "creating otp device failed")
+	dev2, err := services.NewTOTPDevice("otp2", base32.StdEncoding.EncodeToString([]byte("xyz789")), time.Now())
+	require.NoError(t, err, "creating otp device failed")
+
+	// Validate that no users returns an empty page.
+	rsp, err := identity.ListUsers(ctx, &userspb.ListUsersRequest{})
+	assert.NoError(t, err, "no error returned when no users exist")
+	assert.Empty(t, rsp.GetUsers(), "users returned from listing when no users exist")
+	assert.Empty(t, rsp.GetNextPageToken(), "next page token returned from listing when no users exist")
+
+	rsp, err = identity.ListUsers(ctx, userspb.ListUsersRequest_builder{
+		WithSecrets: true,
+	}.Build())
+	assert.NoError(t, err, "no error returned when no users exist")
+	assert.Empty(t, rsp.GetUsers(), "users returned from listing when no users exist")
+	assert.Empty(t, rsp.GetNextPageToken(), "next page token returned from listing when no users exist")
+
+	// Validate that listing works when there is only a single user
+	user, err := types.NewUser("fish0")
+	require.NoError(t, err, "creating new user %s", user)
+
+	user, err = identity.CreateUser(ctx, user)
+	require.NoError(t, err, "creating user %s failed", user)
+	expectedUsers := []*types.UserV2{user.(*types.UserV2)}
+
+	rsp, err = identity.ListUsers(ctx, &userspb.ListUsersRequest{})
+	assert.NoError(t, err, "no error returned when no users exist")
+	assert.Empty(t, rsp.GetNextPageToken(), "next page token returned from listing when no more users exist")
+	assert.Empty(t, cmp.Diff(expectedUsers, rsp.GetUsers(), cmpopts.IgnoreFields(types.UserSpecV2{}, "LocalAuth")), "not all users returned from listing operation")
+
+	rsp, err = identity.ListUsers(ctx, userspb.ListUsersRequest_builder{WithSecrets: true}.Build())
+	assert.NoError(t, err, "no error returned when no users exist")
+	assert.Empty(t, rsp.GetNextPageToken(), "next page token returned from listing when no users exist")
+	assert.Empty(t, cmp.Diff(expectedUsers, rsp.GetUsers()), "not all users returned from listing operation")
+
+	// Create a number of users.
+	usernames := []string{"llama", "alpaca", "fox", "fish", "fish+", "fish2"}
+	for i, name := range usernames {
+		user, err := types.NewUser(name)
+		require.NoError(t, err, "creating new user %s", name)
+
+		// Set varying number of devices so the listing logic
+		// doesn't cleanly land on a user resource.
+		devices := []*types.MFADevice{dev1}
+		switch {
+		case i%2 == 0:
+			devices = append(devices, dev2)
+		case i == 3:
+			devices = nil
+		case i == 1:
+			devices = append(devices, dev2)
+			for range 20 {
+				dev, err := services.NewTOTPDevice(uuid.NewString(), base32.StdEncoding.EncodeToString([]byte("abc123")), time.Now())
+				require.NoError(t, err, "creating otp device failed")
+				devices = append(devices, dev)
+			}
+		}
+
+		user.SetLocalAuth(&types.LocalAuthSecrets{
+			PasswordHash: password,
+			MFA:          devices,
+		})
+
+		created, err := identity.CreateUser(ctx, user)
+		require.NoError(t, err, "creating user %s failed", user)
+		expectedUsers = append(expectedUsers, created.(*types.UserV2))
+	}
+	slices.SortFunc(expectedUsers, func(a, b *types.UserV2) int {
+		return strings.Compare(a.GetName(), b.GetName())
+	})
+
+	// List a few users at a time and validate that all users are eventually returned.
+	var retrieved []*types.UserV2
+	req := userspb.ListUsersRequest_builder{
+		PageSize: 2,
+	}.Build()
+	for {
+		rsp, err := identity.ListUsers(ctx, req)
+		require.NoError(t, err, "no error returned when no users exist")
+
+		for _, user := range rsp.GetUsers() {
+			assert.Empty(t, user.GetLocalAuth(), "expected no secrets to be returned with user %s", user.GetName())
+		}
+
+		retrieved = append(retrieved, rsp.GetUsers()...)
+
+		req.SetPageToken(rsp.GetNextPageToken())
+		if req.GetPageToken() == "" {
+			break
+		}
+
+		if len(retrieved) > len(expectedUsers) {
+			t.Fatalf("listing users has accumulated %d users even though only %d users exist", len(retrieved), len(expectedUsers))
+		}
+	}
+
+	slices.SortFunc(retrieved, func(a, b *types.UserV2) int {
+		return strings.Compare(a.GetName(), b.GetName())
+	})
+	assert.Empty(t, cmp.Diff(expectedUsers, retrieved, cmpopts.IgnoreFields(types.UserSpecV2{}, "LocalAuth")), "not all users returned from listing operation")
+
+	// Validate that listing all users at once returns all expected users with secrets.
+	rsp, err = identity.ListUsers(ctx, userspb.ListUsersRequest_builder{
+		PageSize:    200,
+		WithSecrets: true,
+	}.Build())
+	require.NoError(t, err, "unexpected error listing users")
+	assert.Empty(t, rsp.GetNextPageToken(), "got a next page token when page size was greater than number of items")
+
+	users := rsp.GetUsers()
+
+	slices.SortFunc(users, func(a, b *types.UserV2) int {
+		return strings.Compare(a.GetName(), b.GetName())
+	})
+
+	devicesSort := func(a *types.MFADevice, b *types.MFADevice) bool { return a.GetName() < b.GetName() }
+
+	require.Empty(t, cmp.Diff(expectedUsers, users, cmpopts.SortSlices(devicesSort)), "not all users returned from listing operation")
+
+	// List a few users at a time and validate that all users are eventually returned with their secrets.
+	retrieved = nil
+	req = userspb.ListUsersRequest_builder{
+		PageSize:    2,
+		WithSecrets: true,
+	}.Build()
+	for {
+		rsp, err := identity.ListUsers(ctx, req)
+		require.NoError(t, err, "no error returned when no users exist")
+
+		retrieved = append(retrieved, rsp.GetUsers()...)
+
+		req.SetPageToken(rsp.GetNextPageToken())
+		if req.GetPageToken() == "" {
+			break
+		}
+
+		if len(retrieved) > len(expectedUsers) {
+			t.Fatalf("listing users has accumulated %d users even though only %d users exist", len(retrieved), len(expectedUsers))
+		}
+	}
+
+	slices.SortFunc(retrieved, func(a, b *types.UserV2) int {
+		return strings.Compare(a.GetName(), b.GetName())
+	})
+	require.Empty(t, cmp.Diff(expectedUsers, retrieved, cmpopts.SortSlices(devicesSort)), "not all users returned from listing operation")
+
+	ssoUser := expectedUsers[2]
+	expectedUsers = slices.Delete(expectedUsers, 2, 3)
+	ssoUser.SetExpiry(clock.Now().UTC().Add(time.Minute))
+
+	_, err = identity.UpsertUser(ctx, ssoUser)
+	assert.NoError(t, err, "failed to upsert SSO user")
+
+	clock.Advance(time.Hour)
+
+	rsp, err = identity.ListUsers(ctx, userspb.ListUsersRequest_builder{
+		WithSecrets: true,
+	}.Build())
+	assert.NoError(t, err, "got an error while listing over an expired user")
+	assert.Empty(t, rsp.GetNextPageToken(), "next page token returned from listing all users")
+
+	retrieved = rsp.GetUsers()
+
+	slices.SortFunc(retrieved, func(a, b *types.UserV2) int {
+		return strings.Compare(a.GetName(), b.GetName())
+	})
+	require.Empty(t, cmp.Diff(expectedUsers, retrieved, cmpopts.SortSlices(devicesSort)), "not all users returned from listing operation")
+}
+
+func TestIdentityService_UpsertAndDeletePassword(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	identity := newIdentityService(t, clockwork.NewFakeClock())
+
+	// Create a user.
+	user, err := types.NewUser("capybara")
+	require.NoError(t, err)
+	_, err = identity.CreateUser(ctx, user)
+	require.NoError(t, err, "failed to create the user")
+
+	// Verify the initial password state
+	user, err = identity.GetUser(ctx, "capybara", true /* withSecrets */)
+	require.NoError(t, err, "failed to get the user")
+	assert.Equal(t, types.PasswordState_PASSWORD_STATE_UNSET, user.GetPasswordState(), "password state is not UNSET")
+
+	// Set the password.
+	err = identity.UpsertPassword(user.GetName(), []byte("gimme12chars"))
+	require.NoError(t, err, "failed to set password")
+
+	// Validate that the password is set.
+	user, err = identity.GetUser(ctx, "capybara", true /* withSecrets */)
+	require.NoError(t, err, "failed to get the user")
+	assert.NoError(t,
+		bcrypt.CompareHashAndPassword(user.GetLocalAuth().PasswordHash, []byte("gimme12chars")),
+		"password hash does not match")
+	assert.Equal(t, types.PasswordState_PASSWORD_STATE_SET, user.GetPasswordState(), "password state is not SET")
+
+	// Delete the password.
+	err = identity.DeletePassword(ctx, "capybara")
+	require.NoError(t, err, "failed to delete password")
+
+	// Validate that the password is removed.
+	user, err = identity.GetUser(ctx, "capybara", true /* withSecrets */)
+	require.NoError(t, err, "failed to get the user")
+	assert.Nil(t, user.GetLocalAuth(), "secrets are not empty")
+	assert.Equal(t, types.PasswordState_PASSWORD_STATE_UNSET, user.GetPasswordState(), "password state is not UNSET")
+
+	// Attempt to delete the password again. This should return an error.
+	err = identity.DeletePassword(ctx, "capybara")
+	assert.Error(t, err)
+	assert.True(t, trace.IsNotFound(err), "expected not found error, got %v", err)
+	user, err = identity.GetUser(ctx, "capybara", true /* withSecrets */)
+	require.NoError(t, err, "failed to get the user")
+	assert.Nil(t, user.GetLocalAuth(), "secrets are not empty")
+	assert.Equal(t, types.PasswordState_PASSWORD_STATE_UNSET, user.GetPasswordState(), "password state is not UNSET")
+}
+
+func TestCompareAndSwapUser(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	ctx := context.Background()
+
+	identity := newIdentityService(t, clockwork.NewFakeClock())
+
+	bob1, err := types.NewUser("bob")
+	require.NoError(err)
+	bob1.SetLogins([]string{"bob"})
+
+	bob2, err := types.NewUser("bob")
+	require.NoError(err)
+	bob2.SetLogins([]string{"bob", "alice"})
+
+	require.False(bob1.IsEqual(bob2))
+
+	currentBob, err := identity.UpsertUser(ctx, bob1)
+	require.NoError(err)
+	require.True(currentBob.IsEqual(bob1))
+
+	currentBob, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(err)
+	require.True(currentBob.IsEqual(bob1))
+
+	err = identity.CompareAndSwapUser(ctx, bob2, bob1)
+	require.NoError(err)
+
+	bob2, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(err)
+	require.True(currentBob.IsEqual(bob1))
+
+	item, err := identity.Backend.Get(ctx, backend.NewKey(local.WebPrefix, local.UsersPrefix, "bob", local.ParamsPrefix))
+	require.NoError(err)
+	var m map[string]any
+	require.NoError(json.Unmarshal(item.Value, &m))
+	m["deprecated_field"] = 42
+	item.Value, err = json.Marshal(m)
+	require.NoError(err)
+	_, err = identity.Backend.Put(ctx, *item)
+	require.NoError(err)
+
+	currentBob, err = identity.GetUser(ctx, "bob", true)
+	require.NoError(err)
+	require.True(currentBob.IsEqual(bob2))
+	bob2.SetWeakestDevice(currentBob.GetWeakestDevice())
+	err = identity.CompareAndSwapUser(ctx, bob1, bob2)
+	require.NoError(err)
+
+	currentBob, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(err)
+	require.True(currentBob.IsEqual(bob1))
+}
+
+func TestWeakestMFADeviceKind(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+	identity := newIdentityService(t, clock)
+
+	bob1, err := types.NewUser("bob")
+	require.NoError(t, err)
+	bob1.SetLogins([]string{"bob"})
+
+	got, err := identity.CreateUser(ctx, bob1)
+	require.NoError(t, err)
+	require.Equal(t, types.MFADeviceKind_MFA_DEVICE_KIND_UNSET, got.GetWeakestDevice())
+
+	// Set the MFA state to MFA_DEVICE_KIND_TOTP
+	totpDevice := &types.MFADevice{
+		Metadata: types.Metadata{
+			Name: "totp",
+		},
+		Id:       uuid.NewString(),
+		AddedAt:  clock.Now(),
+		LastUsed: clock.Now(),
+		Device: &types.MFADevice_Totp{
+			Totp: &types.TOTPDevice{
+				Key: "supersecretkey",
+			},
+		},
+	}
+	err = identity.UpsertMFADevice(ctx, "bob", totpDevice)
 	require.NoError(t, err)
 
-	// Should be able to retrieve attestation data despite old fingerprint.
-	retrievedAttestationData, err := identity.GetKeyAttestationData(ctx, key.Public())
+	got, err = identity.GetUser(ctx, "bob", false)
 	require.NoError(t, err)
-	require.Equal(t, attestationData, retrievedAttestationData)
+	require.Equal(t, types.MFADeviceKind_MFA_DEVICE_KIND_TOTP, got.GetWeakestDevice())
+	oldRevision := got.GetMetadata().Revision
+
+	u2fDev := &types.MFADevice{
+		Metadata: types.Metadata{
+			Name: "u2f",
+		},
+		Id:       uuid.NewString(),
+		AddedAt:  time.Now(),
+		LastUsed: time.Now(),
+		Device: &types.MFADevice_U2F{
+			U2F: &types.U2FDevice{
+				KeyHandle: []byte("u2f key handle"),
+				PubKey:    []byte("u2f public key"),
+			},
+		},
+	}
+	err = identity.UpsertMFADevice(ctx, "bob", u2fDev)
+	require.NoError(t, err)
+	got, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(t, err)
+	require.Equal(t, types.MFADeviceKind_MFA_DEVICE_KIND_TOTP, got.GetWeakestDevice())
+	require.Equal(t, oldRevision, got.GetMetadata().Revision, "revision should not change")
+
+	// Create webauthn device but state should still be MFA_DEVICE_KIND_TOTP
+	// because it shows the weakest state.
+	webauthnDevice := &types.MFADevice{
+		Metadata: types.Metadata{
+			Name: "webauthn",
+		},
+		Id:       uuid.NewString(),
+		AddedAt:  clock.Now(),
+		LastUsed: clock.Now(),
+		Device: &types.MFADevice_Webauthn{
+			Webauthn: &types.WebauthnDevice{
+				CredentialId:     []byte("credential ID"),
+				PublicKeyCbor:    []byte("public key"),
+				AttestationType:  "none",
+				Aaguid:           []byte{1, 2, 3, 4, 5},
+				SignatureCounter: 10,
+			},
+		},
+	}
+	err = identity.UpsertMFADevice(ctx, "bob", webauthnDevice)
+	require.NoError(t, err)
+
+	got, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(t, err)
+	require.Equal(t, types.MFADeviceKind_MFA_DEVICE_KIND_TOTP, got.GetWeakestDevice())
+	require.Equal(t, oldRevision, got.GetMetadata().Revision, "revision should not change")
+
+	// Delete the TOTP device and the state should be MFA_DEVICE_KIND_WEBAUTHN
+	err = identity.DeleteMFADevice(ctx, "bob", totpDevice.Id)
+	require.NoError(t, err)
+
+	got, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(t, err)
+	require.Equal(t, types.MFADeviceKind_MFA_DEVICE_KIND_WEBAUTHN, got.GetWeakestDevice())
+	oldRevision = got.GetMetadata().Revision
+
+	// Delete the U2F device and the state should be MFA_DEVICE_KIND_WEBAUTHN
+	err = identity.DeleteMFADevice(ctx, "bob", u2fDev.Id)
+	require.NoError(t, err)
+
+	got, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(t, err)
+	require.Equal(t, types.MFADeviceKind_MFA_DEVICE_KIND_WEBAUTHN, got.GetWeakestDevice())
+	require.Equal(t, oldRevision, got.GetMetadata().Revision, "revision should not change")
+
+	// Delete the Webauthn device and the state should be MFA_DEVICE_KIND_UNSET
+	err = identity.DeleteMFADevice(ctx, "bob", webauthnDevice.Id)
+	require.NoError(t, err)
+	got, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(t, err)
+	require.Equal(t, types.MFADeviceKind_MFA_DEVICE_KIND_UNSET, got.GetWeakestDevice())
+
+	// Set the MFA state to MFA_DEVICE_KIND_WebAuthn
+	err = identity.UpsertMFADevice(ctx, "bob", webauthnDevice)
+	require.NoError(t, err)
+	got, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(t, err)
+	require.Equal(t, types.MFADeviceKind_MFA_DEVICE_KIND_WEBAUTHN, got.GetWeakestDevice())
+
+	// Create TOTP device and state should be MFA_DEVICE_KIND_TOTP
+	err = identity.UpsertMFADevice(ctx, "bob", totpDevice)
+	require.NoError(t, err)
+
+	got, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(t, err)
+	require.Equal(t, types.MFADeviceKind_MFA_DEVICE_KIND_TOTP, got.GetWeakestDevice())
+
+	// An SSO MFA device cannot be created. Instead it is deduced based on the MFA settings being
+	// enabled in the SSO connector spec. It is simulated by creating a SAML connector below.
+	samlConnectorWithSSOMFA, err := types.NewSAMLConnector("saml", types.SAMLConnectorSpecV2{
+		AssertionConsumerService: "http://localhost:65535/acs", // not called
+		Issuer:                   "test",
+		SSO:                      "https://localhost:65535/sso", // not called
+		AttributesToRoles: []types.AttributeMapping{
+			// not used. can be any name, value but role must exist
+			{Name: "groups", Value: "admin", Roles: []string{"access"}},
+		},
+		MFASettings: &types.SAMLConnectorMFASettings{
+			Enabled: true,
+			Issuer:  "test",
+			Sso:     "https://localhost:65535/sso", // not called
+		},
+	})
+	require.NoError(t, err)
+	_, err = identity.UpsertSAMLConnector(ctx, samlConnectorWithSSOMFA)
+	require.NoError(t, err)
+
+	// Update bob to be an SSO user by setting CreatedBy matching with samlConnectorWithSSOMFA.
+	// This will start resolving bob's SSO MFA device.
+	bob1, err = identity.GetUser(ctx, "bob", false /* withSecrets */)
+	require.NoError(t, err)
+	bob1.SetCreatedBy(types.CreatedBy{
+		Connector: &types.ConnectorRef{
+			Type:     constants.SAML,
+			ID:       samlConnectorWithSSOMFA.GetName(),
+			Identity: bob1.GetName(),
+		},
+		Time: clock.Now().UTC(),
+	})
+	got, err = identity.UpdateUser(ctx, bob1)
+	require.NoError(t, err)
+
+	// Weakest device still remains the TOTP.
+	require.Equal(t, types.MFADeviceKind_MFA_DEVICE_KIND_TOTP, got.GetWeakestDevice())
+
+	// Delete TOTP device
+	err = identity.DeleteMFADevice(ctx, "bob", totpDevice.Id)
+	require.NoError(t, err)
+
+	// Expect the new weakest device to be SSO MFA.
+	got, err = identity.GetUser(ctx, "bob", false /* withSecrets */)
+	require.NoError(t, err)
+	require.Equal(t, types.MFADeviceKind_MFA_DEVICE_KIND_SSO, got.GetWeakestDevice())
+
+	// New SAML user that has a referenced connector with MFA settings enabled should
+	// get the MFADeviceKind_MFA_DEVICE_KIND_SSO at the time of resource creation.
+	alice, err := types.NewUser("alice")
+	require.NoError(t, err)
+	alice.SetCreatedBy(types.CreatedBy{
+		Connector: &types.ConnectorRef{
+			Type:     constants.SAML,
+			ID:       samlConnectorWithSSOMFA.GetName(),
+			Identity: alice.GetName(),
+		},
+		Time: clock.Now().UTC(),
+	})
+	got, err = identity.CreateUser(ctx, alice)
+	require.NoError(t, err)
+	require.Equal(t, types.MFADeviceKind_MFA_DEVICE_KIND_SSO, got.GetWeakestDevice())
+}
+
+func TestIdentityService_SSOMFASessionDataCRUD(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	identity := newIdentityService(t, clockwork.NewFakeClock())
+
+	// Verify create.
+	sd := &services.MFASessionData{
+		RequestID:     "request",
+		Username:      "alice",
+		ConnectorID:   "saml",
+		ConnectorType: "saml",
+	}
+	err := identity.UpsertMFASessionData(ctx, sd)
+	require.NoError(t, err)
+
+	// Verify read.
+	got, err := identity.GetMFASessionData(ctx, sd.RequestID)
+	require.NoError(t, err)
+	if diff := cmp.Diff(sd, got); diff != "" {
+		t.Fatalf("GetMFASessionData() mismatch (-want +got):\n%s", diff)
+	}
+
+	// Verify update.
+	sd.Token = "token"
+	err = identity.UpsertMFASessionData(ctx, sd)
+	require.NoError(t, err)
+	got, err = identity.GetMFASessionData(ctx, sd.RequestID)
+	require.NoError(t, err)
+	if diff := cmp.Diff(sd, got); diff != "" {
+		t.Fatalf("GetMFASessionData() mismatch (-want +got):\n%s", diff)
+	}
+
+	// Verify delete.
+	err = identity.DeleteMFASessionData(ctx, sd.RequestID)
+	require.NoError(t, err)
+	_, err = identity.GetMFASessionData(ctx, sd.RequestID)
+	require.True(t, trace.IsNotFound(err))
+}
+
+const entityDescriptor = `
+<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="samlSSOIdP">
+  <md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+    <md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://localhost:65535/sso"/>
+  </md:IDPSSODescriptor>
+</md:EntityDescriptor>`
+
+// newSAMlConenctorWithEDURL returns a new SAML connector configured with Entity Descriptor URL.
+// It expects the endpoint configured in `samlEDURL` and `samlMFAEDURL` to serve a valid SAML metadata.
+func newSAMlConenctorWithEDURL(t *testing.T, idSvc *local.IdentityService, name, samlEDURL, samlMFAEDURL string) types.SAMLConnector {
+	t.Helper()
+
+	connector, err := types.NewSAMLConnector(name, types.SAMLConnectorSpecV2{
+		AssertionConsumerService: "https://localhost:65535/sso", // not called
+		EntityDescriptorURL:      samlEDURL,
+		AttributesToRoles: []types.AttributeMapping{
+			// not used. can be any name, value but role must exist
+			{Name: "groups", Value: "admin", Roles: []string{"access"}},
+		},
+		MFASettings: &types.SAMLConnectorMFASettings{
+			Enabled:             true,
+			EntityDescriptorUrl: samlMFAEDURL,
+		},
+	})
+	require.NoError(t, err)
+	upserted, err := idSvc.UpsertSAMLConnector(t.Context(), connector)
+	require.NoError(t, err)
+
+	// Check that entity descriptor was fetched and set, i.e. URL was followed in general connector validation path.
+	require.NotEmpty(t, upserted.GetEntityDescriptor())
+	require.NotNil(t, upserted.GetMFASettings())
+	require.NotEmpty(t, upserted.GetMFASettings().EntityDescriptor)
+
+	return upserted
 }

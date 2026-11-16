@@ -1,23 +1,26 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { forwardRef } from 'react';
-import { SortAsc, SortDesc } from 'design/Icon';
+import { forwardRef } from 'react';
 import styled from 'styled-components';
+
 import { Text } from 'design';
+import { ChevronDown, ChevronUp } from 'design/Icon';
 
 import { useKeyboardShortcutFormatters } from 'teleterm/ui/services/keyboardShortcuts';
 
@@ -28,65 +31,56 @@ interface ClusterSelectorProps {
   onClick(): void;
 }
 
-export const ClusterSelector = forwardRef<HTMLDivElement, ClusterSelectorProps>(
-  (props, ref) => {
-    const { getLabelWithShortcut } = useKeyboardShortcutFormatters();
-    const SortIcon = props.isOpened ? SortAsc : SortDesc;
-    const text = props.clusterName || 'Select Cluster';
+export const ClusterSelector = forwardRef<
+  HTMLButtonElement,
+  ClusterSelectorProps
+>((props, ref) => {
+  const { getLabelWithAccelerator } = useKeyboardShortcutFormatters();
+  const SortIcon = props.isOpened ? ChevronUp : ChevronDown;
+  const text = props.clusterName || 'Select Cluster';
 
-    return (
-      <Container
-        ref={ref}
-        onClick={props.onClick}
-        isOpened={props.isOpened}
-        isClusterSelected={!!props.clusterName}
-        title={getLabelWithShortcut(
-          [props.clusterName, 'Open Clusters'].filter(Boolean).join('\n'),
-          'toggle-clusters'
-        )}
+  return (
+    <Container
+      ref={ref}
+      onClick={props.onClick}
+      isClusterSelected={!!props.clusterName}
+      title={getLabelWithAccelerator(
+        [props.clusterName, 'Open Clusters'].filter(Boolean).join('\n'),
+        'openClusters'
+      )}
+    >
+      <Text
+        css={`
+          white-space: nowrap;
+        `}
       >
-        <Text
-          css={`
-            white-space: nowrap;
-          `}
-        >
-          {text}
-        </Text>
-        <SortIcon fontSize={12} ml={3} />
-      </Container>
-    );
-  }
-);
+        {text}
+      </Text>
+      <SortIcon size="small" ml={3} />
+    </Container>
+  );
+});
 
-const Container = styled.button`
+const Container = styled.button<{ isClusterSelected?: boolean }>`
   background: inherit;
   color: inherit;
   font-family: inherit;
-  min-width: 0;
-  width: 100%;
+  flex: 1;
+  flex-shrink: 2;
+  min-width: ${props => props.theme.space[8]}px;
   height: 100%;
-  border: 0.5px ${props => props.theme.colors.action.disabledBackground} solid;
+  border: 1px ${props => props.theme.colors.buttons.border.border} solid;
   border-radius: 4px;
   display: flex;
-  flex-grow: 1;
   justify-content: space-between;
   align-items: center;
-  padding: 0 12px;
+  padding: 0 ${props => props.theme.space[2]}px;
   opacity: ${props => (props.isClusterSelected ? 1 : 0.6)};
   cursor: pointer;
 
   &:hover,
   &:focus {
     opacity: 1;
-    border-color: ${props => props.theme.colors.light};
+    background: ${props => props.theme.colors.spotBackground[0]};
   }
-
-  ${props => {
-    if (props.isOpened) {
-      return {
-        borderColor: props.theme.colors.secondary.main,
-        opacity: 1,
-      };
-    }
-  }}
 `;

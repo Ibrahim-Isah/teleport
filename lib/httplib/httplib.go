@@ -1,43 +1,54 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package httplib implements common utility functions for writing
 // classic HTTP handlers
 package httplib
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
-	"strconv"
+	"strings"
 
 	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/trace"
 	"github.com/julienschmidt/httprouter"
-	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api"
 	"github.com/gravitational/teleport/api/observability/tracing"
-	"github.com/gravitational/teleport/lib/httplib/csrf"
+	tracehttp "github.com/gravitational/teleport/api/observability/tracing/http"
 	"github.com/gravitational/teleport/lib/utils"
+)
+
+var (
+	_ http.ResponseWriter = (*ResponseStatusRecorder)(nil)
+	_ http.Flusher        = (*ResponseStatusRecorder)(nil)
+	_ http.Hijacker       = (*ResponseStatusRecorder)(nil)
 )
 
 // timeoutMessage is a generic "timeout" error message that is displayed as a more user-friendly alternative to
@@ -45,10 +56,10 @@ import (
 const timeoutMessage = "unable to complete the request due to a timeout, please try again in a few minutes"
 
 // HandlerFunc specifies HTTP handler function that returns error
-type HandlerFunc func(w http.ResponseWriter, r *http.Request, p httprouter.Params) (interface{}, error)
+type HandlerFunc func(w http.ResponseWriter, r *http.Request, p httprouter.Params) (any, error)
 
 // StdHandlerFunc specifies HTTP handler function that returns error
-type StdHandlerFunc func(w http.ResponseWriter, r *http.Request) (interface{}, error)
+type StdHandlerFunc func(w http.ResponseWriter, r *http.Request) (any, error)
 
 // ErrorWriter is a function responsible for writing the error into response
 // body.
@@ -93,7 +104,15 @@ func MakeTracingHandler(h http.Handler, component string) http.Handler {
 		h.ServeHTTP(w, r)
 	}
 
-	return otelhttp.NewHandler(http.HandlerFunc(handler), component, otelhttp.WithSpanNameFormatter(tracing.HTTPHandlerFormatter))
+	return otelhttp.NewHandler(http.HandlerFunc(handler), component, otelhttp.WithSpanNameFormatter(tracehttp.HandlerFormatter))
+}
+
+// MakeTracingMiddleware returns an HTTP middleware that makes tracing
+// handlers.
+func MakeTracingMiddleware(component string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return MakeTracingHandler(next, component)
+	}
 }
 
 // MakeHandlerWithErrorWriter returns a httprouter.Handle from the HandlerFunc,
@@ -136,36 +155,35 @@ func MakeStdHandlerWithErrorWriter(fn StdHandlerFunc, errWriter ErrorWriter) htt
 	}
 }
 
-// WithCSRFProtection ensures that request to unauthenticated API is checked against CSRF attacks
-func WithCSRFProtection(fn HandlerFunc) httprouter.Handle {
-	hanlderFn := MakeHandler(fn)
-	return func(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
-		err := csrf.VerifyHTTPHeader(r)
-		if err != nil {
-			log.Warningf("unable to validate CSRF token %v", err)
-			trace.WriteError(w, trace.AccessDenied("access denied"))
-			return
-		}
-		hanlderFn(w, r, p)
-	}
+// ReadJSON reads HTTP json request and unmarshals it
+// into passed any obj. A reasonable maximum size is enforced
+// to mitigate resource exhaustion attacks.
+func ReadJSON(r *http.Request, val any) error {
+	return readJSON(r, val, teleport.MaxHTTPRequestSize)
 }
 
-// ReadJSON reads HTTP json request and unmarshals it
-// into passed interface{} obj
-func ReadJSON(r *http.Request, val interface{}) error {
+// ReadJSON reads an HTTP JSON request and unmarshals it
+// into val. A small maximum size is enforced to mitigate
+// resource exhaustion attacks.
+func ReadResourceJSON(r *http.Request, val any) error {
+	return readJSON(r, val, teleport.MaxResourceSize)
+}
+
+func readJSON(r *http.Request, val any, maxSize int64) error {
 	// Check content type to mitigate CSRF attack.
+	// (Form POST requests don't support application/json payloads.)
 	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil {
-		log.Warningf("Error parsing media type for reading JSON: %v", err)
+		slog.WarnContext(r.Context(), "Error parsing media type for reading JSON", "error", err)
 		return trace.BadParameter("invalid request")
 	}
 
 	if contentType != "application/json" {
-		log.Warningf("Invalid HTTP request header content-type %q for reading JSON", contentType)
+		slog.WarnContext(r.Context(), "Invalid HTTP request header content-type for reading JSON", "content_type", contentType)
 		return trace.BadParameter("invalid request")
 	}
 
-	data, err := utils.ReadAtMost(r.Body, teleport.MaxHTTPRequestSize)
+	data, err := utils.ReadAtMost(r.Body, maxSize)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -194,20 +212,42 @@ func ConvertResponse(re *roundtrip.Response, err error) (*roundtrip.Response, er
 	return re, trace.ReadError(re.Code(), re.Bytes())
 }
 
-// ParseBool will parse boolean variable from url query
-// returns value, ok, error
-func ParseBool(q url.Values, name string) (bool, bool, error) {
-	stringVal := q.Get(name)
-	if stringVal == "" {
-		return false, false, nil
+// ProxyVersion describes the parts of a Proxy semver
+// version in the format: major.minor.patch-preRelease
+type ProxyVersion struct {
+	// Major is the first part of version.
+	Major int64 `json:"major"`
+	// Minor is the second part of version.
+	Minor int64 `json:"minor"`
+	// Patch is the third part of version.
+	Patch int64 `json:"patch"`
+	// PreRelease is only defined if there was a hyphen
+	// and a word at the end of version eg: the prerelease
+	// value of version 18.0.0-dev is "dev".
+	PreRelease string `json:"preRelease"`
+	// String contains the whole version.
+	String string `json:"string"`
+}
+
+// RouteNotFoundResponse writes a JSON error reply containing
+// a not found error, a Version object, and a not found HTTP status code.
+func RouteNotFoundResponse(ctx context.Context, w http.ResponseWriter) {
+	SetDefaultSecurityHeaders(w.Header())
+
+	errObj := &trace.TraceErr{
+		Err: trace.NotFound("path not found"),
+		Fields: map[string]any{
+			"proxyVersion": ProxyVersion{
+				Major:      api.VersionMajor,
+				Minor:      api.VersionMinor,
+				Patch:      api.VersionPatch,
+				String:     api.Version,
+				PreRelease: api.VersionPreRelease,
+			},
+		},
 	}
 
-	val, err := strconv.ParseBool(stringVal)
-	if err != nil {
-		return false, false, trace.BadParameter(
-			"'%v': expected 'true' or 'false', got %v", name, stringVal)
-	}
-	return val, true, nil
+	roundtrip.ReplyJSON(w, http.StatusNotFound, errObj)
 }
 
 // RewritePair is a rewrite expression
@@ -237,14 +277,27 @@ func RewritePaths(next http.Handler, rewrites ...RewritePair) http.Handler {
 	})
 }
 
-// SafeRedirect performs a relative redirect to the URI part of the provided redirect URL
-func SafeRedirect(w http.ResponseWriter, r *http.Request, redirectURL string) error {
+// OriginLocalRedirectURI will take an incoming URL including optionally the host and scheme and return the URI
+// associated with the URL.  Additionally, it will ensure that the URI does not include any techniques potentially
+// used to redirect to a different origin.
+func OriginLocalRedirectURI(redirectURL string) (string, error) {
 	parsedURL, err := url.Parse(redirectURL)
 	if err != nil {
-		return trace.Wrap(err)
+		return "", trace.Wrap(err)
+	} else if parsedURL.IsAbs() && (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		return "", trace.BadParameter("Invalid scheme: %s", parsedURL.Scheme)
 	}
-	http.Redirect(w, r, parsedURL.RequestURI(), http.StatusFound)
-	return nil
+
+	// Make sure User field does not exist to prevent basic auth
+	if parsedURL.User != nil {
+		return "", trace.BadParameter("Basic Auth not allowed in redirect URL")
+	}
+
+	resultURI := parsedURL.RequestURI()
+	if strings.HasPrefix(resultURI, "//") {
+		return "", trace.BadParameter("Invalid double slash redirect")
+	}
+	return resultURI, nil
 }
 
 // ResponseStatusRecorder is an http.ResponseWriter that records the response status code.
@@ -272,12 +325,6 @@ func (r *ResponseStatusRecorder) WriteHeader(status int) {
 
 // Flush optionally flushes the inner ResponseWriter if it supports that.
 // Otherwise, Flush is a noop.
-//
-// Flush is optionally used by github.com/gravitational/oxy/forward to flush
-// pending data on streaming HTTP responses (like streaming pod logs).
-//
-// Without this, oxy/forward will handle streaming responses by accumulating
-// ~32kb of response in a buffer before flushing it.
 func (r *ResponseStatusRecorder) Flush() {
 	if r.flusher != nil {
 		r.flusher.Flush()
@@ -293,4 +340,13 @@ func (r *ResponseStatusRecorder) Status() int {
 		return http.StatusOK
 	}
 	return r.status
+}
+
+// Hijack implements the http.Hijacker interface.
+func (r *ResponseStatusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("hijack not supported")
+	}
+	return h.Hijack()
 }

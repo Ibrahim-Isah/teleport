@@ -1,77 +1,72 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package main
 
 import (
 	"path/filepath"
+	"slices"
+	"strings"
 
 	"github.com/gravitational/trace"
 
-	"github.com/gravitational/teleport/lib/tbot/config"
+	"github.com/gravitational/teleport/lib/tbot/cli"
+	"github.com/gravitational/teleport/lib/tbot/services/identity"
 	"github.com/gravitational/teleport/lib/tbot/tshwrap"
-	"github.com/gravitational/teleport/lib/utils"
 )
 
-func onDBCommand(botConfig *config.BotConfig, cf *config.CLIConf) error {
+func onDBCommand(globalCfg *cli.GlobalArgs, dbCmd *cli.DBCommand) error {
+	botConfig, err := cli.LoadConfigWithMutators(globalCfg)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
 	wrapper, err := tshwrap.New()
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	if err := tshwrap.CheckTSHSupported(wrapper); err != nil {
-		return trace.Wrap(err)
-	}
-
-	destination, err := tshwrap.GetDestination(botConfig, cf)
+	destination, err := tshwrap.GetDestinationDirectory(dbCmd.DestinationDir, botConfig)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	destinationPath, err := tshwrap.GetDestinationPath(destination)
+	env, err := tshwrap.GetEnvForTSH(destination.Path)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	identityTemplate, err := tshwrap.GetIdentityTemplate(destination)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	env, err := tshwrap.GetEnvForTSH(destination)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	identityPath := filepath.Join(destinationPath, identityTemplate.FileName)
+	identityPath := filepath.Join(destination.Path, identity.IdentityFilePath)
 	identity, err := tshwrap.LoadIdentity(identityPath)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	args := []string{"-i", identityPath, "db", "--proxy=" + cf.Proxy}
-	if cf.Cluster != "" {
+	args := []string{"-i", identityPath, "db", "--proxy=" + dbCmd.ProxyServer}
+	if dbCmd.Cluster != "" {
 		// If we caught --cluster in our args, pass it through.
-		args = append(args, "--cluster="+cf.Cluster)
-	} else if !utils.HasPrefixAny("--cluster", cf.RemainingArgs) {
+		args = append(args, "--cluster="+dbCmd.Cluster)
+	} else if !slices.ContainsFunc(*dbCmd.RemainingArgs, func(s string) bool { return strings.HasPrefix(s, "--cluster") }) {
 		// If no `--cluster` was provided after a `--`, pass along the cluster
 		// name in the identity.
 		args = append(args, "--cluster="+identity.RouteToCluster)
 	}
-	args = append(args, cf.RemainingArgs...)
+	args = append(args, *dbCmd.RemainingArgs...)
 
 	// Pass through the debug flag, and prepend to satisfy argument ordering
 	// needs (`-d` must precede `db`).

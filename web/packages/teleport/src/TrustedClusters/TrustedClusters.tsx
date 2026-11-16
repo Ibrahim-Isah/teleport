@@ -1,24 +1,26 @@
-/*
-Copyright 2020 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
+import { Box, Button, ButtonPrimary, Flex, H3, Indicator, Link } from 'design';
 import { Danger } from 'design/Alert';
-import { Indicator, Text, Box, Flex, ButtonPrimary, Link } from 'design';
 import Card from 'design/Card';
 import Image from 'design/Image';
+import { P } from 'design/Text/Text';
 
 import {
   FeatureBox,
@@ -26,60 +28,61 @@ import {
   FeatureHeaderTitle,
 } from 'teleport/components/Layout';
 import ResourceEditor from 'teleport/components/ResourceEditor';
-
 import useResources from 'teleport/components/useResources';
 
+import { emptyPng } from './assets';
 import DeleteTrust from './DeleteTrust';
 import templates from './templates';
 import TrustedList from './TrustedList';
 import useTrustedClusters from './useTrustedClusters';
-import { emptyPng } from './assets';
 
 export default function TrustedClusters() {
-  const tclusters = useTrustedClusters();
-  const isEmpty = tclusters.isSuccess && tclusters.items.length === 0;
-  const hasClusters = tclusters.isSuccess && tclusters.items.length > 0;
-  const resources = useResources(tclusters.items, templates);
+  const { items, canCreate, remove, save, attempt } = useTrustedClusters();
+  const isEmpty = attempt.status === 'success' && items.length === 0;
+  const hasClusters = attempt.status === 'success' && items.length > 0;
+  const resources = useResources(items, templates);
 
   const title =
     resources.status === 'creating'
-      ? 'Add a new trusted cluster'
-      : 'Edit trusted cluster';
+      ? 'Add a new trusted root cluster'
+      : 'Edit trusted root cluster';
 
-  function remove() {
-    return tclusters.remove(resources.item.name);
+  function onRemove() {
+    return remove(resources.item.name);
   }
 
-  function save(content: string) {
+  function onSave(content: string) {
     const name = resources.item.name;
     const isNew = resources.status === 'creating';
-    return tclusters.save(name, content, isNew);
+    return save(name, content, isNew);
   }
 
   return (
     <FeatureBox>
       <FeatureHeader alignItems="center">
-        <FeatureHeaderTitle>Trusted Clusters</FeatureHeaderTitle>
+        <FeatureHeaderTitle>Trusted Root Clusters</FeatureHeaderTitle>
         {hasClusters && (
-          <ButtonPrimary
-            disabled={!tclusters.canCreate}
+          <Button
+            intent="primary"
+            fill="border"
+            disabled={!canCreate}
             ml="auto"
             width="240px"
             onClick={() => resources.create('trusted_cluster')}
           >
             Connect to Root Cluster
-          </ButtonPrimary>
+          </Button>
         )}
       </FeatureHeader>
-      {tclusters.isFailed && <Danger>{tclusters.message} </Danger>}
-      {tclusters.isProcessing && (
+      {attempt.status === 'failed' && <Danger>{attempt.statusText} </Danger>}
+      {attempt.status === 'processing' && (
         <Box textAlign="center" m={10}>
           <Indicator />
         </Box>
       )}
       {isEmpty && (
         <Empty
-          disabled={!tclusters.canCreate}
+          disabled={!canCreate}
           onCreate={() => resources.create('trusted_cluster')}
         />
       )}
@@ -88,21 +91,21 @@ export default function TrustedClusters() {
           <TrustedList
             mt="4"
             flex="1"
-            items={tclusters.items}
+            items={items}
             onEdit={resources.edit}
             onDelete={resources.remove}
           />
           <Info
             ml="4"
             width="240px"
-            color="text.primary"
+            color="text.main"
             style={{ flexShrink: 0 }}
           />
         </Flex>
       )}
       {(resources.status === 'creating' || resources.status === 'editing') && (
         <ResourceEditor
-          onSave={save}
+          onSave={onSave}
           title={title}
           onClose={resources.disregard}
           text={resources.item.content}
@@ -114,7 +117,7 @@ export default function TrustedClusters() {
         <DeleteTrust
           name={resources.item.name}
           onClose={resources.disregard}
-          onDelete={remove}
+          onDelete={onRemove}
         />
       )}
     </FeatureBox>
@@ -123,26 +126,24 @@ export default function TrustedClusters() {
 
 const Info = props => (
   <Box {...props}>
-    <Text typography="h6" mb={3}>
-      TRUSTED CLUSTERS
-    </Text>
-    <Text typography="subtitle1" mb={3}>
+    <H3 mb={3}>Trusted Clusters</H3>
+    <P>
       Trusted Clusters allow Teleport administrators to connect multiple
       clusters together and establish trust between them. Users of Trusted
-      Clusters can seamlessly access the nodes of the cluster from the root
-      cluster.
-    </Text>
-    <Text typography="subtitle1" mb={2}>
+      Clusters can seamlessly access the resources of the leaf cluster from the
+      root cluster.
+    </P>
+    <P mb={2}>
       Please{' '}
       <Link
-        color="light"
-        href="https://goteleport.com/docs/setup/admin/trustedclusters/"
+        color="text.main"
+        href="https://goteleport.com/docs/admin-guides/management/admin/trustedclusters/"
         target="_blank"
       >
         view our documentation
       </Link>{' '}
       to learn more about Trusted Clusters.
-    </Text>
+    </P>
   </Box>
 );
 

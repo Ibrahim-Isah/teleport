@@ -30,17 +30,15 @@ import (
 	"io"
 	"math"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
-	"unsafe"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/jwt"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
 )
 
@@ -66,8 +64,9 @@ const (
 
 	PP2TypeTeleport PP2Type = 0xE4 // Teleport own type for transferring our custom data such as connection metadata
 
-	PP2TeleportSubtypeSigningCert PP2TeleportSubtype = 0x01 // Certificate used to sign JWT
-	PP2TeleportSubtypeJWT         PP2TeleportSubtype = 0x02 // JWT used to verify information sent in plain PROXY header
+	PP2TeleportSubtypeSigningCert  PP2TeleportSubtype = 0x01 // Certificate used to sign JWT
+	PP2TeleportSubtypeJWT          PP2TeleportSubtype = 0x02 // JWT used to verify information sent in plain PROXY header
+	PP2TeleportSubtypeOriginalAddr PP2TeleportSubtype = 0x03 // Original IPv6 source address when downgrading to IPv4
 )
 
 var (
@@ -87,6 +86,9 @@ var (
 	ErrNonLocalCluster = errors.New("signing certificate is not signed by local cluster CA")
 	// ErrNoHostCA is returned when CAGetter could not get host CA, for example if auth server is not available
 	ErrNoHostCA = errors.New("could not get specified host CA to verify signed PROXY header")
+	// ErrInvalidPseudoIPv4 is returned when the proxy line source address is a pseudo IPv4 that does not match the signed IPv6
+	// included in the TLVs
+	ErrInvalidPseudoIPv4 = errors.New("mismatched pseudo IPv4 source and original IPv6 in proxy line")
 )
 
 // ProxyLine implements PROXY protocol version 1 and 2
@@ -116,11 +118,11 @@ func (p *ProxyLine) String() string {
 func (p *ProxyLine) Bytes() ([]byte, error) {
 	b := &bytes.Buffer{}
 	header := proxyV2Header{VersionCommand: (Version2 << 4) | ProxyCommand}
-	copy(header.Signature[:], proxyV2Prefix)
-	var addr interface{}
+	copy(header.Signature[:], ProxyV2Prefix)
+	var addr any
 	if p.Source.Port < 0 || p.Destination.Port < 0 ||
 		p.Source.Port > math.MaxUint16 || p.Destination.Port > math.MaxUint16 {
-		return nil, trace.BadParameter("source or destination port (%q,%q) is out of range 0-65535", p.Source.Port, p.Destination.Port)
+		return nil, trace.BadParameter("source or destination port (%d,%d) is out of range 0-65535", p.Source.Port, p.Destination.Port)
 	}
 	switch p.Protocol {
 	case TCP4:
@@ -221,7 +223,7 @@ func ReadProxyLine(reader *bufio.Reader) (*ProxyLine, error) {
 func parsePortNumber(portString string) (int, error) {
 	port, err := strconv.Atoi(portString)
 	if err != nil {
-		return -1, trace.BadParameter("bad port %q: %v", port, err)
+		return -1, trace.BadParameter("bad port %q: %v", portString, err)
 	}
 	if port < 0 || port > 65535 {
 		return -1, trace.BadParameter("port %q not in supported range [0...65535]", portString)
@@ -236,7 +238,7 @@ func parseIP(protocol string, addrString string) (net.IP, error) {
 		return nil, trace.BadParameter("failed to parse address")
 	case addr.To4() != nil && protocol != TCP4:
 		return nil, trace.BadParameter("got IPV4 address %q for IPV6 proto %q", addr.String(), protocol)
-	case addr.To4() == nil && protocol == TCP6:
+	case addr.To4() == nil && protocol != TCP6:
 		return nil, trace.BadParameter("got IPV6 address %v %q for IPV4 proto %q", len(addr), addr.String(), protocol)
 	}
 	return addr, nil
@@ -256,12 +258,20 @@ type proxyV2Address4 struct {
 	DestinationPort uint16
 }
 
+// proxyV2Address4Size is the size of a [proxyV2Address4]. Its correctness is
+// enforced in proxyline_test.go to avoid having to import unsafe here.
+const proxyV2Address4Size = 12
+
 type proxyV2Address6 struct {
 	Source          [16]uint8
 	Destination     [16]uint8
 	SourcePort      uint16
 	DestinationPort uint16
 }
+
+// proxyV2Address6Size is the size of a [proxyV2Address6]. Its correctness is
+// enforced in proxyline_test.go to avoid having to import unsafe here.
+const proxyV2Address6Size = 36
 
 const (
 	Version2     = 2
@@ -272,13 +282,13 @@ const (
 )
 
 // ReadProxyLineV2 reads PROXY protocol v2 line from the reader
-func ReadProxyLineV2(reader *bufio.Reader) (*ProxyLine, error) {
+func ReadProxyLineV2(reader io.Reader) (*ProxyLine, error) {
 	var header proxyV2Header
 	var ret ProxyLine
 	if err := binary.Read(reader, binary.BigEndian, &header); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if !bytes.Equal(header.Signature[:], proxyV2Prefix) {
+	if !bytes.Equal(header.Signature[:], ProxyV2Prefix) {
 		return nil, trace.BadParameter("unrecognized signature %s", hex.EncodeToString(header.Signature[:]))
 	}
 	cmd, ver := header.VersionCommand&0xF, header.VersionCommand>>4
@@ -300,7 +310,7 @@ func ReadProxyLineV2(reader *bufio.Reader) (*ProxyLine, error) {
 	switch header.Protocol {
 	case ProtocolTCP4:
 		var addr proxyV2Address4
-		size = uint16(unsafe.Sizeof(addr))
+		size = proxyV2Address4Size
 		if err := binary.Read(reader, binary.BigEndian, &addr); err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -309,7 +319,7 @@ func ReadProxyLineV2(reader *bufio.Reader) (*ProxyLine, error) {
 		ret.Destination = net.TCPAddr{IP: addr.Destination[:], Port: int(addr.DestinationPort)}
 	case ProtocolTCP6:
 		var addr proxyV2Address6
-		size = uint16(unsafe.Sizeof(addr))
+		size = proxyV2Address6Size
 		if err := binary.Read(reader, binary.BigEndian, &addr); err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -322,13 +332,12 @@ func ReadProxyLineV2(reader *bufio.Reader) (*ProxyLine, error) {
 
 	// If there are more bytes left it means we've got TLVs
 	if header.Length > size {
-		tlvsBytes := &bytes.Buffer{}
-
-		if _, err := io.CopyN(tlvsBytes, reader, int64(header.Length-size)); err != nil {
+		tlvsBytes := make([]byte, header.Length-size)
+		if _, err := io.ReadFull(reader, tlvsBytes); err != nil {
 			return nil, trace.Wrap(err)
 		}
 
-		tlvs, err := UnmarshalTLVs(tlvsBytes.Bytes())
+		tlvs, err := UnmarshalTLVs(tlvsBytes)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -388,9 +397,9 @@ func MarshalTLVs(tlvs []TLV) ([]byte, error) {
 	return raw, nil
 }
 
-// AddSignature adds provided signature and cert to the proxy line, marshaling it
-// into appropriate TLV structure.
-func (p *ProxyLine) AddSignature(signature, signingCert []byte) error {
+// AddTeleportTLVs adds the provided signature, cert, and an optional original address to the proxy line,
+// marshaling it into appropriate TLV structure.
+func (p *ProxyLine) AddTeleportTLVs(signature, signingCert []byte, originalAddr *net.TCPAddr) error {
 	if len(signature) == 0 {
 		return trace.BadParameter("missing signature")
 	}
@@ -398,7 +407,7 @@ func (p *ProxyLine) AddSignature(signature, signingCert []byte) error {
 		return trace.BadParameter("missing signing certificate")
 	}
 
-	signatureTLVs := []TLV{
+	teleportTLVs := []TLV{
 		{
 			Type:  PP2Type(PP2TeleportSubtypeSigningCert),
 			Value: signingCert,
@@ -408,7 +417,15 @@ func (p *ProxyLine) AddSignature(signature, signingCert []byte) error {
 			Value: signature,
 		},
 	}
-	signatureBytes, err := MarshalTLVs(signatureTLVs)
+
+	if originalAddr != nil {
+		teleportTLVs = append(teleportTLVs, TLV{
+			Type:  PP2Type(PP2TeleportSubtypeOriginalAddr),
+			Value: []byte(originalAddr.String()),
+		})
+	}
+
+	teleportTLVBytes, err := MarshalTLVs(teleportTLVs)
 	if err != nil {
 		return err
 	}
@@ -416,48 +433,63 @@ func (p *ProxyLine) AddSignature(signature, signingCert []byte) error {
 	// If there's already signature among TLVs, we replace it
 	for i := range p.TLVs {
 		if p.TLVs[i].Type == PP2TypeTeleport {
-			p.TLVs[i].Value = signatureBytes
+			p.TLVs[i].Value = teleportTLVBytes
 			return nil
 		}
 	}
 
 	// Otherwise we append it
-	p.TLVs = append(p.TLVs, TLV{Type: PP2TypeTeleport, Value: signatureBytes})
+	p.TLVs = append(p.TLVs, TLV{Type: PP2TypeTeleport, Value: teleportTLVBytes})
 
 	return nil
 }
 
-// isSigned returns true if proxy line's TLV contains signature.
+// IsSigned returns true if proxy line's TLV contains signature.
 // Does not take into account if signature is valid or not, just the presence of it.
-func (p *ProxyLine) isSigned() bool {
-	token, proxyCert, _ := p.getSignatureAndSigningCert()
-	return len(token) > 0 || proxyCert != nil
+func (p *ProxyLine) IsSigned() bool {
+	tlvs, _ := p.getTeleportTLVs()
+	return len(tlvs.token) > 0 || tlvs.proxyCert != nil
 }
 
-// getSignatureAndSigningCert finds signature and signing certificate in TLVs if they are present
-func (p *ProxyLine) getSignatureAndSigningCert() (string, []byte, error) {
-	var proxyCert []byte
-	var token string
+type teleportTLVs struct {
+	token           string
+	proxyCert       []byte
+	originalAddress *net.TCPAddr
+}
+
+// getTeleportTLVs returns custom teleport TLVs present in the ProxyLine, if any
+func (p *ProxyLine) getTeleportTLVs() (teleportTLVs, error) {
+	var tlvs teleportTLVs
 	for _, tlv := range p.TLVs {
 		if tlv.Type == PP2TypeTeleport {
 			teleportSubTLVs, err := UnmarshalTLVs(tlv.Value)
 			if err != nil {
-				return "", nil, trace.Wrap(err)
+				return tlvs, trace.Wrap(err)
 			}
 
 			for _, subTLV := range teleportSubTLVs {
-				if subTLV.Type == PP2Type(PP2TeleportSubtypeSigningCert) {
-					proxyCert = subTLV.Value
-				}
-
-				if subTLV.Type == PP2Type(PP2TeleportSubtypeJWT) {
-					token = string(subTLV.Value)
+				switch PP2TeleportSubtype(subTLV.Type) {
+				case PP2TeleportSubtypeSigningCert:
+					tlvs.proxyCert = subTLV.Value
+				case PP2TeleportSubtypeJWT:
+					tlvs.token = string(subTLV.Value)
+				case PP2TeleportSubtypeOriginalAddr:
+					addr, err := net.ResolveTCPAddr("tcp", string(subTLV.Value))
+					if err != nil {
+						return tlvs, trace.Wrap(err)
+					}
+					// If the source address was marked with a port of 0 to prevent IP Pinning,
+					// then the original address should also have a port of 0.
+					if p.Source.Port == 0 {
+						addr.Port = 0
+					}
+					tlvs.originalAddress = addr
 				}
 			}
 			break
 		}
 	}
-	return token, proxyCert, nil
+	return tlvs, nil
 }
 
 // VerifySignature checks that signature contained in the proxy line is securely signed.
@@ -467,15 +499,15 @@ func (p *ProxyLine) VerifySignature(ctx context.Context, caGetter CertAuthorityG
 		return trace.Wrap(ErrNoSignature)
 	}
 
-	token, proxyCert, err := p.getSignatureAndSigningCert()
+	tlvs, err := p.getTeleportTLVs()
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if len(token) == 0 || proxyCert == nil {
+	if len(tlvs.token) == 0 || tlvs.proxyCert == nil {
 		return trace.Wrap(ErrNoSignature)
 	}
 
-	signingCert, err := x509.ParseCertificate(proxyCert)
+	signingCert, err := x509.ParseCertificate(tlvs.proxyCert)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -489,14 +521,14 @@ func (p *ProxyLine) VerifySignature(ctx context.Context, caGetter CertAuthorityG
 			identity.TeleportCluster, localClusterName)
 	}
 
-	hostCA, err := caGetter.GetCertAuthority(ctx, types.CertAuthID{
+	hostCA, err := caGetter(ctx, types.CertAuthID{
 		Type:       types.HostCA,
 		DomainName: localClusterName,
 	}, false)
 	if err != nil {
 		return trace.Wrap(ErrNoHostCA, "CA cluster name: %s", localClusterName)
 	}
-	hostCACerts := services.GetTLSCerts(hostCA)
+	hostCACerts := getTLSCerts(hostCA)
 
 	roots := x509.NewCertPool()
 	for _, cert := range hostCACerts {
@@ -521,17 +553,31 @@ func (p *ProxyLine) VerifySignature(ctx context.Context, caGetter CertAuthorityG
 	jwtVerifier, err := jwt.New(&jwt.Config{
 		Clock:       clock,
 		PublicKey:   signingCert.PublicKey,
-		Algorithm:   defaults.ApplicationTokenAlgorithm,
 		ClusterName: localClusterName,
 	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
+	// Determine if a pseudo IPv4 was used and validate
+	sAddr := p.Source.String()
+	if tlvs.originalAddress != nil {
+		expectedPLSource, err := getPseudoIPV4(*tlvs.originalAddress)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
+		if !expectedPLSource.IP.Equal(p.Source.IP) {
+			return trace.Wrap(ErrInvalidPseudoIPv4)
+		}
+
+		sAddr = tlvs.originalAddress.String()
+	}
 	_, err = jwtVerifier.VerifyPROXY(jwt.PROXYVerifyParams{
 		ClusterName:        localClusterName,
-		SourceAddress:      p.Source.String(),
+		SourceAddress:      sAddr,
 		DestinationAddress: p.Destination.String(),
-		RawToken:           token,
+		RawToken:           tlvs.token,
 	})
 	if err != nil {
 		return trace.Wrap(err)
@@ -539,6 +585,32 @@ func (p *ProxyLine) VerifySignature(ctx context.Context, caGetter CertAuthorityG
 
 	p.IsVerified = true
 	return nil
+}
+
+// ResolveSource returns the source IP address associated with a ProxyLine. If the Source is a class E address
+// then we need to return the IPv6 stored in the teleport TLVs instead.
+func (p *ProxyLine) ResolveSource() net.Addr {
+	// check if class E address
+	if []byte(p.Source.IP)[0] < classEPrefix {
+		return &p.Source
+	}
+
+	if tlvs, err := p.getTeleportTLVs(); err == nil {
+		if tlvs.originalAddress != nil {
+			return tlvs.originalAddress
+		}
+	}
+
+	return &p.Source
+}
+
+func getTLSCerts(ca types.CertAuthority) [][]byte {
+	pairs := ca.GetTrustedTLSKeyPairs()
+	out := make([][]byte, len(pairs))
+	for i, pair := range pairs {
+		out[i] = slices.Clone(pair.Cert)
+	}
+	return out
 }
 
 func checkForSystemRole(identity *tlsca.Identity, roleToFind types.SystemRole) bool {

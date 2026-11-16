@@ -1,78 +1,70 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { ChannelCredentials, Metadata } from '@grpc/grpc-js';
-import { Struct } from 'google-protobuf/google/protobuf/struct_pb';
+import { ChannelCredentials } from '@grpc/grpc-js';
+import { GrpcTransport } from '@protobuf-ts/grpc-transport';
 
-import {
-  PtyHostClient as GrpcClient,
-  PtyCreate,
-  PtyId,
-} from 'teleterm/sharedProcess/ptyHost';
+import { Struct } from 'gen-proto-ts/google/protobuf/struct_pb';
+import { CreatePtyProcessRequest } from 'gen-proto-ts/teleport/web/teleterm/ptyhost/v1/pty_host_service_pb';
+import { PtyHostServiceClient as GrpcClient } from 'gen-proto-ts/teleport/web/teleterm/ptyhost/v1/pty_host_service_pb.client';
 
 import { PtyHostClient } from '../types';
-
 import { PtyEventsStreamHandler } from './ptyEventsStreamHandler';
 
 export function createPtyHostClient(
   address: string,
   credentials: ChannelCredentials
 ): PtyHostClient {
-  const client = new GrpcClient(address, credentials);
+  const transport = new GrpcTransport({
+    host: address,
+    channelCredentials: credentials,
+    // This gRPC client talks to a localhost endpoint on Windows.
+    // Do not route it through HTTP proxies.
+    clientOptions: { 'grpc.enable_http_proxy': 0 },
+  });
+  const client = new GrpcClient(transport);
+
   return {
-    createPtyProcess(ptyOptions) {
-      const request = new PtyCreate()
-        .setArgsList(ptyOptions.args)
-        .setPath(ptyOptions.path)
-        .setEnv(Struct.fromJavaScript(ptyOptions.env));
+    async createPtyProcess(ptyOptions) {
+      const request = CreatePtyProcessRequest.create({
+        args: ptyOptions.args,
+        path: ptyOptions.path,
+        env: Struct.fromJson(ptyOptions.env),
+        useConpty: ptyOptions.useConpty,
+      });
 
       if (ptyOptions.cwd) {
-        request.setCwd(ptyOptions.cwd);
+        request.cwd = ptyOptions.cwd;
+      }
+      if (ptyOptions.initMessage) {
+        request.initMessage = ptyOptions.initMessage;
       }
 
-      if (ptyOptions.initCommand) {
-        request.setInitCommand(ptyOptions.initCommand);
-      }
-
-      return new Promise<string>((resolve, reject) => {
-        client.createPtyProcess(request, (error, response) => {
-          if (error) {
-            reject(error);
-          } else {
-            resolve(response.toObject().id);
-          }
-        });
-      });
+      const { response } = await client.createPtyProcess(request);
+      return response.id;
     },
-    getCwd(ptyId) {
-      return new Promise((resolve, reject) => {
-        client.getCwd(new PtyId().setId(ptyId), (error, response) => {
-          if (error) {
-            reject(error);
-          } else {
-            resolve(response.toObject().cwd);
-          }
-        });
-      });
+    async getCwd(ptyId) {
+      const { response } = await client.getCwd({ id: ptyId });
+      return response.cwd;
     },
-    exchangeEvents(ptyId) {
-      const metadata = new Metadata();
-      metadata.set('ptyId', ptyId);
-      const stream = client.exchangeEvents(metadata);
-      return new PtyEventsStreamHandler(stream);
+    managePtyProcess(ptyId) {
+      const stream = client.managePtyProcess({ meta: { ptyId: ptyId } });
+      return new PtyEventsStreamHandler(stream, ptyId);
     },
   };
 }

@@ -1,36 +1,36 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
-import { Text, Box, Flex, Indicator, Link } from 'design';
+import { Box, Flex, H3, Indicator, Link, Text } from 'design';
 import * as Icons from 'design/Icon';
+import { P } from 'design/Text/Text';
 
-import useTeleport from 'teleport/useTeleport';
 import { TextSelectCopyMulti } from 'teleport/components/TextSelectCopy';
+import useTeleport from 'teleport/useTeleport';
 
 import {
-  HeaderSubtitle,
   ActionButtons,
-  Header,
   ButtonBlueText,
+  Header,
+  HeaderSubtitle,
 } from '../../Shared';
-
-import { useIamPolicy, State } from './useIamPolicy';
-
 import type { AgentStepProps } from '../../types';
+import { State, useIamPolicy } from './useIamPolicy';
 
 export function IamPolicy(props: AgentStepProps) {
   const ctx = useTeleport();
@@ -47,24 +47,26 @@ export function IamPolicyView({
   iamPolicyName,
 }: State) {
   return (
-    <Box maxWidth="800px">
+    <>
       <Header>Configure IAM Policy</Header>
       <HeaderSubtitle>
         Teleport needs AWS IAM permissions to be able to discover and register
         RDS instances and configure IAM authentications.
+        <br />
+        Optional if you already have an IAM policy configured.
       </HeaderSubtitle>
       {attempt.status === 'failed' ? (
         <>
-          <Text my={3}>
-            <Icons.Warning ml={1} mr={2} color="danger" />
-            Encountered Error: {attempt.statusText}
-          </Text>
+          <Flex my={3}>
+            <Icons.Warning size="medium" ml={1} mr={2} color="error.main" />
+            <Text>Encountered Error: {attempt.statusText}</Text>
+          </Flex>
           <ButtonBlueText ml={1} onClick={fetchIamPolicy}>
             Retry
           </ButtonBlueText>
         </>
       ) : (
-        <Flex height="428px">
+        <Flex height="460px">
           {attempt.status === 'processing' && (
             <Flex width="404px" justifyContent="center" alignItems="center">
               <Indicator />
@@ -72,25 +74,8 @@ export function IamPolicyView({
           )}
           {attempt.status === 'success' && (
             <Box>
-              <Text bold>
-                Run this AWS CLI command to create a IAM policy. <br />
-                Then attach this policy to appropriate AWS resources (eg.{' '}
-                <Link
-                  href="https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-create-and-attach-iam-policy.html"
-                  target="_blank"
-                >
-                  IAM users
-                </Link>
-                ,{' '}
-                <Link
-                  href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html#attach-iam-role"
-                  target="_blank"
-                >
-                  ec2 instance
-                </Link>
-                ).
-              </Text>
-              <Box mt={2} mb={1}>
+              <H3>Run this AWS CLI command to create an IAM policy:</H3>
+              <Box mt={2} mb={2}>
                 <TextSelectCopyMulti
                   lines={[
                     {
@@ -107,14 +92,34 @@ export function IamPolicyView({
                   ]}
                 />
               </Box>
+              <H3>Then attach this policy to your AWS EC2 instance role.</H3>
+              <P>
+                See{' '}
+                <Link
+                  href="https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_manage-attach-detach.html#add-policies-console"
+                  target="_blank"
+                >
+                  Attach policy to an IAM role
+                </Link>{' '}
+                and{' '}
+                <Link
+                  href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html#attach-iam-role"
+                  target="_blank"
+                >
+                  Attach an IAM role to an instance
+                </Link>
+              </P>
             </Box>
           )}
         </Flex>
       )}
-      <ActionButtons
-        onProceed={nextStep}
-        disableProceed={attempt.status !== 'success'}
-      />
-    </Box>
+      <Flex>
+        <ActionButtons
+          onProceed={nextStep}
+          disableProceed={attempt.status !== 'success'}
+        />
+        <ActionButtons onSkip={() => nextStep(0)} />
+      </Flex>
+    </>
   );
 }

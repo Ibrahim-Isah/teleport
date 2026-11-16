@@ -1,23 +1,26 @@
-/*
-Copyright 2019 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import { Acl, WebTerminalClipboardMode } from './types';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import { Acl } from './types';
-
-export default function makeAcl(json): Acl {
+export function makeAcl(json): Acl {
   json = json || {};
+  const accessList = json.accessList || defaultAccess;
   const authConnectors = json.authConnectors || defaultAccess;
   const trustedClusters = json.trustedClusters || defaultAccess;
   const roles = json.roles || defaultAccess;
@@ -30,9 +33,20 @@ export default function makeAcl(json): Acl {
   const tokens = json.tokens || defaultAccess;
   const accessRequests = json.accessRequests || defaultAccess;
   const billing = json.billing || defaultAccess;
+  const lock = json.lock || defaultAccess;
+  const plugins = json.plugins || defaultAccess;
+  const integrations = json.integrations || defaultAccessWithUse;
   const dbServers = json.dbServers || defaultAccess;
   const db = json.db || defaultAccess;
   const desktops = json.desktops || defaultAccess;
+  const reviewRequests = json.reviewRequests ?? false;
+  // TODO (avatus) change default to false in v19. We do not want someone
+  // who _can_ access file transfers to be denied access because an older cluster
+  // doesn't return the valid permission. If they don't have access, the action will
+  // still fail with an error, so this is merely a UX improvment.
+  const fileTransferAccess = json.fileTransferAccess ?? true; // use nullish coalescing to prevent default from overriding a strictly false value
+  const webTerminalClipboardMode: WebTerminalClipboardMode =
+    json.webTerminalClipboardMode ?? '';
   const connectionDiagnostic = json.connectionDiagnostic || defaultAccess;
   // Defaults to true, see RFD 0049
   // https://github.com/gravitational/teleport/blob/master/rfd/0049-desktop-clipboard.md#security
@@ -53,7 +67,49 @@ export default function makeAcl(json): Acl {
   const license = json.license || defaultAccess;
   const download = json.download || defaultAccess;
 
+  const deviceTrust = json.deviceTrust || defaultAccess;
+
+  const auditQuery = json.auditQuery || defaultAccess;
+  const securityReport = json.securityReport || defaultAccess;
+
+  const externalAuditStorage = json.externalAuditStorage || defaultAccess;
+
+  const samlIdpServiceProvider = json.samlIdpServiceProvider || defaultAccess;
+  const accessGraph = json.accessGraph || defaultAccess;
+
+  const bots = json.bots || defaultAccess;
+  const accessMonitoringRule = json.accessMonitoringRule || defaultAccess;
+
+  const discoverConfigs = json.discoverConfigs || defaultAccess;
+
+  const contacts = json.contact || defaultAccess;
+  const gitServers = json.gitServers || defaultAccess;
+  const accessGraphSettings = json.accessGraphSettings || defaultAccess;
+
+  const botInstances = json.botInstances || defaultAccess;
+
+  const instances = json.instances || defaultAccess;
+
+  const workloadIdentity = json.workloadIdentity || defaultAccess;
+
+  const clientIpRestriction = json.clientIpRestriction || defaultAccess;
+
+  const autoUpdateConfig = json.autoUpdateConfig || defaultAccess;
+  const autoUpdateVersion = json.autoUpdateVersion || defaultAccess;
+  const autoUpdateAgentRollout = json.autoUpdateAgentRollout || defaultAccess;
+  const autoUpdateAgentReport = json.autoUpdateAgentReport || defaultAccess;
+
+  const inferencePolicy = json.inferencePolicy || defaultAccess;
+  const inferenceModel = json.inferenceModel || defaultAccess;
+  const inferenceSecret = json.inferenceSecret || defaultAccess;
+  const classifier = json.classifier || defaultAccess;
+
+  const beam = json.beam || defaultAccess;
+
+  const mobileDevice = json.mobileDevice || defaultMobileDeviceAccess;
+
   return {
+    accessList,
     authConnectors,
     trustedClusters,
     roles,
@@ -65,7 +121,10 @@ export default function makeAcl(json): Acl {
     kubeServers,
     tokens,
     accessRequests,
+    reviewRequests,
     billing,
+    plugins,
+    integrations,
     dbServers,
     db,
     desktops,
@@ -76,6 +135,35 @@ export default function makeAcl(json): Acl {
     connectionDiagnostic,
     license,
     download,
+    deviceTrust,
+    lock,
+    samlIdpServiceProvider,
+    auditQuery,
+    securityReport,
+    externalAuditStorage,
+    accessGraph,
+    bots,
+    accessMonitoringRule,
+    discoverConfigs,
+    contacts,
+    fileTransferAccess,
+    webTerminalClipboardMode,
+    gitServers,
+    accessGraphSettings,
+    botInstances,
+    instances,
+    workloadIdentity,
+    clientIpRestriction,
+    autoUpdateConfig,
+    autoUpdateVersion,
+    autoUpdateAgentRollout,
+    autoUpdateAgentReport,
+    inferencePolicy,
+    inferenceModel,
+    inferenceSecret,
+    classifier,
+    beam,
+    mobileDevice,
   };
 }
 
@@ -85,4 +173,13 @@ export const defaultAccess = {
   edit: false,
   create: false,
   remove: false,
+};
+
+const defaultAccessWithUse = {
+  ...defaultAccess,
+  use: false,
+};
+
+const defaultMobileDeviceAccess = {
+  createEnrollToken: false,
 };

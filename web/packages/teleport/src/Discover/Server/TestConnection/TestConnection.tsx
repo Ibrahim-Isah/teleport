@@ -1,71 +1,105 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useState } from 'react';
-import styled from 'styled-components';
-import { ButtonSecondary, Text, Box, LabelInput } from 'design';
-import Select from 'shared/components/Select';
+import { useState } from 'react';
 
+import { Box, ButtonSecondary, H3, LabelInput, Subtitle3 } from 'design';
+import Select, { type Option } from 'shared/components/Select';
+
+import ReAuthenticate from 'teleport/components/ReAuthenticate';
+import cfg from 'teleport/config';
 import {
-  HeaderWithBackBtn,
   ActionButtons,
-  HeaderSubtitle,
   ConnectionDiagnosticResult,
-} from '../../Shared';
+  Header,
+  HeaderSubtitle,
+  StyledBox,
+  useConnectionDiagnostic,
+} from 'teleport/Discover/Shared';
+import { openNewTab } from 'teleport/lib/util';
+import { MfaChallengeScope } from 'teleport/services/auth/auth';
+import type { MfaChallengeResponse } from 'teleport/services/mfa';
+import { sortNodeLogins } from 'teleport/services/nodes';
 
-import { useTestConnection, State } from './useTestConnection';
-
-import type { Option } from 'shared/components/Select';
 import type { AgentStepProps } from '../../types';
+import { NodeMeta } from '../../useDiscover';
 
-export default function Container(props: AgentStepProps) {
-  const state = useTestConnection(props);
+export function TestConnection(props: AgentStepProps) {
+  const {
+    runConnectionDiagnostic,
+    attempt,
+    diagnosis,
+    nextStep,
+    prevStep,
+    canTestConnection,
+    showMfaDialog,
+    cancelMfaDialog,
+  } = useConnectionDiagnostic();
+  const node = (props.agentMeta as NodeMeta).node;
+  const logins = sortNodeLogins(node.sshLogins);
 
-  return <TestConnection {...state} />;
-}
+  function startSshSession(login: string) {
+    const url = cfg.getSshConnectRoute({
+      clusterId: node.clusterId,
+      serverId: node.id,
+      login,
+    });
 
-export function TestConnection({
-  attempt,
-  startSshSession,
-  logins,
-  testConnection,
-  diagnosis,
-  nextStep,
-  prevStep,
-  canTestConnection,
-}: State) {
-  const [usernameOpts] = useState(() =>
-    logins.map(l => ({ value: l, label: l }))
-  );
+    openNewTab(url);
+  }
+
+  function testConnection(login: string, mfaResponse?: MfaChallengeResponse) {
+    runConnectionDiagnostic(
+      {
+        resourceKind: 'node',
+        resourceName: props.agentMeta.resourceName,
+        sshPrincipal: login,
+        sshNodeOS: props.resourceSpec.platform,
+        sshNodeSetupMethod: 'script',
+      },
+      mfaResponse
+    );
+  }
+
+  const usernameOpts = logins.map(l => ({ value: l, label: l }));
   // There will always be one login, as the user cannot proceed
   // the step that requires users to have at least one login.
   const [selectedOpt, setSelectedOpt] = useState(usernameOpts[0]);
 
   return (
-    <Box>
-      <HeaderWithBackBtn onPrev={prevStep}>Test Connection</HeaderWithBackBtn>
+    <>
+      {showMfaDialog && (
+        <ReAuthenticate
+          onMfaResponse={async res => testConnection(selectedOpt.value, res)}
+          onClose={cancelMfaDialog}
+          challengeScope={MfaChallengeScope.USER_SESSION}
+        />
+      )}
+      <Header>Test Connection</Header>
       <HeaderSubtitle>
         Optionally verify that you can successfully connect to the server you
         just added.
       </HeaderSubtitle>
       <StyledBox mb={5}>
-        <Text bold>Step 1</Text>
-        <Text typography="subtitle1" mb={3}>
-          Pick the OS user to test
-        </Text>
+        <header>
+          <H3>Step 1</H3>
+          <Subtitle3 mb={3}>Pick the OS user to test</Subtitle3>
+        </header>
         <Box width="320px">
           <LabelInput>Select Login</LabelInput>
           <Select
@@ -85,10 +119,10 @@ export function TestConnection({
         stepDescription="Verify that the server is accessible"
       />
       <StyledBox>
-        <Text bold>Step 3</Text>
-        <Text typography="subtitle1" mb={3}>
-          Connect to the server
-        </Text>
+        <header>
+          <H3>Step 3</H3>
+          <Subtitle3 mb={3}>Connect to the server</Subtitle3>
+        </header>
         <ButtonSecondary
           width="200px"
           onClick={() => startSshSession(selectedOpt.value)}
@@ -96,14 +130,7 @@ export function TestConnection({
           Start Session
         </ButtonSecondary>
       </StyledBox>
-      <ActionButtons onProceed={nextStep} lastStep={true} />
-    </Box>
+      <ActionButtons onProceed={nextStep} lastStep={true} onPrev={prevStep} />
+    </>
   );
 }
-
-const StyledBox = styled(Box)`
-  max-width: 800px;
-  background-color: rgba(255, 255, 255, 0.05);
-  border-radius: 8px;
-  padding: 20px;
-`;

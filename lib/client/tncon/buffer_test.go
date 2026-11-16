@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package tncon
 
@@ -80,7 +82,7 @@ func TestBufferedChannelPipeWrite(t *testing.T) {
 			}()
 
 			p := make([]byte, tc.len)
-			for n := 0; n < tc.len; n++ {
+			for n := range tc.len {
 				p[n] = byte(n)
 			}
 
@@ -131,7 +133,7 @@ func TestBufferedChannelPipeRead(t *testing.T) {
 			t.Cleanup(func() { require.NoError(t, buffer.Close()) })
 
 			write := make([]byte, tc.writeLen)
-			for i := 0; i < tc.writeLen; i++ {
+			for i := range tc.writeLen {
 				write[i] = byte(i)
 			}
 
@@ -151,26 +153,31 @@ func BenchmarkBufferedChannelPipe(b *testing.B) {
 	for _, s := range []int{1, 10, 100, 500, 1000} {
 		data := make([]byte, 1000)
 		b.Run(fmt.Sprintf("size=%d", s), func(b *testing.B) {
-			b.StopTimer() // stop timer during setup
 			buffer := newBufferedChannelPipe(s)
 			b.Cleanup(func() { require.NoError(b, buffer.Close()) })
 
-			errCh := make(chan error)
+			errCh := make(chan error, 1)
+			readCh := make(chan struct{})
+			defer close(readCh)
 			go func() {
-				readBuffer := make([]byte, b.N*len(data))
-				_, err := io.ReadFull(buffer, readBuffer)
-				errCh <- err
+				readBuffer := make([]byte, len(data))
+				for range readCh {
+					_, err := io.ReadFull(buffer, readBuffer)
+					errCh <- err
+					if err != nil {
+						return
+					}
+				}
 			}()
 
 			// benchmark write+read
-			b.StartTimer()
-			for n := 0; n < b.N; n++ {
+			for b.Loop() {
+				readCh <- struct{}{}
 				written, err := buffer.Write(data)
 				require.NoError(b, err)
-				require.Equal(b, len(data), written)
+				require.Len(b, data, written)
+				require.NoError(b, <-errCh)
 			}
-			require.NoError(b, <-errCh)
-			b.StopTimer()
 		})
 	}
 }

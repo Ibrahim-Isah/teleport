@@ -1,27 +1,30 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
 import { MemoryRouter } from 'react-router';
 
-import { initSelectedOptionsHelper } from 'teleport/Discover/Shared/SetupAccess';
+import { DiscoverBox } from 'teleport/Discover/Shared';
+import {
+  initSelectedOptionsHelper,
+  type State,
+} from 'teleport/Discover/Shared/SetupAccess';
 
 import { SetupAccess } from './SetupAccess';
-
-import type { State } from 'teleport/Discover/Shared/SetupAccess';
 
 export default {
   title: 'Teleport/Discover/Kube/SetupAccess',
@@ -29,25 +32,61 @@ export default {
 
 export const NoTraits = () => (
   <MemoryRouter>
-    <SetupAccess {...props} initSelectedOptions={() => []} />
+    <DiscoverBox>
+      <SetupAccess {...props} initSelectedOptions={() => []} />
+    </DiscoverBox>
   </MemoryRouter>
 );
 
 export const WithTraits = () => (
   <MemoryRouter>
-    <SetupAccess {...props} />
+    <DiscoverBox>
+      <SetupAccess {...props} />
+    </DiscoverBox>
+  </MemoryRouter>
+);
+
+export const WithTraitsAutoDiscovery = () => (
+  <MemoryRouter>
+    <DiscoverBox>
+      <SetupAccess
+        {...props}
+        agentMeta={{
+          ...props.agentMeta,
+          autoDiscovery: {
+            config: {
+              name: 'some-name',
+              discoveryGroup: 'some-group',
+              aws: [
+                {
+                  types: ['eks'],
+                  regions: ['us-east-1'],
+                  tags: {},
+                  kubeAppDiscovery: true,
+                  integration: 'some-integration',
+                },
+              ],
+            },
+          },
+        }}
+      />
+    </DiscoverBox>
   </MemoryRouter>
 );
 
 export const NoAccess = () => (
   <MemoryRouter>
-    <SetupAccess {...props} canEditUser={false} />
+    <DiscoverBox>
+      <SetupAccess {...props} canEditUser={false} />
+    </DiscoverBox>
   </MemoryRouter>
 );
 
 export const SsoUser = () => (
   <MemoryRouter>
-    <SetupAccess {...props} isSsoUser={true} />
+    <DiscoverBox>
+      <SetupAccess {...props} isSsoUser={true} />
+    </DiscoverBox>
   </MemoryRouter>
 );
 
@@ -56,7 +95,9 @@ const props: State = {
     status: 'success',
     statusText: '',
   },
+  agentMeta: {} as any,
   onProceed: () => null,
+  onPrev: () => null,
   fetchUserTraits: () => null,
   isSsoUser: false,
   canEditUser: true,
@@ -66,7 +107,7 @@ const props: State = {
     initSelectedOptionsHelper({ trait, staticTraits, dynamicTraits }),
   dynamicTraits: {} as any,
   staticTraits: {} as any,
-  resourceState: {} as any,
+  resourceSpec: {} as any,
 };
 
 const staticTraits = {

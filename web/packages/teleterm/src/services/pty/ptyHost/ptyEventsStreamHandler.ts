@@ -1,100 +1,153 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import { ClientDuplexStream } from '@grpc/grpc-js';
+import { DuplexStreamingCall } from '@protobuf-ts/runtime-rpc';
 
 import {
-  PtyClientEvent,
-  PtyEventData,
-  PtyEventResize,
-  PtyEventStart,
-  PtyServerEvent,
-} from 'teleterm/sharedProcess/ptyHost';
+  ManagePtyProcessRequest,
+  ManagePtyProcessResponse,
+} from 'gen-proto-ts/teleport/web/teleterm/ptyhost/v1/pty_host_service_pb';
+
+import {
+  ptyEventOneOfIsData,
+  ptyEventOneOfIsExit,
+  ptyEventOneOfIsStartError,
+} from 'teleterm/helpers';
+import Logger from 'teleterm/logger';
 
 export class PtyEventsStreamHandler {
+  private logger: Logger;
+
   constructor(
-    private readonly stream: ClientDuplexStream<PtyClientEvent, PtyServerEvent>
-  ) {}
+    private readonly stream: DuplexStreamingCall<
+      ManagePtyProcessRequest,
+      ManagePtyProcessResponse
+    >,
+    ptyId: string
+  ) {
+    this.logger = new Logger(`PtyEventsStreamHandler ${ptyId}`);
+  }
 
   /**
    * Client -> Server stream events
    */
 
-  start(columns: number, rows: number): void {
-    this.writeOrThrow(
-      new PtyClientEvent().setStart(
-        new PtyEventStart().setColumns(columns).setRows(rows)
-      )
-    );
+  async start(columns: number, rows: number): Promise<void> {
+    this.logger.info('Start');
+
+    await this.send({
+      event: {
+        oneofKind: 'start',
+        start: { columns, rows },
+      },
+    });
   }
 
-  write(data: string): void {
-    this.writeOrThrow(
-      new PtyClientEvent().setData(new PtyEventData().setMessage(data))
-    );
+  async write(data: string): Promise<void> {
+    await this.send({
+      event: {
+        oneofKind: 'data',
+        data: { message: data },
+      },
+    });
   }
 
-  resize(columns: number, rows: number): void {
-    this.writeOrThrow(
-      new PtyClientEvent().setResize(
-        new PtyEventResize().setColumns(columns).setRows(rows)
-      )
-    );
+  async resize(columns: number, rows: number): Promise<void> {
+    await this.send({
+      event: {
+        oneofKind: 'resize',
+        resize: { columns, rows },
+      },
+    });
   }
 
-  dispose(): void {
-    this.stream.end();
-    this.stream.removeAllListeners();
+  async dispose(): Promise<void> {
+    this.logger.info('Dispose');
+
+    await this.stream.requests.complete();
   }
 
   /**
    * Stream -> Client stream events
    */
 
-  onOpen(callback: () => void): void {
-    this.stream.addListener('data', (event: PtyServerEvent) => {
-      if (event.hasOpen()) {
-        callback();
+  onOpen(callback: () => void): RemoveListenerFunction {
+    return this.addDataListenerAndReturnRemovalFunction(
+      (event: ManagePtyProcessResponse) => {
+        if (event.event.oneofKind === 'open') {
+          callback();
+        }
       }
-    });
+    );
   }
 
-  onData(callback: (data: string) => void): void {
-    this.stream.addListener('data', (event: PtyServerEvent) => {
-      if (event.hasData()) {
-        callback(event.getData().getMessage());
+  onData(callback: (data: string) => void): RemoveListenerFunction {
+    return this.addDataListenerAndReturnRemovalFunction(
+      (event: ManagePtyProcessResponse) => {
+        if (ptyEventOneOfIsData(event.event)) {
+          callback(event.event.data.message);
+        }
       }
-    });
+    );
   }
 
   onExit(
-    callback: (reason: { exitCode: number; signal?: number }) => void
-  ): void {
-    this.stream.addListener('data', (event: PtyServerEvent) => {
-      if (event.hasExit()) {
-        callback(event.getExit().toObject());
+    callback: (reason: {
+      exitCode: number;
+      signal?: number;
+      lastInputWasCtrlD: boolean;
+    }) => void
+  ): RemoveListenerFunction {
+    return this.addDataListenerAndReturnRemovalFunction(
+      (event: ManagePtyProcessResponse) => {
+        if (ptyEventOneOfIsExit(event.event)) {
+          const exitEvent = event.event.exit;
+          this.logger.info('On exit', {
+            lastInputWasCtrlD: exitEvent.lastInputWasCtrlD,
+            exitCode: exitEvent.exitCode,
+            signal: exitEvent.signal,
+          });
+          callback(exitEvent);
+        }
       }
-    });
+    );
   }
 
-  private writeOrThrow(event: PtyClientEvent) {
-    return this.stream.write(event, (error: Error | undefined) => {
-      if (error) {
-        throw error;
+  onStartError(callback: (message: string) => void): RemoveListenerFunction {
+    return this.addDataListenerAndReturnRemovalFunction(
+      (event: ManagePtyProcessResponse) => {
+        if (ptyEventOneOfIsStartError(event.event)) {
+          this.logger.info('On start error', event.event.startError.message);
+          callback(event.event.startError.message);
+        }
       }
-    });
+    );
+  }
+
+  private send(event: ManagePtyProcessRequest): Promise<void> {
+    return this.stream.requests.send(event);
+  }
+
+  private addDataListenerAndReturnRemovalFunction(
+    callback: (event: ManagePtyProcessResponse) => void
+  ) {
+    return this.stream.responses.onMessage(callback);
   }
 }
+
+type RemoveListenerFunction = () => void;

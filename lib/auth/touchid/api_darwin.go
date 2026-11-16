@@ -1,23 +1,26 @@
 //go:build touchid
-// +build touchid
 
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package touchid
 
-// #cgo CFLAGS: -Wall -xobjective-c -fblocks -fobjc-arc -mmacosx-version-min=10.13
+// #cgo CFLAGS: -Wall -xobjective-c -fblocks -fobjc-arc -mmacosx-version-min=11.0
 // #cgo LDFLAGS: -framework CoreFoundation -framework Foundation -framework LocalAuthentication -framework Security
 // #include <stdlib.h>
 // #include "authenticate.h"
@@ -29,6 +32,7 @@ package touchid
 import "C"
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"runtime/cgo"
@@ -38,7 +42,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
+
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 const (
@@ -54,6 +59,11 @@ const (
 	// promptReason is the LAContext / Touch ID prompt.
 	// The final prompt is: "$binary is trying to authenticate user".
 	promptReason = "authenticate user"
+)
+
+const (
+	kLAErrorDomain       = "com.apple.LocalAuthentication"
+	kLAErrorSystemCancel = -4
 )
 
 type parsedLabel struct {
@@ -88,11 +98,33 @@ type touchIDImpl struct{}
 func (touchIDImpl) Diag() (*DiagResult, error) {
 	var resC C.DiagResult
 	C.RunDiag(&resC)
+	defer func() {
+		C.free(unsafe.Pointer(resC.la_error_domain))
+		C.free(unsafe.Pointer(resC.la_error_description))
+	}()
 
 	signed := (bool)(resC.has_signature)
 	entitled := (bool)(resC.has_entitlements)
 	passedLA := (bool)(resC.passed_la_policy_test)
 	passedEnclave := (bool)(resC.passed_secure_enclave_test)
+	laErrorCode := int64(resC.la_error_code)
+	laErrorDomain := C.GoString(resC.la_error_domain)
+	laErrorDescription := C.GoString(resC.la_error_description)
+	if !passedLA && laErrorDescription != "" {
+		logger.DebugContext(context.Background(), "Received non-empty LAError description", "description", laErrorDescription)
+	}
+
+	isAvailable := signed && entitled && passedLA && passedEnclave
+	isClamshellFailure := !isAvailable &&
+		// LAContext test failed.
+		!passedLA &&
+		// Everything else worked.
+		signed &&
+		entitled &&
+		passedEnclave &&
+		// We got an LAErrorSystemCancel error.
+		laErrorDomain == kLAErrorDomain &&
+		laErrorCode == kLAErrorSystemCancel
 
 	return &DiagResult{
 		HasCompileSupport:       true,
@@ -100,7 +132,8 @@ func (touchIDImpl) Diag() (*DiagResult, error) {
 		HasEntitlements:         entitled,
 		PassedLAPolicyTest:      passedLA,
 		PassedSecureEnclaveTest: passedEnclave,
-		IsAvailable:             signed && entitled && passedLA && passedEnclave,
+		IsAvailable:             isAvailable,
+		isClamshellFailure:      isClamshellFailure,
 	}, nil
 }
 
@@ -109,7 +142,7 @@ func runGoFuncHandle(handle C.uintptr_t) {
 	val := cgo.Handle(handle).Value()
 	fn, ok := val.(func())
 	if !ok {
-		log.Warnf("Touch ID: received unexpected function handle: %T", val)
+		logger.WarnContext(context.Background(), "received unexpected function handle", "handle", logutils.TypeAttr(val))
 		return
 	}
 	fn()
@@ -262,7 +295,7 @@ func (touchIDImpl) ListCredentials() ([]CredentialInfo, error) {
 	})
 	if res < 0 {
 		errMsg := C.GoString(errMsgC)
-		return nil, errorFromStatus("listing credentials", int(res), errMsg)
+		return nil, errorFromStatus("listing credentials", res, errMsg)
 	}
 
 	return infos, nil
@@ -271,6 +304,8 @@ func (touchIDImpl) ListCredentials() ([]CredentialInfo, error) {
 func readCredentialInfos(find func(**C.CredentialInfo) C.int) ([]CredentialInfo, int) {
 	var infosC *C.CredentialInfo
 	defer func() { C.free(unsafe.Pointer(infosC)) }()
+
+	ctx := context.Background()
 
 	res := find(&infosC)
 	if res < 0 {
@@ -306,21 +341,30 @@ func readCredentialInfos(find func(**C.CredentialInfo) C.int) ([]CredentialInfo,
 		// user@rpid
 		parsedLabel, err := parseLabel(label)
 		if err != nil {
-			log.Debugf("Skipping credential %q: %v", credentialID, err)
+			logger.DebugContext(ctx, "Skipping credential",
+				"credential_id", credentialID,
+				"error", err,
+			)
 			continue
 		}
 
 		// user handle
 		userHandle, err := base64.RawURLEncoding.DecodeString(appTag)
 		if err != nil {
-			log.Debugf("Skipping credential %q: unexpected application tag: %q", credentialID, appTag)
+			logger.DebugContext(ctx, "Skipping credential, unexpected application tag",
+				"credential_id", credentialID,
+				"app_tag", appTag,
+			)
 			continue
 		}
 
 		// ECDSA public key
 		pubKeyRaw, err := base64.StdEncoding.DecodeString(pubKeyB64)
 		if err != nil {
-			log.WithError(err).Warnf("Failed to decode public key for credential %q", credentialID)
+			logger.WarnContext(ctx, "Failed to decode public key for credential",
+				"credential_id", credentialID,
+				"error", err,
+			)
 			// Do not return or break out of the loop, it needs to run in order to
 			// deallocate the structs within.
 		}
@@ -329,7 +373,11 @@ func readCredentialInfos(find func(**C.CredentialInfo) C.int) ([]CredentialInfo,
 		const iso8601Format = "2006-01-02T15:04:05Z0700"
 		createTime, err := time.Parse(iso8601Format, creationDate)
 		if err != nil {
-			log.WithError(err).Warnf("Failed to parse creation time %q for credential %q", creationDate, credentialID)
+			logger.WarnContext(ctx, "Failed to parse creation time for credential",
+				"creation_time", creationDate,
+				"credential_id", credentialID,
+				"error", err,
+			)
 		}
 
 		infos = append(infos, CredentialInfo{

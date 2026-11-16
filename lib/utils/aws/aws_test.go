@@ -1,25 +1,39 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package aws
 
 import (
+	"crypto/tls"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 // TestExtractCredFromAuthHeader test the extractCredFromAuthHeader function logic.
@@ -48,19 +62,42 @@ func TestExtractCredFromAuthHeader(t *testing.T) {
 			wantErr: require.NoError,
 		},
 		{
-			name:  "signed headers section missing",
-			input: "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024",
+			name:  "valid header without spaces",
+			input: "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date,Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024",
 			expCred: &SigV4{
 				KeyID:     "AKIAIOSFODNN7EXAMPLE",
 				Date:      "20130524",
 				Region:    "us-east-1",
 				Service:   "s3",
 				Signature: "fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024",
+				SignedHeaders: []string{
+					"host",
+					"x-amz-content-sha256",
+					"x-amz-date",
+				},
 			},
 			wantErr: require.NoError,
 		},
 		{
-			name:    "credential  section missing",
+			name:  "valid with empty list of signed headers",
+			input: "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=,Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024",
+			expCred: &SigV4{
+				KeyID:         "AKIAIOSFODNN7EXAMPLE",
+				Date:          "20130524",
+				Region:        "us-east-1",
+				Service:       "s3",
+				Signature:     "fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024",
+				SignedHeaders: nil,
+			},
+			wantErr: require.NoError,
+		},
+		{
+			name:    "signed headers section missing",
+			input:   "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024",
+			wantErr: require.Error,
+		},
+		{
+			name:    "credential section missing",
 			input:   "AWS4-HMAC-SHA256 SignedHeaders=host;range;x-amz-date, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024",
 			wantErr: require.Error,
 		},
@@ -93,24 +130,28 @@ func TestExtractCredFromAuthHeader(t *testing.T) {
 // TestFilterAWSRoles verifies filtering AWS role ARNs by AWS account ID.
 func TestFilterAWSRoles(t *testing.T) {
 	acc1ARN1 := Role{
-		ARN:     "arn:aws:iam::123456789012:role/EC2FullAccess",
-		Display: "EC2FullAccess",
-		Name:    "EC2FullAccess",
+		ARN:       "arn:aws:iam::123456789012:role/EC2FullAccess",
+		Display:   "EC2FullAccess",
+		Name:      "EC2FullAccess",
+		AccountID: "123456789012",
 	}
 	acc1ARN2 := Role{
-		ARN:     "arn:aws:iam::123456789012:role/EC2ReadOnly",
-		Display: "EC2ReadOnly",
-		Name:    "EC2ReadOnly",
+		ARN:       "arn:aws:iam::123456789012:role/EC2ReadOnly",
+		Display:   "EC2ReadOnly",
+		Name:      "EC2ReadOnly",
+		AccountID: "123456789012",
 	}
 	acc1ARN3 := Role{
-		ARN:     "arn:aws:iam::123456789012:role/path/to/customrole",
-		Display: "customrole",
-		Name:    "path/to/customrole",
+		ARN:       "arn:aws:iam::123456789012:role/path/to/customrole",
+		Display:   "customrole",
+		Name:      "path/to/customrole",
+		AccountID: "123456789012",
 	}
 	acc2ARN1 := Role{
-		ARN:     "arn:aws:iam::210987654321:role/test-role",
-		Display: "test-role",
-		Name:    "test-role",
+		ARN:       "arn:aws:iam::210987654321:role/test-role",
+		Display:   "test-role",
+		Name:      "test-role",
+		AccountID: "210987654321",
 	}
 	invalidARN := Role{
 		ARN: "invalid-arn",
@@ -252,6 +293,336 @@ func TestValidateRoleARNAndExtractRoleName(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, test.wantRoleName, actualRoleName)
 			}
+		})
+	}
+}
+
+func TestParseRoleARN(t *testing.T) {
+	tests := map[string]struct {
+		arn             string
+		wantErrContains string
+	}{
+		"valid role arn": {
+			arn: "arn:aws:iam::123456789012:role/test-role",
+		},
+		"valid sso role arn": {
+			arn: "arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/us-west-2/AWSReservedSSO_AWSPowerUserAccess_xxxxxxxxx",
+		},
+		"valid service role arn": {
+			arn: "arn:aws:iam::123456789012:role/aws-service-role/redshift.amazonaws.com/AWSServiceRoleForRedshift",
+		},
+		"arn fails to parse": {
+			arn:             "foobar",
+			wantErrContains: "invalid AWS ARN",
+		},
+		"sts arn is not iam": {
+			arn:             "arn:aws:sts::123456789012:federated-user/Alice",
+			wantErrContains: "not an AWS IAM role",
+		},
+		"iam arn is not a role": {
+			arn:             "arn:aws:iam::123456789012:user/test-user",
+			wantErrContains: "not an AWS IAM role",
+		},
+		"iam role arn is missing role name section": {
+			arn:             "arn:aws:iam::123456789012:role",
+			wantErrContains: "missing AWS IAM role name",
+		},
+		"iam role arn is missing role name": {
+			arn:             "arn:aws:iam::123456789012:role/",
+			wantErrContains: "missing AWS IAM role name",
+		},
+		"service role arn is missing role name": {
+			arn:             "arn:aws:iam::123456789012:role/aws-service-role/redshift.amazonaws.com/",
+			wantErrContains: "missing AWS IAM role name",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := ParseRoleARN(tt.arn)
+			if tt.wantErrContains != "" {
+				require.Error(t, err)
+				require.ErrorContains(t, err, tt.wantErrContains)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, got)
+		})
+	}
+}
+
+func TestBuildRoleARN(t *testing.T) {
+	tests := map[string]struct {
+		user            string
+		region          string
+		accountID       string
+		wantErrContains string
+		wantARN         string
+	}{
+		"valid role arn in correct partition and account": {
+			user:      "arn:aws:iam::123456789012:role/test-role",
+			region:    "us-west-1",
+			accountID: "123456789012",
+			wantARN:   "arn:aws:iam::123456789012:role/test-role",
+		},
+		"valid role arn in correct account and default partition": {
+			user:      "arn:aws:iam::123456789012:role/test-role",
+			region:    "",
+			accountID: "123456789012",
+			wantARN:   "arn:aws:iam::123456789012:role/test-role",
+		},
+		"valid role arn in default partition and account": {
+			user:      "arn:aws:iam::123456789012:role/test-role",
+			region:    "",
+			accountID: "",
+			wantARN:   "arn:aws:iam::123456789012:role/test-role",
+		},
+		"role name with prefix in default partition and account": {
+			user:      "role/test-role",
+			region:    "",
+			accountID: "123456789012",
+			wantARN:   "arn:aws:iam::123456789012:role/test-role",
+		},
+		"role name in default partition and account": {
+			user:      "test-role",
+			region:    "",
+			accountID: "123456789012",
+			wantARN:   "arn:aws:iam::123456789012:role/test-role",
+		},
+		"role name in china partition and account": {
+			user:      "test-role",
+			region:    "cn-north-1",
+			accountID: "123456789012",
+			wantARN:   "arn:aws-cn:iam::123456789012:role/test-role",
+		},
+		"valid ARN is not an IAM role ARN": {
+			user:            "arn:aws:iam::123456789012:user/test-user",
+			region:          "",
+			accountID:       "",
+			wantErrContains: "not an AWS IAM role",
+		},
+		"valid role arn in different partition": {
+			user:            "arn:aws-cn:iam::123456789012:role/test-role",
+			region:          "us-west-1",
+			accountID:       "",
+			wantErrContains: `expected AWS partition "aws" but got "aws-cn"`,
+		},
+		"valid role arn in different account": {
+			user:            "arn:aws:iam::123456789012:role/test-role",
+			region:          "us-west-1",
+			accountID:       "111222333444",
+			wantErrContains: `expected AWS account ID "111222333444" but got "123456789012"`,
+		},
+		"role name with invalid account characters": {
+			user:            "test-role",
+			region:          "",
+			accountID:       "12345678901f",
+			wantErrContains: "must be 12-digit",
+		},
+		"role name with invalid account id length": {
+			user:            "test-role",
+			region:          "",
+			accountID:       "1234567890123",
+			wantErrContains: "must be 12-digit",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := BuildRoleARN(tt.user, tt.region, tt.accountID)
+			if tt.wantErrContains != "" {
+				require.Error(t, err)
+				require.ErrorContains(t, err, tt.wantErrContains)
+				return
+			}
+			require.NoError(t, err)
+			require.NotEmpty(t, got)
+			require.Equal(t, tt.wantARN, got)
+		})
+	}
+}
+
+func TestIsRoleARN(t *testing.T) {
+	for name, tt := range map[string]struct {
+		arn           string
+		expectedValue bool
+	}{
+		"valid full arn":      {"arn:aws:iam::123456789012:role/role-name", true},
+		"valid partial arn":   {"role/role-name", true},
+		"valid user arn":      {"arn:aws:iam::123456789012:user/user-name", false},
+		"invalid arn":         {"arn:aws:iam:::123456789012:role/role-name", false},
+		"invalid partial arn": {"user/user-name", false},
+		"invalid value":       {"role-name", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tt.expectedValue, IsRoleARN(tt.arn))
+		})
+	}
+}
+
+func TestIsUserARN(t *testing.T) {
+	for name, tt := range map[string]struct {
+		arn           string
+		expectedValue bool
+	}{
+		"valid full arn":      {"arn:aws:iam::123456789012:user/user-name", true},
+		"valid partial arn":   {"user/user-name", true},
+		"valid user arn":      {"arn:aws:iam::123456789012:role/role-name", false},
+		"invalid arn":         {"arn:aws:iam:::123456789012:user/user-name", false},
+		"invalid partial arn": {"role/role-name", false},
+		"invalid value":       {"user-name", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tt.expectedValue, IsUserARN(tt.arn))
+		})
+	}
+}
+
+func FuzzParseSigV4(f *testing.F) {
+	f.Add("")
+	f.Add("Authorization: AWS4-HMAC-SHA256 " +
+		"Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, " +
+		"SignedHeaders=host;range;x-amz-date, " +
+		"Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024")
+
+	f.Fuzz(func(t *testing.T, str string) {
+		require.NotPanics(t, func() {
+			_, _ = ParseSigV4(str)
+		})
+	})
+}
+
+func TestResourceARN(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		resourceType string
+		partition    string
+		accountID    string
+		resourceName string
+		expected     string
+	}{
+		{
+			name:         "role",
+			resourceType: "role",
+			partition:    "aws",
+			accountID:    "123456789012",
+			resourceName: "MyRole",
+			expected:     "arn:aws:iam::123456789012:role/MyRole",
+		},
+		{
+			name:         "policy",
+			resourceType: "policy",
+			partition:    "aws",
+			accountID:    "123456789012",
+			resourceName: "MyPolicy",
+			expected:     "arn:aws:iam::123456789012:policy/MyPolicy",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			switch tt.resourceType {
+			case "role":
+				require.Equal(t, tt.expected, RoleARN(tt.partition, tt.accountID, tt.resourceName))
+			case "policy":
+				require.Equal(t, tt.expected, PolicyARN(tt.partition, tt.accountID, tt.resourceName))
+			}
+		})
+	}
+}
+
+func TestVerifyAWSSignature(t *testing.T) {
+	creds1 := credentials.NewStaticCredentialsProvider("sameid", "secret1", "")
+	creds2 := credentials.NewStaticCredentialsProvider("sameid", "secret2", "")
+	creds3 := credentials.NewStaticCredentialsProvider("otherid", "secret1", "")
+	tests := []struct {
+		desc              string
+		clientCreds       aws.CredentialsProvider
+		serverCreds       aws.CredentialsProvider
+		checksumAlgorithm s3types.ChecksumAlgorithm
+		noTLS             bool
+		wantSha256Header  string
+		wantError         string
+	}{
+		{
+			desc:             "unsigned payload",
+			clientCreds:      creds1,
+			serverCreds:      creds1,
+			wantSha256Header: "UNSIGNED-PAYLOAD",
+		},
+		{
+			desc:        "signed payload",
+			clientCreds: creds1,
+			serverCreds: creds1,
+			// echo -n 'llama' | sha256sum
+			wantSha256Header: "fc5a1047f5919892fcdf8aa79ea5d6bb6531b5c176939ef0110906cb225941c1",
+			noTLS:            true,
+		},
+		{
+			desc:              "streaming unsigned payload trailer",
+			clientCreds:       creds1,
+			serverCreds:       creds1,
+			checksumAlgorithm: s3types.ChecksumAlgorithmCrc32,
+			wantSha256Header:  "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+		},
+		{
+			desc:             "different credential ID",
+			clientCreds:      creds3,
+			serverCreds:      creds1,
+			wantSha256Header: "UNSIGNED-PAYLOAD",
+			wantError:        "AccessKeyID does not match",
+		},
+		{
+			desc:             "different credential secret",
+			clientCreds:      creds2,
+			serverCreds:      creds1,
+			wantSha256Header: "UNSIGNED-PAYLOAD",
+			wantError:        "signature verification failed",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				assert.Equal(t, test.wantSha256Header, req.Header.Get("x-amz-content-sha256"))
+				bodyBefore, err := utils.GetAndReplaceRequestBody(req)
+				assert.NoError(t, err)
+				err = VerifyAWSSignature(req, test.serverCreds)
+				if test.wantError != "" {
+					assert.ErrorContains(t, err, test.wantError)
+				} else {
+					assert.NoError(t, err)
+				}
+				bodyAfter, err := io.ReadAll(req.Body)
+				assert.NoError(t, err)
+				assert.Equal(t, string(bodyBefore), string(bodyAfter),
+					"checking a signature should not modify the request contents",
+				)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			if test.noTLS {
+				srv.Start()
+			} else {
+				srv.StartTLS()
+			}
+			tr := http.DefaultTransport.(*http.Transport).Clone()
+			tr.TLSClientConfig = &tls.Config{
+				InsecureSkipVerify: true,
+			}
+			clt := s3.New(s3.Options{
+				Credentials:      test.clientCreds,
+				BaseEndpoint:     aws.String(srv.URL),
+				Region:           "us-west-2",
+				RetryMaxAttempts: 1,
+				HTTPClient: &http.Client{
+					Transport: tr,
+				},
+			})
+			_, err := clt.PutObject(t.Context(), &s3.PutObjectInput{
+				ChecksumAlgorithm: test.checksumAlgorithm,
+				Bucket:            aws.String("bucket"),
+				Key:               aws.String("key"),
+				Body:              strings.NewReader("llama"),
+			})
+			require.NoError(t, err)
 		})
 	}
 }

@@ -17,20 +17,31 @@ limitations under the License.
 package types
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/types/compare"
 	"github.com/gravitational/teleport/api/utils"
 )
+
+var _ compare.IsEqual[OktaAssignment] = (*OktaAssignmentV1)(nil)
 
 // OktaImportRule specifies a rule for importing and labeling Okta applications and groups.
 type OktaImportRule interface {
 	ResourceWithLabels
 
+	// GetPriority will return the priority of the Okta import rule.
+	GetPriority() int32
+
 	// GetMappings will return the list of mappings for the Okta import rule.
 	GetMappings() []OktaImportRuleMapping
+	// Clone returns a copy of the Okta import rule.
+	Clone() OktaImportRule
 }
 
 // NewOktaImportRule returns a new OktaImportRule.
@@ -47,6 +58,12 @@ func NewOktaImportRule(metadata Metadata, spec OktaImportRuleSpecV1) (OktaImport
 	return o, nil
 }
 
+// Clone returns a copy of the Okta import rule.
+func (o *OktaImportRuleV1) Clone() OktaImportRule {
+	return utils.CloneProtoMsg(o)
+}
+
+// GetPriority will return the priority of the Okta import rule.
 func (o *OktaImportRuleV1) GetPriority() int32 {
 	return o.Spec.Priority
 }
@@ -146,6 +163,10 @@ type OktaImportRuleMatch interface {
 	GetAppIDs() (bool, []string)
 	// GetGroupIDs returns whether or not this match contains a Group ID match and, if so, the list of app IDs.
 	GetGroupIDs() (bool, []string)
+	// GetAppNameRegexes returns whether or not this match contains app name regexes and, if so, the regexes.
+	GetAppNameRegexes() (bool, []string)
+	// GetGroupNameRegexes returns whether or not this match contains group name regexes and, if so, the regexes.
+	GetGroupNameRegexes() (bool, []string)
 }
 
 // GetAppIDs returns whether or not this match contains an App ID match and, if so, the list of app IDs.
@@ -158,6 +179,16 @@ func (o *OktaImportRuleMatchV1) GetGroupIDs() (bool, []string) {
 	return len(o.GroupIDs) > 0, o.GroupIDs
 }
 
+// GetAppNameRegexes returns whether or not this match contains app name regexes and, if so, the regexes.
+func (o *OktaImportRuleMatchV1) GetAppNameRegexes() (bool, []string) {
+	return len(o.AppNameRegexes) > 0, o.AppNameRegexes
+}
+
+// GetGroupNameRegexes returns whether or not this match contains group name regexes and, if so, the regexes.
+func (o *OktaImportRuleMatchV1) GetGroupNameRegexes() (bool, []string) {
+	return len(o.GroupNameRegexes) > 0, o.GroupNameRegexes
+}
+
 // CheckAndSetDefaults checks and sets default values
 func (o *OktaImportRuleMatchV1) CheckAndSetDefaults() error {
 	if len(o.AppIDs) > 0 && len(o.GroupIDs) > 0 {
@@ -167,14 +198,38 @@ func (o *OktaImportRuleMatchV1) CheckAndSetDefaults() error {
 	return nil
 }
 
-// OktaAssignment is a representation of an action or set of actions taken by Teleport to assign Okta users to applications or groups.
+// OktaAssignment is a representation of an action or set of actions taken by Teleport to assign Okta users
+// to applications or groups. When modifying this object, please make sure to update
+// tool/tctl/common/oktaassignment to reflect any new fields that were added.
 type OktaAssignment interface {
 	ResourceWithLabels
 
+	// SetMetadata will set the metadata for the Okta assignment.
+	SetMetadata(metadata Metadata)
 	// GetUser will return the user that the Okta assignment actions applies to.
 	GetUser() string
-	// GetActions will return the list of actions that will be performed as part of this assignment.
-	GetActions() []OktaAssignmentAction
+	// GetTargets will return the list of targets that will be assigned as part of this assignment.
+	GetTargets() []OktaAssignmentTarget
+	// GetCleanupTime will return the optional time that the assignment should be cleaned up.
+	GetCleanupTime() time.Time
+	// SetCleanupTime will set the cleanup time.
+	SetCleanupTime(time.Time)
+	// GetStatus gets the status of the assignment.
+	GetStatus() string
+	// SetStatus sets the status of the eassignment. Only allows valid transitions.
+	SetStatus(status string) error
+	// SetLastTransition sets the last transition time.
+	SetLastTransition(time.Time)
+	// GetLastTransition returns the time that the action last transitioned.
+	GetLastTransition() time.Time
+	// IsFinalized returns the finalized state.
+	IsFinalized() bool
+	// SetFinalized sets the finalized state
+	SetFinalized(bool)
+	// Copy returns a copy of this Okta assignment resource.
+	Copy() OktaAssignment
+	// IsEqual determines if two Okta assignments are equivalent to one another.
+	IsEqual(OktaAssignment) bool
 }
 
 // NewOktaAssignment creates a new Okta assignment object.
@@ -191,25 +246,133 @@ func NewOktaAssignment(metadata Metadata, spec OktaAssignmentSpecV1) (OktaAssign
 	return o, nil
 }
 
+// SetMetadata will set the metadata for the Okta assignment.
+func (o *OktaAssignmentV1) SetMetadata(metadata Metadata) {
+	o.Metadata = metadata
+}
+
 // GetUser returns the user that the actions will be applied to.
 func (o *OktaAssignmentV1) GetUser() string {
 	return o.Spec.User
 }
 
-func (o *OktaAssignmentV1) GetActions() []OktaAssignmentAction {
-	actions := make([]OktaAssignmentAction, len(o.Spec.Actions))
+// GetTargets returns the targets associated with the Okta assignment.
+func (o *OktaAssignmentV1) GetTargets() []OktaAssignmentTarget {
+	targets := make([]OktaAssignmentTarget, len(o.Spec.Targets))
 
-	for i, action := range o.Spec.Actions {
-		actions[i] = action
+	for i, target := range o.Spec.Targets {
+		targets[i] = target
 	}
 
-	return actions
+	return targets
+}
+
+// GetCleanupTime will return the optional time that the assignment should be cleaned up.
+func (o *OktaAssignmentV1) GetCleanupTime() time.Time {
+	return o.Spec.CleanupTime
+}
+
+// SetCleanupTime will set the cleanup time.
+func (o *OktaAssignmentV1) SetCleanupTime(cleanupTime time.Time) {
+	o.Spec.CleanupTime = cleanupTime.UTC()
+}
+
+// GetStatus gets the status of the assignment.
+func (o *OktaAssignmentV1) GetStatus() string {
+	switch o.Spec.Status {
+	case OktaAssignmentSpecV1_PENDING:
+		return constants.OktaAssignmentStatusPending
+	case OktaAssignmentSpecV1_PROCESSING:
+		return constants.OktaAssignmentStatusProcessing
+	case OktaAssignmentSpecV1_SUCCESSFUL:
+		return constants.OktaAssignmentStatusSuccessful
+	case OktaAssignmentSpecV1_FAILED:
+		return constants.OktaAssignmentStatusFailed
+	default:
+		return constants.OktaAssignmentStatusUnknown
+	}
+}
+
+// SetStatus sets the status of the eassignment. Only allows valid transitions.
+//
+// Valid transitions are:
+// * PENDING -> (PROCESSING)
+// * PROCESSING -> (SUCCESSFUL, FAILED, PROCESSING)
+// * SUCCESSFUL -> (PROCESSING)
+// * FAILED -> (PROCESSING)
+func (o *OktaAssignmentV1) SetStatus(status string) error {
+	invalidTransition := false
+	switch o.Spec.Status {
+	case OktaAssignmentSpecV1_PENDING:
+		switch status {
+		case constants.OktaAssignmentStatusProcessing:
+		default:
+			invalidTransition = true
+		}
+	case OktaAssignmentSpecV1_PROCESSING:
+		switch status {
+		case constants.OktaAssignmentStatusProcessing:
+		case constants.OktaAssignmentStatusSuccessful:
+		case constants.OktaAssignmentStatusFailed:
+		default:
+			invalidTransition = true
+		}
+	case OktaAssignmentSpecV1_SUCCESSFUL:
+		switch status {
+		case constants.OktaAssignmentStatusProcessing:
+		default:
+			invalidTransition = true
+		}
+	case OktaAssignmentSpecV1_FAILED:
+		switch status {
+		case constants.OktaAssignmentStatusProcessing:
+		default:
+			invalidTransition = true
+		}
+	case OktaAssignmentSpecV1_UNKNOWN:
+		// All transitions are allowed from UNKNOWN.
+	default:
+		invalidTransition = true
+	}
+
+	if invalidTransition {
+		return trace.BadParameter("invalid transition: %s -> %s", o.GetStatus(), status)
+	}
+
+	o.Spec.Status = OktaAssignmentStatusToProto(status)
+
+	return nil
+}
+
+// SetLastTransition sets the last transition time.
+func (o *OktaAssignmentV1) SetLastTransition(time time.Time) {
+	o.Spec.LastTransition = time.UTC()
+}
+
+// GetLastTransition returns the optional time that the action last transitioned.
+func (o *OktaAssignmentV1) GetLastTransition() time.Time {
+	return o.Spec.LastTransition
+}
+
+// IsFinalized returns the finalized state.
+func (o *OktaAssignmentV1) IsFinalized() bool {
+	return o.Spec.Finalized
+}
+
+// SetFinalized sets the finalized state
+func (o *OktaAssignmentV1) SetFinalized(finalized bool) {
+	o.Spec.Finalized = finalized
+}
+
+// Copy returns a copy of this Okta assignment resource.
+func (o *OktaAssignmentV1) Copy() OktaAssignment {
+	return utils.CloneProtoMsg(o)
 }
 
 // String returns the Okta assignment rule string representation.
 func (o *OktaAssignmentV1) String() string {
-	return fmt.Sprintf("OktaAssignmentV1(Name=%v, Labels=%v)",
-		o.GetName(), o.GetAllLabels())
+	return fmt.Sprintf("OktaAssignmentV1(Name=%v, Labels=%v, User=%s, Status=%s, LastTransition=%s, CleanupTime=%s)",
+		o.GetName(), o.GetAllLabels(), o.GetUser(), o.GetStatus(), o.Spec.LastTransition.UTC().Format(time.RFC3339), o.Spec.CleanupTime.UTC().Format(time.RFC3339))
 }
 
 // MatchSearch goes through select field values and tries to
@@ -236,54 +399,265 @@ func (o *OktaAssignmentV1) CheckAndSetDefaults() error {
 		return trace.BadParameter("user must not be empty")
 	}
 
-	if len(o.Spec.Actions) == 0 {
-		return trace.BadParameter("actions is empty")
+	// Make sure the times are UTC so that Copy() works properly.
+	o.Spec.CleanupTime = o.Spec.CleanupTime.UTC()
+	o.Spec.LastTransition = o.Spec.LastTransition.UTC()
+
+	return nil
+}
+
+// IsEqual determines if two okta assignment resources are equivalent to one another.
+func (o *OktaAssignmentV1) IsEqual(i OktaAssignment) bool {
+	if other, ok := i.(*OktaAssignmentV1); ok {
+		return deriveTeleportEqualOktaAssignmentV1(o, other)
+	}
+	return false
+}
+
+// OktaAssignmentTarget is an target for an Okta assignment.
+type OktaAssignmentTarget interface {
+	// GetTargetType returns the target type.
+	GetTargetType() string
+	// GetID returns the ID of the target.
+	GetID() string
+	// GetStatus returns the processing status of the target.
+	GetStatus() *OktaAssignmentTargetStatus
+	// RecordStatus sets the processing outcome, op type, and last processing time.
+	// In the case of a failed outcome, the failure count is incremented.
+	// In the case of a successful outcome, the failure count is reset.
+	// If an invalid value is provided for op or outcome, then an error is returned.
+	RecordStatus(t time.Time, op constants.OktaAssignmentTargetOp, outcome constants.OktaAssignmentTargetOutcome) error
+}
+
+// GetTargetType returns the target type.
+func (o *OktaAssignmentTargetV1) GetTargetType() string {
+	switch o.Type {
+	case OktaAssignmentTargetV1_APPLICATION:
+		return constants.OktaAssignmentTargetApplication
+	case OktaAssignmentTargetV1_GROUP:
+		return constants.OktaAssignmentTargetGroup
+	default:
+		return constants.OktaAssignmentTargetUnknown
+	}
+}
+
+// GetID returns the ID of the action target.
+func (o *OktaAssignmentTargetV1) GetID() string {
+	return o.Id
+}
+
+// GetStatus returns the processing status of the target.
+func (o *OktaAssignmentTargetV1) GetStatus() *OktaAssignmentTargetStatus {
+	return o.Status
+}
+
+// RecordStatus sets the processing outcome, op type, and last processing time.
+// In the case of transitioning between op types, the failure count is reset.
+// In the case of a failed outcome, the failure count is incremented.
+// In the case of a successful outcome, the failure count is reset.
+// If an invalid value is provided for op or outcome, then an error is returned.
+func (o *OktaAssignmentTargetV1) RecordStatus(
+	t time.Time,
+	op constants.OktaAssignmentTargetOp,
+	outcome constants.OktaAssignmentTargetOutcome,
+) error {
+	switch op {
+	case constants.OktaAssignmentTargetOpProvision:
+	case constants.OktaAssignmentTargetOpCleanup:
+	default:
+		return trace.BadParameter("invalid op provided %q", op)
+	}
+
+	failureCount := int32(0)
+	if o.Status != nil && constants.OktaAssignmentTargetOp(o.Status.Op) == op {
+		failureCount = o.Status.FailureCount
+	}
+
+	switch outcome {
+	case constants.OktaAssignmentTargetOutcomeSuccessful:
+		failureCount = 0
+	case constants.OktaAssignmentTargetOutcomeFailed:
+		failureCount++
+	default:
+		return trace.BadParameter("invalid outcome provided %q", outcome)
+	}
+
+	o.Status = &OktaAssignmentTargetStatus{
+		Outcome:       string(outcome),
+		Op:            string(op),
+		LastProcessed: t.UTC(),
+		FailureCount:  failureCount,
 	}
 
 	return nil
 }
 
-// OktaAssignmentAction is an individual action to apply to an Okta assignment.
-type OktaAssignmentAction interface {
-	// GetStatus returns the current status of the action.
-	GetStatus() string
-	// GetTargetType returns the target type of the action.
-	GetTargetType() string
-	// GetID returns the ID of the action target.
-	GetID() string
+// OktaAssignments is a list of OktaAssignment resources.
+type OktaAssignments []OktaAssignment
+
+// ToMap returns these Okta assignments as a map keyed by Okta assignment name.
+func (o OktaAssignments) ToMap() map[string]OktaAssignment {
+	m := make(map[string]OktaAssignment, len(o))
+	for _, oktaAssignment := range o {
+		m[oktaAssignment.GetName()] = oktaAssignment
+	}
+	return m
 }
 
-// GetStatus returns the current status of the action.
-func (o *OktaAssignmentActionV1) GetStatus() string {
-	switch o.Status {
-	case OktaAssignmentActionV1_PENDING:
-		return constants.OktaAssignmentActionStatusPending
-	case OktaAssignmentActionV1_SUCCESSFUL:
-		return constants.OktaAssignmentActionStatusSuccessful
-	case OktaAssignmentActionV1_FAILED:
-		return constants.OktaAssignmentActionStatusFailed
-	case OktaAssignmentActionV1_CLEANED_UP:
-		return constants.OktaAssignmentActionStatusCleanedUp
-	case OktaAssignmentActionV1_CLEANUP_FAILED:
-		return constants.OktaAssignmentActionStatusCleanupFailed
+// AsResources returns these Okta assignments as resources with labels.
+func (o OktaAssignments) AsResources() ResourcesWithLabels {
+	resources := make(ResourcesWithLabels, 0, len(o))
+	for _, oktaAssignment := range o {
+		resources = append(resources, oktaAssignment)
+	}
+	return resources
+}
+
+// Len returns the slice length.
+func (o OktaAssignments) Len() int { return len(o) }
+
+// Less compares Okta assignments by name.
+func (o OktaAssignments) Less(i, j int) bool { return o[i].GetName() < o[j].GetName() }
+
+// Swap swaps two Okta assignments.
+func (o OktaAssignments) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
+
+// OktaAssignmentStatusToProto will convert the internal notion of an Okta status into the Okta status
+// message understood by protobuf.
+func OktaAssignmentStatusToProto(status string) OktaAssignmentSpecV1_OktaAssignmentStatus {
+	switch status {
+	case constants.OktaAssignmentStatusPending:
+		return OktaAssignmentSpecV1_PENDING
+	case constants.OktaAssignmentStatusProcessing:
+		return OktaAssignmentSpecV1_PROCESSING
+	case constants.OktaAssignmentStatusSuccessful:
+		return OktaAssignmentSpecV1_SUCCESSFUL
+	case constants.OktaAssignmentStatusFailed:
+		return OktaAssignmentSpecV1_FAILED
 	default:
-		return constants.OktaAssignmentActionStatusUnknown
+		return OktaAssignmentSpecV1_UNKNOWN
 	}
 }
 
-// GetTargetType returns the target type of the action.
-func (o *OktaAssignmentActionV1) GetTargetType() string {
-	switch o.Target.Type {
-	case OktaAssignmentActionTargetV1_APPLICATION:
-		return constants.OktaAssignmentActionTargetApplication
-	case OktaAssignmentActionTargetV1_GROUP:
-		return constants.OktaAssignmentActionTargetGroup
+// OktaAssignmentStatusProtoToString will convert the Okta status known to protobuf into the internal notion
+// of an Okta status.
+func OktaAssignmentStatusProtoToString(status OktaAssignmentSpecV1_OktaAssignmentStatus) string {
+	switch status {
+	case OktaAssignmentSpecV1_PENDING:
+		return constants.OktaAssignmentStatusPending
+	case OktaAssignmentSpecV1_PROCESSING:
+		return constants.OktaAssignmentStatusProcessing
+	case OktaAssignmentSpecV1_SUCCESSFUL:
+		return constants.OktaAssignmentStatusSuccessful
+	case OktaAssignmentSpecV1_FAILED:
+		return constants.OktaAssignmentStatusFailed
 	default:
-		return constants.OktaAssignmentActionTargetUnknown
+		return constants.OktaAssignmentStatusUnknown
 	}
 }
 
-// GetID returns the ID of the action target.
-func (o *OktaAssignmentActionV1) GetID() string {
-	return o.Target.Id
+func (o *PluginOktaSettings) GetCredentialsInfo() *PluginOktaCredentialsInfo {
+	if o == nil {
+		return nil
+	}
+	return o.CredentialsInfo
+}
+
+func (o *PluginOktaSettings) GetSyncSettings() *PluginOktaSyncSettings {
+	if o == nil {
+		return nil
+	}
+	return o.SyncSettings
+}
+
+func (o *PluginOktaSyncSettings) GetEnableUserSync() bool {
+	if o == nil {
+		return false
+	}
+	return o.SyncUsers
+}
+
+func (o *PluginOktaSyncSettings) GetEnableAppGroupSync() bool {
+	if !o.GetEnableUserSync() {
+		return false
+	}
+	return !o.DisableSyncAppGroups
+}
+
+func (o *PluginOktaSyncSettings) GetEnableAccessListSync() bool {
+	if !o.GetEnableAppGroupSync() {
+		return false
+	}
+	return o.SyncAccessLists
+}
+
+func (o *PluginOktaSyncSettings) GetEnableBidirectionalSync() bool {
+	if !o.GetEnableAppGroupSync() {
+		return false
+	}
+	return !o.DisableBidirectionalSync
+}
+
+func (o *PluginOktaSyncSettings) GetEnableSystemLogExport() bool {
+	if o == nil {
+		return false
+	}
+	return o.EnableSystemLogExport
+}
+
+func (o *PluginOktaSyncSettings) GetAssignDefaultRoles() bool {
+	if o == nil {
+		return false
+	}
+	return !o.DisableAssignDefaultRoles
+}
+
+type OktaUserSyncSource string
+
+// IsUnknown returns true if user sync source is empty or explicitly set to "unknown".
+func (s OktaUserSyncSource) IsUnknown() bool {
+	switch s {
+	case "", OktaUserSyncSourceUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	// OktaUserSyncSourceUnknown indicates the user sync source is not set.
+	OktaUserSyncSourceUnknown OktaUserSyncSource = "unknown"
+
+	// OktaUserSyncSourceSamlApp indicates users are synchronized from Okta SAML app for the connector assignments.
+	OktaUserSyncSourceSamlApp OktaUserSyncSource = "saml_app"
+
+	// OktaUserSyncSourceSamlOrg indicates users are synchronized  Okta organization (legacy).
+	OktaUserSyncSourceOrg OktaUserSyncSource = "org"
+)
+
+func (o *PluginOktaSyncSettings) GetUserSyncSource() OktaUserSyncSource {
+	if o == nil {
+		return OktaUserSyncSourceUnknown
+	}
+	switch v := OktaUserSyncSource(o.UserSyncSource); v {
+	case "":
+		return OktaUserSyncSourceUnknown
+	case OktaUserSyncSourceUnknown, OktaUserSyncSourceSamlApp, OktaUserSyncSourceOrg:
+		return v
+	default:
+		slog.ErrorContext(context.Background(), "Unhandled PluginOktaSyncSettings_UserSyncSource, returning OktaUserSyncSourceUnknown", "value", o.UserSyncSource)
+		return OktaUserSyncSourceUnknown
+	}
+}
+
+func (o *PluginOktaSyncSettings) SetUserSyncSource(source OktaUserSyncSource) {
+	if o == nil {
+		panic("calling (*PluginOktaSyncSettings).SetUserSyncSource on nil pointer")
+	}
+	switch source {
+	case OktaUserSyncSourceUnknown, OktaUserSyncSourceSamlApp, OktaUserSyncSourceOrg:
+		o.UserSyncSource = string(source)
+	default:
+		slog.ErrorContext(context.Background(), "Unhandled OktaUserSyncSource, not doing anything", "value", source)
+	}
 }

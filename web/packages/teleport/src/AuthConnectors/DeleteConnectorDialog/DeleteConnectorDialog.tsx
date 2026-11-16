@@ -1,39 +1,53 @@
-/*
-Copyright 2020-2021 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
-import useAttempt from 'shared/hooks/useAttemptNext';
-import { ButtonWarning, ButtonSecondary, Text, Alert } from 'design';
+import {
+  Alert,
+  Box,
+  ButtonSecondary,
+  ButtonWarning,
+  Flex,
+  P1,
+  Text,
+} from 'design';
 import Dialog, {
   DialogContent,
   DialogFooter,
   DialogHeader,
   DialogTitle,
 } from 'design/DialogConfirmation';
+import useAttempt from 'shared/hooks/useAttemptNext';
 
 import { State as ResourceState } from 'teleport/components/useResources';
+import { KindAuthConnectors } from 'teleport/services/resources';
+
+import getSsoIcon from '../ssoIcons/getSsoIcon';
 
 export default function DeleteConnectorDialog(props: Props) {
-  const { name, onClose, onDelete } = props;
+  const { name, kind, onClose, onDelete, isDefault, nextDefault } = props;
   const { attempt, run } = useAttempt();
   const isDisabled = attempt.status === 'processing';
 
   function onOk() {
     run(() => onDelete()).then(ok => ok && onClose());
   }
+
+  const Icon = getSsoIcon(kind, name);
 
   return (
     <Dialog
@@ -45,19 +59,36 @@ export default function DeleteConnectorDialog(props: Props) {
       <DialogHeader>
         <DialogTitle>Remove Connector?</DialogTitle>
       </DialogHeader>
-      <DialogContent>
+      <DialogContent mb={4}>
         {attempt.status === 'failed' && <Alert children={attempt.statusText} />}
-        <Text typography="paragraph" mb="6">
-          Are you sure you want to delete connector{' '}
-          <Text as="span" bold color="primary.contrastText">
-            {name}
-          </Text>
-          ?
-        </Text>
+        <Flex gap={3} width="100%">
+          <Box>
+            <Icon />
+          </Box>
+          <P1>
+            Are you sure you want to delete the connector{' '}
+            <Text as="span" bold color="text.main">
+              {name}
+            </Text>
+            ?
+          </P1>
+        </Flex>
+        {isDefault && (
+          <Alert kind="outline-warn" m={0} mt={3}>
+            <P1>
+              This is currently the default auth connector. Deleting this will
+              cause{' '}
+              <Text as="span" bold color="text.main">
+                {nextDefault}
+              </Text>{' '}
+              to become the new default.
+            </P1>
+          </Alert>
+        )}
       </DialogContent>
       <DialogFooter>
         <ButtonWarning mr="3" disabled={isDisabled} onClick={onOk}>
-          Yes, Remove Connector
+          Delete Connector
         </ButtonWarning>
         <ButtonSecondary disabled={isDisabled} onClick={onClose}>
           Cancel
@@ -69,6 +100,9 @@ export default function DeleteConnectorDialog(props: Props) {
 
 type Props = {
   name: string;
+  kind: KindAuthConnectors;
   onClose: ResourceState['disregard'];
   onDelete(): Promise<any>;
+  isDefault: boolean;
+  nextDefault: string;
 };

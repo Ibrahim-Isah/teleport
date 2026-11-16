@@ -1,51 +1,30 @@
 /*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Copyright 2023 Gravitational, Inc.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package sftp
 
 import (
 	"context"
+	"errors"
 	"io"
 	"io/fs"
 	"os"
 )
-
-// fileWrapper provides minimal required file interface for SFTP package
-// including WriteTo() method required for concurrent data transfer.
-type fileWrapper struct {
-	file *os.File
-}
-
-func (wt *fileWrapper) Read(p []byte) (n int, err error) {
-	return wt.file.Read(p)
-}
-
-func (wt *fileWrapper) Close() error {
-	return wt.file.Close()
-}
-
-func (wt *fileWrapper) WriteTo(w io.Writer) (n int64, err error) {
-	return io.Copy(w, wt.file)
-}
-
-func (wt *fileWrapper) Stat() (os.FileInfo, error) {
-	return wt.file.Stat()
-}
 
 // fileStreamReader is a thin wrapper around fs.File with additional streams.
 type fileStreamReader struct {
@@ -73,7 +52,7 @@ func (r *fileStreamReader) Read(b []byte) (int, error) {
 	for _, stream := range r.streams {
 		if _, innerError := stream.Read(readBuff); innerError != nil {
 			// Ignore EOF
-			if err != io.EOF {
+			if !errors.Is(err, io.EOF) {
 				return 0, innerError
 			}
 		}

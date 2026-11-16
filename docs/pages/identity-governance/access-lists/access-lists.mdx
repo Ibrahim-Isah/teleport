@@ -1,0 +1,44 @@
+---
+title: Access Lists
+description: Use Access Lists in Teleport
+template: "no-toc"
+sidebar_position: 3
+tags:
+ - identity-governance
+enterprise: Identity Governance
+---
+
+Access Lists allow Teleport users to be granted long term access to resources
+managed within Teleport. With Access Lists, administrators and Access List
+owners can regularly audit and control membership to specific roles and
+traits, which then tie easily back into Teleport's existing RBAC system.
+
+<Admonition type="tip" title="Review Access List grants">
+Teleport Identity Security can show you which identities reach which resources
+through their Access List memberships, and whether that access has actually been
+used. See [Review Identity Access from the
+CLI](../../identity-security/cli/access-review.mdx) (`tctl access-review`). For
+example, to see what the `Prod Admins` Access List grants and who holds it:
+
+```code
+$ tctl access-review --query "SELECT * FROM access_path WHERE identity_group IN ('Prod Admins')"
+```
+</Admonition>
+
+[Getting Started with Access Lists](guide.mdx)
+
+Three guided flows for creating Access Lists:
+
+[Standing Access Lists](standing-access-list.mdx)
+
+[Just-in-Time Access Lists](jit-access-list.mdx)
+
+[Custom Access Lists](custom-access-list.mdx)
+
+---
+
+[Nested Access Lists](nested-access-lists.mdx)
+
+[Reviewing Access Requests](reviewing-access-requests.mdx)
+
+[Access List Reference](../../reference/access-controls/access-lists.mdx)

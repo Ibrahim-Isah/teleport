@@ -1,44 +1,44 @@
 /*
-Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-package auth
+package auth_test
 
 import (
-	"context"
 	"testing"
 
-	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/backend/memory"
 	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/modules/modulestest"
 	"github.com/gravitational/teleport/lib/services/local"
 )
 
 // TestUnmoderatedSessionsAllowed tests that we allow creating unmoderated sessions even if the
 // license does not support the moderated sessions feature.
 func TestUnmoderatedSessionsAllowed(t *testing.T) {
-	// Use OSS License (which doesn't support moderated sessions).
-	modules.SetTestModules(t, &modules.TestModules{TestBuildType: modules.BuildOSS})
+	t.Parallel()
 
-	srv := &Server{
-		clock:    clockwork.NewRealClock(),
-		Services: &Services{},
-	}
+	// Use OSS License (which doesn't support moderated sessions).
+	srv := auth.ServerWithModules(&modulestest.Modules{TestBuildType: modules.BuildOSS})
+	srv.Services = &auth.Services{}
 
 	bk, err := memory.New(memory.Config{})
 	require.NoError(t, err)
@@ -52,7 +52,7 @@ func TestUnmoderatedSessionsAllowed(t *testing.T) {
 	require.NoError(t, err)
 	tracker.AddParticipant(types.Participant{})
 
-	_, err = srv.CreateSessionTracker(context.Background(), tracker)
+	_, err = srv.CreateSessionTracker(t.Context(), tracker)
 	require.NoError(t, err)
 	require.NotNil(t, tracker)
 }
@@ -60,13 +60,11 @@ func TestUnmoderatedSessionsAllowed(t *testing.T) {
 // TestModeratedSessionsDisabled makes sure moderated sessions are disabled when the license does not support it.
 // Since moderated sessions require trackers, we mediate this in the tracker creation function.
 func TestModeratedSessionsDisabled(t *testing.T) {
-	// Use OSS License (which doesn't support moderated sessions).
-	modules.SetTestModules(t, &modules.TestModules{TestBuildType: modules.BuildOSS})
+	t.Parallel()
 
-	srv := &Server{
-		clock:    clockwork.NewRealClock(),
-		Services: &Services{},
-	}
+	// Use OSS License (which doesn't support moderated sessions)
+	srv := auth.ServerWithModules(&modulestest.Modules{TestBuildType: modules.BuildOSS})
+	srv.Services = &auth.Services{}
 
 	bk, err := memory.New(memory.Config{})
 	require.NoError(t, err)
@@ -91,22 +89,20 @@ func TestModeratedSessionsDisabled(t *testing.T) {
 	require.NoError(t, err)
 	tracker.AddParticipant(types.Participant{})
 
-	tracker, err = srv.CreateSessionTracker(context.Background(), tracker)
+	tracker, err = srv.CreateSessionTracker(t.Context(), tracker)
 	require.Error(t, err)
 	require.Nil(t, tracker)
-	require.ErrorIs(t, err, ErrRequiresEnterprise)
+	require.ErrorIs(t, err, auth.ErrRequiresEnterprise)
 }
 
 // TestModeratedSessionsEnabled verifies that we can create session trackers with moderation
 // requirements when the license supports it.
 func TestModeratedSesssionsEnabled(t *testing.T) {
-	// Use Enterprise License (which supports moderated sessions).
-	modules.SetTestModules(t, &modules.TestModules{TestBuildType: modules.BuildEnterprise})
+	t.Parallel()
 
-	srv := &Server{
-		clock:    clockwork.NewRealClock(),
-		Services: &Services{},
-	}
+	// Use Enterprise License (which supports moderated sessions).
+	srv := auth.ServerWithModules(modulestest.EnterpriseModules())
+	srv.Services = &auth.Services{}
 
 	bk, err := memory.New(memory.Config{})
 	require.NoError(t, err)
@@ -131,7 +127,7 @@ func TestModeratedSesssionsEnabled(t *testing.T) {
 	require.NoError(t, err)
 	tracker.AddParticipant(types.Participant{})
 
-	_, err = srv.CreateSessionTracker(context.Background(), tracker)
+	_, err = srv.CreateSessionTracker(t.Context(), tracker)
 	require.NoError(t, err)
 	require.NotNil(t, tracker)
 }

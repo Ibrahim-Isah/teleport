@@ -1,25 +1,31 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
 import (
+	"context"
+	"errors"
 	"io"
+	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
-
-	log "github.com/sirupsen/logrus"
 )
 
 // maxHistoryBytes is the maximum bytes that are retained as history and broadcasted to new clients.
@@ -94,20 +100,38 @@ func (g *TermManager) writeToClients(p []byte) {
 	g.history = truncateFront(append(g.history, p...), maxHistoryBytes)
 
 	atomic.AddUint64(&g.countWritten, uint64(len(p)))
+	var toDelete []struct {
+		key string
+		err error
+	}
 	for key, w := range g.writers {
 		_, err := w.Write(p)
 		if err != nil {
-			if err != io.EOF {
-				log.Warnf("Failed to write to remote terminal: %v", err)
+			if !errors.Is(err, io.EOF) {
+				slog.WarnContext(context.Background(), "Failed to write to remote terminal", "error", err)
 			}
-
-			// Let term manager decide how to handle broken party writers
-			if g.OnWriteError != nil {
-				g.OnWriteError(key, err)
-			}
+			toDelete = append(
+				toDelete, struct {
+					key string
+					err error
+				}{key, err})
 
 			delete(g.writers, key)
 		}
+	}
+
+	// Let term manager decide how to handle broken party writers
+	if g.OnWriteError != nil {
+		// writeToClients is called with the lock held, so we need to release it
+		// before calling OnWriteError to avoid a deadlock if OnWriteError
+		// calls DeleteWriter/DeleteReader.
+		func() {
+			g.mu.Unlock()
+			defer g.mu.Lock()
+			for _, deleteWriter := range toDelete {
+				g.OnWriteError(deleteWriter.key, deleteWriter.err)
+			}
+		}()
 	}
 }
 
@@ -212,14 +236,19 @@ func (g *TermManager) DeleteWriter(name string) {
 }
 
 func (g *TermManager) AddReader(name string, r io.Reader) {
+	// AddReader is called by goroutines so we need to hold the lock.
+	g.mu.Lock()
 	g.readerState[name] = false
+	g.mu.Unlock()
 
 	go func() {
 		for {
 			buf := make([]byte, 1024)
 			n, err := r.Read(buf)
 			if err != nil {
-				log.Warnf("Failed to read from remote terminal: %v", err)
+				if !errors.Is(err, io.EOF) {
+					slog.WarnContext(context.Background(), "Failed to read from remote terminal", "error", err)
+				}
 				// Let term manager decide how to handle broken party readers.
 				if g.OnReadError != nil {
 					g.OnReadError(name, err)
@@ -228,19 +257,15 @@ func (g *TermManager) AddReader(name string, r io.Reader) {
 				return
 			}
 
-			for _, b := range buf[:n] {
-				// This is the ASCII control code for CTRL+C.
-				if b == 0x03 {
-					g.mu.Lock()
-					if g.state == dataFlowOff && !g.isClosed() {
-						select {
-						case g.terminateNotifier <- struct{}{}:
-						default:
-						}
+			if slices.Contains(buf[:n], 0x03) {
+				g.mu.Lock()
+				if g.state == dataFlowOff && !g.isClosed() {
+					select {
+					case g.terminateNotifier <- struct{}{}:
+					default:
 					}
-					g.mu.Unlock()
-					break
 				}
+				g.mu.Unlock()
 			}
 
 			g.mu.Lock()

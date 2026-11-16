@@ -1,166 +1,244 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, {
-  useCallback,
-  useMemo,
-  useRef,
-  useState,
-  useImperativeHandle,
-} from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import styled from 'styled-components';
-import { Box } from 'design';
-import Popover from 'design/Popover';
 
-import {
-  useKeyboardShortcuts,
-  useKeyboardShortcutFormatters,
-} from 'teleterm/ui/services/keyboardShortcuts';
+import { Box, ButtonText, Flex, Link, P3 } from 'design';
+import { Cross, Stars } from 'design/Icon';
+import Popover from 'design/Popover';
+import { TrustedDeviceRequirement } from 'gen-proto-ts/teleport/legacy/types/trusted_device_requirement_pb';
 
 import * as tshd from 'teleterm/services/tshd/types';
+import { KeyboardArrowsNavigation } from 'teleterm/ui/components/KeyboardArrowsNavigation';
+import { usePersistedState } from 'teleterm/ui/hooks/usePersistedState';
+import { useStoreSelector } from 'teleterm/ui/hooks/useStoreSelector';
+import {
+  useKeyboardShortcutFormatters,
+  useKeyboardShortcuts,
+} from 'teleterm/ui/services/keyboardShortcuts';
 
-import { IdentityRootCluster, useIdentity } from './useIdentity';
-import { IdentityList } from './IdentityList/IdentityList';
+import { ActiveCluster, IdentityList } from './IdentityList/IdentityList';
 import { IdentitySelector } from './IdentitySelector/IdentitySelector';
-import { EmptyIdentityList } from './EmptyIdentityList/EmptyIdentityList';
+import { useIdentity } from './useIdentity';
 
 export function IdentityContainer() {
   const {
-    activeRootCluster,
-    rootClusters,
-    changeRootCluster,
+    activeWorkspaceCluster,
+    otherWorkspaces,
+    changeWorkspace,
     logout,
     addCluster,
+    forget,
+    refreshCluster,
+    changeColor,
   } = useIdentity();
-  const { getLabelWithShortcut } = useKeyboardShortcutFormatters();
-
-  const presenterRef = useRef<IdentityHandler>();
+  const selectorRef = useRef<HTMLButtonElement>(null);
+  const [open, setOpen] = useState(false);
+  const { getLabelWithAccelerator } = useKeyboardShortcutFormatters();
+  const hasAnyWorkspaces = Boolean(
+    activeWorkspaceCluster || otherWorkspaces.length
+  );
+  const togglePopoverOrAddCluster = useCallback(() => {
+    if (hasAnyWorkspaces) {
+      setOpen(o => !o);
+    } else {
+      addCluster();
+    }
+  }, [addCluster, hasAnyWorkspaces]);
 
   useKeyboardShortcuts(
     useMemo(
       () => ({
-        'toggle-identity': presenterRef.current?.togglePopover,
+        openProfiles: togglePopoverOrAddCluster,
       }),
-      [presenterRef.current?.togglePopover]
+      [togglePopoverOrAddCluster]
     )
   );
 
   const makeTitle = (userWithClusterName: string | undefined) =>
-    getLabelWithShortcut(
+    getLabelWithAccelerator(
       [userWithClusterName, 'Open Profiles'].filter(Boolean).join('\n'),
-      'toggle-identity'
+      'openProfiles'
     );
 
+  function withClose<T extends (...args: any[]) => any>(
+    fn: T
+  ): (...args: Parameters<T>) => ReturnType<T> {
+    return (...args) => {
+      setOpen(false);
+      return fn(...args);
+    };
+  }
+
+  const deviceTrustStatus = calculateDeviceTrustStatus(
+    activeWorkspaceCluster?.loggedInUser
+  );
+  const activeColor = useStoreSelector(
+    'workspacesService',
+    useCallback(state => state.workspaces[state.rootClusterUri]?.color, [])
+  );
+
   return (
-    <Identity
-      ref={presenterRef}
-      activeRootCluster={activeRootCluster}
-      rootClusters={rootClusters}
-      changeRootCluster={changeRootCluster}
-      logout={logout}
-      addCluster={addCluster}
-      makeTitle={makeTitle}
-    />
+    <>
+      <IdentitySelector
+        ref={selectorRef}
+        onClick={togglePopoverOrAddCluster}
+        open={open}
+        activeCluster={activeWorkspaceCluster}
+        activeColor={activeColor}
+        makeTitle={makeTitle}
+        deviceTrustStatus={deviceTrustStatus}
+      />
+      <Popover
+        open={open}
+        anchorEl={selectorRef.current}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+        transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+        onClose={() => setOpen(false)}
+        popoverCss={() => `max-width: min(450px, 90%)`}
+        updatePositionOnChildResize
+      >
+        <Container>
+          {activeWorkspaceCluster && (
+            <ActiveCluster
+              activeCluster={activeWorkspaceCluster}
+              activeColor={activeColor}
+              onChangeColor={changeColor}
+              onLogout={withClose(() => logout(activeWorkspaceCluster.uri))}
+              onRefresh={withClose(() =>
+                refreshCluster(activeWorkspaceCluster.uri)
+              )}
+              deviceTrustStatus={deviceTrustStatus}
+            />
+          )}
+          <TshHomeMigrationBanner />
+          <KeyboardArrowsNavigation>
+            {focusGrabber}
+            <IdentityList
+              items={otherWorkspaces}
+              onSelect={withClose(changeWorkspace)}
+              onLogout={withClose(logout)}
+              onAdd={withClose(addCluster)}
+              onForget={withClose(forget)}
+            />
+          </KeyboardArrowsNavigation>
+        </Container>
+      </Popover>
+    </>
   );
 }
 
-export type IdentityHandler = { togglePopover: () => void };
+const Container = styled(Box)`
+  background: ${props => props.theme.colors.levels.elevated};
+  min-width: 300px;
+  width: 100%;
+`;
 
-export type IdentityProps = {
-  activeRootCluster: tshd.Cluster | undefined;
-  rootClusters: IdentityRootCluster[];
-  changeRootCluster: (clusterUri: string) => Promise<void>;
-  logout: (clusterUri: string) => void;
-  addCluster: () => void;
-  makeTitle: (userWithClusterName: string | undefined) => string;
-};
+export type DeviceTrustStatus = 'none' | 'enrolled' | 'requires-enrollment';
 
-export const Identity = React.forwardRef<IdentityHandler, IdentityProps>(
-  (
-    {
-      activeRootCluster,
-      rootClusters,
-      changeRootCluster,
-      logout,
-      addCluster,
-      makeTitle,
-    },
-    ref
-  ) => {
-    const selectorRef = useRef<HTMLButtonElement>();
-    const [isPopoverOpened, setIsPopoverOpened] = useState(false);
-
-    const togglePopover = useCallback(() => {
-      setIsPopoverOpened(wasOpened => !wasOpened);
-    }, [setIsPopoverOpened]);
-
-    function withClose<T extends (...args) => any>(
-      fn: T
-    ): (...args: Parameters<T>) => ReturnType<T> {
-      return (...args) => {
-        setIsPopoverOpened(false);
-        return fn(...args);
-      };
-    }
-
-    useImperativeHandle(ref, () => ({
-      togglePopover: () => {
-        togglePopover();
-      },
-    }));
-
-    const loggedInUser = activeRootCluster?.loggedInUser;
-
-    return (
-      <>
-        <IdentitySelector
-          ref={selectorRef}
-          onClick={togglePopover}
-          isOpened={isPopoverOpened}
-          userName={loggedInUser?.name}
-          clusterName={activeRootCluster?.name}
-          makeTitle={makeTitle}
-        />
-        <Popover
-          open={isPopoverOpened}
-          anchorEl={selectorRef.current}
-          anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
-          transformOrigin={{ vertical: 'top', horizontal: 'right' }}
-          onClose={() => setIsPopoverOpened(false)}
-          popoverCss={() => `max-width: min(560px, 90%)`}
-        >
-          <Container>
-            {rootClusters.length ? (
-              <IdentityList
-                loggedInUser={loggedInUser}
-                clusters={rootClusters}
-                onSelectCluster={withClose(changeRootCluster)}
-                onLogout={withClose(logout)}
-                onAddCluster={withClose(addCluster)}
-              />
-            ) : (
-              <EmptyIdentityList onConnect={withClose(addCluster)} />
-            )}
-          </Container>
-        </Popover>
-      </>
-    );
+function calculateDeviceTrustStatus(
+  loggedInUser: tshd.LoggedInUser
+): DeviceTrustStatus {
+  if (!loggedInUser) {
+    return 'none';
   }
+  if (loggedInUser.isDeviceTrusted) {
+    return 'enrolled';
+  }
+  if (
+    loggedInUser.trustedDeviceRequirement === TrustedDeviceRequirement.REQUIRED
+  ) {
+    return 'requires-enrollment';
+  }
+  return 'none';
+}
+
+// Hack - for some reason xterm.js doesn't allow moving focus to the Identity popover
+// when it is focused using element.focus().
+// It used to restore focus after the popover was closed, but this no longer seems to work.
+const focusGrabber = (
+  <input
+    style={{
+      opacity: 0,
+      position: 'absolute',
+      height: 0,
+      zIndex: -1,
+    }}
+    autoFocus={true}
+  />
 );
 
-const Container = styled(Box)`
-  background: ${props => props.theme.colors.primary.light};
-`;
+export function TshHomeMigrationBanner(props: { className?: string }) {
+  const [state, setState] = usePersistedState(
+    'showTshHomeMigrationBanner',
+    false
+  );
+  if (!state) {
+    return;
+  }
+
+  return (
+    <Flex
+      className={props.className}
+      alignItems="center"
+      gap={2}
+      px={3}
+      py={2}
+      backgroundColor="interactive.tonal.informational.1"
+    >
+      <Stars size="medium" mx={1} />
+      <Flex
+        justifyContent="space-between"
+        alignItems="center"
+        width="100%"
+        gap={2}
+      >
+        {/*This max width value prevents the banner from being too wide in ClusterConnectPanel. */}
+        <Flex maxWidth="280px">
+          {/*Matches the look of a subtitle in TitleAndSubtitle. */}
+          <P3
+            color="text.slightlyMuted"
+            css={`
+              line-height: 1.3;
+            `}
+          >
+            Profiles are now{' '}
+            <Link
+              target="_blank"
+              href={
+                'https://goteleport.com/docs/connect-your-client/teleport-connect/#using-tsh-outside-of-teleport-connect'
+              }
+            >
+              automatically synced
+            </Link>{' '}
+            between Teleport Connect and the tsh command-line tool.
+          </P3>
+        </Flex>
+        <ButtonText
+          size="small"
+          p={1}
+          title="Close"
+          onClick={() => setState(false)}
+        >
+          <Cross size="small" />
+        </ButtonText>
+      </Flex>
+    </Flex>
+  );
+}

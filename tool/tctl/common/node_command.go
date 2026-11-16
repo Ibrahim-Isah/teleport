@@ -1,18 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
@@ -22,30 +24,34 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"text/template"
 	"time"
 
-	"github.com/gravitational/kingpin"
+	template "github.com/DataDog/datadog-agent/pkg/template/text"
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/client/proto"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/api/utils/clientutils"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	libclient "github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/service"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/parse"
+	commonclient "github.com/gravitational/teleport/tool/tctl/common/client"
+	tctlcfg "github.com/gravitational/teleport/tool/tctl/common/config"
+	"github.com/gravitational/teleport/tool/tctl/common/resources"
 )
 
 // NodeCommand implements `tctl nodes` group of commands
 type NodeCommand struct {
-	config *service.Config
-	// format is the output format, e.g. text or json
+	config *servicecfg.Config
+	// format is the output format, e.g. text, json, or yaml.
 	format string
 	// list of roles for the new node to assume
 	roles string
@@ -74,21 +80,21 @@ type NodeCommand struct {
 }
 
 // Initialize allows NodeCommand to plug itself into the CLI parser
-func (c *NodeCommand) Initialize(app *kingpin.Application, config *service.Config) {
+func (c *NodeCommand) Initialize(app *kingpin.Application, _ *tctlcfg.GlobalCLIFlags, config *servicecfg.Config) {
 	c.config = config
 
 	// add node command
-	nodes := app.Command("nodes", "Issue invites for other nodes to join the cluster")
-	c.nodeAdd = nodes.Command("add", "Generate a node invitation token")
+	nodes := app.Command("nodes", "Issue invites for other nodes to join the cluster.")
+	c.nodeAdd = nodes.Command("add", "Generate a node invitation token.")
 	c.nodeAdd.Flag("roles", "Comma-separated list of roles for the new node to assume [node]").Default("node").StringVar(&c.roles)
 	c.nodeAdd.Flag("ttl", "Time to live for a generated token").Default(defaults.ProvisioningTokenTTL.String()).DurationVar(&c.ttl)
 	c.nodeAdd.Flag("token", "Override the default random generated token with a specified value").StringVar(&c.token)
-	c.nodeAdd.Flag("format", "Output format, 'text' or 'json'").Hidden().Default(teleport.Text).StringVar(&c.format)
+	c.nodeAdd.Flag("format", "Output format.").Default(teleport.Text).EnumVar(&c.format, teleport.Text, teleport.JSON, teleport.YAML)
 	c.nodeAdd.Alias(AddNodeHelp)
 
-	c.nodeList = nodes.Command("ls", "List all active SSH nodes within the cluster")
-	c.nodeList.Flag("namespace", "Namespace of the nodes").Default(apidefaults.Namespace).StringVar(&c.namespace)
-	c.nodeList.Flag("format", "Output format, 'text', or 'yaml'").Default(teleport.Text).StringVar(&c.lsFormat)
+	c.nodeList = nodes.Command("ls", "List all active SSH nodes within the cluster.")
+	c.nodeList.Flag("namespace", "Namespace of the nodes").Hidden().Default(apidefaults.Namespace).StringVar(&c.namespace)
+	c.nodeList.Flag("format", "Output format.").Default(teleport.Text).EnumVar(&c.lsFormat, teleport.Text, teleport.JSON, teleport.YAML)
 	c.nodeList.Flag("verbose", "Verbose table output, shows full label output").Short('v').BoolVar(&c.verbose)
 	c.nodeList.Alias(ListNodesHelp)
 	c.nodeList.Arg("labels", labelHelp).StringVar(&c.labels)
@@ -97,16 +103,22 @@ func (c *NodeCommand) Initialize(app *kingpin.Application, config *service.Confi
 }
 
 // TryRun takes the CLI command as an argument (like "nodes ls") and executes it.
-func (c *NodeCommand) TryRun(ctx context.Context, cmd string, client auth.ClientI) (match bool, err error) {
+func (c *NodeCommand) TryRun(ctx context.Context, cmd string, clientFunc commonclient.InitFunc) (match bool, err error) {
+	var commandFunc func(ctx context.Context, client *authclient.Client) error
 	switch cmd {
 	case c.nodeAdd.FullCommand():
-		err = c.Invite(ctx, client)
+		commandFunc = c.Invite
 	case c.nodeList.FullCommand():
-		err = c.ListActive(ctx, client)
-
+		commandFunc = c.ListActive
 	default:
 		return false, nil
 	}
+	client, closeFn, err := clientFunc(ctx)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+	err = commandFunc(ctx, client)
+	closeFn(ctx)
 	return true, trace.Wrap(err)
 }
 
@@ -123,7 +135,8 @@ Run this on the new node to join the cluster:
 
 > teleport start \
    --roles={{.roles}} \
-   --token={{.token}} \{{range .ca_pins}}
+   --token={{.token}} \{{with .secret}}
+   --token-secret={{.}} \{{end}}{{range .ca_pins}}
    --ca-pin={{.}} \{{end}}
    --auth-server={{.auth_server}}
 
@@ -135,7 +148,7 @@ Please note:
 
 // Invite generates a token which can be used to add another SSH node
 // to a cluster
-func (c *NodeCommand) Invite(ctx context.Context, client auth.ClientI) error {
+func (c *NodeCommand) Invite(ctx context.Context, client *authclient.Client) error {
 	// parse --roles flag
 	roles, err := types.ParseTeleportRoles(c.roles)
 	if err != nil {
@@ -144,7 +157,7 @@ func (c *NodeCommand) Invite(ctx context.Context, client auth.ClientI) error {
 
 	token := c.token
 	if c.token == "" {
-		token, err = utils.CryptoRandomHex(auth.TokenLenBytes)
+		token, err = utils.CryptoRandomHex(defaults.TokenLenBytes)
 		if err != nil {
 			return trace.WrapWithMessage(err, "generating token value")
 		}
@@ -175,7 +188,12 @@ func (c *NodeCommand) Invite(ctx context.Context, client auth.ClientI) error {
 		return trace.Wrap(err)
 	}
 
-	authServers, err := client.GetAuthServers()
+	authServers, err := clientutils.CollectWithFallback(
+		ctx,
+		client.ListAuthServers,
+		//nolint:staticcheck // TODO(kiosion) DELETE IN 21.0.0
+		func(context.Context) ([]types.Server, error) { return client.GetAuthServers() },
+	)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -184,36 +202,20 @@ func (c *NodeCommand) Invite(ctx context.Context, client auth.ClientI) error {
 	}
 
 	// output format switch:
-	if c.format == teleport.Text {
+	switch c.format {
+	case teleport.Text:
 		if roles.Include(types.RoleTrustedCluster) {
 			fmt.Printf(trustedClusterMessage, token, int(c.ttl.Minutes()))
 		} else {
-			authServer := authServers[0].GetAddr()
-
-			pingResponse, err := client.Ping(ctx)
-			if err != nil {
-				log.Debugf("unable to ping auth client: %s.", err.Error())
-			}
-
-			if err == nil && pingResponse.GetServerFeatures().Cloud {
-				proxies, err := client.GetProxies()
-				if err != nil {
-					return trace.Wrap(err)
-				}
-
-				if len(proxies) != 0 {
-					authServer = proxies[0].GetPublicAddr()
-				}
-			}
-			return nodeMessageTemplate.Execute(os.Stdout, map[string]interface{}{
+			return nodeMessageTemplate.Execute(os.Stdout, map[string]any{
 				"token":       token,
 				"minutes":     int(c.ttl.Minutes()),
 				"roles":       strings.ToLower(roles.String()),
 				"ca_pins":     caPins,
-				"auth_server": authServer,
+				"auth_server": controlPlaneAddr(ctx, client, authServers[0].GetAddr()),
 			})
 		}
-	} else {
+	case teleport.JSON:
 		// Always return a list, otherwise we'll break users tooling. See #1846 for
 		// more details.
 		tokens := []string{token}
@@ -222,55 +224,56 @@ func (c *NodeCommand) Invite(ctx context.Context, client auth.ClientI) error {
 			return trace.Wrap(err, "failed to marshal token")
 		}
 		fmt.Print(string(out))
+	case teleport.YAML:
+		// Always return a list, otherwise we'll break users tooling. See #1846 for
+		// more details.
+		if err := utils.WriteYAML(os.Stdout, []string{token}); err != nil {
+			return trace.Wrap(err, "failed to marshal token")
+		}
+	default:
+		return trace.BadParameter("unknown format %q", c.format)
 	}
 	return nil
 }
 
 // ListActive retrieves the list of nodes who recently sent heartbeats to
 // to a cluster and prints it to stdout
-func (c *NodeCommand) ListActive(ctx context.Context, clt auth.ClientI) error {
-	labels, err := libclient.ParseLabelSpec(c.labels)
+func (c *NodeCommand) ListActive(ctx context.Context, clt *authclient.Client) error {
+	labels, err := parse.LabelSelectorSpec(c.labels)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	var nodes []types.Server
-	resources, err := client.GetResourcesWithFilters(ctx, clt, proto.ListResourcesRequest{
+	nodes, err := client.GetAllResources[types.Server](ctx, clt, &proto.ListResourcesRequest{
 		ResourceType:        types.KindNode,
 		Namespace:           c.namespace,
 		Labels:              labels,
 		PredicateExpression: c.predicateExpr,
 		SearchKeywords:      libclient.ParseSearchKeywords(c.searchKeywords, ','),
 	})
-	switch {
-	case err != nil:
+	if err != nil {
 		if utils.IsPredicateError(err) {
 			return trace.Wrap(utils.PredicateError{Err: err})
 		}
 		return trace.Wrap(err)
-	default:
-		nodes, err = types.ResourcesWithLabels(resources).AsServers()
-		if err != nil {
-			return trace.Wrap(err)
-		}
 	}
 
-	coll := &serverCollection{servers: nodes, verbose: c.verbose}
+	coll := resources.NewServerCollection(nodes)
 	switch c.lsFormat {
 	case teleport.Text:
-		if err := coll.writeText(os.Stdout); err != nil {
+		if err := coll.WriteText(os.Stdout, c.verbose); err != nil {
 			return trace.Wrap(err)
 		}
 	case teleport.YAML:
-		if err := coll.writeYAML(os.Stdout); err != nil {
+		if err := coll.WriteYAML(os.Stdout); err != nil {
 			return trace.Wrap(err)
 		}
 	case teleport.JSON:
-		if err := coll.writeJSON(os.Stdout); err != nil {
+		if err := coll.WriteJSON(os.Stdout); err != nil {
 			return trace.Wrap(err)
 		}
 	default:
-		return trace.Errorf("Invalid format %s, only text, json and yaml are supported", c.lsFormat)
+		return trace.BadParameter("unknown format %q", c.lsFormat)
 	}
 	return nil
 }

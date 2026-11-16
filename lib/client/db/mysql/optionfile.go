@@ -1,23 +1,25 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package mysql
 
 import (
-	"os/user"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -26,7 +28,12 @@ import (
 	"gopkg.in/ini.v1"
 
 	"github.com/gravitational/teleport/lib/client/db/profile"
+	hostuser "github.com/gravitational/teleport/session/host/user"
 )
+
+func init() {
+	ini.PrettyFormat = false // Pretty format breaks mysql.
+}
 
 // OptionFile represents MySQL option file.
 //
@@ -38,13 +45,20 @@ type OptionFile struct {
 	path string
 }
 
+// DefaultConfigPath returns the default config path, which is .my.cnf file in
+// the user's home directory. Home dir is determined by environment if not
+// supplied as an argument.
 func DefaultConfigPath() (string, error) {
-	// Default location is .my.cnf file in the user's home directory.
-	usr, err := user.Current()
-	if err != nil {
-		return "", trace.ConvertSystemError(err)
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		usr, err := hostuser.Current()
+		if err != nil {
+			return "", trace.ConvertSystemError(err)
+		}
+		home = usr.HomeDir
 	}
-	return filepath.Join(usr.HomeDir, mysqlOptionFile), nil
+
+	return filepath.Join(home, mysqlOptionFile), nil
 }
 
 // Load loads MySQL option file from the default location.
@@ -83,6 +97,7 @@ func (o *OptionFile) Upsert(profile profile.ConnectProfile) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
+	section.NewBooleanKey("skip-password")
 	section.NewKey("host", profile.Host)
 	section.NewKey("port", strconv.Itoa(profile.Port))
 	if profile.User != "" {
@@ -100,7 +115,6 @@ func (o *OptionFile) Upsert(profile profile.ConnectProfile) error {
 	section.NewKey("ssl-ca", strings.ReplaceAll(profile.CACertPath, `\`, `\\`))
 	section.NewKey("ssl-cert", strings.ReplaceAll(profile.CertPath, `\`, `\\`))
 	section.NewKey("ssl-key", strings.ReplaceAll(profile.KeyPath, `\`, `\\`))
-	ini.PrettyFormat = false
 	return o.iniFile.SaveTo(o.path)
 }
 

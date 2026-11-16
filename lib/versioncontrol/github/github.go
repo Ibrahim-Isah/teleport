@@ -1,23 +1,26 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package github
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,10 +28,10 @@ import (
 	"strings"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/mod/semver"
+	"golang.org/x/mod/semver" //nolint:depguard // Usage precedes the x/mod/semver rule.
 
 	"github.com/gravitational/teleport"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 	vc "github.com/gravitational/teleport/lib/versioncontrol"
 )
 
@@ -36,9 +39,7 @@ import (
 // `TEST_GITHUB_API=yes`. this will enable some additional tests that are not
 // run as part of normal CI.
 
-var log = logrus.WithFields(logrus.Fields{
-	trace.Component: teleport.ComponentVersionControl,
-})
+var logger = logutils.NewPackageLogger(teleport.ComponentKey, teleport.ComponentVersionControl)
 
 // Visit uses the supplied visitor to aggregate release info from the github releases api.
 func Visit(visitor *vc.Visitor) error {
@@ -193,7 +194,7 @@ func (i *Iterator) Next() bool {
 	i.page = make([]vc.Target, 0, len(page))
 	for _, r := range page {
 		if !semver.IsValid(r.TagName) {
-			log.Debugf("Skipping non-semver release tag: %q\n", r.TagName)
+			logger.DebugContext(context.Background(), "Skipping non-semver release tag", "tag_name", r.TagName)
 			continue
 		}
 		labels := parseReleaseNoteLabels(r.Body)
@@ -242,15 +243,15 @@ func parseReleaseNoteLabels(notes string) map[string]string {
 			continue
 		}
 		l = strings.TrimPrefix(l, labelPrefix)
-		for _, kv := range strings.Split(l, ",") {
+		for kv := range strings.SplitSeq(l, ",") {
 			if !strings.Contains(kv, "=") {
-				log.Debugf("Skipping invalid release label keypair: %q", kv)
+				logger.DebugContext(context.Background(), "Skipping invalid release label keypair", "label", kv)
 				continue
 			}
 
 			parts := strings.SplitN(kv, "=", 2)
 			if len(parts) != 2 {
-				log.Debugf("Skipping invalid release label keypair: %q", kv)
+				logger.DebugContext(context.Background(), "Skipping invalid release label keypair", "label", kv)
 				continue
 			}
 
@@ -258,7 +259,7 @@ func parseReleaseNoteLabels(notes string) map[string]string {
 			val := strings.TrimSpace(parts[1])
 
 			if !vc.IsValidTargetKey(key) || !vc.IsValidTargetVal(val) {
-				log.Debugf("Skipping invalid release label keypair: %q", kv)
+				logger.DebugContext(context.Background(), "Skipping invalid release label keypair", "label", kv)
 				// NOTE: we are skipping invalid keypairs for github release scraping
 				// because github releases are using a generally simplistic release representation.
 				// The TUF implementation will not skip invalid keypairs, preferring to

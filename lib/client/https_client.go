@@ -1,19 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package client
 
@@ -25,12 +26,9 @@ import (
 
 	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/trace"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"golang.org/x/net/http/httpproxy"
 
-	"github.com/gravitational/teleport"
-	apiproxy "github.com/gravitational/teleport/api/client/proxy"
-	"github.com/gravitational/teleport/api/observability/tracing"
+	tracehttp "github.com/gravitational/teleport/api/observability/tracing/http"
 	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/httplib"
 	"github.com/gravitational/teleport/lib/utils"
@@ -42,10 +40,7 @@ func NewInsecureWebClient() *http.Client {
 
 func newClient(insecure bool, pool *x509.CertPool, extraHeaders map[string]string) *http.Client {
 	return &http.Client{
-		Transport: otelhttp.NewTransport(
-			apiproxy.NewHTTPRoundTripper(httpTransport(insecure, pool), extraHeaders),
-			otelhttp.WithSpanNameFormatter(tracing.HTTPTransportFormatter),
-		),
+		Transport: tracehttp.NewTransport(apiutils.NewHTTPRoundTripper(httpTransport(insecure, pool), extraHeaders)),
 	}
 }
 
@@ -66,7 +61,9 @@ func httpTransport(insecure bool, pool *x509.CertPool) *http.Transport {
 
 func NewWebClient(url string, opts ...roundtrip.ClientParam) (*WebClient, error) {
 	opts = append(opts, roundtrip.SanitizerEnabled(true))
-	clt, err := roundtrip.NewClient(url, teleport.WebAPIVersion, opts...)
+	// We do not add the version prefix since web api endpoints will contain
+	// differing version prefixes.
+	clt, err := roundtrip.NewClient(url, "" /* version prefix */, opts...)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -86,9 +83,9 @@ type WebClient struct {
 //
 // If these conditions are not met, then the plain-HTTP fallback is not allowed,
 // and a the HTTPS failure will be considered final.
-func (w *WebClient) PostJSONWithFallback(ctx context.Context, endpoint string, val interface{}, allowHTTPFallback bool) (*roundtrip.Response, error) {
+func (w *WebClient) PostJSONWithFallback(ctx context.Context, endpoint string, val any, allowHTTPFallback bool) (*roundtrip.Response, error) {
 	// First try HTTPS and see how that goes
-	log.Debugf("Attempting %s", endpoint)
+	log.DebugContext(ctx, "Attempting request", "endpoint", endpoint)
 	resp, httpsErr := w.Client.PostJSON(ctx, endpoint, val)
 	if httpsErr == nil {
 		// If all went well, then we don't need to do anything else - just return
@@ -120,15 +117,19 @@ func (w *WebClient) PostJSONWithFallback(ctx context.Context, endpoint string, v
 	// re-write the endpoint to try HTTP
 	u.Scheme = "http"
 	endpoint = u.String()
-	log.Warnf("Request for %s/%s falling back to PLAIN HTTP", u.Host, u.Path)
+	log.WarnContext(ctx, "Request for falling back to PLAIN HTTP", "endpoint", endpoint)
 	return httplib.ConvertResponse(w.Client.PostJSON(ctx, endpoint, val))
 }
 
-func (w *WebClient) PostJSON(ctx context.Context, endpoint string, val interface{}) (*roundtrip.Response, error) {
+func (w *WebClient) PostJSON(ctx context.Context, endpoint string, val any) (*roundtrip.Response, error) {
 	return httplib.ConvertResponse(w.Client.PostJSON(ctx, endpoint, val))
 }
 
-func (w *WebClient) PutJSON(ctx context.Context, endpoint string, val interface{}) (*roundtrip.Response, error) {
+func (w *WebClient) PostWithFormData(ctx context.Context, endpoint string, val url.Values) (*roundtrip.Response, error) {
+	return httplib.ConvertResponse(w.Client.PostForm(ctx, endpoint, val))
+}
+
+func (w *WebClient) PutJSON(ctx context.Context, endpoint string, val any) (*roundtrip.Response, error) {
 	return httplib.ConvertResponse(w.Client.PutJSON(ctx, endpoint, val))
 }
 

@@ -1,40 +1,40 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React from 'react';
+import { ButtonIcon, ButtonPrimary, ButtonSecondary, H2, Link } from 'design';
 import DialogConfirmation, {
   DialogContent,
   DialogFooter,
   DialogHeader,
 } from 'design/DialogConfirmation';
-import { ButtonIcon, ButtonPrimary, ButtonSecondary, Link, Text } from 'design';
-import { Close } from 'design/Icon';
+import { Cross } from 'design/Icon';
+import { P } from 'design/Text/Text';
 
-interface UsageDataProps {
+export function UsageData(props: {
   onCancel(): void;
-
   onAllow(): void;
-
   onDecline(): void;
-}
-
-export function UsageData(props: UsageDataProps) {
+  hidden?: boolean;
+}) {
   return (
     <DialogConfirmation
-      open={true}
+      open={!props.hidden}
+      keepInDOMAfterClose
       onClose={props.onCancel}
       dialogCss={() => ({
         maxWidth: '400px',
@@ -52,23 +52,21 @@ export function UsageData(props: UsageDataProps) {
           mb={0}
           alignItems="baseline"
         >
-          <Text typography="h4" bold>
-            Anonymous usage data
-          </Text>
+          <H2 mb={4}>Anonymous usage data</H2>
           <ButtonIcon
             type="button"
             onClick={props.onCancel}
-            color="text.secondary"
+            color="text.slightlyMuted"
           >
-            <Close fontSize={5} />
+            <Cross size="medium" />
           </ButtonIcon>
         </DialogHeader>
         <DialogContent mb={4}>
-          <Text typography="body1" color="text.secondary">
+          <P>
             Do you agree to Teleport Connect collecting anonymized usage data?
             This will help us improve the product.
-          </Text>
-          <Text typography="body1" color="text.secondary">
+          </P>
+          <P>
             To learn more, see{' '}
             <Link
               href="https://goteleport.com/docs/faq/#teleport-connect"
@@ -77,7 +75,7 @@ export function UsageData(props: UsageDataProps) {
               our documentation
             </Link>
             .
-          </Text>
+          </P>
         </DialogContent>
         <DialogFooter>
           <ButtonPrimary autoFocus mr={3} type="submit">

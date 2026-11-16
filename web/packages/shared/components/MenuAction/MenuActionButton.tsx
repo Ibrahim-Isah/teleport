@@ -1,27 +1,52 @@
-/*
-Copyright 2020 Gravitational, Inc.
+/**
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import React, { PropsWithChildren, Ref } from 'react';
+import styled from 'styled-components';
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-import React from 'react';
+import { Button, ButtonBorder } from 'design';
+import { ChevronDown } from 'design/Icon';
 import Menu from 'design/Menu';
-import { ButtonBorder } from 'design';
-import { CarrotDown } from 'design/Icon';
 
-import { MenuProps, AnchorProps } from './types';
+import { AnchorProps, MenuProps } from './types';
 
-export default class MenuActionIcon extends React.Component<Props> {
+type Props = MenuProps & {
+  defaultOpen?: boolean;
+  buttonProps?: AnchorProps;
+  buttonText?: React.ReactNode;
+  menuProps?: MenuProps;
+
+  // If present, button text is not used, and a square icon button is rendered instead of a border button
+  icon?: React.ReactNode;
+};
+
+export default function MenuActionIcon({
+  ref,
+  ...otherProps
+}: PropsWithChildren<Props> & { ref?: Ref<HTMLButtonElement> }) {
+  // Since React class components can't forward refs, we wrap it in a function component.
+  // This lets HoverTooltip access the ref to attach the tooltip to it.
+  return <InnerMenuActionIcon {...otherProps} forwardedRef={ref} />;
+}
+
+class InnerMenuActionIcon extends React.Component<
+  PropsWithChildren<Props & { forwardedRef?: Ref<HTMLButtonElement> }>
+> {
   anchorEl = null;
 
   state = {
@@ -42,33 +67,63 @@ export default class MenuActionIcon extends React.Component<Props> {
     this.setState({ open: false });
   };
 
+  private assignRef(e: HTMLButtonElement) {
+    this.anchorEl = e;
+    const { forwardedRef } = this.props;
+    if (typeof forwardedRef === 'function') {
+      forwardedRef(e);
+    } else if (forwardedRef && typeof forwardedRef === 'object') {
+      forwardedRef.current = e;
+    }
+  }
+
   render() {
     const { open } = this.state;
-    const { children, menuProps, buttonProps } = this.props;
+    const { children, menuProps, buttonProps, icon } = this.props;
     return (
       <>
-        <ButtonBorder
-          height="24px"
-          size="small"
-          setRef={e => (this.anchorEl = e)}
-          onClick={this.onOpen}
-          {...buttonProps}
-        >
-          OPTIONS
-          <CarrotDown ml={2} mr={-2} fontSize="2" color="text.secondary" />
-        </ButtonBorder>
+        {icon ? (
+          <FilledButtonIcon
+            intent="neutral"
+            ref={e => {
+              this.assignRef(e);
+            }}
+            onClick={this.onOpen}
+            {...buttonProps}
+          >
+            {icon}
+          </FilledButtonIcon>
+        ) : (
+          <ButtonBorder
+            size="small"
+            ref={e => {
+              this.assignRef(e);
+            }}
+            onClick={this.onOpen}
+            {...buttonProps}
+          >
+            {this.props.buttonText || 'Options'}
+            <ChevronDown
+              ml={2}
+              size="small"
+              color={buttonProps?.color || 'text.slightlyMuted'}
+            />
+          </ButtonBorder>
+        )}
         <Menu
           getContentAnchorEl={null}
           menuListCss={menuListCss}
           anchorEl={this.anchorEl}
           open={open}
           onClose={this.onClose}
+          autoFocus
+          trapFocus
           transformOrigin={{
             vertical: 'top',
             horizontal: 'right',
           }}
           anchorOrigin={{
-            vertical: 'center',
+            vertical: 'bottom',
             horizontal: 'right',
           }}
           {...menuProps}
@@ -81,7 +136,7 @@ export default class MenuActionIcon extends React.Component<Props> {
 
   renderItems(children) {
     const filtered = React.Children.toArray(children);
-    const cloned = filtered.map((child: React.ReactElement) => {
+    const cloned = filtered.map((child: React.ReactElement<any>) => {
       return React.cloneElement(child, {
         onClick: this.makeOnClick(child.props.onClick),
       });
@@ -103,8 +158,8 @@ const menuListCss = () => `
   min-width: 100px;
 `;
 
-type Props = MenuProps & {
-  defaultOpen?: boolean;
-  buttonProps?: AnchorProps;
-  menuProps?: MenuProps;
-};
+const FilledButtonIcon = styled(Button)`
+  width: 32px;
+  height: 32px;
+  padding: 0;
+`;

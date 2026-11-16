@@ -1,18 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package config
 
@@ -49,6 +51,7 @@ teleport:
   cache:
     enabled: yes
     ttl: 20h
+    max_backoff: 12m
 
 auth_service:
   enabled: yes
@@ -93,6 +96,7 @@ teleport:
   log:
     output: stderr
     severity: INFO
+  shutdown_delay: "7m35s"
   connection_limits:
     max_connections: 90
     max_users: 91
@@ -122,7 +126,7 @@ auth_service:
       slot_number: 1
       pin: "example_pin"
   authentication:
-    second_factor: "optional"
+    second_factor: "webauthn"
     webauthn:
       rp_id: "goteleport.com"
       attestation_allowed_cas:
@@ -169,17 +173,26 @@ db_service:
   resources:
     - labels:
         "*": "*"
+      aws:
+        assume_role_arn: "arn:aws:iam::123456789012:role/DBAccess"
+        external_id: "externalID123"
   azure:
     - subscriptions: ["sub1", "sub2"]
       resource_groups: ["group1", "group2"]
       types: ["postgres", "mysql"]
       regions: ["eastus", "centralus"]
+      integration: integration123
       tags:
         "a": "b"
     - types: ["postgres", "mysql"]
       regions: ["westus"]
       tags:
         "c": "d"
+  aws:
+      - types: ["rds"]
+        regions: ["us-west-1"]
+        assume_role_arn: "arn:aws:iam::123456789012:role/DBDiscoverer"
+        external_id: "externalID123"
 
 kubernetes_service:
     enabled: yes
@@ -195,6 +208,18 @@ discovery_service:
     aws:
       - types: ["ec2"]
         regions: ["eu-central-1"]
+        assume_role_arn: "arn:aws:iam::123456789012:role/DBDiscoverer"
+        external_id: "externalID123"
+
+okta_service:
+    enabled: yes
+    api_endpoint: https://some-endpoint
+    api_token_path: %v
+    sync_period: 300s
+    sync:
+      sync_access_lists: yes
+      default_owners:
+      - owner1
 `
 
 // NoServicesConfigString is a configuration file with no services enabled
@@ -323,7 +348,7 @@ auth_service:
   - "auth:yyy"
   authentication:
     type: local
-    second_factor: off
+    second_factors: [otp]
 
 ssh_service:
   enabled: no

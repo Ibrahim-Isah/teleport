@@ -1,142 +1,116 @@
 /**
- * Copyright 2023 Gravitational, Inc
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import React, { useState } from 'react';
+import { useState } from 'react';
 
+import { ClickableLabelCell, DateCell, LabelCell } from './Cells';
 import Table from './Table';
-import { LabelCell, DateCell, ClickableLabelCell } from './Cells';
+import { TableProps } from './types';
 
 export default {
   title: 'Design/DataTable',
 };
 
-export const VariousColumns = () => {
-  return (
-    <Table<DummyDataType>
-      columns={[
-        { key: 'name', headerText: 'Name', isSortable: true },
-        { key: 'desc', headerText: 'Description' },
-        { key: 'amount', headerText: 'Amount', isSortable: true },
-        {
-          key: 'createdDate',
-          headerText: 'Created Date',
-          isSortable: true,
-          render: row => <DateCell data={row.createdDate} />,
-        },
-        {
-          key: 'removedDate',
-          headerText: 'Removed Date',
-          isSortable: true,
-          render: row => <DateCell data={row.removedDate} />,
-        },
-        {
-          key: 'tags',
-          headerText: 'Labels',
-          render: row => <LabelCell data={row.tags} />,
-          isSortable: true,
-          onSort: sortTagsByLength,
-        },
-        { key: 'bool', headerText: 'Boolean', isSortable: true },
-      ]}
-      data={data}
-      emptyText={'No Dummy Data Found'}
-      isSearchable
-    />
-  );
+// `if (state.pagination)` is the second view conditionally rendered by Table
+// it returns a PagedTable wrapped in StyledTableWrapper
+export const WithPagination = () => {
+  const props = getDefaultProps();
+  props.pagination = {
+    pageSize: 7,
+    pagerPosition: 'top',
+  };
+  return <Table<DummyDataType> {...props} />;
 };
 
+export const WithPaginationEmpty = () => {
+  const props = getDefaultProps();
+  props.data = [];
+  props.pagination = {
+    pageSize: 7,
+    pagerPosition: 'top',
+  };
+  return <Table<DummyDataType> {...props} />;
+};
+
+// `if (isSearchable)` is the third view conditionally rendered by Table
+// it returns a SearchableBasicTable wrapped in StyledTableWrapper
+export const IsSearchable = () => {
+  const props = getDefaultProps();
+  props.isSearchable = true;
+  return <Table<DummyDataType> {...props} />;
+};
+
+export const IsSearchableEmpty = () => {
+  const props = getDefaultProps();
+  props.isSearchable = true;
+  props.data = [];
+  return <Table<DummyDataType> {...props} />;
+};
+
+// the default view rendered by Table
+// it returns a BasicTable
+export const DefaultBasic = () => {
+  const props = getDefaultProps();
+  return <Table<DummyDataType> {...props} />;
+};
+
+export const DefaultBasicEmpty = () => {
+  const props = getDefaultProps();
+  props.data = [];
+  return <Table<DummyDataType> {...props} />;
+};
+
+export const EmptyWithHint = () => {
+  const props = getDefaultProps();
+  props.data = [];
+  props.emptyHint = 'Gimme some data';
+  return <Table<DummyDataType> {...props} />;
+};
+
+// state.pagination table view with fetching props
 export const ClientSidePagination = () => {
   const [allData, setAllData] = useState(data);
 
-  return (
-    <Table<DummyDataType>
-      columns={[
-        { key: 'name', headerText: 'Name', isSortable: true },
-        { key: 'desc', headerText: 'Description' },
-        { key: 'amount', headerText: 'Amount', isSortable: true },
-        {
-          key: 'createdDate',
-          headerText: 'Created Date',
-          isSortable: true,
-          render: row => <DateCell data={row.createdDate} />,
-        },
-        {
-          key: 'removedDate',
-          headerText: 'Removed Date',
-          isSortable: true,
-          render: row => <DateCell data={row.removedDate} />,
-        },
-        {
-          key: 'tags',
-          headerText: 'Labels',
-          render: row => <LabelCell data={row.tags} />,
-          isSortable: true,
-          onSort: sortTagsByLength,
-        },
-        { key: 'bool', headerText: 'Boolean', isSortable: true },
-      ]}
-      pagination={{
-        pageSize: 7,
-        pagerPosition: 'top',
-      }}
-      fetching={{
-        onFetchMore: () => setAllData([...allData, ...extraData]),
-        fetchStatus: '',
-      }}
-      data={allData}
-      emptyText={'No Dummy Data Found'}
-      isSearchable
-    />
-  );
+  const props = getDefaultProps();
+  props.isSearchable = true;
+  props.pagination = {
+    pageSize: 7,
+    pagerPosition: 'top',
+  };
+  props.fetching = {
+    onFetchMore: () => setAllData([...allData, ...extraData]),
+    fetchStatus: '',
+  };
+  props.data = allData;
+
+  return <Table<DummyDataType> {...props} />;
 };
 
+// `if (issearchable)` view with ISO date strings
 export function ISODateStrings() {
-  return (
-    <Table<DummyDataISOStringType>
-      columns={[
-        { key: 'name', headerText: 'Name', isSortable: true },
-        { key: 'desc', headerText: 'Description' },
-        { key: 'amount', headerText: 'Amount', isSortable: true },
-        {
-          key: 'createdDate',
-          headerText: 'Created Date',
-          isSortable: true,
-        },
-        {
-          key: 'removedDate',
-          headerText: 'Removed Date',
-          isSortable: true,
-        },
-        {
-          key: 'tags',
-          headerText: 'Labels',
-          render: row => <LabelCell data={row.tags} />,
-          isSortable: true,
-          onSort: sortTagsByLength,
-        },
-        { key: 'bool', headerText: 'Boolean', isSortable: true },
-      ]}
-      initialSort={{ key: 'createdDate', dir: 'DESC' }}
-      data={isoDateStringData}
-      emptyText={'No Dummy Data Found'}
-      isSearchable
-    />
-  );
+  const props = getDefaultIsoProps();
+  props.initialSort = { key: 'createdDate', dir: 'DESC' };
+  props.emptyText = 'No Dummy Data Found';
+  props.isSearchable = true;
+  return <Table<DummyDataISOStringType> {...props} />;
 }
 
+// default basic table with interactive cells
 export function DefaultAndClickableLabels() {
   return (
     <Table<DefaultAndClickableLabelsDataType>
@@ -164,9 +138,63 @@ export function DefaultAndClickableLabels() {
   );
 }
 
-function sortTagsByLength(a: DummyDataType['tags'], b: DummyDataType['tags']) {
-  return a.length - b.length;
-}
+const getDefaultProps = (): TableProps<DummyDataType> => ({
+  data: data,
+  emptyText: 'No Dummy Data Found',
+  columns: [
+    { key: 'name', headerText: 'Name', isSortable: true },
+    { key: 'desc', headerText: 'Description' },
+    { key: 'amount', headerText: 'Amount', isSortable: true },
+    {
+      key: 'createdDate',
+      headerText: 'Created Date',
+      isSortable: true,
+      render: row => <DateCell data={row.createdDate} />,
+    },
+    {
+      key: 'removedDate',
+      headerText: 'Removed Date',
+      isSortable: true,
+      render: row => <DateCell data={row.removedDate} />,
+    },
+    {
+      key: 'tags',
+      headerText: 'Labels',
+      render: row => <LabelCell data={row.tags} />,
+      isSortable: true,
+      onSort: (a, b) => a.tags.length - b.tags.length,
+    },
+    { key: 'bool', headerText: 'Boolean', isSortable: true },
+  ],
+});
+
+const getDefaultIsoProps = (): TableProps<DummyDataISOStringType> => ({
+  data: isoDateStringData,
+  emptyText: 'No Dummy Data Found',
+  columns: [
+    { key: 'name', headerText: 'Name', isSortable: true },
+    { key: 'desc', headerText: 'Description' },
+    { key: 'amount', headerText: 'Amount', isSortable: true },
+    {
+      key: 'createdDate',
+      headerText: 'Created Date',
+      isSortable: true,
+    },
+    {
+      key: 'removedDate',
+      headerText: 'Removed Date',
+      isSortable: true,
+    },
+    {
+      key: 'tags',
+      headerText: 'Labels',
+      render: row => <LabelCell data={row.tags} />,
+      isSortable: true,
+      onSort: (a, b) => a.tags.length - b.tags.length,
+    },
+    { key: 'bool', headerText: 'Boolean', isSortable: true },
+  ],
+});
 
 const data: DummyDataType[] = [
   {
@@ -323,7 +351,7 @@ const isoDateStringData: DummyDataISOStringType[] = [
     createdDate: '2022-09-09T19:08:17.27Z',
     removedDate: new Date(1635322403).toISOString(),
     tags: ['test12: test12'],
-    bool: false,
+    bool: true,
   },
   {
     name: 'j-test',

@@ -1,30 +1,35 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package streamproto
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	"k8s.io/client-go/tools/remotecommand"
 
 	"github.com/gravitational/teleport/api/types"
@@ -39,7 +44,7 @@ type metaMessage struct {
 	ServerHandshake *ServerHandshake            `json:"server_handshake,omitempty"`
 }
 
-// ClientHandshake is the first message sent by a client to inform a server of it's intentions.
+// ClientHandshake is the first message sent by a client to inform a server of its intentions.
 type ClientHandshake struct {
 	Mode types.SessionParticipantMode `json:"mode"`
 }
@@ -63,15 +68,18 @@ type SessionStream struct {
 	// A list of resize requests.
 	resizeQueue chan *remotecommand.TerminalSize
 
-	// A notification channel for force termination requests.
-	forceTerminate chan struct{}
+	// A notification channel for force termination requests, along with a
+	// guard so it is closed at most once.
+	forceTerminate     chan struct{}
+	forceTerminateOnce sync.Once
 
 	writeSync   sync.Mutex
 	done        chan struct{}
 	closeOnce   sync.Once
-	closed      int32
+	closed      atomic.Bool
 	MFARequired bool
 	Mode        types.SessionParticipantMode
+	isClient    bool
 }
 
 // NewSessionStream creates a new session stream.
@@ -87,6 +95,7 @@ func NewSessionStream(conn *websocket.Conn, handshake any) (*SessionStream, erro
 
 	clientHandshake, isClient := handshake.(ClientHandshake)
 	serverHandshake, ok := handshake.(ServerHandshake)
+	s.isClient = isClient
 
 	if !isClient && !ok {
 		return nil, trace.BadParameter("Handshake must be either client or server handshake, got %T", handshake)
@@ -158,13 +167,22 @@ func NewSessionStream(conn *websocket.Conn, handshake any) (*SessionStream, erro
 }
 
 func (s *SessionStream) readTask() {
+	defer s.closeOnce.Do(func() { close(s.done) })
 	for {
-		defer s.closeOnce.Do(func() { close(s.done) })
-
 		ty, data, err := s.conn.ReadMessage()
 		if err != nil {
-			if err != io.EOF && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseAbnormalClosure, websocket.CloseNoStatusReceived) {
-				log.WithError(err).Warn("Failed to read message from websocket")
+			if !errors.Is(err, io.EOF) && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseAbnormalClosure, websocket.CloseNoStatusReceived) {
+				slog.WarnContext(context.Background(), "Failed to read message from websocket", "error", err)
+			}
+
+			var closeErr *websocket.CloseError
+			// If it's a close error, we want to send a message to the stdout
+			if s.isClient && errors.As(err, &closeErr) && closeErr.Text != "" {
+				select {
+				case s.in <- fmt.Appendf(nil, "\r\n---\r\nConnection closed: %v\r\n", closeErr.Text):
+				case <-s.done:
+					return
+				}
 			}
 
 			return
@@ -193,13 +211,13 @@ func (s *SessionStream) readTask() {
 			}
 
 			if msg.ForceTerminate {
-				close(s.forceTerminate)
+				s.forceTerminateOnce.Do(func() { close(s.forceTerminate) })
 			}
 		}
 
 		if ty == websocket.CloseMessage {
 			s.conn.Close()
-			atomic.StoreInt32(&s.closed, 1)
+			s.closed.Store(true)
 			return
 		}
 	}
@@ -220,11 +238,7 @@ func (s *SessionStream) Read(p []byte) (int, error) {
 }
 
 func (s *SessionStream) Write(data []byte) (int, error) {
-	s.writeSync.Lock()
-	defer s.writeSync.Unlock()
-
-	err := s.conn.WriteMessage(websocket.BinaryMessage, data)
-	if err != nil {
+	if err := s.write(websocket.BinaryMessage, data); err != nil {
 		return 0, trace.Wrap(err)
 	}
 
@@ -239,9 +253,7 @@ func (s *SessionStream) Resize(size *remotecommand.TerminalSize) error {
 		return trace.Wrap(err)
 	}
 
-	s.writeSync.Lock()
-	defer s.writeSync.Unlock()
-	return trace.Wrap(s.conn.WriteMessage(websocket.TextMessage, json))
+	return trace.Wrap(s.write(websocket.TextMessage, json))
 }
 
 // ResizeQueue returns a channel that will receive resize requests.
@@ -262,32 +274,37 @@ func (s *SessionStream) ForceTerminate() error {
 		return trace.Wrap(err)
 	}
 
-	s.writeSync.Lock()
-	defer s.writeSync.Unlock()
-
-	return trace.Wrap(s.conn.WriteMessage(websocket.TextMessage, json))
+	return trace.Wrap(s.write(websocket.TextMessage, json))
 }
 
 func (s *SessionStream) Done() <-chan struct{} {
 	return s.done
 }
 
+func (s *SessionStream) write(messageType int, data []byte) error {
+	s.writeSync.Lock()
+	defer s.writeSync.Unlock()
+
+	return trace.Wrap(s.conn.WriteMessage(messageType, data))
+}
+
 // Close closes the stream.
 func (s *SessionStream) Close() error {
-	if atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
-		err := s.conn.WriteMessage(websocket.CloseMessage, []byte{})
-		if err != nil {
-			log.Warnf("Failed to gracefully close websocket connection: %v", err)
-		}
-		t := time.NewTimer(time.Second * 5)
-		defer t.Stop()
-		select {
-		case <-s.done:
-		case <-t.C:
-			s.conn.Close()
-		}
-		s.closeOnce.Do(func() { close(s.done) })
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
 	}
 
-	return nil
+	if err := s.write(websocket.CloseMessage, nil); err != nil {
+		slog.WarnContext(context.Background(), "Failed to gracefully close websocket connection", "error", err)
+	}
+
+	var err error
+	select {
+	case <-s.done:
+	case <-time.After(5 * time.Second):
+		err = s.conn.Close()
+	}
+	s.closeOnce.Do(func() { close(s.done) })
+
+	return trace.Wrap(err)
 }

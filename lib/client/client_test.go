@@ -1,23 +1,25 @@
 /*
-Copyright 2016 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package client
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -26,49 +28,39 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/gravitational/teleport/api/client/proto"
 	tracessh "github.com/gravitational/teleport/api/observability/tracing/ssh"
 	"github.com/gravitational/teleport/lib/observability/tracing"
-	"github.com/gravitational/teleport/lib/sshutils"
+	"github.com/gravitational/teleport/lib/tlsca"
 )
 
 func TestHelperFunctions(t *testing.T) {
-	require.Equal(t, nodeName("one"), "one")
-	require.Equal(t, nodeName("one:22"), "one")
+	assert.Equal(t, "one", nodeName(TargetNode{Addr: "one"}))
+	assert.Equal(t, "one", nodeName(TargetNode{Addr: "one:22"}))
+	assert.Equal(t, "example.com", nodeName(TargetNode{Addr: "one", Hostname: "example.com"}))
 }
 
 func TestNewSession(t *testing.T) {
 	nc := &NodeClient{
-		Namespace: "blue",
-		Tracer:    tracing.NoopProvider().Tracer("test"),
+		TC:     &TeleportClient{},
+		Tracer: tracing.NoopProvider().Tracer("test"),
 	}
 
 	ctx := context.Background()
 	// defaults:
-	ses, err := newSession(ctx, nc, nil, nil, nil, nil, nil, true)
+	ses, err := newSession(ctx, nc, nil, nil, nil, nil, true)
 	require.NoError(t, err)
 	require.NotNil(t, ses)
-	require.Equal(t, ses.NodeClient(), nc)
-	require.Equal(t, ses.namespace, nc.Namespace)
+	require.Equal(t, nc, ses.NodeClient())
 	require.NotNil(t, ses.env)
-	require.Equal(t, ses.terminal.Stderr(), os.Stderr)
-	require.Equal(t, ses.terminal.Stdout(), os.Stdout)
-	require.Equal(t, ses.terminal.Stdin(), os.Stdin)
-
-	// pass environ map
-	env := map[string]string{
-		sshutils.SessionEnvVar: "session-id",
-	}
-	ses, err = newSession(ctx, nc, nil, env, nil, nil, nil, true)
-	require.NoError(t, err)
-	require.NotNil(t, ses)
-	require.Empty(t, cmp.Diff(ses.env, env))
-	// the session ID must be taken from tne environ map, if passed:
-	require.Equal(t, string(ses.id), "session-id")
+	require.Equal(t, os.Stderr, ses.terminal.Stderr())
+	require.Equal(t, os.Stdout, ses.terminal.Stdout())
+	require.Equal(t, os.Stdin, ses.terminal.Stdin())
 }
 
 // TestProxyConnection verifies that client or server-side disconnect
@@ -124,7 +116,7 @@ func TestProxyConnection(t *testing.T) {
 	err = localCon.Close()
 	require.NoError(t, err)
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		select {
 		case err := <-proxyErrCh:
 			require.NoError(t, err)
@@ -156,7 +148,7 @@ func TestProxyConnection(t *testing.T) {
 	err = remoteCon.Close()
 	require.NoError(t, err)
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		select {
 		case err := <-proxyErrCh:
 			require.NoError(t, err)
@@ -244,7 +236,6 @@ func TestListenAndForwardCancel(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func newTestListener(t *testing.T, handle func(net.Conn)) net.Listener {
@@ -255,7 +246,6 @@ func newTestListener(t *testing.T, handle func(net.Conn)) net.Listener {
 		for {
 			con, err := l.Accept()
 			if err != nil {
-				t.Logf("listener error: %v", err)
 				return
 			}
 			go handle(con)
@@ -297,4 +287,94 @@ func newWrappedListener(acceptCh chan struct{}) (*wrappedListener, error) {
 func (l wrappedListener) Accept() (net.Conn, error) {
 	close(l.acceptCh)
 	return l.Listener.Accept()
+}
+
+func TestLineLabeledWriter(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		inputs     []string
+		lineLength int
+		expected   string
+	}{
+		{
+			name:     "typical input",
+			inputs:   []string{"this is\nsome test\ninput"},
+			expected: "[label] this is\n[label] some test\n[label] input\n",
+		},
+		{
+			name:     "don't add empty line at end",
+			inputs:   []string{"dangling newline\n"},
+			expected: "[label] dangling newline\n",
+		},
+		{
+			name:     "blank lines in middle",
+			inputs:   []string{"this\n\nis\n\nsome input"},
+			expected: "[label] this\n[label] \n[label] is\n[label] \n[label] some input\n",
+		},
+		{
+			name:     "line break between writes",
+			inputs:   []string{"line 1\n", "line 2\n"},
+			expected: "[label] line 1\n[label] line 2\n",
+		},
+		{
+			name:     "line break immediately on second write",
+			inputs:   []string{"line 1", "\nline 2"},
+			expected: "[label] line 1\n[label] line 2\n",
+		},
+		{
+			name:     "line continues between writes",
+			inputs:   []string{"this is all ", "one continuous line ", "until\nnow"},
+			expected: "[label] this is all one continuous line until\n[label] now\n",
+		},
+		{
+			name:       "long lines wrapped",
+			inputs:     []string{"1234\nabcdefghijklmnopqrstuvwxyz\n1234"},
+			lineLength: 16,
+			expected:   "[label] 1234\n[label] abcdefgh\n[label] ijklmnop\n[label] qrstuvwx\n[label] yz\n[label] 1234\n",
+		},
+		{
+			name:       "exact length lines",
+			inputs:     []string{"abcdefgh", "\nijklmnop"},
+			lineLength: 16,
+			expected:   "[label] abcdefgh\n[label] ijklmnop\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			w, err := newLineLabeledWriter(&buf, "label", tc.lineLength)
+			require.NoError(t, err)
+
+			totalBytes := 0
+			expectedBytes := 0
+			for _, line := range tc.inputs {
+				n, err := w.Write([]byte(line))
+				assert.NoError(t, err)
+				totalBytes += n
+				expectedBytes += len(line)
+			}
+			assert.NoError(t, w.Close())
+			assert.Equal(t, expectedBytes, totalBytes)
+			assert.Equal(t, tc.expected, buf.String())
+		})
+	}
+}
+
+func TestRouteToDatabaseToProto(t *testing.T) {
+	input := tlsca.RouteToDatabase{
+		ServiceName: "db-service",
+		Database:    "db-name",
+		Username:    "db-user",
+		Protocol:    "db-protocol",
+		Roles:       []string{"db-role1", "db-role2"},
+	}
+	expected := proto.RouteToDatabase{
+		ServiceName: "db-service",
+		Database:    "db-name",
+		Username:    "db-user",
+		Protocol:    "db-protocol",
+		Roles:       []string{"db-role1", "db-role2"},
+	}
+	require.Equal(t, expected, RouteToDatabaseToProto(input))
 }

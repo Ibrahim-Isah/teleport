@@ -1,38 +1,39 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package reversetunnel
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
 	"testing"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 
+	apissh "github.com/gravitational/teleport/api/ssh"
 	"github.com/gravitational/teleport/api/types"
 	apisshutils "github.com/gravitational/teleport/api/utils/sshutils"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/sshutils"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
 
 // TestAgentCertChecker validates that reverse tunnel agents properly validate
@@ -73,7 +74,7 @@ func TestAgentCertChecker(t *testing.T) {
 				"test",
 				utils.NetAddr{AddrNetwork: "tcp", Addr: "localhost:0"},
 				handler,
-				[]ssh.Signer{cert},
+				sshutils.StaticHostSigners(cert),
 				sshutils.AuthMethods{NoClient: true},
 				sshutils.SetInsecureSkipHostValidation(),
 			)
@@ -81,16 +82,21 @@ func TestAgentCertChecker(t *testing.T) {
 			t.Cleanup(func() { require.NoError(t, sshServer.Close()) })
 			require.NoError(t, sshServer.Start())
 
-			priv, err := rsa.GenerateKey(rand.Reader, 2048)
+			priv, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.Ed25519)
 			require.NoError(t, err)
 
 			signer, err := ssh.NewSignerFromKey(priv)
 			require.NoError(t, err)
 
 			dialer := agentDialer{
-				client:      &fakeClient{caKey: ca.PublicKey()},
-				authMethods: []ssh.AuthMethod{ssh.PublicKeys(signer)},
-				log:         logrus.New(),
+				client:   &fakeClient{caKey: ca.PublicKey()},
+				username: "alice",
+				publicKeyAuth: apissh.PublicKeyAuthConfig{
+					Signers: func() ([]ssh.Signer, error) {
+						return []ssh.Signer{signer}, nil
+					},
+				},
+				logger: logtest.NewLogger(),
 			}
 
 			_, err = dialer.DialContext(context.Background(), *utils.MustParseAddr(sshServer.Addr()))
@@ -100,11 +106,11 @@ func TestAgentCertChecker(t *testing.T) {
 }
 
 type fakeClient struct {
-	auth.AccessCache
+	authclient.AccessCache
 	caKey ssh.PublicKey
 }
 
-func (fc *fakeClient) GetCertAuthorities(ctx context.Context, caType types.CertAuthType, loadKeys bool, opts ...services.MarshalOption) ([]types.CertAuthority, error) {
+func (fc *fakeClient) GetCertAuthorities(ctx context.Context, caType types.CertAuthType, loadKeys bool) ([]types.CertAuthority, error) {
 	ca, err := types.NewCertAuthority(types.CertAuthoritySpecV2{
 		Type:        types.HostCA,
 		ClusterName: "example.com",
@@ -122,6 +128,6 @@ func (fc *fakeClient) GetCertAuthorities(ctx context.Context, caType types.CertA
 	return []types.CertAuthority{ca}, nil
 }
 
-func (fc *fakeClient) GetClusterNetworkingConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterNetworkingConfig, error) {
+func (fc *fakeClient) GetClusterNetworkingConfig(ctx context.Context) (types.ClusterNetworkingConfig, error) {
 	return types.NewClusterNetworkingConfigFromConfigFile(types.ClusterNetworkingConfigSpecV2{})
 }

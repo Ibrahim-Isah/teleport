@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gcp
 
@@ -26,6 +28,7 @@ import (
 	"time"
 
 	containerpb "cloud.google.com/go/container/apiv1/containerpb"
+	"github.com/google/go-cmp/cmp"
 	gax "github.com/googleapis/gax-go/v2"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
@@ -50,7 +53,7 @@ func Test_gcpGKEClient_ListClusters(t *testing.T) {
 		fields        fields
 		args          args
 		want          []GKECluster
-		errValidation func(t require.TestingT, err error, msgAndArgs ...interface{})
+		errValidation func(t require.TestingT, err error, msgAndArgs ...any)
 	}{
 		{
 			name: "list wildcard region",
@@ -167,7 +170,7 @@ func Test_gcpGKEClient_ListClusters(t *testing.T) {
 				return got[i].Name < got[j].Name
 			})
 
-			require.Equal(t, got, tt.want)
+			require.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -210,16 +213,23 @@ func (f *fakeTokenSource) Token() (*oauth2.Token, error) {
 	}, nil
 }
 
+func boolPtr(b bool) *bool {
+	return &b
+}
+
 var clusters = map[string]*containerpb.Cluster{
 	"projects/p1/locations/region1/clusters/cluster1": {
 		Name:           "cluster1",
 		Description:    "desc1",
 		Status:         containerpb.Cluster_RUNNING,
 		Location:       "region1",
-		Endpoint:       "foobar1.com",
+		Endpoint:       "test.example.com",
 		ResourceLabels: labels,
-		MasterAuth: &containerpb.MasterAuth{
-			ClusterCaCertificate: ca,
+		ControlPlaneEndpointsConfig: &containerpb.ControlPlaneEndpointsConfig{
+			DnsEndpointConfig: &containerpb.ControlPlaneEndpointsConfig_DNSEndpointConfig{
+				Endpoint:             "foobar1.com",
+				AllowExternalTraffic: boolPtr(true),
+			},
 		},
 	},
 	"projects/p1/locations/region1/clusters/cluster2": {
@@ -227,10 +237,16 @@ var clusters = map[string]*containerpb.Cluster{
 		Description:    "desc2",
 		Status:         containerpb.Cluster_RUNNING,
 		Location:       "region1",
-		Endpoint:       "foobar2.com",
+		Endpoint:       "test.example.com",
 		ResourceLabels: labels,
 		MasterAuth: &containerpb.MasterAuth{
 			ClusterCaCertificate: ca,
+		},
+		ControlPlaneEndpointsConfig: &containerpb.ControlPlaneEndpointsConfig{
+			IpEndpointsConfig: &containerpb.ControlPlaneEndpointsConfig_IPEndpointsConfig{
+				Enabled:        boolPtr(true),
+				PublicEndpoint: "foobar2.com",
+			},
 		},
 	},
 	"projects/p1/locations/region3/clusters/cluster3": {
@@ -238,10 +254,16 @@ var clusters = map[string]*containerpb.Cluster{
 		Description:    "desc3",
 		Status:         containerpb.Cluster_RUNNING,
 		Location:       "region3",
-		Endpoint:       "foobar3.com",
+		Endpoint:       "test.example.com",
 		ResourceLabels: labels,
 		MasterAuth: &containerpb.MasterAuth{
 			ClusterCaCertificate: ca,
+		},
+		ControlPlaneEndpointsConfig: &containerpb.ControlPlaneEndpointsConfig{
+			IpEndpointsConfig: &containerpb.ControlPlaneEndpointsConfig_IPEndpointsConfig{
+				Enabled:         boolPtr(true),
+				PrivateEndpoint: "foobar3.com",
+			},
 		},
 	},
 }
@@ -266,7 +288,7 @@ func Test_gcpGKEClient_GetClusterRestConfig(t *testing.T) {
 		args               args
 		expectedCfg        *rest.Config
 		expectedExpiration time.Time
-		errValidation      func(t require.TestingT, err error, msgAndArgs ...interface{})
+		errValidation      func(t require.TestingT, err error, msgAndArgs ...any)
 	}{
 		{
 			name: "missing cluster",
@@ -312,9 +334,6 @@ func Test_gcpGKEClient_GetClusterRestConfig(t *testing.T) {
 			expectedCfg: &rest.Config{
 				Host:        "https://foobar1.com",
 				BearerToken: "fake_token",
-				TLSClientConfig: rest.TLSClientConfig{
-					CAData: caBytes,
-				},
 			},
 		},
 		{
@@ -389,8 +408,8 @@ func Test_gcpGKEClient_GetClusterRestConfig(t *testing.T) {
 
 			got, exp, err := client.GetClusterRestConfig(tt.args.ctx, tt.args.cfg)
 			tt.errValidation(t, err)
-			require.Equal(t, tt.expectedCfg, got)
-			require.Equal(t, tt.expectedExpiration, exp)
+			require.Empty(t, cmp.Diff(tt.expectedCfg, got))
+			require.Empty(t, cmp.Diff(tt.expectedExpiration, exp))
 		})
 	}
 }
